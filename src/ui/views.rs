@@ -387,7 +387,7 @@ async fn card(labels: &mut Labels<'_>, ctx: CardCtx, task: &Task) -> StoreResult
     };
     let held = matches!(
         task.status,
-        TaskStatus::Claimed | TaskStatus::Blocked | TaskStatus::Review
+        TaskStatus::Planning | TaskStatus::Claimed | TaskStatus::Blocked | TaskStatus::Review
     );
     let owner_live = match task.owner_session_id {
         Some(s) if held => Some(
@@ -737,7 +737,10 @@ async fn overview_data(state: &AppState) -> UiResult<(Counters, Vec<AgentCard>)>
             .filter(|t| {
                 matches!(
                     t.status,
-                    TaskStatus::Claimed | TaskStatus::Blocked | TaskStatus::Review
+                    TaskStatus::Planning
+                        | TaskStatus::Claimed
+                        | TaskStatus::Blocked
+                        | TaskStatus::Review
                 )
             })
             .max_by_key(|t| t.updated_at)

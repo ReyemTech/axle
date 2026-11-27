@@ -7,9 +7,10 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use super::{
-    ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate, MessageReceipt, Recipient,
-    Store, StoreError, StoreResult, TaskFilter, TransitionRequest, Transitioned, child_event,
-    children_complete_event, claim_event, closes_child, edit_payload, send_time_recipient,
+    AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate,
+    MessageReceipt, ProjectsAdded, Recipient, Store, StoreError, StoreResult, TaskFilter,
+    TransitionRequest, Transitioned, child_event, children_complete_event, claim_event,
+    closes_child, edit_payload, projects_added_note, projects_added_payload, send_time_recipient,
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, Eligibility, Importance, InboxItem, Message, MessageId,
@@ -101,6 +102,8 @@ fn task_from(row: &PgRow) -> StoreResult<Task> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         version: row.try_get("version")?,
+        requires_plan: row.try_get("requires_plan")?,
+        plan_state: parse_text(row.try_get("plan_state")?)?,
     })
 }
 
@@ -199,7 +202,7 @@ async fn record_event(
             .execute(&mut *conn)
             .await?;
         }
-        Some("open" | "blocked" | "review") => {}
+        Some("open" | "planning" | "blocked" | "review") => {}
         _ => return Ok(false),
     }
     insert_event(conn, &children_complete_event(parent, event), token).await?;
@@ -211,7 +214,8 @@ macro_rules! task_cols {
     () => {
         "id, project_id, parent_id, title, body, status, owner_session_id, owner_agent_id,
          lease_expires_at, lease_epoch, lease_ttl_secs, eligible_harness, eligible_host,
-         created_by_agent_id, created_by_session_id, created_at, updated_at, version"
+         created_by_agent_id, created_by_session_id, created_at, updated_at, version,
+         requires_plan, plan_state"
     };
 }
 
@@ -228,7 +232,9 @@ macro_rules! eligible {
     };
 }
 
-/// The guarded claim inside an open transaction. Locks the row first so `previous` is
+/// The guarded claim inside an open transaction. A `requires_plan` task is claimed into
+/// `planning`; a planning task stays planning on a takeover, and a submitted plan (waiting
+/// on the human) keeps having no lease. Locks the row first so `previous` is
 /// exactly what the guarded update replaces (and the per-task TTL is read under the lock).
 async fn claim_locked(
     conn: &mut PgConnection,
@@ -262,12 +268,18 @@ async fn claim_locked(
     let claimed = sqlx::query(concat!(
         "UPDATE tasks
             SET owner_session_id = $5, owner_agent_id = $6,
-                status = 'claimed', lease_expires_at = $7,
+                status = CASE WHEN status = 'open' AND requires_plan THEN 'planning'
+                              WHEN status = 'planning' THEN 'planning'
+                              ELSE 'claimed' END,
+                plan_state = CASE WHEN status = 'open' AND requires_plan THEN 'drafting'
+                                  ELSE plan_state END,
+                lease_expires_at = CASE WHEN status = 'planning' AND plan_state = 'submitted'
+                                        THEN NULL ELSE $7 END,
                 lease_epoch = lease_epoch + 1, version = version + 1, updated_at = $8
           WHERE id = $1
             AND (status = 'open'
-                 OR (status = 'claimed' AND lease_expires_at < $8)
-                 OR (status IN ('claimed', 'blocked', 'review') AND owner_agent_id = $6
+                 OR (status IN ('claimed', 'planning') AND lease_expires_at < $8)
+                 OR (status IN ('claimed', 'planning', 'blocked', 'review') AND owner_agent_id = $6
                      AND (owner_session_id = $5
                           OR NOT EXISTS (SELECT 1 FROM sessions s
                                           WHERE s.id = tasks.owner_session_id
@@ -306,7 +318,7 @@ async fn claim_locked(
 macro_rules! message_cols {
     () => {
         "m.id, m.project_id, m.from_agent_id, m.from_session_id, m.to_kind, m.to_id, m.task_id,
-         m.subject, m.body, m.importance, m.reply_to, m.created_at"
+         m.subject, m.body, m.importance, m.reply_to, m.created_at, m.kind"
     };
 }
 
@@ -368,6 +380,7 @@ fn message_from(row: &PgRow) -> StoreResult<Message> {
         task_id: opt_id(row, "task_id")?,
         reply_to: opt_id(row, "reply_to")?,
         created_at: row.try_get("created_at")?,
+        kind: parse_text(row.try_get("kind")?)?,
     })
 }
 
@@ -381,8 +394,8 @@ async fn insert_message(
     sqlx::query(
         "INSERT INTO messages
              (id, project_id, from_agent_id, from_session_id, token_id, to_kind, to_id, task_id,
-              subject, body, importance, reply_to, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+              subject, body, importance, reply_to, created_at, kind)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
     )
     .bind(m.id.as_uuid())
     .bind(m.project_id.map(|p| p.as_uuid()))
@@ -397,6 +410,7 @@ async fn insert_message(
     .bind(m.importance.as_str())
     .bind(m.reply_to.map(|r| r.as_uuid()))
     .bind(m.created_at)
+    .bind(m.kind.as_str())
     .execute(&mut *conn)
     .await?;
     if let Some((agent, session)) = send_time_recipient(&m.to) {
@@ -781,17 +795,29 @@ impl Store for PostgresStore {
         token: Option<TokenId>,
         event: &TaskEvent,
         first_message: &Message,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<bool> {
         let (by_agent, by_session) = task.created_by.ids();
         let mut tx = self.pool.begin().await?;
+        if let Some(parent) = task.parent_id {
+            // FOR SHARE holds off a concurrent claim moving the parent into `planning`.
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM tasks WHERE id = $1 FOR SHARE")
+                    .bind(parent.as_uuid())
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if status.as_deref() == Some("planning") {
+                tx.commit().await?;
+                return Ok(false);
+            }
+        }
         sqlx::query(
             "INSERT INTO tasks
                  (id, project_id, parent_id, title, body, status, owner_session_id,
                   owner_agent_id, lease_expires_at, lease_epoch, lease_ttl_secs,
                   eligible_harness, eligible_host, created_by_agent_id, created_by_session_id,
-                  token_id, created_at, updated_at, version)
+                  token_id, created_at, updated_at, version, requires_plan, plan_state)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                     $17, $18, $19)",
+                     $17, $18, $19, $20, $21)",
         )
         .bind(task.id.as_uuid())
         .bind(task.project_id.as_uuid())
@@ -812,6 +838,8 @@ impl Store for PostgresStore {
         .bind(task.created_at)
         .bind(task.updated_at)
         .bind(task.version)
+        .bind(task.requires_plan)
+        .bind(task.plan_state.as_str())
         .execute(&mut *tx)
         .await?;
         for project in extra_projects {
@@ -827,7 +855,87 @@ impl Store for PostgresStore {
         insert_event(&mut tx, event, token).await?;
         insert_message(&mut tx, first_message, token).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(true)
+    }
+
+    async fn add_task_projects(
+        &self,
+        req: &AddProjectsRequest<'_>,
+    ) -> StoreResult<Option<ProjectsAdded>> {
+        let (agent, session) = match req.editor {
+            Some((a, s)) => (Some(a.as_uuid()), Some(s.as_uuid())),
+            None => (None, None),
+        };
+        let mut tx = self.pool.begin().await?;
+        // The guard, as a locking read (a no-op addition writes nothing).
+        let guarded = sqlx::query(concat!(
+            "SELECT ",
+            task_cols!(),
+            " FROM tasks
+             WHERE id = $1 AND parent_id IS NULL AND status NOT IN ('done', 'cancelled')
+               AND ($2::uuid IS NULL OR created_by_agent_id = $2
+                    OR (owner_session_id = $3::uuid
+                        AND status IN ('planning', 'claimed', 'blocked', 'review')))
+             FOR UPDATE"
+        ))
+        .bind(req.task.as_uuid())
+        .bind(agent)
+        .bind(session)
+        .fetch_optional(&mut *tx)
+        .await?
+        .as_ref()
+        .map(task_from)
+        .transpose()?;
+        let Some(mut task) = guarded else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let mut added = Vec::new();
+        let mut names = Vec::new();
+        for project in req.projects {
+            if *project == task.project_id || added.contains(project) {
+                continue;
+            }
+            let inserted = sqlx::query(
+                "INSERT INTO task_projects (task_id, project_id) VALUES ($1, $2)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(req.task.as_uuid())
+            .bind(project.as_uuid())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+                == 1;
+            if inserted {
+                added.push(*project);
+                let name: String =
+                    sqlx::query_scalar("SELECT display_name FROM projects WHERE id = $1")
+                        .bind(project.as_uuid())
+                        .fetch_one(&mut *tx)
+                        .await?;
+                names.push(name);
+            }
+        }
+        if !added.is_empty() {
+            let row = sqlx::query(concat!(
+                "UPDATE tasks SET version = version + 1, updated_at = $1 WHERE id = $2
+                 RETURNING ",
+                task_cols!()
+            ))
+            .bind(req.event.at)
+            .bind(req.task.as_uuid())
+            .fetch_one(&mut *tx)
+            .await?;
+            task = task_from(&row)?;
+            let mut event = req.event.clone();
+            event.payload = Some(projects_added_payload(&added));
+            insert_event(&mut tx, &event, req.token).await?;
+            let mut note = req.note.clone();
+            note.body = projects_added_note(&names);
+            insert_message(&mut tx, &note, req.token).await?;
+        }
+        tx.commit().await?;
+        Ok(Some(ProjectsAdded { task, added }))
     }
 
     async fn get_task(&self, id: TaskId) -> StoreResult<Option<Task>> {
@@ -947,7 +1055,8 @@ impl Store for PostgresStore {
         let picked: Option<Uuid> = sqlx::query_scalar(concat!(
             "SELECT id FROM tasks
               WHERE project_id = $1
-                AND (status = 'open' OR (status = 'claimed' AND lease_expires_at < $5))
+                AND (status = 'open'
+                     OR (status IN ('claimed', 'planning') AND lease_expires_at < $5))
                 AND ",
             eligible!(),
             " ORDER BY created_at, id
@@ -976,10 +1085,15 @@ impl Store for PostgresStore {
             LeaseUpdate::Clear => (false, None),
             LeaseUpdate::Set(t) => (false, Some(t)),
         };
+        let plan_from: Option<Vec<&str>> = req
+            .plan_from
+            .as_ref()
+            .map(|states| states.iter().map(|s| s.as_str()).collect());
         let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(concat!(
             "UPDATE tasks
                 SET status = COALESCE($1::text, status),
+                    plan_state = COALESCE($9::text, plan_state),
                     lease_expires_at = CASE WHEN $2 THEN lease_expires_at
                                             ELSE $3::timestamptz END,
                     owner_session_id = CASE WHEN $4 THEN NULL ELSE owner_session_id END,
@@ -988,6 +1102,7 @@ impl Store for PostgresStore {
               WHERE id = $6
                 AND status = ANY($7::text[])
                 AND ($8::uuid IS NULL OR owner_session_id = $8)
+                AND ($10::text[] IS NULL OR plan_state = ANY($10::text[]))
               RETURNING ",
             task_cols!()
         ))
@@ -999,6 +1114,8 @@ impl Store for PostgresStore {
         .bind(req.task.as_uuid())
         .bind(&from)
         .bind(req.owner.map(|s| s.as_uuid()))
+        .bind(req.plan_to.map(|s| s.as_str()))
+        .bind(&plan_from)
         .fetch_optional(&mut *tx)
         .await?
         .as_ref()
@@ -1009,6 +1126,9 @@ impl Store for PostgresStore {
             return Ok(None);
         };
         let children_complete = record_event(&mut tx, &task, &req.event, req.token).await?;
+        if let Some(message) = &req.message {
+            insert_message(&mut tx, message, req.token).await?;
+        }
         tx.commit().await?;
         Ok(Some(Transitioned {
             task,
@@ -1033,7 +1153,8 @@ impl Store for PostgresStore {
               WHERE id = $4
                 AND status NOT IN ('done', 'cancelled')
                 AND (created_by_agent_id = $5
-                     OR (owner_session_id = $6 AND status IN ('claimed', 'blocked', 'review')))
+                     OR (owner_session_id = $6
+                         AND status IN ('planning', 'claimed', 'blocked', 'review')))
               RETURNING ",
             task_cols!()
         ))
@@ -1079,7 +1200,8 @@ impl Store for PostgresStore {
             "UPDATE tasks
                 SET lease_expires_at = $1
                     + make_interval(secs => COALESCE(lease_ttl_secs, $3)::double precision)
-              WHERE owner_session_id = $2 AND status = 'claimed' AND lease_expires_at >= $1",
+              WHERE owner_session_id = $2 AND status IN ('claimed', 'planning')
+                AND lease_expires_at >= $1",
         )
         .bind(now)
         .bind(session.as_uuid())

@@ -115,6 +115,7 @@ impl MessageService {
             task_id,
             reply_to: new.reply_to,
             created_at: self.clock.now(),
+            kind: crate::domain::MessageKind::Message,
         };
         self.store.insert_message(&message, token).await?;
         if let Some(bus) = &self.events {

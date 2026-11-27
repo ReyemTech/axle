@@ -165,12 +165,16 @@ pub struct TaskCreateParams {
     pub eligibility: Option<EligibilityParams>,
     /// Promote this message (id) to the task; an empty title / body default to its own.
     pub from_message: Option<String>,
+    /// Require a plan the human approves before work starts (claiming moves the task to
+    /// `planning`). Usually left off by agents.
+    pub requires_plan: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum StatusParam {
     Open,
+    Planning,
     Claimed,
     Blocked,
     Review,
@@ -182,6 +186,7 @@ impl From<StatusParam> for TaskStatus {
     fn from(s: StatusParam) -> Self {
         match s {
             StatusParam::Open => TaskStatus::Open,
+            StatusParam::Planning => TaskStatus::Planning,
             StatusParam::Claimed => TaskStatus::Claimed,
             StatusParam::Blocked => TaskStatus::Blocked,
             StatusParam::Review => TaskStatus::Review,
@@ -247,6 +252,18 @@ pub struct TaskUpdateParams {
     pub title: Option<String>,
     /// New body (creator or owner only).
     pub body: Option<String>,
+    /// Projects to add to a top-level task (keys or display names; creator or owner only).
+    /// Projects are never removed; adding one already listed does nothing.
+    pub add_projects: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TaskProposePlanParams {
+    /// Task id (one you hold in `planning`).
+    pub id: String,
+    /// The spec or plan, as text (at most 64 KB). For a parent spanning projects, list the
+    /// subtasks per project.
+    pub plan: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -418,8 +435,9 @@ impl AxleMcp {
     }
 
     #[tool(description = described!(
-        "Set a task you own to `blocked` (with a reason) or `review`, and/or edit its title \
-         or body (creator or owner)."
+        "Set a task you own to `blocked` (with a reason) or `review`, edit its title or body \
+         (creator or owner), and/or add participating projects to a top-level task \
+         (`add_projects`; creator or owner)."
     ))]
     async fn task_update(
         &self,
@@ -430,7 +448,23 @@ impl AxleMcp {
         render(self.task_update_impl(&me, p).await)
     }
 
-    #[tool(description = described!("Extend your lease on a claimed task."))]
+    #[tool(description = described!(
+        "Submit the spec or plan of a task you hold in `planning` for the human's approval; \
+         calling it again replaces the plan under review. Then wait: the approval (or a \
+         request for changes) arrives as a message, and the task becomes `claimed` once \
+         approved. While planning you may post, renew or release, but not create subtasks, \
+         block, review or complete."
+    ))]
+    async fn task_propose_plan(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<TaskProposePlanParams>,
+    ) -> CallToolResult {
+        let me = me!(self, parts);
+        render(self.task_propose_plan_impl(&me, p).await)
+    }
+
+    #[tool(description = described!("Extend your lease on a claimed or planning task."))]
     async fn task_renew(
         &self,
         Extension(parts): Extension<Parts>,
@@ -487,7 +521,10 @@ impl AxleMcp {
             t.owner_session_id == Some(me.session.id)
                 && matches!(
                     t.status,
-                    TaskStatus::Claimed | TaskStatus::Blocked | TaskStatus::Review
+                    TaskStatus::Planning
+                        | TaskStatus::Claimed
+                        | TaskStatus::Blocked
+                        | TaskStatus::Review
                 )
         }) {
             leases.push(json!({
@@ -598,7 +635,10 @@ impl AxleMcp {
                     t.owner_session_id == Some(s.id)
                         && matches!(
                             t.status,
-                            TaskStatus::Claimed | TaskStatus::Blocked | TaskStatus::Review
+                            TaskStatus::Planning
+                                | TaskStatus::Claimed
+                                | TaskStatus::Blocked
+                                | TaskStatus::Review
                         )
                 }) {
                     tasks.push(json!({
@@ -746,6 +786,7 @@ impl AxleMcp {
                 host: non_blank(eligibility.host),
             },
             lease_ttl: None,
+            requires_plan: p.requires_plan.unwrap_or(false),
         };
         let task = match p.from_message {
             Some(m) => {
@@ -842,7 +883,9 @@ impl AxleMcp {
             (Some(id), false) => {
                 let id: TaskId = parse_id("task", id)?;
                 match self.state.tasks.claim(me, id).await? {
-                    ClaimOutcome::Claimed(task) => labels.task_summary(&task).await,
+                    ClaimOutcome::Claimed(task) => {
+                        with_plan_step(labels.task_summary(&task).await?, &task)
+                    }
                     ClaimOutcome::AlreadyOwned { by, until } => {
                         let by = labels.agent(by).await?;
                         Err(ToolError::invalid(match until {
@@ -850,8 +893,8 @@ impl AxleMcp {
                                 format!("already owned by {by}, lease until {}", timestamp(t))
                             }
                             None => format!(
-                                "already owned by {by} (blocked or in review: its lease does not \
-                                 expire)"
+                                "already owned by {by} (blocked, in review or with a plan \
+                                 awaiting approval: its lease does not expire)"
                             ),
                         }))
                     }
@@ -871,7 +914,7 @@ impl AxleMcp {
                     ));
                 };
                 match self.state.tasks.claim_next(me, home.id).await? {
-                    Some(task) => labels.task_summary(&task).await,
+                    Some(task) => with_plan_step(labels.task_summary(&task).await?, &task),
                     None => Ok(json!({
                         "task": null,
                         "note": format!("no open task you are eligible for in {}", home.key),
@@ -908,10 +951,15 @@ impl AxleMcp {
     /// successful status change the caller holds the task, so the edit's guard passes.
     async fn task_update_impl(&self, me: &Resolved, p: TaskUpdateParams) -> ToolResult {
         let id: TaskId = parse_id("task", &p.id)?;
-        if p.status.is_none() && p.title.is_none() && p.body.is_none() {
+        let add_projects = p.add_projects.unwrap_or_default();
+        if p.status.is_none() && p.title.is_none() && p.body.is_none() && add_projects.is_empty() {
             return Err(ToolError::invalid(
-                "nothing to update: pass `status`, `title` and/or `body`",
+                "nothing to update: pass `status`, `title`, `body` and/or `add_projects`",
             ));
+        }
+        let mut projects = Vec::with_capacity(add_projects.len());
+        for name in &add_projects {
+            projects.push(self.project(name).await?.id);
         }
         if p.reason.is_some() && p.status.is_none() {
             return Err(ToolError::invalid(
@@ -943,8 +991,28 @@ impl AxleMcp {
         if p.title.is_some() || p.body.is_some() {
             task = Some(self.state.tasks.edit(me, id, p.title, p.body).await?);
         }
+        if !projects.is_empty() {
+            task = Some(
+                self.state
+                    .tasks
+                    .add_projects(Caller::Agent(me), id, &projects)
+                    .await?,
+            );
+        }
         let task = task.expect("at least one update ran");
         self.labels().task_summary(&task).await
+    }
+
+    async fn task_propose_plan_impl(&self, me: &Resolved, p: TaskProposePlanParams) -> ToolResult {
+        let id: TaskId = parse_id("task", &p.id)?;
+        let (task, plan) = self.state.tasks.propose_plan(me, id, p.plan).await?;
+        let mut v = self.labels().task_summary(&task).await?;
+        v["plan_message"] = json!(plan.id);
+        v["next_step"] = json!(
+            "Wait for the human's decision; it arrives as a message. Do not start the work until \
+             the task is `claimed` (approved)."
+        );
+        Ok(v)
     }
 
     async fn task_renew_impl(&self, me: &Resolved, p: TaskIdParams) -> ToolResult {
@@ -1063,6 +1131,19 @@ impl AxleMcp {
             Address::Human
         })
     }
+}
+
+/// A claimed `planning` task tells the agent what the plan gate expects of it.
+fn with_plan_step(mut v: Value, task: &crate::domain::Task) -> ToolResult {
+    if task.status == TaskStatus::Planning {
+        v["next_step"] = json!(
+            "This task needs a plan the human approves before any work. Write a spec or plan \
+             and submit it with task_propose_plan (for a parent spanning projects, list the \
+             subtasks per project), then wait for the approval message. Until then you cannot \
+             create subtasks, block, review or complete it."
+        );
+    }
+    Ok(v)
 }
 
 fn actor(me: &Resolved) -> crate::domain::Actor {

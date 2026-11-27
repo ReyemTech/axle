@@ -11,15 +11,15 @@ use uuid::Uuid;
 use crate::clock::Clock;
 use crate::config::ServerConfig;
 use crate::domain::{
-    Actor, Address, AgentId, Eligibility, Importance, Message, MessageId, ProjectId, SessionId,
-    Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId,
+    Actor, Address, AgentId, Eligibility, Importance, Message, MessageId, MessageKind, PlanState,
+    ProjectId, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId,
 };
 use crate::events::{Event, EventBus};
 use crate::service::identity::{IdentityError, NAME_MAX, Resolved, check_label};
 use crate::service::messages::{MessageError, SUBJECT_MAX, check_body, check_subject};
 use crate::store::{
-    ClaimRequest, Claimant, EditRequest, LeaseUpdate, Store, StoreError, TaskFilter,
-    TransitionRequest, Transitioned, claim_event,
+    AddProjectsRequest, ClaimRequest, Claimant, EditRequest, LeaseUpdate, Store, StoreError,
+    TaskFilter, TransitionRequest, Transitioned, claim_event,
 };
 
 /// Who is calling a task operation that agents and the human may both perform.
@@ -56,6 +56,9 @@ pub struct NewTask {
     pub eligibility: Eligibility,
     /// Lease length for this task (whole seconds, at least 1 s); `None` uses the server TTL.
     pub lease_ttl: Option<Duration>,
+    /// The plan gate: claiming moves it to `planning`, and the human approves a plan before
+    /// the work starts.
+    pub requires_plan: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -171,6 +174,18 @@ pub enum TaskError {
     ChildExtraProjects,
     #[error("a child task's project must be its parent's project or one the parent spans")]
     ChildProjectMismatch,
+    #[error("{}", plan_hint(*.0))]
+    PlanNotApproved(PlanState),
+    #[error("a plan can only be proposed while the task is planning (it is {0})")]
+    NotPlanning(TaskStatus),
+    #[error("there is no submitted plan to decide on (the plan is {})", plan_words(*.0))]
+    NoPlanToReview(PlanState),
+    #[error("a plan needs some text")]
+    EmptyPlan,
+    #[error("a note is required to request changes")]
+    NoteRequired,
+    #[error("unknown project")]
+    UnknownProject,
     /// The task body is over the message cap, or a promoted message does not exist.
     #[error(transparent)]
     Message(#[from] MessageError),
@@ -190,6 +205,43 @@ pub struct TaskService {
 
 /// A guarded write that agents retry only when a re-read says the guard should now pass.
 const MAX_GUARD_RETRIES: usize = 3;
+
+/// What an agent should do next when the plan gate refuses something.
+fn plan_hint(state: PlanState) -> &'static str {
+    match state {
+        PlanState::Submitted => {
+            "the plan is waiting for the human's approval: wait for their answer (it arrives as \
+             a message) before doing the work"
+        }
+        PlanState::ChangesRequested => {
+            "the human asked for changes to the plan: revise it and submit it again with \
+             task_propose_plan"
+        }
+        _ => {
+            "the plan is not approved yet: write a spec or plan, submit it with \
+             task_propose_plan and wait for the human's approval"
+        }
+    }
+}
+
+/// A plan state in words, for people.
+pub fn plan_words(state: PlanState) -> &'static str {
+    match state {
+        PlanState::None => "not started",
+        PlanState::Drafting => "being drafted",
+        PlanState::Submitted => "awaiting approval",
+        PlanState::ChangesRequested => "being revised",
+        PlanState::Approved => "approved",
+    }
+}
+
+/// Every plan state but `Submitted`: the states in which a planning lease runs.
+const LEASED_PLAN_STATES: [PlanState; 4] = [
+    PlanState::None,
+    PlanState::Drafting,
+    PlanState::ChangesRequested,
+    PlanState::Approved,
+];
 
 impl TaskService {
     pub fn new(
@@ -283,8 +335,11 @@ impl TaskService {
                 .get_task(parent_id)
                 .await?
                 .ok_or(TaskError::NotFound)?;
-            // A task's projects never change after creation, so checking outside the insert
-            // is safe.
+            if parent.status == TaskStatus::Planning {
+                return Err(TaskError::PlanNotApproved(parent.plan_state));
+            }
+            // A task's projects are only ever added to, so checking outside the insert is
+            // safe (the store re-checks the parent's status under its lock).
             if parent.project_id != new.project_id
                 && !self
                     .store
@@ -313,6 +368,8 @@ impl TaskService {
             created_at: now,
             updated_at: now,
             version: 0,
+            requires_plan: new.requires_plan,
+            plan_state: PlanState::None,
         };
         let event = self.event(task.id, by.actor(), TaskEventKind::Created, None, None);
         let first = Message {
@@ -326,10 +383,21 @@ impl TaskService {
             task_id: Some(task.id),
             reply_to,
             created_at: now,
+            kind: MessageKind::Message,
         };
-        self.store
+        if !self
+            .store
             .insert_task(&task, &new.extra_projects, by.token(), &event, &first)
-            .await?;
+            .await?
+        {
+            let parent = task.parent_id.expect("only a child insert is refused");
+            let state = self
+                .store
+                .get_task(parent)
+                .await?
+                .map_or(PlanState::Drafting, |p| p.plan_state);
+            return Err(TaskError::PlanNotApproved(state));
+        }
         self.changed(&task, TaskEventKind::Created).await;
         Ok(task)
     }
@@ -381,23 +449,192 @@ impl TaskService {
 
     /// Explicitly extends the caller's lease on a `claimed` task to `now + ttl` (the task's
     /// own TTL, else the server's).
+    /// A `planning` task renews too, except while its plan waits on the human: that lease
+    /// does not run, so renewing it is a successful no-op.
     pub async fn renew(&self, caller: &Resolved, id: TaskId) -> Result<Task, TaskError> {
         // A task's TTL never changes after creation, so reading it outside the write is safe.
         let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+        if task.status == TaskStatus::Planning
+            && task.plan_state == PlanState::Submitted
+            && task.owner_session_id == Some(caller.session.id)
+        {
+            return Ok(task);
+        }
         let until = self.clock.now() + task.lease_ttl.unwrap_or(self.lease_ttl);
-        self.owner_transition(
+        self.guarded(
             caller,
             id,
-            &[TaskStatus::Claimed],
-            TaskStatus::Claimed,
-            None,
-            LeaseUpdate::Set(until),
-            false,
-            TaskEventKind::Renewed,
-            None,
-            None,
+            Guarded {
+                from: &[TaskStatus::Claimed, TaskStatus::Planning],
+                target: TaskStatus::Claimed,
+                to: None,
+                lease: LeaseUpdate::Set(until),
+                plan_from: Some(&LEASED_PLAN_STATES),
+                ..Guarded::new(TaskEventKind::Renewed)
+            },
         )
         .await
+    }
+
+    /// The owner submits (or resubmits) the plan of a `planning` task: it is stored as a `plan`
+    /// message in the thread addressed to the human, the plan state becomes `submitted` and the
+    /// lease stops running until the human decides. One transaction.
+    pub async fn propose_plan(
+        &self,
+        caller: &Resolved,
+        id: TaskId,
+        plan: String,
+    ) -> Result<(Task, Message), TaskError> {
+        if plan.trim().is_empty() {
+            return Err(TaskError::EmptyPlan);
+        }
+        check_body(&plan)?;
+        let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+        let message = Message {
+            id: MessageId::new(),
+            project_id: Some(task.project_id),
+            from: actor_of(caller),
+            to: Address::Human,
+            subject: Some(prefixed("Plan: ", &task.title)),
+            body: plan,
+            importance: Importance::High,
+            task_id: Some(id),
+            reply_to: None,
+            created_at: self.clock.now(),
+            kind: MessageKind::Plan,
+        };
+        let done = self
+            .guarded(
+                caller,
+                id,
+                Guarded {
+                    from: &[TaskStatus::Planning],
+                    target: TaskStatus::Planning,
+                    to: None,
+                    lease: LeaseUpdate::Clear,
+                    plan_to: Some(PlanState::Submitted),
+                    message: Some(message.clone()),
+                    ..Guarded::new(TaskEventKind::PlanSubmitted)
+                },
+            )
+            .await;
+        match done {
+            Ok(task) => {
+                self.message_created(&message).await;
+                Ok((task, message))
+            }
+            Err(TaskError::InvalidTransition { from, .. }) => Err(TaskError::NotPlanning(from)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The human approves the submitted plan: `planning → claimed` with a fresh lease, and a
+    /// system message tells the owner's session to go ahead.
+    pub async fn approve_plan(&self, id: TaskId) -> Result<Task, TaskError> {
+        let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+        let until = self.clock.now() + task.lease_ttl.unwrap_or(self.lease_ttl);
+        let body = format!(
+            "The human approved your plan for \"{}\". The task is claimed by you now: go ahead \
+             with the work as planned.",
+            task.title
+        );
+        self.decide_plan(
+            &task,
+            TaskStatus::Claimed,
+            PlanState::Approved,
+            LeaseUpdate::Set(until),
+            TaskEventKind::PlanApproved,
+            None,
+            ("plan approved", body, MessageKind::System),
+        )
+        .await
+    }
+
+    /// The human asks for changes (a note is required): the plan state becomes
+    /// `changes_requested`, the task stays `planning` with a running lease again, and the note
+    /// goes to the owner's session.
+    pub async fn request_plan_changes(&self, id: TaskId, note: &str) -> Result<Task, TaskError> {
+        let note = note.trim();
+        if note.is_empty() {
+            return Err(TaskError::NoteRequired);
+        }
+        check_body(note)?;
+        let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+        let until = self.clock.now() + task.lease_ttl.unwrap_or(self.lease_ttl);
+        self.decide_plan(
+            &task,
+            TaskStatus::Planning,
+            PlanState::ChangesRequested,
+            LeaseUpdate::Set(until),
+            TaskEventKind::PlanChangesRequested,
+            Some(note.to_string()),
+            (
+                "plan changes requested",
+                note.to_string(),
+                MessageKind::Message,
+            ),
+        )
+        .await
+    }
+
+    /// Adds participating projects to a top-level task (append-only). Allowed for the human,
+    /// the creating agent and the session holding the task. Adding projects already listed is
+    /// a no-op; otherwise a system note in the thread and a `projects_added` event record it.
+    pub async fn add_projects(
+        &self,
+        by: Caller<'_>,
+        id: TaskId,
+        projects: &[ProjectId],
+    ) -> Result<Task, TaskError> {
+        for p in projects {
+            if self.store.get_project(*p).await?.is_none() {
+                return Err(TaskError::UnknownProject);
+            }
+        }
+        let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+        if task.parent_id.is_some() {
+            return Err(TaskError::ChildExtraProjects);
+        }
+        let now = self.clock.now();
+        let req = AddProjectsRequest {
+            task: id,
+            projects,
+            editor: match by {
+                Caller::Agent(r) => Some((r.agent.id, r.session.id)),
+                Caller::Human => None,
+            },
+            token: by.token(),
+            event: self.event(id, by.actor(), TaskEventKind::ProjectsAdded, None, None),
+            note: Message {
+                id: MessageId::new(),
+                project_id: Some(task.project_id),
+                from: by.actor(),
+                to: Address::Task(id),
+                subject: Some("projects added".into()),
+                body: String::new(),
+                importance: Importance::Normal,
+                task_id: Some(id),
+                reply_to: None,
+                created_at: now,
+                kind: MessageKind::System,
+            },
+        };
+        match self.store.add_task_projects(&req).await? {
+            Some(done) => {
+                if !done.added.is_empty() {
+                    self.changed(&done.task, TaskEventKind::ProjectsAdded).await;
+                    self.message_created(&req.note).await;
+                }
+                Ok(done.task)
+            }
+            None => {
+                let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+                if matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled) {
+                    return Err(TaskError::Closed(task.status));
+                }
+                Err(TaskError::NotOwner)
+            }
+        }
     }
 
     /// Gives the task back: `open`, no owner, no lease.
@@ -410,7 +647,12 @@ impl TaskService {
         self.owner_transition(
             caller,
             id,
-            &[TaskStatus::Claimed, TaskStatus::Blocked, TaskStatus::Review],
+            &[
+                TaskStatus::Planning,
+                TaskStatus::Claimed,
+                TaskStatus::Blocked,
+                TaskStatus::Review,
+            ],
             TaskStatus::Open,
             Some(TaskStatus::Open),
             LeaseUpdate::Clear,
@@ -555,6 +797,7 @@ impl TaskService {
             by.token(),
             &[
                 TaskStatus::Open,
+                TaskStatus::Planning,
                 TaskStatus::Claimed,
                 TaskStatus::Blocked,
                 TaskStatus::Review,
@@ -572,7 +815,12 @@ impl TaskService {
             id,
             Actor::Human,
             None,
-            &[TaskStatus::Claimed, TaskStatus::Blocked, TaskStatus::Review],
+            &[
+                TaskStatus::Planning,
+                TaskStatus::Claimed,
+                TaskStatus::Blocked,
+                TaskStatus::Review,
+            ],
             TaskStatus::Open,
             true,
             TaskEventKind::ForceReleased,
@@ -736,19 +984,13 @@ impl TaskService {
             task_id: Some(parent.id),
             reply_to: None,
             created_at: self.clock.now(),
+            kind: MessageKind::System,
         };
         if let Err(e) = self.store.insert_message(&message, token).await {
             eprintln!("axl: failed to notify parent task {}: {e}", parent.id);
             return;
         }
-        if let Some(bus) = &self.events {
-            bus.emit(Event::MessageCreated {
-                id: message.id,
-                to: message.to,
-                project_id: message.project_id,
-            })
-            .await;
-        }
+        self.message_created(&message).await;
     }
 
     fn claim_request(&self, caller: &Resolved) -> ClaimRequest {
@@ -789,7 +1031,8 @@ impl TaskService {
     }
 
     /// A transition only the owning session may make. `target` names the destination in
-    /// `InvalidTransition` errors; `to` is what is written (`None` keeps the status).
+    /// `InvalidTransition` errors; `to` is what is written (`None` keeps the status). Going
+    /// back to `open` resets the plan state.
     #[allow(clippy::too_many_arguments)]
     async fn owner_transition(
         &self,
@@ -804,30 +1047,69 @@ impl TaskService {
         note: Option<String>,
         payload: Option<serde_json::Value>,
     ) -> Result<Task, TaskError> {
+        self.guarded(
+            caller,
+            id,
+            Guarded {
+                from,
+                target,
+                to,
+                lease,
+                clear_owner,
+                note,
+                payload,
+                plan_to: (to == Some(TaskStatus::Open)).then_some(PlanState::None),
+                ..Guarded::new(kind)
+            },
+        )
+        .await
+    }
+
+    /// The owner-guarded transition behind `owner_transition`, with the plan guard and an
+    /// optional message written in the same transaction. A task in `planning` that the
+    /// transition does not start from is refused with `PlanNotApproved`.
+    async fn guarded(
+        &self,
+        caller: &Resolved,
+        id: TaskId,
+        g: Guarded<'_>,
+    ) -> Result<Task, TaskError> {
         let session = caller.session.id;
         for _ in 0..MAX_GUARD_RETRIES {
             let req = TransitionRequest {
                 task: id,
-                from: from.to_vec(),
-                to,
+                from: g.from.to_vec(),
+                to: g.to,
                 owner: Some(session),
-                lease,
-                clear_owner,
+                lease: g.lease,
+                clear_owner: g.clear_owner,
                 now: self.clock.now(),
                 token: Some(caller.session.token_id),
-                event: self.event(id, actor_of(caller), kind, note.clone(), payload.clone()),
+                event: self.event(
+                    id,
+                    actor_of(caller),
+                    g.kind,
+                    g.note.clone(),
+                    g.payload.clone(),
+                ),
+                plan_from: g.plan_from.map(<[PlanState]>::to_vec),
+                plan_to: g.plan_to,
+                message: g.message.clone(),
             };
             if let Some(done) = self.store.transition_task(&req).await? {
-                if kind != TaskEventKind::Renewed {
+                if g.kind != TaskEventKind::Renewed {
                     self.after_transition(&done, &req.event, req.token).await;
                 }
                 return Ok(done.task);
             }
             let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
-            if !from.contains(&task.status) {
+            if !g.from.contains(&task.status) {
+                if task.status == TaskStatus::Planning {
+                    return Err(TaskError::PlanNotApproved(task.plan_state));
+                }
                 return Err(TaskError::InvalidTransition {
                     from: task.status,
-                    to: target,
+                    to: g.target,
                 });
             }
             if task.owner_session_id != Some(session) {
@@ -837,9 +1119,91 @@ impl TaskService {
                     TaskError::NotOwner
                 });
             }
+            if let Some(states) = g.plan_from
+                && !states.contains(&task.plan_state)
+            {
+                return Err(TaskError::PlanNotApproved(task.plan_state));
+            }
             // The task changed between the guarded write and the re-read; try again.
         }
         Err(TaskError::LeaseLost)
+    }
+
+    /// The human's decision on a submitted plan: guarded on `planning` + `submitted` and on the
+    /// owner session read beforehand, so the message reaches the session that wrote the plan.
+    #[allow(clippy::too_many_arguments)]
+    async fn decide_plan(
+        &self,
+        task: &Task,
+        to: TaskStatus,
+        plan_to: PlanState,
+        lease: LeaseUpdate,
+        kind: TaskEventKind,
+        note: Option<String>,
+        (subject, body, message_kind): (&str, String, MessageKind),
+    ) -> Result<Task, TaskError> {
+        let id = task.id;
+        let mut current = task.clone();
+        for _ in 0..MAX_GUARD_RETRIES {
+            if current.status != TaskStatus::Planning {
+                return Err(TaskError::InvalidTransition {
+                    from: current.status,
+                    to,
+                });
+            }
+            let Some(owner) = current.owner_session_id else {
+                return Err(TaskError::NoPlanToReview(current.plan_state));
+            };
+            if current.plan_state != PlanState::Submitted {
+                return Err(TaskError::NoPlanToReview(current.plan_state));
+            }
+            let now = self.clock.now();
+            let message = Message {
+                id: MessageId::new(),
+                project_id: Some(current.project_id),
+                from: Actor::Human,
+                to: Address::Session(owner),
+                subject: Some(subject.to_string()),
+                body: body.clone(),
+                importance: Importance::High,
+                task_id: Some(id),
+                reply_to: None,
+                created_at: now,
+                kind: message_kind,
+            };
+            let req = TransitionRequest {
+                task: id,
+                from: vec![TaskStatus::Planning],
+                to: Some(to),
+                owner: Some(owner),
+                lease,
+                clear_owner: false,
+                now,
+                token: None,
+                event: self.event(id, Actor::Human, kind, note.clone(), None),
+                plan_from: Some(vec![PlanState::Submitted]),
+                plan_to: Some(plan_to),
+                message: Some(message.clone()),
+            };
+            if let Some(done) = self.store.transition_task(&req).await? {
+                self.after_transition(&done, &req.event, None).await;
+                self.message_created(&message).await;
+                return Ok(done.task);
+            }
+            current = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+        }
+        Err(TaskError::NoPlanToReview(current.plan_state))
+    }
+
+    async fn message_created(&self, message: &Message) {
+        if let Some(bus) = &self.events {
+            bus.emit(Event::MessageCreated {
+                id: message.id,
+                to: message.to,
+                project_id: message.project_id,
+            })
+            .await;
+        }
     }
 
     /// A transition with no ownership guard (authorisation is the caller's job).
@@ -864,6 +1228,9 @@ impl TaskService {
             now: self.clock.now(),
             token,
             event: self.event(id, actor, kind, None, None),
+            plan_from: None,
+            plan_to: (to == TaskStatus::Open).then_some(PlanState::None),
+            message: None,
         };
         match self.store.transition_task(&req).await? {
             Some(done) => {
@@ -897,6 +1264,49 @@ fn check_eligibility(e: &Eligibility) -> Result<(), TaskError> {
         }
     }
     Ok(())
+}
+
+/// The options of an owner-guarded transition (see `TaskService::guarded`).
+struct Guarded<'a> {
+    from: &'a [TaskStatus],
+    /// The destination named in `InvalidTransition` errors.
+    target: TaskStatus,
+    /// What is written (`None` keeps the status).
+    to: Option<TaskStatus>,
+    lease: LeaseUpdate,
+    clear_owner: bool,
+    kind: TaskEventKind,
+    note: Option<String>,
+    payload: Option<serde_json::Value>,
+    plan_from: Option<&'a [PlanState]>,
+    plan_to: Option<PlanState>,
+    message: Option<Message>,
+}
+
+impl Guarded<'_> {
+    fn new(kind: TaskEventKind) -> Self {
+        Self {
+            from: &[],
+            target: TaskStatus::Claimed,
+            to: None,
+            lease: LeaseUpdate::Keep,
+            clear_owner: false,
+            kind,
+            note: None,
+            payload: None,
+            plan_from: None,
+            plan_to: None,
+            message: None,
+        }
+    }
+}
+
+/// `prefix` + `text`, cut to the subject cap.
+fn prefixed(prefix: &str, text: &str) -> String {
+    format!("{prefix}{text}")
+        .chars()
+        .take(SUBJECT_MAX)
+        .collect()
 }
 
 fn actor_of(r: &Resolved) -> Actor {

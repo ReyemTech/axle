@@ -13,8 +13,9 @@ use time::{Duration, OffsetDateTime};
 
 use crate::config::Backend;
 use crate::domain::{
-    Actor, Address, Agent, AgentId, Importance, InboxItem, Message, MessageId, Project, ProjectId,
-    Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId, TokenInfo,
+    Actor, Address, Agent, AgentId, Importance, InboxItem, Message, MessageId, PlanState, Project,
+    ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId,
+    TokenInfo,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -126,7 +127,9 @@ pub trait Store: Send + Sync {
     // ---- tasks ----
 
     /// Inserts a new task, its extra participating projects, its `created` event and the first
-    /// message of its thread in one transaction. `token` is the writer's token.
+    /// message of its thread in one transaction. `token` is the writer's token. A child task is
+    /// refused (nothing written, `false`) while its parent is `planning`: the parent's status
+    /// is read under the write lock, so the check and the insert are atomic.
     async fn insert_task(
         &self,
         task: &Task,
@@ -134,7 +137,17 @@ pub trait Store: Send + Sync {
         token: Option<TokenId>,
         event: &TaskEvent,
         first_message: &Message,
-    ) -> StoreResult<()>;
+    ) -> StoreResult<bool>;
+    /// Appends participating projects to a top-level task, in one transaction: locks the task,
+    /// applies only if it has no parent, is not `done` / `cancelled` and `req.editor` is `None`
+    /// (the human), its creator or the session holding it. Projects already listed are skipped;
+    /// when any is new it bumps `version` / `updated_at` and appends `req.event` (payload: the
+    /// added project ids) and `req.note` (body: `projects_added_note` of their display names).
+    /// `None` when the guard did not match.
+    async fn add_task_projects(
+        &self,
+        req: &AddProjectsRequest<'_>,
+    ) -> StoreResult<Option<ProjectsAdded>>;
     async fn get_task(&self, id: TaskId) -> StoreResult<Option<Task>>;
     /// The extra participating projects listed for `id` (not its home project).
     async fn task_projects(&self, id: TaskId) -> StoreResult<Vec<ProjectId>>;
@@ -164,8 +177,10 @@ pub trait Store: Send + Sync {
         project: ProjectId,
         req: &ClaimRequest,
     ) -> StoreResult<Option<Task>>;
-    /// A guarded state change: applies only if the task's status is in `from` and (when
-    /// `owner` is set) `owner_session_id = owner`. Appends `event` in the same transaction.
+    /// A guarded state change: applies only if the task's status is in `from`, (when
+    /// `plan_from` is set) its plan state is in `plan_from` and (when `owner` is set)
+    /// `owner_session_id = owner`. Appends `event`, and `message` when set, in the same
+    /// transaction.
     /// `None` when the guard did not match (callers re-read to explain why).
     async fn transition_task(&self, req: &TransitionRequest) -> StoreResult<Option<Transitioned>>;
     /// A guarded edit, in one transaction: applies only if the task is not `done` /
@@ -179,8 +194,9 @@ pub trait Store: Send + Sync {
     /// owned it").
     async fn session_held_task(&self, task: TaskId, session: SessionId) -> StoreResult<bool>;
     /// Sets `lease_expires_at = now + ttl` (the task's own TTL, else `default_ttl`) on every
-    /// `claimed` task owned by `session` whose lease has not yet expired at `now` (heartbeat
-    /// renewal never revives an expired lease). Returns the number of leases extended.
+    /// `claimed` or `planning` task owned by `session` whose lease has not yet expired at `now`
+    /// (heartbeat renewal never revives an expired lease, and a submitted plan has no lease).
+    /// Returns the number of leases extended.
     async fn extend_session_leases(
         &self,
         session: SessionId,
@@ -379,6 +395,49 @@ pub struct TransitionRequest {
     pub now: OffsetDateTime,
     pub token: Option<TokenId>,
     pub event: TaskEvent,
+    /// Required plan states; `None` skips the plan guard.
+    pub plan_from: Option<Vec<PlanState>>,
+    /// `None` keeps the plan state.
+    pub plan_to: Option<PlanState>,
+    /// A message written with the transition (a submitted plan, an approval).
+    pub message: Option<Message>,
+}
+
+/// A request to append participating projects to a task (see `Store::add_task_projects`).
+#[derive(Debug, Clone)]
+pub struct AddProjectsRequest<'a> {
+    pub task: TaskId,
+    pub projects: &'a [ProjectId],
+    /// `None`: the human; else the agent (allowed as creator) and its session (as holder).
+    pub editor: Option<(AgentId, SessionId)>,
+    pub token: Option<TokenId>,
+    /// Appended when something was added; its payload is filled in.
+    pub event: TaskEvent,
+    /// Posted to the thread when something was added; its body is filled in.
+    pub note: Message,
+}
+
+/// What `add_task_projects` did.
+#[derive(Debug, Clone)]
+pub struct ProjectsAdded {
+    pub task: Task,
+    /// The projects that were new, in request order (empty: nothing changed).
+    pub added: Vec<ProjectId>,
+}
+
+/// The thread note for added projects, from their display names.
+pub fn projects_added_note(names: &[String]) -> String {
+    match names {
+        [one] => format!("Added project {one} to this task."),
+        many => format!("Added projects {} to this task.", many.join(", ")),
+    }
+}
+
+/// The event payload for added projects.
+pub fn projects_added_payload(added: &[ProjectId]) -> serde_json::Value {
+    serde_json::json!({
+        "added_projects": added.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+    })
 }
 
 /// A transition that applied.
@@ -447,7 +506,7 @@ pub fn claim_event(previous: &Task, req: &ClaimRequest) -> TaskEvent {
         (TaskStatus::Open, _) | (_, None) => (TaskEventKind::Claimed, None, None),
         (status, Some(agent)) if agent == c.agent => {
             if previous.owner_session_id == Some(c.session) {
-                if status == TaskStatus::Claimed {
+                if matches!(status, TaskStatus::Claimed | TaskStatus::Planning) {
                     (TaskEventKind::Renewed, None, None)
                 } else {
                     (

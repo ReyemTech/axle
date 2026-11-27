@@ -157,6 +157,8 @@ macro_rules! text_enum {
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Open,
+    /// Claimed, but the owner is writing a plan for the human to approve before any work.
+    Planning,
     Claimed,
     Blocked,
     Review,
@@ -166,11 +168,36 @@ pub enum TaskStatus {
 
 text_enum!(TaskStatus {
     Open => "open",
+    Planning => "planning",
     Claimed => "claimed",
     Blocked => "blocked",
     Review => "review",
     Done => "done",
     Cancelled => "cancelled",
+});
+
+/// Where a `requires_plan` task's plan is (`None` for tasks without the gate, and after a
+/// release).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanState {
+    #[default]
+    None,
+    /// Claimed; the owner is writing the plan.
+    Drafting,
+    /// Waiting on the human (the lease does not expire).
+    Submitted,
+    /// The human asked for changes; the owner is revising.
+    ChangesRequested,
+    Approved,
+}
+
+text_enum!(PlanState {
+    None => "none",
+    Drafting => "drafting",
+    Submitted => "submitted",
+    ChangesRequested => "changes_requested",
+    Approved => "approved",
 });
 
 /// Optional claim filter: when set, only agents with this harness / on this host may claim.
@@ -228,6 +255,9 @@ pub struct Task {
     pub updated_at: OffsetDateTime,
     /// Incremented by every state change.
     pub version: i64,
+    /// Claiming moves it to `planning`; work starts once the human approves the plan.
+    pub requires_plan: bool,
+    pub plan_state: PlanState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -250,6 +280,13 @@ pub enum TaskEventKind {
     ChildrenComplete,
     /// The title and/or body was changed (the previous values are in the payload).
     Edited,
+    /// The owner submitted a plan for approval (the plan is a `plan` message in the thread).
+    PlanSubmitted,
+    PlanApproved,
+    /// The human asked for changes to the plan (the note is the event's note).
+    PlanChangesRequested,
+    /// Participating projects were added to a parent task (listed in the payload).
+    ProjectsAdded,
 }
 
 text_enum!(TaskEventKind {
@@ -269,6 +306,10 @@ text_enum!(TaskEventKind {
     ChildCancelled => "child_cancelled",
     ChildrenComplete => "children_complete",
     Edited => "edited",
+    PlanSubmitted => "plan_submitted",
+    PlanApproved => "plan_approved",
+    PlanChangesRequested => "plan_changes_requested",
+    ProjectsAdded => "projects_added",
 });
 
 /// One append-only entry in a task's history.
@@ -343,6 +384,24 @@ impl Address {
     }
 }
 
+/// What a message is, beyond who sent it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageKind {
+    #[default]
+    Message,
+    /// A plan submitted for the human's approval (the latest one in a thread is under review).
+    Plan,
+    /// A note the server wrote on someone's behalf (an approval, added projects).
+    System,
+}
+
+text_enum!(MessageKind {
+    Message => "message",
+    Plan => "plan",
+    System => "system",
+});
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub id: MessageId,
@@ -358,6 +417,7 @@ pub struct Message {
     pub task_id: Option<TaskId>,
     pub reply_to: Option<MessageId>,
     pub created_at: OffsetDateTime,
+    pub kind: MessageKind,
 }
 
 /// A message as one recipient sees it.
@@ -399,6 +459,7 @@ mod tests {
     fn task_enums_round_trip_as_text() {
         for s in [
             TaskStatus::Open,
+            TaskStatus::Planning,
             TaskStatus::Claimed,
             TaskStatus::Blocked,
             TaskStatus::Review,
@@ -412,6 +473,16 @@ mod tests {
             "lease_expired_takeover"
         );
         assert!("nope".parse::<TaskStatus>().is_err());
+        for p in [
+            PlanState::None,
+            PlanState::Drafting,
+            PlanState::Submitted,
+            PlanState::ChangesRequested,
+            PlanState::Approved,
+        ] {
+            assert_eq!(p.as_str().parse::<PlanState>().unwrap(), p);
+        }
+        assert_eq!(MessageKind::Plan.to_string(), "plan");
     }
 
     #[test]

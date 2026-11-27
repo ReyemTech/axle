@@ -159,13 +159,14 @@ store_matrix!(tool_schemas_have_no_identity_params, |store: Arc<
         "task_renew",
         "task_release",
         "task_complete",
+        "task_propose_plan",
     ] {
         assert!(
             names.contains(&expected),
             "missing tool {expected}: {names:?}"
         );
     }
-    assert_eq!(names.len(), 16, "unexpected tools: {names:?}");
+    assert_eq!(names.len(), 17, "unexpected tools: {names:?}");
     for tool in &tools {
         let description = tool.description.as_deref().unwrap_or_default();
         assert!(
@@ -763,3 +764,149 @@ store_matrix!(
         assert_eq!(res.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
     }
 );
+
+store_matrix!(plan_gate_via_mcp, |store: Arc<dyn Store>| async move {
+    let server = start(store).await;
+    let lead = server.agent("mac", "claude-code").await;
+    let task = ok(
+        &lead,
+        "task_create",
+        json!({"title": "Gated", "body": "Plan first.", "requires_plan": true}),
+    )
+    .await;
+    assert_eq!(task["requires_plan"], true);
+    assert_eq!(task["plan_state"], "none");
+    let id = task["id"].as_str().unwrap().to_string();
+
+    let claimed = ok(&lead, "task_claim", json!({"id": id})).await;
+    assert_eq!(claimed["status"], "planning");
+    assert_eq!(claimed["plan_state"], "drafting");
+    assert!(
+        claimed["next_step"]
+            .as_str()
+            .unwrap()
+            .contains("task_propose_plan"),
+        "{claimed}"
+    );
+
+    // The gate explains what to do next.
+    let (is_error, text) = call(&lead, "task_complete", json!({"id": id, "summary": "x"})).await;
+    assert!(is_error);
+    assert!(text.contains("task_propose_plan"), "{text}");
+    let (is_error, text) = call(&lead, "task_update", json!({"id": id, "status": "review"})).await;
+    assert!(is_error && text.contains("not approved"), "{text}");
+    let (is_error, text) = call(
+        &lead,
+        "task_create",
+        json!({"title": "child", "body": "", "parent": id}),
+    )
+    .await;
+    assert!(is_error && text.contains("not approved"), "{text}");
+    ok(&lead, "task_post", json!({"id": id, "body": "thinking"})).await;
+
+    let submitted = ok(
+        &lead,
+        "task_propose_plan",
+        json!({"id": id, "plan": "1. do x\n2. do y"}),
+    )
+    .await;
+    assert_eq!(submitted["plan_state"], "submitted");
+    assert_eq!(submitted["lease_expires_at"], Value::Null);
+    assert!(submitted["plan_message"].is_string());
+    let (is_error, text) = call(&lead, "task_complete", json!({"id": id, "summary": "x"})).await;
+    assert!(is_error && text.contains("waiting for the human"), "{text}");
+
+    let detail = ok(&lead, "task_get", json!({"id": id})).await;
+    let last = detail["thread"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["kind"], "plan");
+    assert_eq!(last["to"], "human");
+    assert!(last["body"].as_str().unwrap().contains(WRAP_TAIL));
+
+    // Someone else cannot propose.
+    let other = server.agent("linux", "codex").await;
+    let (is_error, text) = call(
+        &other,
+        "task_propose_plan",
+        json!({"id": id, "plan": "mine"}),
+    )
+    .await;
+    assert!(is_error && text.contains("not the owner"), "{text}");
+    for c in [lead, other] {
+        c.cancel().await.unwrap();
+    }
+});
+
+store_matrix!(add_projects_via_mcp, |store: Arc<dyn Store>| async move {
+    let server = start(store).await;
+    let lead = server.agent("mac", "claude-code").await;
+    let session = uuid::Uuid::now_v7().to_string();
+    let nimbus = server
+        .connect(&[
+            ("x-axl-project", "github.com/reyemtech/nimbus"),
+            ("x-axl-host", "mac"),
+            ("x-axl-harness", "claude-code"),
+            ("x-axl-session", &session),
+        ])
+        .await;
+    ok(&nimbus, "whoami", json!({})).await;
+    let task = ok(&lead, "task_create", json!({"title": "Parent", "body": ""})).await;
+    let id = task["id"].as_str().unwrap().to_string();
+
+    let (is_error, text) = call(
+        &lead,
+        "task_update",
+        json!({"id": id, "add_projects": ["github.com/nope/none"]}),
+    )
+    .await;
+    assert!(is_error && text.contains("unknown project"), "{text}");
+    ok(
+        &lead,
+        "task_update",
+        json!({"id": id, "add_projects": ["github.com/reyemtech/nimbus"]}),
+    )
+    .await;
+    // Again: a no-op, not an error.
+    ok(
+        &lead,
+        "task_update",
+        json!({"id": id, "add_projects": ["github.com/reyemtech/nimbus"]}),
+    )
+    .await;
+    let child = ok(
+        &lead,
+        "task_create",
+        json!({"title": "Nimbus part", "body": "", "parent": id,
+                   "project": "github.com/reyemtech/nimbus"}),
+    )
+    .await;
+    let (is_error, text) = call(
+        &lead,
+        "task_update",
+        json!({"id": child["id"], "add_projects": ["github.com/reyemtech/axle"]}),
+    )
+    .await;
+    assert!(
+        is_error && text.contains("child tasks belong to one project"),
+        "{text}"
+    );
+    // A stranger may not extend it.
+    let (is_error, text) = call(
+        &nimbus,
+        "task_update",
+        json!({"id": id, "add_projects": ["github.com/reyemtech/nimbus"]}),
+    )
+    .await;
+    assert!(is_error && text.contains("not the owner"), "{text}");
+    let detail = ok(&lead, "task_get", json!({"id": id})).await;
+    assert!(
+        detail["thread"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["kind"] == "system"),
+        "{detail}"
+    );
+    for c in [lead, nimbus] {
+        c.cancel().await.unwrap();
+    }
+});

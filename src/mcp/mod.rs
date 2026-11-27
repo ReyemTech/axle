@@ -466,6 +466,7 @@ impl<'a> Labels<'a> {
             "importance": m.importance,
             "task": m.task_id,
             "reply_to": m.reply_to,
+            "kind": m.kind,
             "created_at": timestamp(m.created_at),
             "body": self.wrap(m.from, m.project_id, &m.body).await?,
         }))
@@ -486,6 +487,8 @@ impl<'a> Labels<'a> {
             "owner": owner,
             "owner_session": t.owner_session_id,
             "lease_expires_at": t.lease_expires_at.map(timestamp),
+            "requires_plan": t.requires_plan,
+            "plan_state": t.plan_state,
             "eligibility": {
                 "harness": t.eligibility.harness,
                 "host": t.eligibility.host,

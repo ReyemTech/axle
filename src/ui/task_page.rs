@@ -14,7 +14,9 @@ use super::views::{
     Labels, LeaseView, ProjectLabel, ProjectOption, Pulse, UiError, UiResult, ago, html,
     lease_view, pulse_counts,
 };
-use crate::domain::{Message, MessageId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus};
+use crate::domain::{
+    Message, MessageId, PlanState, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus,
+};
 use crate::http::AppState;
 use crate::store::{StoreResult, TaskFilter};
 
@@ -193,6 +195,22 @@ fn lease_text(now: OffsetDateTime, task: &Task, owner: Option<&str>) -> String {
     let owner = owner.unwrap_or("nobody");
     match task.status {
         TaskStatus::Open => "Not claimed.".into(),
+        TaskStatus::Planning => match (task.plan_state, task.lease_expires_at) {
+            (PlanState::Submitted, _) => format!(
+                "Held by {owner} for planning; the lease does not expire while the plan awaits \
+                 your approval."
+            ),
+            (_, Some(until)) if until > now => format!(
+                "Held by {owner} for planning until {} (renewed by heartbeat).",
+                Stamp::new(now, until).text
+            ),
+            (_, Some(until)) => format!(
+                "Held by {owner} for planning, lease expired at {}; any eligible agent may take \
+                 it over.",
+                Stamp::new(now, until).text
+            ),
+            (_, None) => format!("Held by {owner} for planning."),
+        },
         TaskStatus::Claimed => match task.lease_expires_at {
             Some(until) if until > now => format!(
                 "Held by {owner} until {} (renewed by heartbeat).",
@@ -288,7 +306,7 @@ pub async fn task_page(
         eligibility,
         can_release: matches!(
             task.status,
-            TaskStatus::Claimed | TaskStatus::Blocked | TaskStatus::Review
+            TaskStatus::Planning | TaskStatus::Claimed | TaskStatus::Blocked | TaskStatus::Review
         ),
         can_cancel: !matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled),
     };

@@ -172,7 +172,10 @@ async fn heartbeat(
             t.owner_session_id == Some(r.session.id)
                 && matches!(
                     t.status,
-                    TaskStatus::Claimed | TaskStatus::Blocked | TaskStatus::Review
+                    TaskStatus::Planning
+                        | TaskStatus::Claimed
+                        | TaskStatus::Blocked
+                        | TaskStatus::Review
                 )
         })
         .map(|t| t.id)

@@ -40,8 +40,14 @@ fn task_error(e: TaskError) -> UiError {
         e @ (TaskError::InvalidTransition { .. }
         | TaskError::Closed(_)
         | TaskError::NotOwner
-        | TaskError::LeaseLost) => UiError::Conflict(capitalise(&e.to_string())),
+        | TaskError::LeaseLost
+        | TaskError::PlanNotApproved(_)
+        | TaskError::NotPlanning(_)
+        | TaskError::NoPlanToReview(_)) => UiError::Conflict(capitalise(&e.to_string())),
         e @ (TaskError::ReasonRequired
+        | TaskError::EmptyPlan
+        | TaskError::NoteRequired
+        | TaskError::UnknownProject
         | TaskError::InvalidLeaseTtl
         | TaskError::ChildExtraProjects
         | TaskError::ChildProjectMismatch
