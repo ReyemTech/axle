@@ -694,8 +694,7 @@ async fn hostile_labels_and_hosts_are_escaped() {
         )
         .await;
     let tokens = app.get("/ui/tokens", Some(&cookie)).await;
-    // The device host bypasses sanitize_label here by going through the store-facing service
-    // only when it keeps the characters; assert escaping wherever the text shows up at all.
+    // The normal path sanitises the host before it is stored, so the card shows that form.
     let (_, user_code) = pending_device(&app, XSS).await;
     let card = app
         .post_form(
@@ -704,7 +703,44 @@ async fn hostile_labels_and_hosts_are_escaped() {
             &format!("csrf={csrf}&user_code={user_code}"),
         )
         .await;
-    for page in [&issued, &tokens, &card] {
+    assert!(
+        card.text().contains("-script-alert-1---script-"),
+        "{}",
+        card.text()
+    );
+
+    // A host that reached the store unsanitised must still render escaped.
+    let raw = axle::store::NewEnrollment {
+        id: axle::domain::EnrollmentId::new(),
+        kind: axle::domain::EnrollmentKind::Device,
+        secret_hash: &axle::service::auth::hash("axld_raw-host"),
+        user_code_hash: Some(&axle::service::auth::hash("ABCD2345")),
+        label: XSS,
+        host: XSS,
+        requester_ip: Some("10.0.0.9"),
+        now: app.state.clock.now(),
+        expires_at: app.state.clock.now() + time::Duration::minutes(10),
+    };
+    app.state.store.insert_enrollment(&raw).await.unwrap();
+    let raw_card = app
+        .post_form(
+            "/ui/connect/lookup",
+            Some(&cookie),
+            &format!("csrf={csrf}&user_code=ABCD-2345"),
+        )
+        .await;
+    assert_eq!(raw_card.status, StatusCode::OK, "{}", raw_card.body);
+    assert!(
+        raw_card.body.contains("&#60;script&#62;alert(1)"),
+        "{}",
+        raw_card.body
+    );
+    assert!(!raw_card.body.contains(XSS));
+    assert!(!raw_card.body.contains("<script>alert"));
+    let list = app.get("/ui/tokens", Some(&cookie)).await;
+    assert!(list.body.contains("&#60;script&#62;alert(1)"));
+    assert!(!list.body.contains("<script>alert"));
+    for page in [&issued, &tokens] {
         assert!(!page.body.contains("<script>alert"), "{}", page.body);
         assert!(!page.body.contains(XSS));
     }
