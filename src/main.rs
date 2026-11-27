@@ -1,8 +1,3 @@
-#![allow(dead_code)] // library-style modules are wired up in later tasks
-
-mod clock;
-mod config;
-
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]

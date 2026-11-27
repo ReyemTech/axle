@@ -35,7 +35,12 @@ impl Clock for TestClock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::{macros::datetime, Duration};
+    use time::{Duration, macros::datetime};
 
-    #[test] fn test_clock_advances() { let c = TestClock::new(datetime!(2026-01-01 0:00 UTC)); c.advance(Duration::minutes(5)); assert_eq!(c.now(), datetime!(2026-01-01 0:05 UTC)); }
+    #[test]
+    fn test_clock_advances() {
+        let c = TestClock::new(datetime!(2026-01-01 0:00 UTC));
+        c.advance(Duration::minutes(5));
+        assert_eq!(c.now(), datetime!(2026-01-01 0:05 UTC));
+    }
 }
