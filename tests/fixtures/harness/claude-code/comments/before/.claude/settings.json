@@ -1,0 +1,15 @@
+{
+   // permissions I tuned
+   "permissions": { "allow": ["Bash(ls:*)"] },
+
+   "hooks": {
+      /* mail for this machine */
+      "Stop": [
+         { "hooks": [ { "type": "command", "command": "axl hook stop", "timeout": 5 } ] },
+         { "hooks": [ { "type": "command", "command": "notify-send done" } ] }
+      ],
+      "SessionStart": [
+         { "hooks": [{ "type": "command", "command": "echo hi" }] }
+      ]
+   }
+}

@@ -114,7 +114,7 @@ pub fn apply(plan: &Plan, now: OffsetDateTime) -> io::Result<()> {
             back_up(&e.path)?;
         }
         match &e.after {
-            Some(after) => write_atomic(&e.path, after.as_bytes(), 0o644)?,
+            Some(after) => write_atomic(&e.path, after.as_bytes(), new_file_mode(&e.path))?,
             None => std::fs::remove_file(&e.path)?,
         }
     }
@@ -122,6 +122,20 @@ pub fn apply(plan: &Plan, now: OffsetDateTime) -> io::Result<()> {
         apply_link(l, &mut back_up)?;
     }
     Ok(())
+}
+
+/// Files under `~/.axl` (config.toml, the integrations tree) are created private; everything
+/// else a harness owns gets the usual 0644. An existing file keeps its own mode either way.
+fn new_file_mode(path: &Path) -> u32 {
+    if path
+        .ancestors()
+        .skip(1)
+        .any(|a| a.file_name().is_some_and(|n| n == ".axl"))
+    {
+        0o600
+    } else {
+        0o644
+    }
 }
 
 fn apply_link(l: &LinkEdit, back_up: &mut impl FnMut(&Path) -> io::Result<()>) -> io::Result<()> {

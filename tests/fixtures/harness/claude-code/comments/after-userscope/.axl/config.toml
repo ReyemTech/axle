@@ -1,0 +1,3 @@
+# my axl config
+port = 7420
+server_url = "https://axle.example.com"

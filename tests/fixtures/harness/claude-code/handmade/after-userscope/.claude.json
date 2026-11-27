@@ -1,0 +1,11 @@
+{
+  "numStartups": 12,
+  "mcpServers": {
+    "axle": {
+      "type": "stdio",
+      "command": "{{AXL}}",
+      "args": ["bridge", "--harness", "claude-code"]
+    },
+    "other": { "type": "stdio", "command": "other-mcp", "args": [] }
+  }
+}

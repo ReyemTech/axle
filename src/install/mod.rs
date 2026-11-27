@@ -1,13 +1,15 @@
 //! Shared foundation for the harness editors: which harnesses exist, the `axl` path to
 //! write, planned edits with diffs and backups, marker blocks, and the manifest.
 
+pub mod claude_code;
 pub mod fsutil;
+pub mod jsonc;
 pub mod manifest;
 pub mod paths;
 
 use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -79,4 +81,42 @@ pub fn is_axl_hook_command(cmd: &str) -> Option<crate::hook::Event> {
         return None;
     }
     crate::hook::Event::from_str(event, true).ok()
+}
+
+/// Why a harness editor could not produce a plan.
+#[derive(Debug)]
+pub enum EditError {
+    /// The file is not in a shape the editor can change without rewriting what the user
+    /// wrote. `snippet` is what to add by hand.
+    NeedsManual {
+        file: PathBuf,
+        reason: String,
+        snippet: String,
+    },
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for EditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EditError::NeedsManual {
+                file,
+                reason,
+                snippet,
+            } => write!(
+                f,
+                "manual step needed in {}: {reason}\nadd this yourself:\n{snippet}",
+                file.display()
+            ),
+            EditError::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for EditError {}
+
+impl From<std::io::Error> for EditError {
+    fn from(e: std::io::Error) -> Self {
+        EditError::Io(e)
+    }
 }
