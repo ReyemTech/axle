@@ -1,24 +1,26 @@
 <article class="card" id="task-{{ card.id }}" data-status="{{ card.status }}" data-line="{{ card.project.line }}" data-nav tabindex="-1"
          sse-swap="task-{{ card.id }}" hx-swap="outerHTML">
-  <div class="card-head">
-    <span class="aspect" data-aspect="{{ card.status }}" aria-hidden="true"></span>
-    <h3 class="card-title"><a class="card-link" href="/ui/tasks/{{ card.id }}">{{ card.title }}</a></h3>
+  <h3 class="card-title"><a class="card-link" href="/ui/tasks/{{ card.id }}">{{ card.title }}</a></h3>
+  {% if let Some((pid, ptitle)) = card.parent %}<p class="card-parent">Subtask of <a href="/ui/tasks/{{ pid }}">{{ ptitle }}</a></p>{% endif %}
+  <div class="card-meta">
+    <span class="state" data-status="{{ card.status }}"><span class="aspect" data-aspect="{{ card.status }}" aria-hidden="true"></span><span class="status">{{ card.status }}</span></span>
+    <span class="project" data-line="{{ card.project.line }}" title="{{ card.project.key }}">{{ card.project.name }}</span>
   </div>
-  <div class="card-meta"><span class="project" data-line="{{ card.project.line }}" title="{{ card.project.key }}">{{ card.project.name }}</span>{% if let Some(owner) = card.owner %}<span class="owner">{{ owner }}</span>{% endif %}<span class="status visually-hidden">{{ card.status }}</span></div>
+  {% if let Some(owner) = card.owner %}
+  <div class="card-owner"><span class="owner-label">{% if card.status == "done" %}Done by{% else %}Held by{% endif %}</span> <span class="owner">{{ owner }}</span>{% if let Some(live) = card.owner_live %} <span class="presence" data-presence="{% if live %}live{% else %}stale{% endif %}" title="{% if live %}Session heartbeat within the last 90 seconds{% else %}No heartbeat for over 90 seconds{% endif %}"><span class="aspect" data-aspect="{% if live %}live{% else %}stale{% endif %}" aria-hidden="true"></span>{% if live %}live{% else %}stale{% endif %}</span>{% endif %}</div>
+  {% endif %}
   {% if let Some(l) = card.lease %}
-  <div class="lease-meter" data-lease-left="{{ l.left }}" data-lease-ttl="{{ l.ttl }}" data-lease-state="{% if l.left <= 0 %}expired{% else if l.left * 5 < l.ttl %}low{% else %}ok{% endif %}">
+  <div class="lease-meter" data-line="{{ card.project.line }}" data-lease-left="{{ l.left }}" data-lease-ttl="{{ l.ttl }}" data-lease-state="{% if l.left <= 0 %}expired{% else if l.left * 5 < l.ttl %}low{% else %}ok{% endif %}" title="Lease: the claim lapses unless the agent's heartbeat renews it">
+    <span class="lease-text">lease <span class="lease-left">{{ l.text }}</span></span>
     <span class="track" aria-hidden="true"><span class="occupancy"></span></span>
-    <span class="lease-left">{{ l.text }}</span>
   </div>
-  {% else %}
-  <span class="track" aria-hidden="true"></span>
   {% endif %}
   {% if let Some(p) = card.progress %}
   <div class="progress">
-    <ol class="stations" aria-label="{{ p.done }} of {{ p.total }} subtasks done">
-      {% for s in p.stations %}<li class="station" data-status="{{ s }}" title="{{ s }}"><span class="visually-hidden">{{ s }}</span></li>{% endfor %}
+    <ol class="stations" aria-label="Subtasks">
+      {% for s in p.stations %}<li class="station" data-status="{{ s.status }}" title="{{ s.title }}: {{ s.status }}"><span class="visually-hidden">{{ s.status }}</span></li>{% endfor %}
     </ol>
-    <span class="ratio">{{ p.done }}/{{ p.total }}</span>
+    <span class="ratio-text"><span class="ratio">{{ p.done }} of {{ p.total }}</span> subtasks done</span>
     {% if p.blocked > 0 %}<span class="badge-blocked"><span class="aspect" data-aspect="blocked" aria-hidden="true"></span>{{ p.blocked }} blocked</span>{% endif %}
   </div>
   {% if !p.owners.is_empty() %}
@@ -27,7 +29,7 @@
   </ul>
   {% endif %}
   <details class="children">
-    <summary data-expand>{{ p.total }} subtask{% if p.total != 1 %}s{% endif %}</summary>
+    <summary data-expand>Show {{ p.total }} subtask{% if p.total != 1 %}s{% endif %}</summary>
     <div hx-get="/ui/tasks/{{ card.id }}/children" hx-trigger="toggle from:closest details" hx-swap="innerHTML"><p class="loading">Loading subtasks…</p></div>
   </details>
   {% endif %}

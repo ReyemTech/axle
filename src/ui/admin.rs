@@ -7,7 +7,7 @@ use axum::response::Response;
 
 use super::SessionCtx;
 use super::task_page::Stamp;
-use super::views::{UiError, UiResult, html, line_colours};
+use super::views::{Pulse, UiError, UiResult, html, line_colours, pulse_counts};
 use crate::domain::DISPLAY_NAME_MAX;
 use crate::http::AppState;
 
@@ -24,6 +24,8 @@ pub struct ProjectRow {
 #[template(path = "projects.html")]
 struct ProjectsPage {
     csrf: Option<String>,
+    /// The top bar's counts (`None` when signed out).
+    pulse: Option<Pulse>,
     nav: &'static str,
     projects: Vec<ProjectRow>,
     max: usize,
@@ -49,6 +51,7 @@ pub async fn projects(
     projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.key.cmp(&b.key)));
     html(&ProjectsPage {
         csrf: Some(session.csrf),
+        pulse: Some(pulse_counts(&state).await?),
         nav: "projects",
         projects,
         max: DISPLAY_NAME_MAX,
@@ -67,6 +70,8 @@ pub struct TokenRow {
 #[template(path = "tokens.html")]
 struct TokensPage {
     csrf: Option<String>,
+    /// The top bar's counts (`None` when signed out).
+    pulse: Option<Pulse>,
     nav: &'static str,
     tokens: Vec<TokenRow>,
 }
@@ -95,6 +100,7 @@ pub async fn tokens(
     tokens.sort_by_key(|t| t.revoked.is_some());
     html(&TokensPage {
         csrf: Some(session.csrf),
+        pulse: Some(pulse_counts(&state).await?),
         nav: "tokens",
         tokens,
     })

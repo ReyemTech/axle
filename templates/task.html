@@ -20,8 +20,8 @@
     <h2 class="panel-title">Lease</h2>
     {% if let Some(l) = task.lease_bar %}
     <div class="lease-meter lease-wide" data-line="{{ task.project.line }}" data-lease-left="{{ l.left }}" data-lease-ttl="{{ l.ttl }}" data-lease-state="{% if l.left <= 0 %}expired{% else if l.left * 5 < l.ttl %}low{% else %}ok{% endif %}">
+      <span class="lease-text">lease <span class="lease-left">{{ l.text }}</span></span>
       <span class="track" aria-hidden="true"><span class="occupancy"></span></span>
-      <span class="lease-left">{{ l.text }}</span>
     </div>
     {% endif %}
     <p>{{ task.lease }}</p>
@@ -44,9 +44,9 @@
     <ul class="child-list">
     {% for c in children %}
       <li class="child" data-status="{{ c.status }}">
-        <span class="station" data-status="{{ c.status }}" title="{{ c.status }}" aria-label="{{ c.status }}"></span>
+        <span class="station" data-status="{{ c.status }}" title="{{ c.status }}" aria-hidden="true"></span>
         <a class="child-title" href="/ui/tasks/{{ c.id }}"><span class="project" data-line="{{ c.project.line }}" title="{{ c.project.key }}">{{ c.project.name }}</span> {{ c.title }}</a>
-        <span class="child-owner">{% if let Some(o) = c.owner %}{{ o }}{% else %}(open){% endif %}</span>
+        <span class="child-owner"><span class="child-state">{{ c.status }}</span> · {% if let Some(o) = c.owner %}{{ o }}{% else %}(open){% endif %}</span>
       </li>
     {% endfor %}
     </ul>

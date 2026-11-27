@@ -24,8 +24,8 @@
     <a href="/ui/tokens"{% if nav == "tokens" %} aria-current="page"{% endif %}>Tokens</a>
   </nav>
   <input id="search" class="search" type="search" placeholder="Filter this page  /" aria-label="Filter this page (press /)" autocomplete="off">
-  <div id="pulse" class="pulse" hx-get="/ui/pulse" hx-trigger="load, sse:overview delay:300ms, every 30s" hx-swap="innerHTML" aria-live="polite">
-    <span class="pulse-item"><span class="aspect" data-aspect="none" aria-hidden="true"></span><span class="num">–</span> live</span>
+  <div id="pulse" class="pulse" hx-get="/ui/pulse" hx-trigger="sse:overview delay:300ms, every 30s" hx-swap="innerHTML" aria-live="polite">
+{% if let Some(p) = pulse %}{% include "_pulse.html" %}{% endif %}
   </div>
   <form class="logout" method="post" action="/ui/logout">
     <input type="hidden" name="csrf" value="{{ token }}">

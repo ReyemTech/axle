@@ -407,8 +407,10 @@ async fn board_columns_and_progress() {
         select_texts(&page, ".column > header h2"),
         ["Open", "Claimed", "Blocked", "Review", "Done"]
     );
-    let text = page.text();
-    assert!(text.contains("1/3"), "{text}");
+    assert_eq!(
+        select_texts(&page, ".card .ratio-text"),
+        ["1 of 3 subtasks done"]
+    );
     assert!(
         select_texts(&page, ".card .badge-blocked").is_empty(),
         "no badge without a blocked child"
@@ -448,7 +450,18 @@ async fn board_columns_and_progress() {
         select_texts(&page, ".card .stations .station"),
         ["done", "blocked", "open"]
     );
-    // The top bar's pulse counts the blocked child.
+    // The blocked child also has a card of its own in Blocked, naming its parent, so the
+    // board and the top bar's pulse count the same tasks.
+    assert_eq!(
+        select_texts(&page, ".column[data-status=blocked] .card-title"),
+        ["roll CNPG users"]
+    );
+    assert_eq!(
+        select_texts(&page, ".column[data-status=blocked] .card-parent"),
+        ["Subtask of Rotate DB creds"]
+    );
+    assert_eq!(select_texts(&page, "#pulse .pulse-item")[1], "1 blocked");
+    // The top bar's pulse fragment counts the blocked child.
     let pulse = app.get("/ui/pulse", Some(&cookie)).await;
     assert_eq!(pulse.status, StatusCode::OK);
     assert!(!pulse.body.contains("<html"));
@@ -493,8 +506,9 @@ async fn claimed_card_draws_its_lease() {
     let page = app.get("/ui/board", Some(&cookie)).await;
     assert_eq!(
         lease_meter(&page),
-        (900, 900, "ok".into(), "15m left".into())
+        (900, 900, "ok".into(), "lease 15m left".into())
     );
+    assert_eq!(select_texts(&page, ".card .presence"), ["live"]);
     let detail = app
         .get(&format!("/ui/tasks/{}", task.id), Some(&cookie))
         .await;
@@ -505,7 +519,12 @@ async fn claimed_card_draws_its_lease() {
     let page = app.get("/ui/board", Some(&cookie)).await;
     assert_eq!(
         lease_meter(&page),
-        (120, 900, "low".into(), "2m left".into())
+        (120, 900, "low".into(), "lease 2m left".into())
+    );
+    assert_eq!(
+        select_texts(&page, ".card .presence"),
+        ["stale"],
+        "no heartbeat for 13 minutes"
     );
     app.clock.advance(time::Duration::minutes(5));
     let page = app.get("/ui/board", Some(&cookie)).await;
@@ -775,7 +794,7 @@ async fn live_stream_rerenders_changed_cards() {
     )
     .await
     .expect("parent card event");
-    assert!(card.contains("0/1"), "{card}");
+    assert!(card.contains("0 of 1"), "{card}");
     assert!(!card.contains("<one>"), "{card}");
     let fragment = Html::parse_fragment(&card);
     let title = Selector::parse(".card-title").unwrap();

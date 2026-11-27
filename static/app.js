@@ -110,7 +110,7 @@
 
   function leaseText(left) {
     var s = Math.ceil(left);
-    if (s <= 0) return "lease expired";
+    if (s <= 0) return "expired";
     if (s < 60) return s + "s left";
     if (s < 3600) return Math.floor(s / 60) + "m left";
     return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m left";

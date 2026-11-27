@@ -11,7 +11,8 @@ use time::format_description::well_known::Rfc3339;
 
 use super::SessionCtx;
 use super::views::{
-    Labels, LeaseView, ProjectLabel, ProjectOption, UiError, UiResult, ago, html, lease_view,
+    Labels, LeaseView, ProjectLabel, ProjectOption, Pulse, UiError, UiResult, ago, html,
+    lease_view, pulse_counts,
 };
 use crate::domain::{Message, MessageId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus};
 use crate::http::AppState;
@@ -158,6 +159,8 @@ pub struct TaskView {
 #[template(path = "task.html")]
 struct TaskPage {
     csrf: Option<String>,
+    /// The top bar's counts (`None` when signed out).
+    pulse: Option<Pulse>,
     nav: &'static str,
     task: TaskView,
     thread: Vec<MessageView>,
@@ -381,6 +384,7 @@ pub async fn task_page(
 
     html(&TaskPage {
         csrf: Some(session.csrf),
+        pulse: Some(pulse_counts(&state).await?),
         nav: "board",
         task: view,
         thread,

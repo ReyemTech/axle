@@ -10,7 +10,9 @@ use serde::Deserialize;
 
 use super::SessionCtx;
 use super::task_page::{MessageView, message_view};
-use super::views::{Labels, ProjectOption, UiError, UiResult, html, project_options};
+use super::views::{
+    Labels, ProjectOption, Pulse, UiError, UiResult, html, project_options, pulse_counts,
+};
 use crate::domain::{Actor, Address, MessageId};
 use crate::http::AppState;
 use crate::service::messages::InboxFilter;
@@ -58,6 +60,8 @@ pub struct AgentOption {
 #[template(path = "inbox.html")]
 struct InboxPage {
     csrf: Option<String>,
+    /// The top bar's counts (`None` when signed out).
+    pulse: Option<Pulse>,
     nav: &'static str,
     /// `inbox`, `all` or `search`.
     view: &'static str,
@@ -259,6 +263,7 @@ pub async fn inbox(
 
     html(&InboxPage {
         csrf: Some(session.csrf),
+        pulse: Some(pulse_counts(&state).await?),
         nav: "inbox",
         view,
         list_href: base(&selected_id.map(|m| format!("m={m}")).unwrap_or_default()),

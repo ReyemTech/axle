@@ -106,6 +106,8 @@ pub(super) fn html(t: &impl Template) -> UiResult<Response> {
 #[template(path = "login.html")]
 struct LoginPage<'a> {
     csrf: Option<String>,
+    /// The top bar's counts (`None` when signed out).
+    pulse: Option<Pulse>,
     nav: &'static str,
     error: Option<&'a str>,
 }
@@ -113,6 +115,7 @@ struct LoginPage<'a> {
 pub fn login_page(status: StatusCode, error: Option<&str>) -> Response {
     let page = LoginPage {
         csrf: None,
+        pulse: None,
         nav: "",
         error,
     };
@@ -254,6 +257,10 @@ pub struct CardView {
     pub project: ProjectLabel,
     /// The agent holding the task (or that finished it).
     pub owner: Option<String>,
+    /// Whether the holder's session is live, for a task still held (`None` otherwise).
+    pub owner_live: Option<bool>,
+    /// The parent `(id, title)` of a subtask shown as its own card.
+    pub parent: Option<(String, String)>,
     /// The running lease of a claimed task.
     pub lease: Option<LeaseView>,
     pub progress: Option<ProgressView>,
@@ -267,10 +274,10 @@ pub struct LeaseView {
     pub text: String,
 }
 
-/// "lease expired", "42s left", "12m left", "1h 5m left".
+/// "expired", "42s left", "12m left", "1h 5m left" (shown after the word "lease").
 pub(super) fn lease_left_text(left: i64) -> String {
     match left {
-        s if s <= 0 => "lease expired".into(),
+        s if s <= 0 => "expired".into(),
         s if s < 60 => format!("{s}s left"),
         s if s < 3600 => format!("{}m left", s / 60),
         s => format!("{}h {}m left", s / 3600, s % 3600 / 60),
@@ -296,11 +303,17 @@ pub(super) fn lease_view(
     })
 }
 
+/// One child on a parent's line.
+pub struct Station {
+    pub status: &'static str,
+    pub title: String,
+}
+
 pub struct ProgressView {
     pub done: u32,
     pub total: u32,
-    /// Each child's status, in order: the parent's line of stations.
-    pub stations: Vec<&'static str>,
+    /// Each child, in order: the parent's line of stations.
+    pub stations: Vec<Station>,
     /// Children that are `blocked`, shown as a badge so they are seen without expanding.
     pub blocked: u32,
     pub owners: Vec<OwnerGroup>,
@@ -312,12 +325,26 @@ pub struct OwnerGroup {
     pub agents: Vec<String>,
 }
 
-async fn card(
-    labels: &mut Labels<'_>,
+/// What every card on one render shares: the time, and the server's lease and presence
+/// settings.
+#[derive(Clone, Copy)]
+struct CardCtx {
     now: OffsetDateTime,
-    default_ttl: Duration,
-    task: &Task,
-) -> StoreResult<CardView> {
+    lease_ttl: Duration,
+    presence_stale: Duration,
+}
+
+impl CardCtx {
+    fn of(state: &AppState) -> Self {
+        Self {
+            now: state.clock.now(),
+            lease_ttl: state.config.lease_ttl,
+            presence_stale: state.config.presence_stale,
+        }
+    }
+}
+
+async fn card(labels: &mut Labels<'_>, ctx: CardCtx, task: &Task) -> StoreResult<CardView> {
     let children = labels
         .store
         .list_tasks(&TaskFilter {
@@ -343,7 +370,13 @@ async fn card(
         Some(ProgressView {
             done: p.done,
             total: p.total,
-            stations: children.iter().map(|c| c.status.as_str()).collect(),
+            stations: children
+                .iter()
+                .map(|c| Station {
+                    status: c.status.as_str(),
+                    title: c.title.clone(),
+                })
+                .collect(),
             blocked: p.blocked,
             owners,
         })
@@ -352,13 +385,36 @@ async fn card(
         Some(a) => Some(labels.agent_label(a).await?),
         None => None,
     };
+    let held = matches!(
+        task.status,
+        TaskStatus::Claimed | TaskStatus::Blocked | TaskStatus::Review
+    );
+    let owner_live = match task.owner_session_id {
+        Some(s) if held => Some(
+            labels
+                .store
+                .get_session(s)
+                .await?
+                .is_some_and(|s| s.last_heartbeat_at >= ctx.now - ctx.presence_stale),
+        ),
+        _ => None,
+    };
+    let parent = match task.parent_id {
+        Some(p) => labels
+            .task_title(p)
+            .await?
+            .map(|title| (p.to_string(), title)),
+        None => None,
+    };
     Ok(CardView {
         id: task.id.to_string(),
         title: task.title.clone(),
         status: task.status.as_str(),
         project: labels.project(task.project_id),
         owner,
-        lease: lease_view(now, default_ttl, task),
+        owner_live,
+        parent,
+        lease: lease_view(ctx.now, ctx.lease_ttl, task),
         progress,
     })
 }
@@ -390,6 +446,8 @@ pub struct ProjectOption {
 #[template(path = "board.html")]
 struct BoardPage {
     csrf: Option<String>,
+    /// The top bar's counts (`None` when signed out).
+    pulse: Option<Pulse>,
     nav: &'static str,
     projects: Vec<ProjectOption>,
     /// The filtered project's id (for the columns re-fetch URL).
@@ -447,14 +505,16 @@ async fn board_filter(store: &dyn Store, q: &BoardQuery) -> UiResult<Option<Proj
     found.map(Some).ok_or(UiError::NotFound("No such project."))
 }
 
-/// Top-level tasks per column; Done holds tasks finished within `DONE_WINDOW`, newest first.
+/// Tasks per column. Open, Claimed and Done hold top-level tasks (subtasks show on their
+/// parent's card); Blocked and Review also hold subtasks, so everything waiting on someone is
+/// in its column. Done holds tasks finished within `DONE_WINDOW`, newest first.
 async fn columns(
     state: &AppState,
     labels: &mut Labels<'_>,
     project: Option<ProjectId>,
 ) -> StoreResult<Vec<ColumnView>> {
-    let now = state.clock.now();
-    let since = now - DONE_WINDOW;
+    let ctx = CardCtx::of(state);
+    let since = ctx.now - DONE_WINDOW;
     let mut out = Vec::with_capacity(COLUMNS.len());
     for (status, label) in COLUMNS {
         let mut tasks: Vec<Task> = state
@@ -466,7 +526,9 @@ async fn columns(
             })
             .await?
             .into_iter()
-            .filter(|t| t.parent_id.is_none())
+            .filter(|t| {
+                t.parent_id.is_none() || matches!(status, TaskStatus::Blocked | TaskStatus::Review)
+            })
             .collect();
         if status == TaskStatus::Done {
             tasks.retain(|t| t.updated_at >= since);
@@ -474,7 +536,7 @@ async fn columns(
         }
         let mut cards = Vec::with_capacity(tasks.len());
         for t in &tasks {
-            cards.push(card(labels, now, state.config.lease_ttl, t).await?);
+            cards.push(card(labels, ctx, t).await?);
         }
         out.push(ColumnView {
             status: status.as_str(),
@@ -496,6 +558,7 @@ pub async fn board(
     let projects = project_options(&labels, filter.as_ref().map(|f| f.id));
     html(&BoardPage {
         csrf: Some(session.csrf),
+        pulse: Some(pulse_counts(&state).await?),
         nav: "board",
         projects,
         filter: filter.map(|p| p.id.to_string()),
@@ -582,6 +645,8 @@ pub struct AgentCard {
 #[template(path = "overview.html")]
 struct OverviewPage {
     csrf: Option<String>,
+    /// The top bar's counts (`None` when signed out).
+    pulse: Option<Pulse>,
     nav: &'static str,
     counters: Counters,
     agents: Vec<AgentCard>,
@@ -698,6 +763,7 @@ pub async fn overview(
     let (counters, agents) = overview_data(&state).await?;
     html(&OverviewPage {
         csrf: Some(session.csrf),
+        pulse: Some(pulse_counts(&state).await?),
         nav: "overview",
         counters,
         agents,
@@ -711,15 +777,14 @@ pub async fn overview_panel(State(state): State<AppState>) -> UiResult<Response>
 
 // ---------------------------------------------------------------- pulse
 
-/// The top bar's live state: agents with a live session, and blocked tasks.
-#[derive(Template)]
-#[template(path = "_pulse.html")]
-struct PulseFragment {
-    live: usize,
-    blocked: usize,
+/// The top bar's live state: agents with a live session, and blocked tasks (at any depth,
+/// the same tasks the board's Blocked column shows).
+pub struct Pulse {
+    pub live: usize,
+    pub blocked: usize,
 }
 
-pub async fn pulse(State(state): State<AppState>) -> UiResult<Response> {
+pub async fn pulse_counts(state: &AppState) -> StoreResult<Pulse> {
     let live_since = state.clock.now() - state.config.presence_stale;
     let live: HashSet<AgentId> = state
         .store
@@ -737,9 +802,21 @@ pub async fn pulse(State(state): State<AppState>) -> UiResult<Response> {
         })
         .await?
         .len();
-    html(&PulseFragment {
+    Ok(Pulse {
         live: live.len(),
         blocked,
+    })
+}
+
+#[derive(Template)]
+#[template(path = "_pulse.html")]
+struct PulseFragment {
+    p: Pulse,
+}
+
+pub async fn pulse(State(state): State<AppState>) -> UiResult<Response> {
+    html(&PulseFragment {
+        p: pulse_counts(&state).await?,
     })
 }
 
@@ -802,17 +879,13 @@ async fn task_frames(state: &AppState, event: &Event) -> UiResult<Frames> {
             .ok_or(UiError::NotFound("task"))?;
         frames.push((format!("detail-{parent}"), PING.into()));
     }
-    if root.id == id && kind != crate::domain::TaskEventKind::Edited {
+    // Subtasks have cards of their own while blocked or in review, so any status change may
+    // move a card between columns.
+    if kind != crate::domain::TaskEventKind::Edited {
         frames.push(("board".into(), PING.into()));
     }
     let mut labels = Labels::load(&*state.store).await?;
-    let card = card(
-        &mut labels,
-        state.clock.now(),
-        state.config.lease_ttl,
-        &root,
-    )
-    .await?;
+    let card = card(&mut labels, CardCtx::of(state), &root).await?;
     // SSE data must be one line per `data:` field; HTML does not care about the newlines.
     let html = CardFragment { card }.render()?.replace(['\r', '\n'], " ");
     frames.push((format!("task-{}", root.id), html));
