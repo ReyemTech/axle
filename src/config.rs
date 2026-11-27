@@ -10,6 +10,8 @@ pub enum ConfigError {
     Missing(&'static str),
     #[error("environment variable {0} must not be empty")]
     Empty(&'static str),
+    #[error("{0} must be a positive whole number, got {1:?}")]
+    BadNumber(&'static str, String),
     #[error("invalid COORD_BIND address: {0}")]
     BadBind(String),
 }
@@ -39,6 +41,10 @@ pub struct ServerConfig {
     pub lease_ttl: Duration,
     pub presence_stale: Duration,
     pub idle_renew_cap: Duration,
+    /// Per-token sustained request rate (`COORD_RATE_LIMIT_PER_SEC`, default 20).
+    pub rate_limit_per_sec: u32,
+    /// Per-token burst size (`COORD_RATE_LIMIT_BURST`, default 100).
+    pub rate_limit_burst: u32,
 }
 
 const DEFAULT_BIND: &str = "127.0.0.1:7420";
@@ -53,6 +59,21 @@ fn required(
         return Err(ConfigError::Empty(name));
     }
     Ok(value)
+}
+
+/// An optional positive integer variable, `default` when unset.
+fn positive(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: u32,
+) -> Result<u32, ConfigError> {
+    match get(name) {
+        None => Ok(default),
+        Some(raw) => match raw.trim().parse::<u32>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(ConfigError::BadNumber(name, raw)),
+        },
+    }
 }
 
 /// The backend named by `DATABASE_URL` (what the admin commands need, without the server's
@@ -85,6 +106,8 @@ impl ServerConfig {
             lease_ttl: Duration::minutes(15),
             presence_stale: Duration::seconds(90),
             idle_renew_cap: Duration::hours(2),
+            rate_limit_per_sec: positive(&get, "COORD_RATE_LIMIT_PER_SEC", 20)?,
+            rate_limit_burst: positive(&get, "COORD_RATE_LIMIT_BURST", 100)?,
         })
     }
 }
@@ -125,6 +148,39 @@ mod tests {
         assert_eq!(c.presence_stale, Duration::seconds(90));
         assert_eq!(c.idle_renew_cap, Duration::hours(2));
         assert_eq!(c.bind.to_string(), "127.0.0.1:7420");
+        assert_eq!(c.rate_limit_per_sec, 20);
+        assert_eq!(c.rate_limit_burst, 100);
+    }
+
+    #[test]
+    fn rate_limit_overrides_and_bad_values() {
+        let base = [
+            ("DATABASE_URL", "sqlite://./coord.db"),
+            ("COORD_ADMIN_SECRET", "s3cret"),
+        ];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let vars: Vec<(&str, &str)> = base.iter().chain(extra).copied().collect();
+            ServerConfig::from_lookup(lookup(&vars))
+        };
+        let c = with(&[
+            ("COORD_RATE_LIMIT_PER_SEC", "5"),
+            ("COORD_RATE_LIMIT_BURST", "7"),
+        ])
+        .unwrap();
+        assert_eq!((c.rate_limit_per_sec, c.rate_limit_burst), (5, 7));
+        for (name, value) in [
+            ("COORD_RATE_LIMIT_PER_SEC", "0"),
+            ("COORD_RATE_LIMIT_PER_SEC", "fast"),
+            ("COORD_RATE_LIMIT_BURST", "0"),
+            ("COORD_RATE_LIMIT_BURST", "-1"),
+        ] {
+            let e = with(&[(name, value)]).unwrap_err();
+            assert!(
+                matches!(e, ConfigError::BadNumber(n, _) if n == name),
+                "{e}"
+            );
+            assert!(e.to_string().contains(name), "{e}");
+        }
     }
     #[test]
     fn missing_required_vars_error() {

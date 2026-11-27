@@ -187,7 +187,7 @@ pub struct SessionQuery {
 
 /// SSE stream of the events relevant to one session. Event name = `Event` variant, data =
 /// its JSON. A subscriber that falls behind gets a `Lagged` event (data: how many were
-/// dropped) and should re-read its inbox.
+/// dropped) and should re-read its inbox. The stream ends when the server shuts down.
 async fn events(
     State(state): State<AppState>,
     Extension(AuthToken(token)): Extension<AuthToken>,
@@ -202,21 +202,30 @@ async fn events(
         agent: r.agent.id,
         project: r.agent.project_id,
     };
-    let stream = futures_util::stream::unfold((rx, watcher), |(mut rx, w)| async move {
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    if w.wants(&event).await {
-                        let data = serde_json::to_string(&event).expect("events serialise");
-                        let sse = SseEvent::default().event(event.name()).data(data);
+    let shutdown = state.shutdown.clone();
+    let stream = futures_util::stream::unfold((rx, watcher), move |(mut rx, w)| {
+        let shutdown = shutdown.clone();
+        async move {
+            loop {
+                let received = tokio::select! {
+                    received = rx.recv() => received,
+                    // End the response so graceful shutdown is not held open by this client.
+                    () = shutdown.wait() => return None,
+                };
+                match received {
+                    Ok(event) => {
+                        if w.wants(&event).await {
+                            let data = serde_json::to_string(&event).expect("events serialise");
+                            let sse = SseEvent::default().event(event.name()).data(data);
+                            return Some((Ok(sse), (rx, w)));
+                        }
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        let sse = SseEvent::default().event("Lagged").data(n.to_string());
                         return Some((Ok(sse), (rx, w)));
                     }
+                    Err(RecvError::Closed) => return None,
                 }
-                Err(RecvError::Lagged(n)) => {
-                    let sse = SseEvent::default().event("Lagged").data(n.to_string());
-                    return Some((Ok(sse), (rx, w)));
-                }
-                Err(RecvError::Closed) => return None,
             }
         }
     });

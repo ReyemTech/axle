@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use coord::clock::{Clock, SystemClock};
 use coord::config::{ServerConfig, backend_from_env};
 use coord::domain::TokenId;
-use coord::http::{AppState, router};
+use coord::http::AppState;
 use coord::service::auth::AuthService;
 use coord::store::{Store, open_store};
 use time::format_description::well_known::Rfc3339;
@@ -76,15 +76,38 @@ async fn serve(bind: Option<SocketAddr>) -> CliResult {
     }
     let store = open_store(&config.backend).await?;
     let addr = config.bind;
-    let app = router(AppState::new(store, Arc::new(SystemClock), config));
+    let state = AppState::new(store, Arc::new(SystemClock), config);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("coord: listening on http://{}", listener.local_addr()?);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    coord::http::serve(listener, state, stop_signal()).await?;
+    eprintln!("coord: stopped");
     Ok(())
+}
+
+/// Resolves on SIGINT (Ctrl-C) or, on Unix, SIGTERM (what Kubernetes sends).
+async fn stop_signal() {
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                eprintln!("coord: cannot listen for SIGTERM: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = interrupt => {}
+        () = terminate => {}
+    }
+    eprintln!("coord: shutting down");
 }
 
 async fn migrate() -> CliResult {

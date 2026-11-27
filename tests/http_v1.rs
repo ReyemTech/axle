@@ -22,6 +22,7 @@ use tower::ServiceExt;
 
 struct App {
     state: AppState,
+    clock: Arc<TestClock>,
     router: Router,
     pool: SqlitePool,
 }
@@ -44,10 +45,11 @@ async fn app() -> App {
         _ => None,
     })
     .unwrap();
-    let state = AppState::new(store, clock, config);
+    let state = AppState::new(store, clock.clone(), config);
     App {
         router: router(state.clone()),
         state,
+        clock,
         pool,
     }
 }
@@ -490,4 +492,107 @@ async fn health_endpoints_unauthenticated() {
         .call(Request::get("/healthz").body(Body::empty()).unwrap())
         .await;
     assert_eq!(res.status(), StatusCode::OK);
+}
+
+/// Status of a heartbeat for an unknown session (404 while under the rate limit).
+async fn probe(app: &App, token: &str) -> axum::response::Response {
+    app.call(
+        Request::post("/v1/heartbeat")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"session_id": SessionId::new()}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn rate_limit_is_per_token_with_burst() {
+    let app = app().await;
+    let (a, b) = (app.token().await, app.token().await);
+    let burst = app.state.config.rate_limit_burst;
+    assert_eq!(burst, 100);
+
+    // The test clock is frozen, so nothing refills during the burst.
+    for _ in 0..burst {
+        assert_eq!(probe(&app, &a).await.status(), StatusCode::NOT_FOUND);
+    }
+    let res = probe(&app, &a).await;
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(res.headers()[header::RETRY_AFTER], "1");
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body, json!({"error": "rate_limited"}));
+
+    // Another token has its own bucket.
+    assert_eq!(probe(&app, &b).await.status(), StatusCode::NOT_FOUND);
+
+    // 20/s sustained: one second later 20 more requests pass, the 21st does not.
+    app.clock.advance(time::Duration::seconds(1));
+    for _ in 0..20 {
+        assert_eq!(probe(&app, &a).await.status(), StatusCode::NOT_FOUND);
+    }
+    assert_eq!(
+        probe(&app, &a).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    // Unauthenticated probes are not limited.
+    let res = app
+        .call(Request::get("/healthz").body(Body::empty()).unwrap())
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn shutdown_ends_sse_streams_and_returns() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let app = app().await;
+    let token = app.token().await;
+    let (session, _) = app.register(&token, "github.com/reyemtech/iac").await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(coord::http::serve(listener, app.state.clone(), async {
+        let _ = stopped.await;
+    }));
+
+    // A connected SSE client.
+    let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+    conn.write_all(
+        format!(
+            "GET /v1/events?session={session} HTTP/1.1\r\nHost: x\r\n\
+             Authorization: Bearer {token}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut head = vec![0u8; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(2), conn.read(&mut head))
+        .await
+        .expect("response head")
+        .unwrap();
+    let head = String::from_utf8_lossy(&head[..n]);
+    assert!(head.contains("text/event-stream"), "{head}");
+
+    let started = std::time::Instant::now();
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .expect("serve returns promptly with an SSE client connected")
+        .unwrap()
+        .unwrap();
+    assert!(started.elapsed() < coord::http::SHUTDOWN_DRAIN);
+
+    // The stream was ended by the server: the client reads to EOF.
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), conn.read_to_end(&mut rest))
+        .await
+        .expect("connection closed")
+        .unwrap();
 }
