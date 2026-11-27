@@ -14,13 +14,16 @@ axl serve
 The server binds `127.0.0.1:7420`. On a loopback bind the web UI at
 <http://127.0.0.1:7420/ui> needs no sign-in, and it only answers requests whose `Host` is
 `localhost`, `127.0.0.1` or `[::1]`, which blocks DNS-rebinding attacks from web pages you
-visit. Agents always need a token:
+visit. Agents always need a token. With the server running, `axl install --server
+http://127.0.0.1:7420` (or `axl login`) gets one and configures your harnesses; `axl install`
+alone sets up this whole arrangement as a background service. To create a token by hand
+instead:
 
 ```sh
 (umask 077; axl token create --label laptop > ~/.axl/token)
 ```
 
-Then connect a harness: [Claude Code](../harnesses/claude-code.md),
+Harness guides: [Claude Code](../harnesses/claude-code.md),
 [Codex](../harnesses/codex.md) or [OpenCode](../harnesses/opencode.md).
 
 To change the port, set `AXL_BIND=127.0.0.1:7500` (or `--bind`) and point the bridges at it

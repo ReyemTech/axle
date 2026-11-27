@@ -107,5 +107,12 @@ AXL_UI_AUTH=none AXL_ALLOWED_HOSTS=axle.internal.example.com axl serve --bind 0.
 
 ## Command-line reference
 
-See the [CLI reference](cli.md) for `install`, `login`, `logout`, `uninstall`, `status` and
-`service`. Run `axl --help` for the full list.
+| Command | Purpose |
+|---|---|
+| `axl serve` | Run the server (needs `DATABASE_URL`). `--bind` and `--trusted-header` override the variables above. |
+| `axl token create\|list\|revoke` | Manage tokens by hand (needs `DATABASE_URL`). |
+| `axl install`, `login`, `logout`, `uninstall`, `status`, `service` | Set up a machine; see the [CLI reference](cli.md). |
+| `axl bridge`, `axl hook` | Spawned by harnesses. |
+| `axl migrate`, `axl project` | Migrate the database; manage projects. |
+
+Run `axl --help` for the full list.

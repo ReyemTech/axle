@@ -123,9 +123,8 @@ agent claims that task it moves to **planning** and the agent must submit a plan
 
 ## Next steps
 
-- Prefer to do it by hand? Create a token with `axl token create` and register the bridge
+- Prefer to do it by hand? Create a token with `axl token create` ([CLI reference](cli.md#server-and-tokens)) and register the bridge
   yourself: see "Manual setup" in each harness guide ([Claude Code](harnesses/claude-code.md#manual-setup)).
-
 - Learn the model: [concepts](concepts.md).
 - Run it for a team of machines: [Docker](deploy/docker.md) or
   [Kubernetes](deploy/kubernetes.md), with [UI sign-in](configuration.md#ui-sign-in).

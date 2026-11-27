@@ -25,7 +25,8 @@ Axle never executes anything it receives. It stores and relays text.
 
 ## Tokens
 
-- Each machine, or each machine and harness, gets its own token from
+- Each machine, or each machine and harness, gets its own token, normally
+  through [enrollment](#enrollment) (`axl install` or **Connect a machine**) or by hand with
   `axl token create --label <name>`. Tokens are 256 random bits with an `axl_` prefix, so a
   leaked one is easy to recognise in logs and secret scanners.
 - The database stores only a SHA-256 hash. The plaintext is printed once.

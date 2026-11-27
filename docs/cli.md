@@ -1,9 +1,8 @@
 # Command-line reference
 
 `axl` is one binary: the server, the bridge and hooks harnesses spawn, and the commands that
-set up a machine. This page covers the setup commands. For `serve`, `bridge` and `hook` see
-[configuration](configuration.md) and the [harness guides](harnesses/claude-code.md); for
-`token`, `project` and `migrate` run `axl <command> --help`.
+set up a machine. This page covers the setup commands and the server and token commands. For
+`bridge` and `hook` see the [harness guides](harnesses/claude-code.md).
 
 | Command | What it does |
 |---|---|
@@ -13,6 +12,8 @@ set up a machine. This page covers the setup commands. For `serve`, `bridge` and
 | [`axl uninstall`](#axl-uninstall) | Undo `axl install` |
 | [`axl status`](#axl-status) | Show what is connected and what is not |
 | [`axl service`](#axl-service) | Run the server in the background on this machine |
+| [`axl serve`](#server-and-tokens) | Run the server in the foreground |
+| [`axl token`](#server-and-tokens) | Create, list and revoke tokens by hand |
 
 ## `axl install`
 
@@ -45,7 +46,8 @@ What it changes, per harness:
 | OpenCode | yes | none: OpenCode has no shell hooks | `~/.config/opencode/` |
 
 Each harness also gets a short block of instructions (`CLAUDE.md` or `AGENTS.md`) telling
-the agent how to use the Axle tools. Codex asks you to trust new hooks the next time it starts; review them with `/hooks`.
+the agent how to use the Axle tools. Codex hooks run `axl hook <event> --harness codex`.
+Codex asks you to trust new hooks the next time it starts; review them with `/hooks`.
 Existing hand-made `axle` entries are adopted rather than duplicated.
 
 Before it edits a file, `axl install` saves a copy as `<file>.axl-backup-<UTC timestamp>`
@@ -127,6 +129,21 @@ remembered for later installs).
 | `start`, `stop`, `restart` | Control it. |
 | `status` | Show whether it is running. |
 | `logs` | Print the end of `~/.axl/logs/axl.log`. |
+
+## Server and tokens
+
+```sh
+axl serve [--bind ADDR] [--trusted-header NAME]
+axl token create --label NAME | list | revoke ID
+```
+
+`axl serve` runs the server in the foreground and needs `DATABASE_URL`; the flags override
+`AXL_BIND` and `AXL_TRUSTED_HEADER` (see [configuration](configuration.md)). `axl token`
+also needs `DATABASE_URL`. It is the manual and admin path: `create` prints a token once
+(redirect it into `~/.axl/token` with mode 0600), `list` shows id, label, creation, last use
+and revocation, and `revoke` cuts one off by id. For normal onboarding use `axl install` or
+**Tokens → Connect a machine** instead. `axl project` and `axl migrate` have their own
+`--help`.
 
 ## Files on the client
 

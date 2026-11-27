@@ -18,7 +18,7 @@ Behind an ingress, also pass `AXL_TRUSTED_PROXY_HEADER` through `extraEnv`; see
 ## UI sign-in (`ui`)
 
 `ui` controls how a human signs in to the web UI. Agents are not affected: MCP and `/v1`
-always need a bearer token, created with `kubectl exec … axl token create`.
+always need a bearer token, from **Connect a machine** or `kubectl exec … axl token create`.
 
 ```yaml
 ui:

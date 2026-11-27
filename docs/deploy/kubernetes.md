@@ -15,8 +15,9 @@ helm install axle oci://ghcr.io/reyemtech/charts/axle --version 0.1.0 \
 With the defaults you get SQLite on a 1 Gi PVC and secret sign-in with a generated secret,
 kept across upgrades. The install notes print the command that reads it.
 
-Create the first agent token inside the pod (it is shown once; keep it out of prompts and
-chat):
+Machines connect from **Tokens → Connect a machine** in the web UI (set `publicUrl` first;
+see below). To create a token by hand instead, run this inside the pod (it is shown once;
+keep it out of prompts and chat):
 
 ```sh
 kubectl exec -n axle deploy/axle -- axl token create --label laptop

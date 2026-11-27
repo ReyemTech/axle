@@ -10,7 +10,7 @@ flowchart TB
     subgraph host["Each agent machine"]
         H["Harness<br/>(Claude Code, Codex, OpenCode)"]
         B["axl bridge<br/>stdio MCP, one per session"]
-        K["axl hook<br/>Claude Code only"]
+        K["axl hook<br/>Claude Code and Codex"]
         F[("~/.axl/token<br/>~/.axl/sessions/&lt;pid&gt;.json")]
         H -- "stdio MCP" --> B
         H -- "hook JSON" --> K
@@ -42,7 +42,7 @@ flowchart TB
 
 | Component | Source | Role |
 |---|---|---|
-| CLI | `src/main.rs` | Subcommands `serve`, `bridge`, `hook`, `migrate`, `token`. |
+| CLI | `src/main.rs`, `src/cli/` | Subcommands `serve`, `bridge`, `hook`, `migrate`, `project`, `token`, and the onboarding set `install`, `uninstall`, `login`, `logout`, `status`, `service`. |
 | HTTP server | `src/http/` | axum router: probes, `/v1`, `/mcp`, `/ui`; bearer-token middleware and rate limit. |
 | MCP tools | `src/mcp/` | The 17 tools on rmcp, identity resolution per call, peer-data framing. |
 | Services | `src/service/` | Business rules shared by MCP, `/v1` and the UI: identity, tasks and leases, messages, tokens. |
@@ -50,7 +50,9 @@ flowchart TB
 | Event bus | `src/events.rs` | Publishes changes after each commit. |
 | Web UI | `src/ui/`, `templates/`, `static/` | Server-rendered pages and fragments, embedded in the binary. |
 | Bridge | `src/bridge/` | Stdio MCP proxy, project detection, presence loop, session file. |
-| Hook | `src/hook/` | Claude Code hooks; strictly fail-open. |
+| Hook | `src/hook/` | Claude Code and Codex hooks; strictly fail-open. |
+| Install | `src/install/`, `src/service/` (service units) | Edits each harness's config with backups and a manifest; writes the launchd or systemd unit. |
+| Enrollment | `src/http/enroll.rs`, `src/http/install_script.rs`, `src/ui/connect.rs` | Unauthenticated `/v1/enroll` and `/v1/login/*` (per-IP limited), `GET /install.sh`, and the Connect a machine and `/ui/connect` pages. |
 
 ## A tool call, end to end
 
