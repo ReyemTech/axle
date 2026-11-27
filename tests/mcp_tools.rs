@@ -596,3 +596,45 @@ store_matrix!(lists_are_paged, |store: Arc<dyn Store>| async move {
         c.cancel().await.unwrap();
     }
 });
+
+store_matrix!(
+    project_pages_follow_byte_order,
+    |store: Arc<dyn Store>| async move {
+        // Collation (e.g. Postgres en_US) and byte order disagree on these keys; paging must still
+        // visit every project exactly once.
+        let server = start(store).await;
+        let mut clients = vec![];
+        for key in ["github.com/ab", "github.com/a-z", "github.com/Zed"] {
+            let c = server
+                .connect(&[
+                    ("x-coord-project", key),
+                    ("x-coord-host", "mac"),
+                    ("x-coord-harness", "codex"),
+                ])
+                .await;
+            ok(&c, "whoami", json!({})).await;
+            clients.push(c);
+        }
+        let mut seen = vec![];
+        let mut after = Value::Null;
+        loop {
+            let page = ok(
+                &clients[0],
+                "project_list",
+                json!({"limit": 1, "after": after}),
+            )
+            .await;
+            for p in page["projects"].as_array().unwrap() {
+                seen.push(p["key"].as_str().unwrap().to_string());
+            }
+            after = page["next"].clone();
+            if after.is_null() {
+                break;
+            }
+        }
+        assert_eq!(seen, ["github.com/Zed", "github.com/a-z", "github.com/ab"]);
+        for c in clients {
+            c.cancel().await.unwrap();
+        }
+    }
+);

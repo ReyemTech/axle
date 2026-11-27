@@ -280,8 +280,8 @@ impl CoordMcp {
     }
 
     #[tool(description = described!(
-        "Projects with display names, live agent counts and open task counts, by key; \
-         paged (`limit`, `after` = the previous page's `next`)."
+        "Projects with display names, live agent counts and open task counts, by key \
+         (byte order); paged (`limit`, `after` = the previous page's `next`)."
     ))]
     async fn project_list(
         &self,
@@ -512,19 +512,15 @@ impl CoordMcp {
     async fn project_list_impl(&self, p: ProjectListParams) -> ToolResult {
         let now = self.state.clock.now();
         let limit = page(p.limit) as usize;
-        // Ordered by key.
-        let mut projects: Vec<Project> = self
-            .state
-            .store
-            .list_projects()
-            .await?
-            .into_iter()
-            .filter(|proj| {
-                p.after
-                    .as_deref()
-                    .is_none_or(|after| proj.key.as_str() > after)
-            })
-            .collect();
+        // Sort bytewise here: the cursor compares bytewise, and the store's ORDER BY follows
+        // the database collation, which may disagree (e.g. Postgres en_US).
+        let mut projects: Vec<Project> = self.state.store.list_projects().await?;
+        projects.sort_by(|a, b| a.key.cmp(&b.key));
+        projects.retain(|proj| {
+            p.after
+                .as_deref()
+                .is_none_or(|after| proj.key.as_str() > after)
+        });
         let next = more(&mut projects, limit).map(|last| last.key.clone());
         let mut out = vec![];
         for proj in &projects {
