@@ -7,6 +7,8 @@ include breaking changes.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-27
+
 The first release: the MVP.
 
 ### Added
@@ -51,4 +53,5 @@ The first release: the MVP.
   installer and Homebrew formula, crates.io (`axle-mcp`), a multi-arch image on GHCR, and a
   Helm chart published as an OCI artifact.
 
-[Unreleased]: https://github.com/ReyemTech/axle/commits/main
+[Unreleased]: https://github.com/ReyemTech/axle/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/ReyemTech/axle/releases/tag/v0.1.0

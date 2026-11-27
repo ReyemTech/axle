@@ -2,8 +2,34 @@
 
 ## Cut a release
 
-1. Bump `version` in `Cargo.toml`, run `cargo build` so `Cargo.lock` follows, commit to `main`.
-2. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`. The tag must equal the Cargo version.
+Releases are automated with [release-plz](https://release-plz.dev) (`release-plz.toml`,
+`.github/workflows/release-plz.yml`):
+
+1. Every push to `main` opens or updates a **release PR**. It bumps `version` in
+   `Cargo.toml` and `Cargo.lock` and adds a `CHANGELOG.md` section built from the
+   conventional commit messages (`feat:`, `fix:`, `feat!:` …). Edit the changelog in that PR
+   if the wording needs work.
+2. **Merging the release PR** creates the tag `vX.Y.Z`. Nothing else is released by
+   release-plz: it does not publish to crates.io and does not create the GitHub Release.
+
+Versions come from git tags (`git_only = true`), not from crates.io. Before 1.0, a breaking
+change bumps the minor version and everything else bumps the patch.
+
+### First release (v0.1.0)
+
+release-plz waits until a `v*` tag exists, so the first one is tagged by hand on the merge
+commit of the MVP. `CHANGELOG.md` already has the `0.1.0` section.
+
+```sh
+git switch main && git pull
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+### Manual release (fallback)
+
+Bump `version` in `Cargo.toml`, run `cargo build` so `Cargo.lock` follows, add the
+`CHANGELOG.md` section, commit to `main`, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+The tag must equal the Cargo version.
 
 Three workflows run on the tag:
 
@@ -18,6 +44,13 @@ Pull requests run `dist plan` to catch breakage early. The arm64 Linux binary bu
 on `ubuntu-24.04-arm`, so aws-lc-rs needs no cross toolchain.
 
 ## One-time owner setup
+
+- [ ] Create a fine-grained PAT for release-plz: resource owner **ReyemTech**, repository
+  **ReyemTech/axle** only, permissions **Contents: read and write** and **Pull requests:
+  read and write**. Save it in `ReyemTech/axle` as secret `RELEASE_PLZ_TOKEN`. It must not
+  be the default `GITHUB_TOKEN`: tags pushed with that token do not start other workflows, so
+  no release would build. Until it is set, the Release PR workflow fails with a message
+  saying so.
 
 - [x] `ReyemTech/homebrew-tap` already exists (it holds the stint casks). dist adds `Formula/axle.rb` next to them, so `brew install reyemtech/tap/axle` works.
 - [ ] Create a fine-grained PAT limited to `ReyemTech/homebrew-tap` with **Contents: read and write**. Save it in `ReyemTech/axle` as secret `HOMEBREW_TAP_TOKEN`. The stint repo already has a secret with this name; you can reuse the same token if it is scoped to the tap, or make it an org-level secret shared by both repos.

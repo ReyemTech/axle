@@ -18,7 +18,7 @@ contributions, which is required because ReyemTech alone offers Axle as a hosted
 
 1. Open an issue first for anything bigger than a small fix.
 2. Fork, branch from `main`, and keep each pull request focused.
-3. Use conventional commit messages (`feat:`, `fix:`, `docs:`, `ci:`).
+3. Use conventional commit messages (`feat:`, `fix:`, `docs:`, `ci:`; `feat!:` for breaking changes). release-plz builds the version bump and changelog from them.
 4. Update the docs under [`docs/`](docs/README.md) and the `[Unreleased]` section of
    [CHANGELOG.md](CHANGELOG.md) for anything a user would notice.
 5. Run the checks below, then open the pull request.
