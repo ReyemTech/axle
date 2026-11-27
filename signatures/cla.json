@@ -1,3 +1,12 @@
 {
-   "signedContributors": []
+  "signedContributors": [
+    {
+      "name": "mariomeyer",
+      "id": 867650,
+      "comment_id": 7227405371,
+      "created_at": "2026-11-27T20:20:22Z",
+      "repoId": 1474022719,
+      "pullRequestNo": 2
+    }
+  ]
 }
