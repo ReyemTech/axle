@@ -522,3 +522,196 @@ async fn overview_empty_state_points_at_connect() {
     let panel = app.get("/ui/overview/panel", Some(&cookie)).await;
     assert!(panel.text().contains("No agents yet."));
 }
+
+const XSS: &str = "<script>alert(1)</script>";
+
+async fn pending_device(app: &App, host: &str) -> (String, String) {
+    let start = app
+        .state
+        .enroll
+        .start_device(host, Some("10.0.0.7"))
+        .await
+        .unwrap();
+    let id = app
+        .state
+        .enroll
+        .lookup_user_code(&start.user_code)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    (id.to_string(), start.user_code)
+}
+
+#[tokio::test]
+async fn result_panel_has_a_countdown_and_distinct_copy_labels() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let csrf = app.get("/ui/tokens", Some(&cookie)).await.csrf();
+    let page = app.connect(&cookie, &csrf, "laptop").await;
+    assert_eq!(
+        page.attrs("#connect-result [data-countdown]", "data-countdown"),
+        vec!["900".to_string()]
+    );
+    assert_eq!(
+        page.attrs("#connect-result [data-expires-at]", "data-expires-at"),
+        vec!["2026-11-27T09:15:00Z".to_string()]
+    );
+    assert!(page.text().contains("expires in 15:00"));
+    assert_eq!(
+        page.attrs("button[data-copy]", "aria-label"),
+        vec!["Copy code", "Copy install command", "Copy login command"]
+    );
+}
+
+#[tokio::test]
+async fn mutating_routes_need_csrf_and_change_nothing() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let (id, user_code) = pending_device(&app, "build-02").await;
+    let csrf = app.get("/ui/tokens", Some(&cookie)).await.csrf();
+    app.connect(&cookie, &csrf, "laptop").await;
+    let before = app.state.enroll.pending().await.unwrap().len();
+    assert_eq!(before, 2);
+    for (path, form) in [
+        (
+            "/ui/connect/lookup".to_string(),
+            format!("user_code={user_code}"),
+        ),
+        (format!("/ui/connect/{id}/approve"), String::new()),
+        (format!("/ui/connect/{id}/deny"), String::new()),
+        (format!("/ui/enrollments/{id}/revoke"), String::new()),
+        (
+            format!("/ui/enrollments/{id}/revoke"),
+            "csrf=wrong".to_string(),
+        ),
+    ] {
+        let res = app.post_form(&path, Some(&cookie), &form).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{path}");
+    }
+    assert_eq!(app.state.enroll.pending().await.unwrap().len(), before);
+}
+
+#[tokio::test]
+async fn approve_without_a_session_is_refused() {
+    let app = app().await;
+    let (id, _) = pending_device(&app, "build-02").await;
+    for path in [
+        format!("/ui/connect/{id}/approve"),
+        format!("/ui/connect/{id}/deny"),
+        format!("/ui/enrollments/{id}/revoke"),
+    ] {
+        let res = app.post_form(&path, None, "csrf=anything").await;
+        assert_eq!(res.status, StatusCode::SEE_OTHER, "{path}");
+        assert!(res.location.as_deref().unwrap().starts_with("/ui/login"));
+    }
+    assert_eq!(app.state.enroll.pending().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn approve_needs_csrf_even_without_ui_sign_in() {
+    // Loopback bind, no admin secret: UI auth is `none`.
+    let opts: SqliteConnectOptions = "sqlite::memory:".parse().unwrap();
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .min_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .connect_with(opts.foreign_keys(true))
+        .await
+        .unwrap();
+    let store = Arc::new(SqliteStore::from_pool(pool).await.unwrap());
+    let clock = Arc::new(TestClock::new(datetime!(2026-11-27 9:00 UTC)));
+    let config =
+        ServerConfig::from_lookup(|k| (k == "DATABASE_URL").then(|| "sqlite::memory:".to_string()))
+            .unwrap();
+    assert_eq!(config.ui_auth, axle::config::UiAuth::None);
+    let state = AppState::new(store, clock, config);
+    let app = App {
+        router: router(state.clone()),
+        state,
+    };
+    let (id, _) = pending_device(&app, "mac").await;
+    let host = |req: axum::http::request::Builder| req.header(header::HOST, "127.0.0.1:7420");
+    let post = |path: String, form: String, cookie: Option<String>| {
+        let mut r = host(Request::post(path))
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(c) = cookie {
+            r = r.header(header::COOKIE, c);
+        }
+        r.body(Body::from(form)).unwrap()
+    };
+    // No session at all, no token: refused, nothing approved.
+    let res = app
+        .send(post(
+            format!("/ui/connect/{id}/approve"),
+            String::new(),
+            None,
+        ))
+        .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    assert_eq!(app.state.enroll.pending().await.unwrap().len(), 1);
+    // With a session but no token: still refused.
+    let page = app
+        .send(
+            host(Request::get("/ui/connect"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let cookie = cookie_pair(page.set_cookie.as_deref().unwrap());
+    let res = app
+        .send(post(
+            format!("/ui/connect/{id}/approve"),
+            String::new(),
+            Some(cookie.clone()),
+        ))
+        .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    assert_eq!(app.state.enroll.pending().await.unwrap().len(), 1);
+    // With the token it goes through.
+    let res = app
+        .send(post(
+            format!("/ui/connect/{id}/approve"),
+            format!("csrf={}", page.csrf()),
+            Some(cookie),
+        ))
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+}
+
+#[tokio::test]
+async fn hostile_labels_and_hosts_are_escaped() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let csrf = app.get("/ui/tokens", Some(&cookie)).await.csrf();
+    let label = "%3Cscript%3Ealert(1)%3C%2Fscript%3E";
+    let issued = app
+        .post_form(
+            "/ui/tokens/connect",
+            Some(&cookie),
+            &format!("csrf={csrf}&label={label}"),
+        )
+        .await;
+    let tokens = app.get("/ui/tokens", Some(&cookie)).await;
+    // The device host bypasses sanitize_label here by going through the store-facing service
+    // only when it keeps the characters; assert escaping wherever the text shows up at all.
+    let (_, user_code) = pending_device(&app, XSS).await;
+    let card = app
+        .post_form(
+            "/ui/connect/lookup",
+            Some(&cookie),
+            &format!("csrf={csrf}&user_code={user_code}"),
+        )
+        .await;
+    for page in [&issued, &tokens, &card] {
+        assert!(!page.body.contains("<script>alert"), "{}", page.body);
+        assert!(!page.body.contains(XSS));
+    }
+    assert!(
+        issued.body.contains("&#60;script&#62;alert(1)"),
+        "{}",
+        issued.body
+    );
+    assert!(tokens.body.contains("&#60;script&#62;alert(1)"));
+}

@@ -149,6 +149,16 @@
         ? "expired"
         : "expires in " + Math.floor(s / 60) + ":" + ("0" + (s % 60)).slice(-2);
       if (el.textContent !== text) el.textContent = text;
+      // A code that has expired can no longer be used: stop offering to copy it.
+      var scope = el.getAttribute("data-expire-scope");
+      var box = scope && document.getElementById(scope);
+      if (box && s === 0 && !box.hasAttribute("data-expired")) {
+        box.setAttribute("data-expired", "");
+        box.querySelectorAll("[data-copy]").forEach(function (b) {
+          b.disabled = true;
+          b.hidden = true;
+        });
+      }
     });
   }
   tickCountdowns();

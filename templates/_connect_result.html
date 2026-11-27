@@ -1,17 +1,17 @@
 {% if let Some(issued) = connect.issued %}
 <div class="result" id="connect-result" role="status">
   <p><span class="aspect" data-aspect="done" aria-hidden="true"></span><strong>Code for {{ issued.label }}</strong></p>
-  <p class="code-line"><code class="code-big" id="connect-code">{{ issued.code }}</code> <button type="button" class="secondary" data-copy="connect-code">Copy</button></p>
-  <p class="muted">Shown once, valid for 15 minutes, works once. Run one of these on the machine:</p>
+  <p class="code-line"><code class="code-big" id="connect-code">{{ issued.code }}</code> <button type="button" class="secondary" data-copy="connect-code" aria-label="Copy code">Copy</button></p>
+  <p class="muted">Shown once, valid for 15 minutes, works once. <span data-countdown="{{ issued.left }}" data-expires-at="{{ issued.expires_iso }}" data-expire-scope="connect-result">{{ issued.left_text }}</span>. Run one of these on the machine:</p>
   <div class="cmd">
     <span class="muted">Install and connect</span>
     <code id="cmd-install">{{ issued.install_cmd }}</code>
-    <button type="button" class="secondary" data-copy="cmd-install">Copy</button>
+    <button type="button" class="secondary" data-copy="cmd-install" aria-label="Copy install command">Copy</button>
   </div>
   <div class="cmd">
     <span class="muted">Already installed</span>
     <code id="cmd-login">{{ issued.login_cmd }}</code>
-    <button type="button" class="secondary" data-copy="cmd-login">Copy</button>
+    <button type="button" class="secondary" data-copy="cmd-login" aria-label="Copy login command">Copy</button>
   </div>
 </div>
 {% endif %}

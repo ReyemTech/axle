@@ -49,6 +49,10 @@ pub struct IssuedPanel {
     pub code: String,
     pub install_cmd: String,
     pub login_cmd: String,
+    /// When the code stops working (RFC 3339, UTC), and the seconds left now.
+    pub expires_iso: String,
+    pub left: i64,
+    pub left_text: String,
 }
 
 /// One pending enrollment as the list shows it.
@@ -182,6 +186,15 @@ pub async fn connect_machine(
         issued: Some(IssuedPanel {
             install_cmd: format!("curl -fsSL {url}/install.sh | sh -s -- {}", issued.code),
             login_cmd: format!("axl login {url} --code {}", issued.code),
+            expires_iso: issued
+                .expires_at
+                .to_offset(time::UtcOffset::UTC)
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            left: (issued.expires_at - state.clock.now())
+                .whole_seconds()
+                .max(0),
+            left_text: clock_text((issued.expires_at - state.clock.now()).whole_seconds()),
             code: issued.code,
             label,
         }),
