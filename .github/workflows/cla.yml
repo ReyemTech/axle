@@ -29,4 +29,4 @@ jobs:
           path-to-signatures: signatures/cla.json
           path-to-document: https://github.com/ReyemTech/axle/blob/main/CLA.md
           branch: cla-signatures
-          allowlist: ReyemTech,dependabot[bot],github-actions[bot]
+          allowlist: mariomeyer,dependabot[bot],github-actions[bot]

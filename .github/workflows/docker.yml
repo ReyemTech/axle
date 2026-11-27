@@ -71,6 +71,19 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=axle
+            org.opencontainers.image.description=Self-hosted MCP server for coding agents: durable cross-machine messaging and task claims with renewable leases, plus a live web UI.
+            org.opencontainers.image.source=https://github.com/ReyemTech/axle
+            org.opencontainers.image.url=https://github.com/ReyemTech/axle
+            org.opencontainers.image.documentation=https://github.com/ReyemTech/axle/tree/main/docs
+            org.opencontainers.image.licenses=Elastic-2.0
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+          # GHCR reads the description and repo link of a multi-arch image from the index.
+          annotations: |
+            index:org.opencontainers.image.description=Self-hosted MCP server for coding agents: durable cross-machine messaging and task claims with renewable leases, plus a live web UI.
+            index:org.opencontainers.image.source=https://github.com/ReyemTech/axle
+            index:org.opencontainers.image.licenses=Elastic-2.0
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

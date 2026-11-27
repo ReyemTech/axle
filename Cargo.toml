@@ -2,13 +2,13 @@
 name = "axle-mcp"
 version = "0.1.0"
 edition = "2024"
-description = "Axle: self-hosted MCP server for agent messaging and task claiming with leases"
+description = "Axle (axl): self-hosted MCP server where coding agents on any machine message each other and claim tasks under renewable leases, with a live web UI"
 license = "Elastic-2.0"
 repository = "https://github.com/ReyemTech/axle"
-homepage = "https://github.com/ReyemTech/axle#readme"
+documentation = "https://github.com/ReyemTech/axle/tree/main/docs"
 readme = "README.md"
-keywords = ["mcp", "agents", "coordination", "tasks", "leases"]
-categories = ["command-line-utilities", "development-tools"]
+keywords = ["mcp", "ai-agents", "claude-code", "coordination", "task-queue"]
+categories = ["command-line-utilities", "development-tools", "web-programming::http-server"]
 include = [
     "/src/**",
     "/migrations/**",
@@ -62,3 +62,8 @@ http-body-util = "0.1.5"
 scraper = "0.29.0"
 tokio = { version = "1.54.1", features = ["io-util", "process"] }
 tower = { version = "0.5.3", features = ["util"] }
+
+# The profile `dist` builds release binaries with.
+[profile.dist]
+inherits = "release"
+lto = "thin"
