@@ -99,3 +99,24 @@ impl Manifest {
         }
     }
 }
+
+impl Manifest {
+    /// Drops every entry recorded for `harness`; returns how many there were.
+    pub fn remove_harness(&mut self, harness: Harness) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|e| e.harness != harness);
+        before - self.entries.len()
+    }
+
+    /// Saves the manifest, or deletes the file once nothing is left to record.
+    pub fn persist(&self, dir: &AxlDir) -> io::Result<()> {
+        if !self.entries.is_empty() {
+            return self.save(dir);
+        }
+        match std::fs::remove_file(dir.manifest_path()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}

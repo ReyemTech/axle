@@ -14,7 +14,7 @@ use std::time::Duration;
 use axle::bridge::short_hostname;
 use axle::cli::{
     HarnessRow, InstallArgs, InstallEnv, InstallReport, LoginArgs, LoginHooks, Outcome, Prompt,
-    install, login,
+    UninstallArgs, install, login, uninstall,
 };
 use axle::client::{Api, AxlDir, ClientConfig, load_config, save_config, write_token};
 use axle::clock::{Clock, SystemClock};
@@ -1137,4 +1137,331 @@ fn e2e_hand_made_token_is_never_printed() {
         );
         assert!(stdout.contains("<redacted>") || argv.len() == 2, "{stdout}");
     }
+}
+
+// ---- axl uninstall ----
+
+fn uninstall_args() -> UninstallArgs {
+    UninstallArgs {
+        harness: Vec::new(),
+        service: false,
+        purge: false,
+        revoke: false,
+    }
+}
+
+async fn run_uninstall(
+    home: &TempHome,
+    a: UninstallArgs,
+    service: &FakeService,
+    now: OffsetDateTime,
+) -> (Result<(), axle::client::ClientError>, String) {
+    let mut out = Vec::new();
+    let svc = service.clone();
+    let factory =
+        move || -> Result<Box<dyn ServiceControl>, NoServiceManager> { Ok(Box::new(svc.clone())) };
+    let result = {
+        let mut env = InstallEnv {
+            home: home.path().to_path_buf(),
+            path_env: Some(OsString::new()),
+            current_exe: home.exe("bin/axl"),
+            interactive: false,
+            prompt: &NoPrompt,
+            out: &mut out,
+            service: &factory,
+            login_hooks: hooks(),
+            now,
+        };
+        uninstall(&mut env, a).await
+    };
+    (result, String::from_utf8(out).unwrap())
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let dest = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_tree(&e.path(), &dest);
+        } else {
+            std::fs::copy(e.path(), &dest).unwrap();
+        }
+    }
+}
+
+/// A home holding the `before` trees of the three harnesses' `variant` fixtures.
+fn fixture_home(variant: &str) -> TempHome {
+    let home = TempHome::new();
+    for h in ["claude-code", "codex", "opencode"] {
+        let before = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/harness")
+            .join(h)
+            .join(variant)
+            .join("before");
+        copy_tree(&before, home.path());
+    }
+    // Claude Code's `empty` fixture is only a .gitkeep: give it its config directory.
+    home.mkdir(".claude");
+    // The fake `axl` install runs from.
+    home.exe("bin/axl");
+    home
+}
+
+/// The tree minus Axle's own directory and the backups it made.
+fn user_tree(root: &Path) -> BTreeMap<String, (u32, Vec<u8>)> {
+    snapshot(root)
+        .into_iter()
+        .filter(|(k, _)| !k.contains(".axl-backup-") && k != ".axl" && !k.starts_with(".axl/"))
+        .collect()
+}
+
+#[tokio::test]
+async fn install_then_uninstall_restores_tree() {
+    for variant in ["unrelated", "empty"] {
+        let srv = server().await;
+        let home = fixture_home(variant);
+        connect(&home, &srv).await;
+        let before = user_tree(home.path());
+        let service = FakeService::default();
+        let (installed, out) = run(&home, args(), &NoPrompt, false, &service, T1).await;
+        installed.unwrap();
+        assert_ne!(
+            user_tree(home.path()),
+            before,
+            "{variant}: install did nothing: {out}"
+        );
+
+        let (result, out) = run_uninstall(&home, uninstall_args(), &service, T2).await;
+        result.unwrap();
+        assert_eq!(user_tree(home.path()), before, "{variant}: {out}");
+        // Axle's own tree: no integrations left, no manifest, the login kept.
+        let dir = AxlDir::new(home.path());
+        assert!(!dir.integrations_dir().exists(), "{variant}");
+        assert!(!dir.manifest_path().exists(), "{variant}");
+        assert!(
+            dir.token_path().exists(),
+            "{variant}: token must stay without --revoke"
+        );
+        assert!(service.calls.lock().unwrap().is_empty(), "{variant}");
+    }
+}
+
+#[tokio::test]
+async fn uninstall_one_harness_keeps_others() {
+    let srv = server().await;
+    let home = full_home(&srv).await;
+    let service = FakeService::default();
+    run(&home, args(), &NoPrompt, false, &service, T1)
+        .await
+        .0
+        .unwrap();
+
+    let (result, out) = run_uninstall(
+        &home,
+        UninstallArgs {
+            harness: vec![Harness::Codex],
+            ..uninstall_args()
+        },
+        &service,
+        T2,
+    )
+    .await;
+    result.unwrap();
+    let codex = std::fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
+    assert_eq!(codex, "model = \"o3\"\n", "{out}");
+    let opencode =
+        std::fs::read_to_string(home.path().join(".config/opencode/opencode.json")).unwrap();
+    assert!(opencode.contains("axle"), "opencode lost its entry");
+    assert!(
+        std::fs::read_link(home.path().join(".claude/skills/axle")).is_ok(),
+        "claude code link removed"
+    );
+    // The manifest keeps only the other harnesses.
+    let manifest = std::fs::read_to_string(AxlDir::new(home.path()).manifest_path()).unwrap();
+    assert!(!manifest.contains("\"codex\""), "{manifest}");
+    assert!(manifest.contains("claude-code") && manifest.contains("opencode"));
+
+    // A second run of the same command is a no-op.
+    let tree = snapshot(home.path());
+    let (again, _) = run_uninstall(
+        &home,
+        UninstallArgs {
+            harness: vec![Harness::Codex],
+            ..uninstall_args()
+        },
+        &service,
+        T2,
+    )
+    .await;
+    again.unwrap();
+    assert_eq!(snapshot(home.path()), tree);
+}
+
+#[tokio::test]
+async fn uninstall_ignores_unrecorded_user_edits() {
+    let srv = server().await;
+    let home = TempHome::new();
+    home.write(
+        ".config/opencode/opencode.json",
+        "{\n  \"theme\": \"x\"\n}\n",
+    );
+    connect(&home, &srv).await;
+    let service = FakeService::default();
+    run(&home, args(), &NoPrompt, false, &service, T1)
+        .await
+        .0
+        .unwrap();
+    // The user adds a server of their own next to `axle`.
+    let path = home.path().join(".config/opencode/opencode.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\"axle\""), "{text}");
+    let edited = text.replacen(
+        "\"axle\"",
+        "\"mine\": {\"type\": \"local\", \"command\": [\"/usr/bin/mine\"]},\n    \"axle\"",
+        1,
+    );
+    std::fs::write(&path, edited).unwrap();
+
+    let (result, out) = run_uninstall(&home, uninstall_args(), &service, T2).await;
+    result.unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(after.contains("/usr/bin/mine"), "{after}\n{out}");
+    assert!(after.contains("\"theme\""), "{after}");
+    assert!(!after.contains("\"axle\""), "{after}");
+}
+
+#[tokio::test]
+async fn uninstall_service_keeps_db_without_purge() {
+    let srv = server().await;
+    let home = full_home(&srv).await;
+    let dir = AxlDir::new(home.path());
+    home.write(".axl/axl.db", "db")
+        .write(".axl/axl.db-wal", "wal")
+        .write(".axl/axl.db.bak", "bak");
+    let service = FakeService::default();
+
+    let (result, out) = run_uninstall(
+        &home,
+        UninstallArgs {
+            service: true,
+            ..uninstall_args()
+        },
+        &service,
+        T2,
+    )
+    .await;
+    result.unwrap();
+    assert!(
+        service
+            .calls
+            .lock()
+            .unwrap()
+            .contains(&"uninstall".to_string())
+    );
+    assert!(dir.db_path().exists(), "{out}");
+    assert!(out.contains("--purge"), "{out}");
+
+    let (result, _) = run_uninstall(
+        &home,
+        UninstallArgs {
+            service: true,
+            purge: true,
+            ..uninstall_args()
+        },
+        &service,
+        T2,
+    )
+    .await;
+    result.unwrap();
+    assert!(!dir.db_path().exists());
+    assert!(!dir.root.join("axl.db-wal").exists());
+    assert!(
+        dir.root.join("axl.db.bak").exists(),
+        "purge deleted a user file"
+    );
+}
+
+#[tokio::test]
+async fn purge_without_service_is_refused_before_anything_changes() {
+    let srv = server().await;
+    let home = full_home(&srv).await;
+    let service = FakeService::default();
+    run(&home, args(), &NoPrompt, false, &service, T1)
+        .await
+        .0
+        .unwrap();
+    let tree = snapshot(home.path());
+    let (result, _) = run_uninstall(
+        &home,
+        UninstallArgs {
+            purge: true,
+            ..uninstall_args()
+        },
+        &service,
+        T2,
+    )
+    .await;
+    assert!(result.unwrap_err().to_string().contains("--service"));
+    assert_eq!(snapshot(home.path()), tree);
+}
+
+#[tokio::test]
+async fn uninstall_revoke_invalidates_token() {
+    let srv = server().await;
+    let home = full_home(&srv).await;
+    let dir = AxlDir::new(home.path());
+    let token = std::fs::read_to_string(dir.token_path()).unwrap();
+    let api = Api::new(&srv.base);
+    api.whoami(token.trim()).await.unwrap();
+
+    let service = FakeService::default();
+    let (result, out) = run_uninstall(
+        &home,
+        UninstallArgs {
+            revoke: true,
+            ..uninstall_args()
+        },
+        &service,
+        T2,
+    )
+    .await;
+    result.unwrap();
+    assert!(
+        api.whoami(token.trim()).await.is_err(),
+        "token still valid: {out}"
+    );
+    assert!(!dir.token_path().exists());
+    assert!(!out.contains(token.trim()), "token printed: {out}");
+}
+
+#[tokio::test]
+async fn corrupt_manifest_stops_uninstall() {
+    let srv = server().await;
+    let home = full_home(&srv).await;
+    home.write(".axl/install-manifest.json", "{ not json");
+    let service = FakeService::default();
+    let (result, _) = run_uninstall(
+        &home,
+        UninstallArgs {
+            service: true,
+            revoke: true,
+            ..uninstall_args()
+        },
+        &service,
+        T2,
+    )
+    .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("install-manifest.json")
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.path().join(".axl/install-manifest.json")).unwrap(),
+        "{ not json"
+    );
+    assert!(service.calls.lock().unwrap().is_empty());
+    assert!(AxlDir::new(home.path()).token_path().exists());
 }

@@ -87,6 +87,22 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Undo `axl install`: remove what it added to each harness (optionally also the local
+    /// service and this machine's token)
+    Uninstall {
+        /// Only undo this harness (repeatable)
+        #[arg(long, value_enum, value_name = "NAME")]
+        harness: Vec<axle::install::Harness>,
+        /// Also stop and remove the local background service (the database is kept)
+        #[arg(long)]
+        service: bool,
+        /// With --service: also delete the local database
+        #[arg(long, requires = "service")]
+        purge: bool,
+        /// Revoke this machine's token on the server and forget it
+        #[arg(long)]
+        revoke: bool,
+    },
     /// Forget this machine's token (optionally revoking it on the server)
     Logout {
         /// Also revoke the token on the server
@@ -206,6 +222,20 @@ async fn main() -> ExitCode {
                 local,
                 dry_run,
                 yes,
+            })
+            .await;
+        }
+        Command::Uninstall {
+            harness,
+            service,
+            purge,
+            revoke,
+        } => {
+            return uninstall(axle::cli::UninstallArgs {
+                harness,
+                service,
+                purge,
+                revoke,
             })
             .await;
         }
@@ -343,6 +373,36 @@ async fn install(args: axle::cli::InstallArgs) -> ExitCode {
     };
     match run.await {
         Ok(code) => code,
+        Err(e) => {
+            eprintln!("axl: {}", axle::cli::install::redact(&e.to_string()));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn uninstall(args: axle::cli::UninstallArgs) -> ExitCode {
+    let run = async {
+        let home = home_dir()?;
+        let service_home = home.clone();
+        let service =
+            move || axle::daemon::platform(&service_home, Box::new(axle::daemon::SystemRunner));
+        let mut stdout = std::io::stdout();
+        let mut env = axle::cli::InstallEnv {
+            home,
+            path_env: std::env::var_os("PATH"),
+            current_exe: std::env::current_exe()?,
+            interactive: false,
+            prompt: &axle::cli::TerminalPrompt,
+            out: &mut stdout,
+            service: &service,
+            login_hooks: axle::cli::LoginHooks::default(),
+            now: time::OffsetDateTime::now_utc(),
+        };
+        axle::cli::uninstall(&mut env, args).await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    };
+    match run.await {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("axl: {}", axle::cli::install::redact(&e.to_string()));
             ExitCode::FAILURE

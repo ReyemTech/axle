@@ -157,7 +157,7 @@ fn usage(msg: impl Into<String>) -> ClientError {
     ClientError::Usage(msg.into())
 }
 
-fn display_name(h: Harness) -> &'static str {
+pub(super) fn display_name(h: Harness) -> &'static str {
     match h {
         Harness::ClaudeCode => "Claude Code",
         Harness::Codex => "Codex",
