@@ -3,10 +3,10 @@ mod common;
 
 use std::sync::Arc;
 
-use coord::clock::TestClock;
-use coord::domain::{SessionId, TokenId};
-use coord::service::identity::{IdentityError, IdentityInput, IdentityService};
-use coord::store::{Store, open_store};
+use axle::clock::TestClock;
+use axle::domain::{SessionId, TokenId};
+use axle::service::identity::{IdentityError, IdentityInput, IdentityService};
+use axle::store::{Store, open_store};
 use time::macros::datetime;
 
 fn input(token: TokenId, project_key: Option<&str>, session: SessionId) -> IdentityInput {
@@ -220,9 +220,8 @@ store_matrix!(
 
 #[tokio::test]
 async fn open_store_creates_and_reopens_sqlite_file() {
-    let path = std::env::temp_dir().join(format!("coord-test-{}.db", uuid::Uuid::now_v7()));
-    let backend =
-        coord::config::Backend::from_url(&format!("sqlite://{}", path.display())).unwrap();
+    let path = std::env::temp_dir().join(format!("axle-test-{}.db", uuid::Uuid::now_v7()));
+    let backend = axle::config::Backend::from_url(&format!("sqlite://{}", path.display())).unwrap();
     let now = datetime!(2026-11-27 9:00 UTC);
 
     let store = open_store(&backend).await.unwrap();

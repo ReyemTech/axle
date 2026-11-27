@@ -1,5 +1,5 @@
 ---
-name: coord
+name: axle
 description: Block signalling control room for a fleet of coding agents; state is read from signal aspects, track rules and labelled cards.
 colors:
   ground: "#edebe4"
@@ -184,13 +184,13 @@ components:
     padding: "12px 14px 14px"
 ---
 
-# Design System: coord
+# Design System: axle
 
 ## Overview
 
 **Creative North Star: "Block Signalling"**
 
-coord reads like a railway signal box. Every project is a line with its own colour. Every task is a block on that line. The lease on a claim is the occupancy of the block, and a small set of signal aspects (ring, half, square, centred ring, filled) says what state each block is in. It is a control room kept on a second screen all day, so the system favours state that can be read from across the desk over anything decorative.
+Axle reads like a railway signal box. Every project is a line with its own colour. Every task is a block on that line. The lease on a claim is the occupancy of the block, and a small set of signal aspects (ring, half, square, centred ring, filled) says what state each block is in. It is a control room kept on a second screen all day, so the system favours state that can be read from across the desk over anything decorative.
 
 The first build was pure hairlines and read as too minimal and hard to scan. The shipped system keeps the signalling grammar but adds structure: columns are tinted bands, tasks are bordered cards, actions are labelled buttons, and every glyph has a text label beside it. These additions are deliberate rules, not drift. Density is still protected: cards are compact (10px/12px padding, 12.5px meta) and no surface carries chrome that does not report state.
 

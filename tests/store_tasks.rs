@@ -3,21 +3,21 @@ mod common;
 
 use std::sync::Arc;
 
-use coord::clock::{Clock, TestClock};
-use coord::domain::{
+use axle::clock::{Clock, TestClock};
+use axle::domain::{
     Actor, Address, Eligibility, Importance, ProjectId, SessionId, Task, TaskEventKind, TaskId,
     TaskStatus,
 };
-use coord::service::identity::{IdentityInput, IdentityService, Resolved};
-use coord::service::tasks::{
+use axle::service::identity::{IdentityInput, IdentityService, Resolved};
+use axle::service::tasks::{
     Caller, ClaimOutcome, Completion, NewTask, Progress, TaskError, TaskService,
 };
-use coord::store::{InboxFilter, Recipient, Store, TaskFilter};
+use axle::store::{InboxFilter, Recipient, Store, TaskFilter};
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
 const T0: OffsetDateTime = datetime!(2026-11-27 9:00 UTC);
-const PROJECT: &str = "github.com/reyemtech/coord";
+const PROJECT: &str = "github.com/reyemtech/axle";
 
 struct Env {
     store: Arc<dyn Store>,
@@ -491,7 +491,7 @@ store_matrix!(eligibility_filters, |store: Arc<dyn Store>| async move {
     assert_eq!(next.owner_agent_id, Some(codex.agent.id));
     assert_eq!(
         env.svc
-            .claim(&codex, coord::domain::TaskId::new())
+            .claim(&codex, axle::domain::TaskId::new())
             .await
             .unwrap(),
         ClaimOutcome::NotFound
@@ -526,7 +526,7 @@ store_matrix!(invalid_transition, |store: Arc<dyn Store>| async move {
         Err(TaskError::NotOwner)
     ));
     assert!(matches!(
-        env.svc.renew(&a, coord::domain::TaskId::new()).await,
+        env.svc.renew(&a, axle::domain::TaskId::new()).await,
         Err(TaskError::NotFound)
     ));
     env.svc
@@ -1117,7 +1117,7 @@ store_matrix!(
     |store: Arc<dyn Store>| async move {
         // Stores keep microseconds; the clock here has nanoseconds, like SystemClock.
         let clock = Arc::new(TestClock::new(datetime!(2026-01-01 0:00:00.123456789 UTC)));
-        let bus = coord::events::EventBus::new(store.clone(), clock.clone());
+        let bus = axle::events::EventBus::new(store.clone(), clock.clone());
         let svc = Arc::new(
             TaskService::new(
                 store.clone(),
@@ -1154,7 +1154,7 @@ store_matrix!(
 
         let mut kinds = vec![];
         while let Ok(e) = rx.try_recv() {
-            if let coord::events::Event::TaskChanged {
+            if let axle::events::Event::TaskChanged {
                 id, kind, status, ..
             } = e
             {
@@ -1275,7 +1275,7 @@ store_matrix!(edit_is_guarded_attributed_and_published, |store: Arc<
     dyn Store,
 >| async move {
     let env = Env::new(store.clone());
-    let bus = coord::events::EventBus::new(store.clone(), env.clock.clone());
+    let bus = axle::events::EventBus::new(store.clone(), env.clock.clone());
     let svc = TaskService::new(
         store.clone(),
         env.clock.clone(),
@@ -1303,7 +1303,7 @@ store_matrix!(edit_is_guarded_attributed_and_published, |store: Arc<
         Some(serde_json::json!({"previous_title": "fix the flaky test"}))
     );
     match rx.recv().await.unwrap() {
-        coord::events::Event::TaskChanged { id, kind, .. } => {
+        axle::events::Event::TaskChanged { id, kind, .. } => {
             assert_eq!((id, kind), (task.id, TaskEventKind::Edited));
         }
         other => panic!("expected TaskChanged, got {other:?}"),
@@ -1404,7 +1404,7 @@ store_matrix!(
             env.clock.advance(Duration::seconds(1));
             env.svc.renew(&me, task.id).await.unwrap();
         }
-        let kinds = |es: &[coord::domain::TaskEvent]| es.iter().map(|e| e.kind).collect::<Vec<_>>();
+        let kinds = |es: &[axle::domain::TaskEvent]| es.iter().map(|e| e.kind).collect::<Vec<_>>();
         let first = env
             .store
             .task_events_page(task.id, None, None, 2)

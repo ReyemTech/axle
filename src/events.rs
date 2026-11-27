@@ -78,7 +78,7 @@ impl EventBus {
     /// returned, so the caller does not report (and retry) a change that did happen.
     pub async fn emit(&self, event: Event) {
         if let Err(e) = self.publish(event).await {
-            eprintln!("coord: failed to publish event: {e}");
+            eprintln!("axl: failed to publish event: {e}");
         }
     }
 

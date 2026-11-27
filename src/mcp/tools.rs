@@ -14,7 +14,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{CoordMcp, Labels, ToolError, project_view, render, timestamp};
+use super::{AxleMcp, Labels, ToolError, project_view, render, timestamp};
 use crate::domain::{
     Address, Agent, Eligibility, Importance, MessageId, Project, ProjectId, Session, SessionId,
     TaskId, TaskStatus,
@@ -269,7 +269,7 @@ pub struct TaskCompleteParams {
 // ---------------------------------------------------------------- tools
 
 #[tool_router(vis = "pub(super)")]
-impl CoordMcp {
+impl AxleMcp {
     #[tool(description = described!(
         "Who you are: project, agent, session, the tasks you hold and your unread count. \
          Call it after a restart or compaction."
@@ -467,7 +467,7 @@ impl CoordMcp {
 
 type ToolResult = Result<Value, ToolError>;
 
-impl CoordMcp {
+impl AxleMcp {
     fn labels(&self) -> Labels<'_> {
         Labels::new(&*self.state.store)
     }

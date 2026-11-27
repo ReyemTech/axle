@@ -664,7 +664,7 @@ impl TaskService {
             Ok(Some(p)) => p,
             Ok(None) => return,
             Err(e) => {
-                eprintln!("coord: failed to read parent task {parent_id}: {e}");
+                eprintln!("axl: failed to read parent task {parent_id}: {e}");
                 return;
             }
         };
@@ -738,7 +738,7 @@ impl TaskService {
             created_at: self.clock.now(),
         };
         if let Err(e) = self.store.insert_message(&message, token).await {
-            eprintln!("coord: failed to notify parent task {}: {e}", parent.id);
+            eprintln!("axl: failed to notify parent task {}: {e}", parent.id);
             return;
         }
         if let Some(bus) = &self.events {

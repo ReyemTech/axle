@@ -43,8 +43,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/${{ steps.meta.outputs.owner }}/coord:${{ steps.meta.outputs.version }}
-            ghcr.io/${{ steps.meta.outputs.owner }}/coord:latest
+            ghcr.io/${{ steps.meta.outputs.owner }}/axle:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ steps.meta.outputs.owner }}/axle:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -57,5 +57,5 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "$GH_TOKEN" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
-          helm package deploy/helm/coord --version "$VERSION" --app-version "$VERSION" --destination dist
-          helm push "dist/coord-${VERSION}.tgz" "oci://ghcr.io/${OWNER}/charts"
+          helm package deploy/helm/axle --version "$VERSION" --app-version "$VERSION" --destination dist
+          helm push "dist/axle-${VERSION}.tgz" "oci://ghcr.io/${OWNER}/charts"

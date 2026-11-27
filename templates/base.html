@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="light dark">
 <meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false}'>
 {% if let Some(token) = csrf %}<meta name="csrf-token" content="{{ token }}">{% endif %}
-<title>{% block title %}coord{% endblock %} · coord</title>
+<title>{% block title %}axle{% endblock %} · axle</title>
 <link rel="stylesheet" href="/ui/static/app.css">
 <script src="/ui/static/htmx.min.js" defer></script>
 <script src="/ui/static/htmx-ext-sse.js" defer></script>
@@ -15,7 +15,7 @@
 {% if let Some(token) = csrf %}
 <body hx-ext="sse" sse-connect="/ui/live">
 <header class="topbar">
-  <a class="brand" href="/ui/"><span class="brand-mark" aria-hidden="true"></span>coord</a>
+  <a class="brand" href="/ui/"><span class="brand-mark" aria-hidden="true"></span>axle</a>
   <nav class="tabs" aria-label="Sections">
     <a href="/ui/"{% if nav == "overview" %} aria-current="page"{% endif %}>Overview</a>
     <a href="/ui/board"{% if nav == "board" %} aria-current="page"{% endif %}>Board</a>

@@ -1,4 +1,4 @@
-//! `~/.coord/sessions/<harness-pid>.json` (spec §6): how hooks and adapters, which are also
+//! `~/.axl/sessions/<harness-pid>.json` (spec §6): how hooks and adapters, which are also
 //! children of the harness, find the bridge's session without asking the model.
 
 use std::fs::{DirBuilder, OpenOptions};
@@ -18,9 +18,9 @@ pub struct SessionInfo {
     pub harness: String,
 }
 
-/// `<home>/.coord/sessions/<harness_pid>.json`.
+/// `<home>/.axl/sessions/<harness_pid>.json`.
 pub fn path(home: &Path, harness_pid: u32) -> PathBuf {
-    home.join(".coord")
+    home.join(".axl")
         .join("sessions")
         .join(format!("{harness_pid}.json"))
 }
@@ -63,7 +63,7 @@ impl SessionFile {
             .and_then(|b| serde_json::from_slice::<SessionInfo>(&b).ok())
             .is_some_and(|info| info.session_id == self.session_id);
         if ours && let Err(e) = std::fs::remove_file(&self.path) {
-            eprintln!("coord: cannot remove {}: {e}", self.path.display());
+            eprintln!("axl: cannot remove {}: {e}", self.path.display());
         }
     }
 }

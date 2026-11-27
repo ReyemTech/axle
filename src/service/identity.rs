@@ -4,7 +4,7 @@ use crate::clock::Clock;
 use crate::domain::{Agent, Project, Session, SessionId, TokenId};
 use crate::store::{Store, StoreError};
 
-/// What a caller presents (from the bridge or `X-Coord-*` headers plus its token).
+/// What a caller presents (from the bridge or `X-Axl-*` headers plus its token).
 #[derive(Debug, Clone)]
 pub struct IdentityInput {
     pub project_key: Option<String>,

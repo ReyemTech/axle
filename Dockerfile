@@ -12,7 +12,7 @@ RUN mkdir -p src migrations \
     && echo 'fn main() {}' > src/main.rs \
     && touch src/lib.rs \
     && cargo build --release --locked \
-    && rm -rf src target/release/deps/coord* target/release/.fingerprint/coord* target/release/coord*
+    && rm -rf src target/release/deps/axl* target/release/.fingerprint/axl* target/release/axl*
 
 COPY migrations ./migrations
 COPY src ./src
@@ -21,14 +21,14 @@ COPY static ./static
 # COPY keeps old mtimes; make cargo see the real sources as newer than the stubs.
 RUN touch src/main.rs src/lib.rs \
     && cargo build --release --locked \
-    && install -D target/release/coord /out/usr/local/bin/coord \
+    && install -D target/release/axl /out/usr/local/bin/axl \
     && mkdir -p /out/data
 
 FROM gcr.io/distroless/cc-debian12:nonroot
-COPY --from=builder /out/usr/local/bin/coord /usr/local/bin/coord
+COPY --from=builder /out/usr/local/bin/axl /usr/local/bin/axl
 COPY --from=builder --chown=65532:65532 /out/data /data
 VOLUME /data
 EXPOSE 7420
 USER nonroot
-ENTRYPOINT ["coord"]
+ENTRYPOINT ["axl"]
 CMD ["serve", "--bind", "0.0.0.0:7420"]

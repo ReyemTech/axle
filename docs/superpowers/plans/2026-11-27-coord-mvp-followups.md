@@ -1,3 +1,5 @@
+> Note: the project was renamed from coord to Axle (CLI `axl`) on 2026-11-27.
+
 # coord MVP — rulings and follow-ups
 
 Recorded during the subagent-driven build of feat/mvp (2026-11-27).

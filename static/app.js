@@ -1,4 +1,4 @@
-// coord web UI: CSRF header for htmx requests, j/k selection, "/" search, filter autosubmit,
+// axle web UI: CSRF header for htmx requests, j/k selection, "/" search, filter autosubmit,
 // confirmations on destructive forms, and lease bars that count down between renders.
 (function () {
   "use strict";

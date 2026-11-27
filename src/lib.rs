@@ -1,4 +1,4 @@
-//! coord: MCP coordination server for coding agents.
+//! Axle: MCP coordination server for coding agents.
 
 pub mod bridge;
 pub mod clock;

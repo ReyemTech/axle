@@ -3,15 +3,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axle::clock::TestClock;
+use axle::config::ServerConfig;
+use axle::domain::{Actor, Address, AgentId, Importance, ProjectId, SessionId};
+use axle::http::{AppState, router};
+use axle::service::messages::NewMessage;
+use axle::store::sqlite::SqliteStore;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use coord::clock::TestClock;
-use coord::config::ServerConfig;
-use coord::domain::{Actor, Address, AgentId, Importance, ProjectId, SessionId};
-use coord::http::{AppState, router};
-use coord::service::messages::NewMessage;
-use coord::store::sqlite::SqliteStore;
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -41,7 +41,7 @@ async fn app() -> App {
     let clock = Arc::new(TestClock::new(datetime!(2026-11-27 9:00 UTC)));
     let config = ServerConfig::from_lookup(|k| match k {
         "DATABASE_URL" => Some("sqlite::memory:".into()),
-        "COORD_ADMIN_SECRET" => Some("test-secret-0123456789".into()),
+        "AXL_ADMIN_SECRET" => Some("test-secret-0123456789".into()),
         _ => None,
     })
     .unwrap();
@@ -193,7 +193,7 @@ async fn rejects_without_token() {
             .body(Body::from("{}"))
             .unwrap(),
         Request::post("/v1/heartbeat")
-            .header(header::AUTHORIZATION, "Bearer coord_not-a-real-token")
+            .header(header::AUTHORIZATION, "Bearer axl_not-a-real-token")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from("{}"))
             .unwrap(),
@@ -324,8 +324,8 @@ async fn heartbeat_lists_held_leases() {
         .state
         .tasks
         .create(
-            coord::service::tasks::Caller::Human,
-            coord::service::tasks::NewTask {
+            axle::service::tasks::Caller::Human,
+            axle::service::tasks::NewTask {
                 project_id: project,
                 title: "rotate the keys".into(),
                 ..Default::default()
@@ -333,7 +333,7 @@ async fn heartbeat_lists_held_leases() {
         )
         .await
         .unwrap();
-    let resolved = coord::service::identity::IdentityService::load(&*app.state.store, session)
+    let resolved = axle::service::identity::IdentityService::load(&*app.state.store, session)
         .await
         .unwrap()
         .expect("registered session");
@@ -400,8 +400,8 @@ async fn events_report_task_changes_in_project() {
         .state
         .tasks
         .create(
-            coord::service::tasks::Caller::Human,
-            coord::service::tasks::NewTask {
+            axle::service::tasks::Caller::Human,
+            axle::service::tasks::NewTask {
                 project_id: project,
                 title: "rotate the keys".into(),
                 ..Default::default()
@@ -456,7 +456,7 @@ async fn inbox_summary_lists_unacked_with_short_preview() {
 async fn token_plaintext_never_stored() {
     let app = app().await;
     let (id, plaintext) = app.state.auth.create("mac-claude").await.unwrap();
-    assert!(plaintext.starts_with("coord_"), "{plaintext}");
+    assert!(plaintext.starts_with("axl_"), "{plaintext}");
 
     let hashes: Vec<String> = sqlx::query_scalar("SELECT hash FROM tokens")
         .fetch_all(&app.pool)
@@ -464,7 +464,7 @@ async fn token_plaintext_never_stored() {
         .unwrap();
     assert_eq!(hashes.len(), 1);
     assert_ne!(hashes[0], plaintext);
-    assert!(!hashes[0].contains(plaintext.trim_start_matches("coord_")));
+    assert!(!hashes[0].contains(plaintext.trim_start_matches("axl_")));
 
     let listed = app.state.auth.list().await.unwrap();
     assert_eq!(listed.len(), 1);
@@ -557,7 +557,7 @@ async fn shutdown_ends_sse_streams_and_returns() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(coord::http::serve(listener, app.state.clone(), async {
+    let server = tokio::spawn(axle::http::serve(listener, app.state.clone(), async {
         let _ = stopped.await;
     }));
 
@@ -587,7 +587,7 @@ async fn shutdown_ends_sse_streams_and_returns() {
         .expect("serve returns promptly with an SSE client connected")
         .unwrap()
         .unwrap();
-    assert!(started.elapsed() < coord::http::SHUTDOWN_DRAIN);
+    assert!(started.elapsed() < axle::http::SHUTDOWN_DRAIN);
 
     // The stream was ended by the server: the client reads to EOF.
     let mut rest = Vec::new();

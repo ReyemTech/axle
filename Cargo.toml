@@ -1,7 +1,17 @@
 [package]
-name = "coord"
+name = "axle-mcp"
 version = "0.1.0"
 edition = "2024"
+description = "Axle: self-hosted MCP server for agent messaging and task claiming with leases"
+repository = "https://github.com/ReyemTech/axle"
+
+[lib]
+name = "axle"
+path = "src/lib.rs"
+
+[[bin]]
+name = "axl"
+path = "src/main.rs"
 
 [dependencies]
 async-trait = "0.1.92"

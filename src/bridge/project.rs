@@ -1,5 +1,5 @@
-//! Project resolution for a bridge session (spec §6 "Projects"): `COORD_PROJECT`, then the
-//! nearest `.coordination` file, then the normalised git `origin`, else no project. Never an
+//! Project resolution for a bridge session (spec §6 "Projects"): `AXL_PROJECT`, then the
+//! nearest `.axl` file, then the normalised git `origin`, else no project. Never an
 //! error: anything unusable is logged once and treated as no project.
 
 use std::collections::HashMap;
@@ -11,7 +11,7 @@ use serde::Deserialize;
 use crate::service::identity::{PROJECT_KEY_MAX, check_label};
 
 /// The file that pins a directory tree to a project.
-pub const COORDINATION_FILE: &str = ".coordination";
+pub const PROJECT_FILE: &str = ".axl";
 
 /// The environment variables the bridge reads, captured once (tests build their own).
 #[derive(Debug, Clone, Default)]
@@ -40,7 +40,7 @@ impl Env {
 }
 
 #[derive(Debug, Deserialize)]
-struct CoordinationFile {
+struct ProjectFile {
     project: String,
     #[allow(dead_code)]
     display_name: Option<String>,
@@ -48,18 +48,18 @@ struct CoordinationFile {
 
 /// The session's project key for `cwd`, or `None`.
 pub fn resolve_project(cwd: &Path, env: &Env) -> Option<String> {
-    if let Some(key) = env.get("COORD_PROJECT") {
-        return usable(key, "COORD_PROJECT");
+    if let Some(key) = env.get("AXL_PROJECT") {
+        return usable(key, "AXL_PROJECT");
     }
-    if let Some(file) = nearest_coordination_file(cwd) {
+    if let Some(file) = nearest_project_file(cwd) {
         let source = file.display().to_string();
         let parsed = std::fs::read_to_string(&file)
             .map_err(|e| e.to_string())
-            .and_then(|text| toml::from_str::<CoordinationFile>(&text).map_err(|e| e.to_string()));
+            .and_then(|text| toml::from_str::<ProjectFile>(&text).map_err(|e| e.to_string()));
         return match parsed {
             Ok(f) => usable(f.project.trim(), &source),
             Err(e) => {
-                eprintln!("coord: ignoring {source}: {e}; running with no project");
+                eprintln!("axl: ignoring {source}: {e}; running with no project");
                 None
             }
         };
@@ -72,19 +72,19 @@ fn usable(key: &str, source: &str) -> Option<String> {
     match check_label("project key", key, PROJECT_KEY_MAX, true) {
         Ok(()) if !key.is_empty() => Some(key.to_string()),
         Ok(()) => {
-            eprintln!("coord: {source} names an empty project; running with no project");
+            eprintln!("axl: {source} names an empty project; running with no project");
             None
         }
         Err(e) => {
-            eprintln!("coord: ignoring project from {source}: {e}; running with no project");
+            eprintln!("axl: ignoring project from {source}: {e}; running with no project");
             None
         }
     }
 }
 
-fn nearest_coordination_file(cwd: &Path) -> Option<std::path::PathBuf> {
+fn nearest_project_file(cwd: &Path) -> Option<std::path::PathBuf> {
     cwd.ancestors()
-        .map(|dir| dir.join(COORDINATION_FILE))
+        .map(|dir| dir.join(PROJECT_FILE))
         .find(|p| p.is_file())
 }
 

@@ -385,7 +385,7 @@ mod tests {
             " \t ",
             "a\nb",
             "a\u{7f}b",
-            "[coord from x]",
+            "[axl from x]",
             "x]",
             "rtl\u{202E}gnp",
             "zero\u{200B}width",

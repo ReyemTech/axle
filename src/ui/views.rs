@@ -73,7 +73,7 @@ impl IntoResponse for UiError {
             UiError::Invalid(why) => error_page(StatusCode::UNPROCESSABLE_ENTITY, &why),
             UiError::Conflict(why) => error_page(StatusCode::CONFLICT, &why),
             UiError::Internal(e) => {
-                eprintln!("coord: ui error: {e}");
+                eprintln!("axl: ui error: {e}");
                 error_page(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong.")
             }
         }
@@ -844,7 +844,7 @@ pub async fn live_frames(state: &AppState, event: &Event) -> Frames {
     match task_frames(state, event).await {
         Ok(frames) => frames,
         Err(e) => {
-            eprintln!("coord: ui live update failed: {e}");
+            eprintln!("axl: ui live update failed: {e}");
             refresh_frames()
         }
     }

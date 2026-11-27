@@ -1,6 +1,6 @@
 database:
   mode: postgres
-  existingSecret: coord-db
+  existingSecret: axle-db
   urlKey: DATABASE_URL
 adminSecret:
-  existingSecret: coord-admin
+  existingSecret: axle-admin

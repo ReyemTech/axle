@@ -4,9 +4,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-IMAGE="coord-smoke:$$"
-NAME="coord-smoke-$$"
-PORT="${COORD_SMOKE_PORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')}"
+IMAGE="axle-smoke:$$"
+NAME="axle-smoke-$$"
+PORT="${AXL_SMOKE_PORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')}"
 SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
 
 cleanup() {
@@ -21,8 +21,8 @@ echo "building image"
 docker build -q -t "$IMAGE" . >/dev/null
 
 docker run -d --name "$NAME" -p "127.0.0.1:$PORT:7420" \
-  -e DATABASE_URL=sqlite:///data/coord.db \
-  -e COORD_ADMIN_SECRET="$SECRET" \
+  -e DATABASE_URL=sqlite:///data/axl.db \
+  -e AXL_ADMIN_SECRET="$SECRET" \
   "$IMAGE" >/dev/null
 
 base="http://127.0.0.1:$PORT"
@@ -36,7 +36,7 @@ done
 [ -n "$ready" ] || fail "/healthz never returned 200"
 echo "ok /healthz 200"
 
-token="$(docker exec -e COORD_ADMIN_SECRET="$SECRET" "$NAME" coord token create --label smoke)" \
+token="$(docker exec -e AXL_ADMIN_SECRET="$SECRET" "$NAME" axl token create --label smoke)" \
   || fail "token creation failed"
 [ -n "$token" ] || fail "empty token"
 echo "ok token created"

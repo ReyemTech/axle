@@ -1,8 +1,8 @@
-# coord runs as a single replica in the MVP; the schema rejects anything else.
+# Axle runs as a single replica in the MVP; the schema rejects anything else.
 replicaCount: 1
 
 image:
-  repository: ghcr.io/reyemtech/coord
+  repository: ghcr.io/reyemtech/axle
   # Defaults to the chart appVersion.
   tag: ""
   pullPolicy: IfNotPresent
@@ -12,7 +12,7 @@ nameOverride: ""
 fullnameOverride: ""
 
 database:
-  # sqlite: a PVC mounted at /data, DATABASE_URL=sqlite:///data/coord.db, Recreate strategy.
+  # sqlite: a PVC mounted at /data, DATABASE_URL=sqlite:///data/axl.db, Recreate strategy.
   # postgres: the URL is read from an existing Secret; no PVC, RollingUpdate with maxSurge 0.
   mode: sqlite
   # postgres mode only: the Secret holding the connection URL and the key inside it.
@@ -31,14 +31,14 @@ adminSecret:
   # named after the release. Set this for GitOps or Pulumi: they render with `helm template`,
   # where the chart cannot look up the existing Secret, so a generated one changes every render.
   existingSecret: ""
-  key: COORD_ADMIN_SECRET
+  key: AXL_ADMIN_SECRET
 
-# Mark the UI session cookie Secure (COORD_COOKIE_SECURE). Leave null to enable it
+# Mark the UI session cookie Secure (AXL_COOKIE_SECURE). Leave null to enable it
 # automatically when ingress.tls is set; set true/false to force it.
 cookieSecure: null
 
 # Header set by an authenticating proxy (e.g. oauth2-proxy) that signs UI requests in without
-# the admin secret (COORD_TRUSTED_HEADER). Empty = off. Only safe behind a proxy that sets
+# the admin secret (AXL_TRUSTED_HEADER). Empty = off. Only safe behind a proxy that sets
 # the header and strips it from client requests.
 trustedHeader: ""
 
@@ -49,7 +49,7 @@ service:
 ingress:
   enabled: false
   className: ""
-  # coord streams events over SSE, so the proxy must not buffer responses and must keep idle
+  # Axle streams events over SSE, so the proxy must not buffer responses and must keep idle
   # connections open. Example for ingress-nginx:
   #   annotations:
   #     nginx.ingress.kubernetes.io/proxy-buffering: "off"
@@ -57,16 +57,16 @@ ingress:
   #     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
   annotations: {}
   hosts: []
-  #  - host: coord.example.com
+  #  - host: axle.example.com
   #    paths:
   #      - path: /
   #        pathType: Prefix
   tls: []
-  #  - secretName: coord-tls
-  #    hosts: [coord.example.com]
+  #  - secretName: axle-tls
+  #    hosts: [axle.example.com]
 
 extraEnv: []
-#  - name: COORD_RATE_LIMIT_PER_SEC
+#  - name: AXL_RATE_LIMIT_PER_SEC
 #    value: "50"
 
 resources: {}

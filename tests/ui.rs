@@ -4,17 +4,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axle::clock::TestClock;
+use axle::config::ServerConfig;
+use axle::domain::{Actor, Address, Importance, SessionId, Task, TaskId};
+use axle::http::{AppState, router};
+use axle::service::identity::{IdentityInput, IdentityService, Resolved};
+use axle::service::messages::NewMessage;
+use axle::service::tasks::{Caller, ClaimOutcome, Completion, NewTask};
+use axle::store::sqlite::SqliteStore;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use coord::clock::TestClock;
-use coord::config::ServerConfig;
-use coord::domain::{Actor, Address, Importance, SessionId, Task, TaskId};
-use coord::http::{AppState, router};
-use coord::service::identity::{IdentityInput, IdentityService, Resolved};
-use coord::service::messages::NewMessage;
-use coord::service::tasks::{Caller, ClaimOutcome, Completion, NewTask};
-use coord::store::sqlite::SqliteStore;
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use scraper::{Html, Selector};
@@ -45,7 +45,7 @@ async fn app_with(configure: impl FnOnce(&mut ServerConfig)) -> App {
     let clock = Arc::new(TestClock::new(datetime!(2026-11-27 9:00 UTC)));
     let mut config = ServerConfig::from_lookup(|k| match k {
         "DATABASE_URL" => Some("sqlite::memory:".into()),
-        "COORD_ADMIN_SECRET" => Some(SECRET.into()),
+        "AXL_ADMIN_SECRET" => Some(SECRET.into()),
         _ => None,
     })
     .unwrap();
@@ -189,7 +189,7 @@ impl App {
     }
 }
 
-/// `coord_ui=abc` from a `Set-Cookie` value.
+/// `axl_ui=abc` from a `Set-Cookie` value.
 fn cookie_pair(set_cookie: &str) -> String {
     set_cookie.split(';').next().unwrap().trim().to_string()
 }
@@ -223,7 +223,7 @@ async fn ui_requires_login() {
         assert_eq!(page.location.as_deref(), Some("/ui/login"), "{path}");
     }
     // A bogus cookie is no better than none.
-    let page = app.get("/ui/", Some("coord_ui=forged")).await;
+    let page = app.get("/ui/", Some("axl_ui=forged")).await;
     assert_eq!(page.location.as_deref(), Some("/ui/login"));
 
     let login = app.get("/ui/login", None).await;
@@ -244,7 +244,7 @@ async fn ui_requires_login() {
         .await;
     assert_eq!(page.status, StatusCode::SEE_OTHER);
     let set_cookie = page.set_cookie.unwrap();
-    assert!(set_cookie.starts_with("coord_ui="), "{set_cookie}");
+    assert!(set_cookie.starts_with("axl_ui="), "{set_cookie}");
     assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
     assert!(set_cookie.contains("SameSite=Strict"), "{set_cookie}");
     assert!(set_cookie.contains("Path=/ui"), "{set_cookie}");
@@ -1117,7 +1117,7 @@ async fn human_creates_task_visible_on_board() {
         .unwrap()
         .unwrap();
     assert!(
-        matches!(event, coord::events::Event::TaskChanged { id: e, .. } if e == id),
+        matches!(event, axle::events::Event::TaskChanged { id: e, .. } if e == id),
         "{event:?}"
     );
 
@@ -1178,7 +1178,7 @@ async fn human_creates_task_visible_on_board() {
     assert_eq!(
         app.state
             .store
-            .list_tasks(&coord::store::TaskFilter::default())
+            .list_tasks(&axle::store::TaskFilter::default())
             .await
             .unwrap()
             .len(),
@@ -1220,11 +1220,11 @@ async fn force_release_reopens_and_records_event() {
     assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
     assert_eq!(page.location.as_deref(), Some(page_path.as_str()));
     let after = app.state.store.get_task(task.id).await.unwrap().unwrap();
-    assert_eq!(after.status, coord::domain::TaskStatus::Open);
+    assert_eq!(after.status, axle::domain::TaskStatus::Open);
     assert_eq!(after.owner_agent_id, None);
     let events = app.state.store.task_events(task.id).await.unwrap();
     let last = events.last().unwrap();
-    assert_eq!(last.kind, coord::domain::TaskEventKind::ForceReleased);
+    assert_eq!(last.kind, axle::domain::TaskEventKind::ForceReleased);
     assert_eq!(last.actor, Actor::Human);
     let detail = app.get(&page_path, Some(&cookie)).await;
     assert!(
@@ -1253,7 +1253,7 @@ async fn force_release_reopens_and_records_event() {
         .await;
     assert_eq!(page.status, StatusCode::SEE_OTHER);
     let after = app.state.store.get_task(task.id).await.unwrap().unwrap();
-    assert_eq!(after.status, coord::domain::TaskStatus::Cancelled);
+    assert_eq!(after.status, axle::domain::TaskStatus::Cancelled);
 }
 
 #[tokio::test]
@@ -1456,13 +1456,13 @@ async fn inbox_split_view_receipts_and_search() {
         .unwrap()
         .unwrap();
     assert!(
-        matches!(event, coord::events::Event::MessageCreated { .. }),
+        matches!(event, axle::events::Event::MessageCreated { .. }),
         "{event:?}"
     );
     let got = app
         .state
         .messages
-        .inbox(&iac, coord::service::messages::InboxFilter::default())
+        .inbox(&iac, axle::service::messages::InboxFilter::default())
         .await
         .unwrap();
     assert_eq!(got.len(), 1);
@@ -1593,7 +1593,7 @@ async fn post_into_thread_as_human() {
     let got = app
         .state
         .messages
-        .inbox(&iac, coord::service::messages::InboxFilter::default())
+        .inbox(&iac, axle::service::messages::InboxFilter::default())
         .await
         .unwrap();
     assert!(got.iter().any(|i| i.message.body == "From the human"));
@@ -1644,7 +1644,7 @@ async fn rename_project_sanitises_display_name() {
         "   ",
         "line\nbreak",
         "tab\there",
-        "[coord from x]",
+        "[axl from x]",
         "a]b",
         too_long.as_str(),
     ] {

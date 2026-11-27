@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "generatedAt": "2026-11-27T16:36:27.562239+00:00",
-  "title": "Design System: coord",
+  "title": "Design System: axle",
   "extensions": {
     "colorMeta": {
       "ink": {
@@ -276,7 +276,7 @@
       "kind": "nav",
       "refersTo": "topbar",
       "description": "Dark bar with mark, tabs and live pulse.",
-      "html": "<div class=\"ds-bar\"><span class=\"ds-brand\"><span class=\"ds-mark\"></span>coord</span><nav class=\"ds-tabs\"><a class=\"ds-on\">Board</a><a>Inbox</a><a>Projects</a></nav></div>",
+      "html": "<div class=\"ds-bar\"><span class=\"ds-brand\"><span class=\"ds-mark\"></span>axle</span><nav class=\"ds-tabs\"><a class=\"ds-on\">Board</a><a>Inbox</a><a>Projects</a></nav></div>",
       "css": ".ds-bar{display:flex;align-items:center;gap:20px;padding:0 16px;min-height:44px;background:var(--bar);color:var(--bar-text);font:14px var(--font)}.ds-brand{display:inline-flex;align-items:center;gap:8px;font-weight:700;font-size:15px}.ds-mark{position:relative;width:22px;height:2px;background:currentColor}.ds-mark::after{content:'';position:absolute;left:7px;top:-3px;width:8px;height:8px;background:var(--sig-red)}.ds-tabs{display:flex;align-self:stretch}.ds-tabs a{display:flex;align-items:center;padding:0 10px;color:var(--bar-muted);border-bottom:2px solid transparent}.ds-tabs a.ds-on{color:var(--bar-text);font-weight:600;border-bottom-color:var(--bar-text)}"
     },
     {
@@ -290,7 +290,7 @@
   ],
   "narrative": {
     "northStar": "Block Signalling",
-    "overview": "coord reads like a railway signal box: projects are lines, tasks are blocks, a lease is the occupancy of a block, and a few signal aspects say what state each block is in. The first build was pure hairlines and read as too minimal; the shipped system adds column bands, bordered cards, labelled buttons and a text label beside every glyph, while keeping density.",
+    "overview": "axle reads like a railway signal box: projects are lines, tasks are blocks, a lease is the occupancy of a block, and a few signal aspects say what state each block is in. The first build was pure hairlines and read as too minimal; the shipped system adds column bands, bordered cards, labelled buttons and a text label beside every glyph, while keeping density.",
     "keyCharacteristics": [
       "Neutral warm-paper ground and graphite ink; saturated colour only for state and project lines.",
       "Three signal hues, each with a text-safe twin.",

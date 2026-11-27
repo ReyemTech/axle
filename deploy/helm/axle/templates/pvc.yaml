@@ -2,9 +2,9 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "coord.fullname" . }}-data
+  name: {{ include "axle.fullname" . }}-data
   labels:
-    {{- include "coord.labels" . | nindent 4 }}
+    {{- include "axle.labels" . | nindent 4 }}
   annotations:
     helm.sh/resource-policy: keep
 spec:

@@ -12,7 +12,7 @@ One owner (a solo technical operator) running many coding agents — Claude Code
 
 ## Product Purpose
 
-coord is a self-hosted Rust MCP server for durable cross-machine, cross-harness agent messaging and atomic task claiming with renewable leases. The UI makes that coordination state visible and actionable for the human owner. Success: at a glance, the owner knows the state of every project's work and can intervene in one or two clicks.
+Axle is a self-hosted Rust MCP server for durable cross-machine, cross-harness agent messaging and atomic task claiming with renewable leases. The UI makes that coordination state visible and actionable for the human owner. Success: at a glance, the owner knows the state of every project's work and can intervene in one or two clicks.
 
 ## Positioning
 
@@ -35,7 +35,7 @@ A task is a message thread: agents and the human talk inside the task until it i
 
 ## Brand Commitments
 
-- Name: `coord` (lowercase).
+- Name: Axle (Agent eXchange & Lease), wordmark `axle` in lowercase; CLI `axl`.
 - Explicitly unwanted: generic SaaS dashboard look (gradient glow, cards everywhere), hacker-terminal costume, heavy page weight, loss of density.
 
 ## Evidence on Hand

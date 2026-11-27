@@ -2,9 +2,9 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "coord.fullname" . }}
+  name: {{ include "axle.fullname" . }}
   labels:
-    {{- include "coord.labels" . | nindent 4 }}
+    {{- include "axle.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
   {{- if $sqlite }}
@@ -19,11 +19,11 @@ spec:
   {{- end }}
   selector:
     matchLabels:
-      {{- include "coord.selectorLabels" . | nindent 6 }}
+      {{- include "axle.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "coord.selectorLabels" . | nindent 8 }}
+        {{- include "axle.selectorLabels" . | nindent 8 }}
       {{- with .Values.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
@@ -33,12 +33,12 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      serviceAccountName: {{ include "coord.serviceAccountName" . }}
+      serviceAccountName: {{ include "axle.serviceAccountName" . }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
-        - name: coord
+        - name: axle
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["serve", "--bind", "0.0.0.0:7420"]
@@ -51,22 +51,22 @@ spec:
           env:
             - name: DATABASE_URL
               {{- if $sqlite }}
-              value: sqlite:///data/coord.db
+              value: sqlite:///data/axl.db
               {{- else }}
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.database.existingSecret }}
                   key: {{ .Values.database.urlKey }}
               {{- end }}
-            - name: COORD_ADMIN_SECRET
+            - name: AXL_ADMIN_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "coord.adminSecretName" . }}
+                  name: {{ include "axle.adminSecretName" . }}
                   key: {{ .Values.adminSecret.key }}
-            - name: COORD_COOKIE_SECURE
-              value: {{ include "coord.cookieSecure" . | quote }}
+            - name: AXL_COOKIE_SECURE
+              value: {{ include "axle.cookieSecure" . | quote }}
             {{- with .Values.trustedHeader }}
-            - name: COORD_TRUSTED_HEADER
+            - name: AXL_TRUSTED_HEADER
               value: {{ . | quote }}
             {{- end }}
             {{- with .Values.extraEnv }}
@@ -101,7 +101,7 @@ spec:
         {{- if $sqlite }}
         - name: data
           persistentVolumeClaim:
-            claimName: {{ include "coord.fullname" . }}-data
+            claimName: {{ include "axle.fullname" . }}-data
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

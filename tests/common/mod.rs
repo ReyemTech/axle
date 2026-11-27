@@ -4,7 +4,7 @@
 //! `name` with one `#[tokio::test]` per backend:
 //! - `name::sqlite` — a fresh SQLite file in the temp dir (WAL, pooled connections, so
 //!   concurrent tests race for real), always run; the files are removed even on panic;
-//! - `name::postgres` — only with `--features pg-tests`; uses `COORD_TEST_PG_URL` and a
+//! - `name::postgres` — only with `--features pg-tests`; uses `AXL_TEST_PG_URL` and a
 //!   freshly created schema per test, dropped afterwards even when the body panics, so
 //!   tests run in parallel.
 //!
@@ -15,8 +15,8 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use coord::store::Store;
-use coord::store::sqlite::SqliteStore;
+use axle::store::Store;
+use axle::store::sqlite::SqliteStore;
 use tokio::task::JoinError;
 
 macro_rules! store_matrix {
@@ -66,8 +66,8 @@ where
 }
 
 /// A fresh token row (sessions, tasks and messages reference the writer's token).
-pub async fn token(store: &dyn Store) -> coord::domain::TokenId {
-    let id = coord::domain::TokenId::new();
+pub async fn token(store: &dyn Store) -> axle::domain::TokenId {
+    let id = axle::domain::TokenId::new();
     store
         .insert_token(
             id,
@@ -92,7 +92,7 @@ impl Drop for TempDb {
 }
 
 pub async fn sqlite_store() -> (Arc<dyn Store>, TempDb) {
-    let path = std::env::temp_dir().join(format!("coord-test-{}.db", uuid::Uuid::now_v7()));
+    let path = std::env::temp_dir().join(format!("axle-test-{}.db", uuid::Uuid::now_v7()));
     let store = SqliteStore::connect(&format!("sqlite://{}", path.display()))
         .await
         .expect("open temp-file sqlite store");
@@ -107,8 +107,8 @@ mod pg {
     use std::str::FromStr;
     use std::sync::Arc;
 
-    use coord::store::Store;
-    use coord::store::postgres::PostgresStore;
+    use axle::store::Store;
+    use axle::store::postgres::PostgresStore;
     use sqlx::AssertSqlSafe;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
@@ -138,16 +138,16 @@ mod pg {
     }
 
     pub async fn pg_store() -> (Arc<dyn Store>, TestSchema) {
-        let url = std::env::var("COORD_TEST_PG_URL")
-            .expect("COORD_TEST_PG_URL must be set when running with --features pg-tests");
-        let admin = PgConnectOptions::from_str(&url).expect("parse COORD_TEST_PG_URL");
-        let name = format!("coord_test_{}", uuid::Uuid::now_v7().simple());
+        let url = std::env::var("AXL_TEST_PG_URL")
+            .expect("AXL_TEST_PG_URL must be set when running with --features pg-tests");
+        let admin = PgConnectOptions::from_str(&url).expect("parse AXL_TEST_PG_URL");
+        let name = format!("axl_test_{}", uuid::Uuid::now_v7().simple());
 
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect_with(admin.clone())
             .await
-            .expect("connect to COORD_TEST_PG_URL");
+            .expect("connect to AXL_TEST_PG_URL");
         sqlx::query(AssertSqlSafe(format!("CREATE SCHEMA \"{name}\"")))
             .execute(&pool)
             .await

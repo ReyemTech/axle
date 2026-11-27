@@ -1,4 +1,4 @@
--- coord schema, Postgres flavour. Kept in step with migrations/sqlite/0001_init.sql.
+-- axl schema, Postgres flavour. Kept in step with migrations/sqlite/0001_init.sql.
 
 -- ---------------------------------------------------------------- identity
 

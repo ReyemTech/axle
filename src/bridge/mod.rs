@@ -1,9 +1,9 @@
-//! `coord bridge` (spec §5, §6): the stdio MCP server each harness session spawns. It
+//! `axl bridge` (spec §5, §6): the stdio MCP server each harness session spawns. It
 //! serves the same tools as `/mcp` and forwards every call to the server with the bearer
-//! token and the `X-Coord-*` identity headers, so the model never sees either.
+//! token and the `X-Axl-*` identity headers, so the model never sees either.
 //!
 //! It fails open: with no token or no reachable server it still starts, still lists the
-//! tools, and answers every call with `coord unavailable: <reason>` (an `isError` result),
+//! tools, and answers every call with `axle unavailable: <reason>` (an `isError` result),
 //! while it retries registration every 30 s. Logs go to stderr only (stdout is the MCP
 //! channel), each distinct problem once; the token is never logged.
 
@@ -35,7 +35,7 @@ use self::project::{Env, resolve_project};
 use self::session_file::{SessionFile, SessionInfo};
 use crate::domain::SessionId;
 use crate::mcp::{
-    CoordMcp, HARNESS_HEADER, HOST_HEADER, INSTRUCTIONS, PROJECT_HEADER, SESSION_HEADER, UNKNOWN,
+    AxleMcp, HARNESS_HEADER, HOST_HEADER, INSTRUCTIONS, PROJECT_HEADER, SESSION_HEADER, UNKNOWN,
 };
 use crate::service::identity::NAME_MAX;
 
@@ -43,9 +43,9 @@ pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:7420";
 /// How often the bridge heartbeats (or, while unregistered, retries registering).
 pub const HEARTBEAT: Duration = Duration::from_secs(30);
 /// Overrides `HEARTBEAT`, in milliseconds. For tests and tuning only; not a user setting.
-pub const HEARTBEAT_ENV: &str = "COORD_HEARTBEAT_MS";
+pub const HEARTBEAT_ENV: &str = "AXL_HEARTBEAT_MS";
 /// Every tool result while the server cannot be used starts with this.
-pub const UNAVAILABLE: &str = "coord unavailable";
+pub const UNAVAILABLE: &str = "axle unavailable";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -60,9 +60,9 @@ pub struct Config {
     pub project_key: Option<String>,
     /// Without a trailing `/`.
     pub server_url: String,
-    /// `HEARTBEAT`, unless `COORD_HEARTBEAT_MS` (tests and tuning only) sets another.
+    /// `HEARTBEAT`, unless `AXL_HEARTBEAT_MS` (tests and tuning only) sets another.
     pub heartbeat: Duration,
-    /// `COORD_TOKEN`, if set; otherwise the token is read from `~/.coord/token` on use, so
+    /// `AXL_TOKEN`, if set; otherwise the token is read from `~/.axl/token` on use, so
     /// a token written after startup is picked up by the next retry.
     env_token: Option<String>,
     pub home: Option<PathBuf>,
@@ -72,7 +72,7 @@ impl Config {
     pub fn resolve(harness: &str, cwd: &Path, env: &Env) -> Self {
         let harness_label = sanitize_label(harness);
         if harness_label != harness {
-            eprintln!("coord: harness name {harness:?} used as {harness_label:?}");
+            eprintln!("axl: harness name {harness:?} used as {harness_label:?}");
         }
         Self {
             session_id: SessionId::new(),
@@ -80,7 +80,7 @@ impl Config {
             host: sanitize_label(&short_hostname()),
             project_key: resolve_project(cwd, env),
             server_url: env
-                .get("COORD_SERVER_URL")
+                .get("AXL_SERVER_URL")
                 .unwrap_or(DEFAULT_SERVER_URL)
                 .trim_end_matches('/')
                 .to_string(),
@@ -89,7 +89,7 @@ impl Config {
                 .and_then(|ms| ms.parse::<u64>().ok())
                 .filter(|&ms| ms > 0)
                 .map_or(HEARTBEAT, Duration::from_millis),
-            env_token: env.get("COORD_TOKEN").map(str::to_string),
+            env_token: env.get("AXL_TOKEN").map(str::to_string),
             home: env.get("HOME").map(PathBuf::from),
         }
     }
@@ -99,15 +99,15 @@ impl Config {
         if let Some(t) = &self.env_token {
             return Ok(t.clone());
         }
-        let missing = "no token (set COORD_TOKEN or write ~/.coord/token)".to_string();
+        let missing = "no token (set AXL_TOKEN or write ~/.axl/token)".to_string();
         let Some(home) = &self.home else {
             return Err(missing);
         };
-        match std::fs::read_to_string(home.join(".coord").join("token")) {
+        match std::fs::read_to_string(home.join(".axl").join("token")) {
             Ok(t) if !t.trim().is_empty() => Ok(t.trim().to_string()),
             Ok(_) => Err(missing),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(missing),
-            Err(e) => Err(format!("cannot read ~/.coord/token: {e}")),
+            Err(e) => Err(format!("cannot read ~/.axl/token: {e}")),
         }
     }
 
@@ -197,7 +197,7 @@ impl Bridge {
     fn recovered(&self) {
         let mut last = self.inner.last_problem.lock().expect("log lock");
         if last.take().is_some() {
-            eprintln!("coord: connected to {}", self.inner.config.server_url);
+            eprintln!("axl: connected to {}", self.inner.config.server_url);
         }
     }
 
@@ -233,7 +233,7 @@ impl Bridge {
         );
         let client = ClientConfig::new(
             ClientCapabilities::default(),
-            Implementation::new("coord-bridge", env!("CARGO_PKG_VERSION")),
+            Implementation::new("axle-bridge", env!("CARGO_PKG_VERSION")),
         );
         let connected = tokio::time::timeout(CONNECT_TIMEOUT, client.serve(transport))
             .await
@@ -389,7 +389,7 @@ fn unavailable(reason: &str) -> CallToolResult {
 impl ServerHandler for Bridge {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("coord", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new("axle", env!("CARGO_PKG_VERSION")))
             .with_instructions(INSTRUCTIONS)
     }
 
@@ -412,7 +412,7 @@ impl ServerHandler for Bridge {
             }
         };
         Ok(ListToolsResult::with_all_items(
-            remote.unwrap_or_else(CoordMcp::tool_definitions),
+            remote.unwrap_or_else(AxleMcp::tool_definitions),
         ))
     }
 
@@ -445,7 +445,7 @@ pub async fn run(harness: &str, stop: impl Future<Output = ()>) {
     let config = Config::resolve(harness, &cwd, &env);
     let session_file = match &config.home {
         None => {
-            eprintln!("coord: HOME is not set; not writing a session file");
+            eprintln!("axl: HOME is not set; not writing a session file");
             None
         }
         Some(home) => {
@@ -453,7 +453,7 @@ pub async fn run(harness: &str, stop: impl Future<Output = ()>) {
             match SessionFile::write(path, &config.session_info()) {
                 Ok(f) => Some(f),
                 Err(e) => {
-                    eprintln!("coord: cannot write the session file: {e}");
+                    eprintln!("axl: cannot write the session file: {e}");
                     None
                 }
             }
@@ -465,7 +465,7 @@ pub async fn run(harness: &str, stop: impl Future<Output = ()>) {
     tokio::select! {
         served = serve_stdio(bridge) => {
             if let Err(e) = served {
-                eprintln!("coord: stdio MCP session ended: {e}");
+                eprintln!("axl: stdio MCP session ended: {e}");
             }
         }
         () = stop => {}

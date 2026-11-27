@@ -254,7 +254,7 @@ impl Watcher {
             Event::TaskChanged { id, project_id, .. } => self.wants_task(id, project_id).await,
         };
         result.unwrap_or_else(|e| {
-            eprintln!("coord: dropping event for session {}: {e}", self.session);
+            eprintln!("axl: dropping event for session {}: {e}", self.session);
             false
         })
     }

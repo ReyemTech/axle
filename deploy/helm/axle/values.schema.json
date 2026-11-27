@@ -6,7 +6,7 @@
     "replicaCount": {
       "type": "integer",
       "const": 1,
-      "description": "coord runs as a single replica in the MVP"
+      "description": "Axle runs as a single replica in the MVP"
     },
     "database": {
       "type": "object",

@@ -167,6 +167,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "axle-mcp"
+version = "0.1.0"
+dependencies = [
+ "askama",
+ "async-trait",
+ "axum",
+ "clap",
+ "futures-util",
+ "getrandom 0.4.3",
+ "http-body-util",
+ "libc",
+ "reqwest",
+ "rmcp",
+ "schemars",
+ "scraper",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sha2",
+ "sqlx",
+ "thiserror",
+ "time",
+ "tokio",
+ "toml",
+ "tower",
+ "uuid",
+]
+
+[[package]]
 name = "axum"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -386,35 +415,6 @@ name = "const-oid"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be95d4a884358a21a199689323c29e9256b4a1b315e22f183d155422041d3a9a"
-
-[[package]]
-name = "coord"
-version = "0.1.0"
-dependencies = [
- "askama",
- "async-trait",
- "axum",
- "clap",
- "futures-util",
- "getrandom 0.4.3",
- "http-body-util",
- "libc",
- "reqwest",
- "rmcp",
- "schemars",
- "scraper",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "sha2",
- "sqlx",
- "thiserror",
- "time",
- "tokio",
- "toml",
- "tower",
- "uuid",
-]
 
 [[package]]
 name = "core-foundation"

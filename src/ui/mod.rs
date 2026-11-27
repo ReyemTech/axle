@@ -2,7 +2,7 @@
 //! every POST, the overview, the board, task pages, the unified inbox, projects and tokens,
 //! the human's actions, and a live SSE stream that re-renders changed cards.
 //!
-//! UI routes do not use bearer tokens. A request is signed in by the `coord_ui` cookie (an
+//! UI routes do not use bearer tokens. A request is signed in by the `axl_ui` cookie (an
 //! in-memory session; the MVP runs one replica) or, in trusted-header mode, by the header an
 //! auth proxy sets. Every non-GET request must carry the session's CSRF token, as the form
 //! field `csrf` or the `X-CSRF-Token` header (what htmx requests send).
@@ -37,7 +37,7 @@ use crate::http::AppState;
 use crate::http::rate_limit::RateLimiter;
 
 /// The session cookie.
-pub const COOKIE: &str = "coord_ui";
+pub const COOKIE: &str = "axl_ui";
 /// How long a UI session lasts after login.
 pub const SESSION_TTL: Duration = Duration::hours(12);
 /// Login attempts allowed per client IP per minute.
@@ -196,7 +196,7 @@ async fn security_headers(req: Request, next: Next) -> Response {
 
 // ---------------------------------------------------------------- session middleware
 
-/// The `coord_ui` cookie's value, if sent.
+/// The `axl_ui` cookie's value, if sent.
 fn session_cookie(headers: &HeaderMap) -> Option<&str> {
     headers
         .get_all(header::COOKIE)
@@ -490,10 +490,10 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(
             header::COOKIE,
-            HeaderValue::from_static("a=1; coord_ui=abc; b=2"),
+            HeaderValue::from_static("a=1; axl_ui=abc; b=2"),
         );
         assert_eq!(session_cookie(&h), Some("abc"));
-        h.insert(header::COOKIE, HeaderValue::from_static("coord_uix=abc"));
+        h.insert(header::COOKIE, HeaderValue::from_static("axl_uix=abc"));
         assert_eq!(session_cookie(&h), None);
     }
 

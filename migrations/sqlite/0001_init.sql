@@ -1,4 +1,4 @@
--- coord schema, SQLite flavour. Kept in step with migrations/postgres/0001_init.sql.
+-- axl schema, SQLite flavour. Kept in step with migrations/postgres/0001_init.sql.
 -- Ids are hyphenated UUID text; timestamps are UTC RFC3339 text with exactly six
 -- fractional digits (`2026-11-27T09:00:00.000000Z`) so they compare correctly as text.
 

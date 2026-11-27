@@ -1,5 +1,5 @@
 apiVersion: v2
-name: coord
+name: axle
 description: MCP coordination server for coding agents
 type: application
 version: 0.1.0

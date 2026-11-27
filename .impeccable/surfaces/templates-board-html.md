@@ -5,9 +5,9 @@ primary_target: "templates/board.html"
 related_targets: ["templates/base.html","templates/overview.html","templates/task.html","templates/inbox.html","templates/login.html","static/app.css"]
 ---
 
-# coord web UI — surface brief
+# axle web UI — surface brief
 
-Scope: the whole coord web UI (login, overview, projects, board, task thread, inbox, tokens, error). Mode: Operate. Primary surface: the kanban board. Visitor: the solo owner, UI open all day on a second screen as a live control room. Must keep or improve density; no added clicks; strict CSP (no external fonts/scripts/styles); tiny page weight; light + dark via prefers-color-scheme.
+Scope: the whole axle web UI (login, overview, projects, board, task thread, inbox, tokens, error). Mode: Operate. Primary surface: the kanban board. Visitor: the solo owner, UI open all day on a second screen as a live control room. Must keep or improve density; no added clicks; strict CSP (no external fonts/scripts/styles); tiny page weight; light + dark via prefers-color-scheme.
 
 Avoid (user): generic SaaS dashboard (gradient glow, cards everywhere), hacker-terminal costume, heavy page weight, losing density.
 
@@ -19,7 +19,7 @@ OWN-WORLD: Light ground #EDEBE4 (dark: #16181A), track ink #1E2124, signal aspec
 
 STORY: The owner sees at a glance which blocks are occupied (claimed), by whom and for how long, what is blocked or awaiting review, and who is live; they post, force-release or cancel in place.
 
-FIRST VIEWPORT: Top bar: coord wordmark, project lines as coloured track segments (nav), live count and blocked count at right. Below: five columns OPEN / CLAIMED / BLOCKED / REVIEW / DONE separated by track rules. Each claimed card shows an occupancy segment (bar) draining with lease remaining (length = time), owner agent@host. Parent tasks render children as stations on a line ━●━◐━○━ with n/m. Primary action: open task / claim actions inside card and task page.
+FIRST VIEWPORT: Top bar: axle wordmark, project lines as coloured track segments (nav), live count and blocked count at right. Below: five columns OPEN / CLAIMED / BLOCKED / REVIEW / DONE separated by track rules. Each claimed card shows an occupancy segment (bar) draining with lease remaining (length = time), owner agent@host. Parent tasks render children as stations on a line ━●━◐━○━ with n/m. Primary action: open task / claim actions inside card and task page.
 
 FORM: Block Signalling — railway track diagrams and absolute block signalling; position 1 on the ordered list (IMPECCABLE'S PICK, chosen over the assigned roll). seed:733433137f427578. Raises kept: 1px ruled dividers (plate section); visible grid armature (Crouwel); lease as exact-length bar (labanotation); one --lease custom property drives bar/fade (variable specimen); snap between whole states (vertical feed).
 

@@ -3,11 +3,11 @@ mod common;
 
 use std::sync::Arc;
 
-use coord::clock::{Clock, TestClock};
-use coord::domain::{AgentId, ProjectId, SessionId, TaskEventKind, TaskId, TaskStatus, TokenId};
-use coord::events::{Event, EventBus};
-use coord::service::auth::{AuthError, AuthService};
-use coord::store::{Store, StoreError};
+use axle::clock::{Clock, TestClock};
+use axle::domain::{AgentId, ProjectId, SessionId, TaskEventKind, TaskId, TaskStatus, TokenId};
+use axle::events::{Event, EventBus};
+use axle::service::auth::{AuthError, AuthService};
+use axle::store::{Store, StoreError};
 use time::Duration;
 use time::macros::datetime;
 
@@ -16,7 +16,7 @@ store_matrix!(token_lifecycle, |store: Arc<dyn Store>| async move {
     let auth = AuthService::new(store.clone(), clock.clone());
 
     let (id, plaintext) = auth.create("mac-claude").await.unwrap();
-    assert!(plaintext.starts_with("coord_"));
+    assert!(plaintext.starts_with("axl_"));
     let (other, other_plain) = auth.create("ci").await.unwrap();
     assert_ne!(plaintext, other_plain);
 
@@ -34,9 +34,9 @@ store_matrix!(token_lifecycle, |store: Arc<dyn Store>| async move {
         auth.verify(&other_plain, used_at).await.unwrap(),
         Some(other)
     );
-    assert_eq!(auth.verify("coord_wrong", used_at).await.unwrap(), None);
+    assert_eq!(auth.verify("axl_wrong", used_at).await.unwrap(), None);
     assert_eq!(auth.verify("", used_at).await.unwrap(), None);
-    let no_prefix = plaintext.trim_start_matches("coord_");
+    let no_prefix = plaintext.trim_start_matches("axl_");
     assert_eq!(auth.verify(no_prefix, used_at).await.unwrap(), None);
     assert_eq!(auth.list().await.unwrap()[0].last_used_at, Some(used_at));
 
@@ -105,8 +105,8 @@ store_matrix!(ping_and_outbox, |store: Arc<dyn Store>| async move {
     // Publishing with no subscribers is not an error.
     drop(rx);
     bus.publish(Event::MessageCreated {
-        id: coord::domain::MessageId::new(),
-        to: coord::domain::Address::Agent(AgentId::new()),
+        id: axle::domain::MessageId::new(),
+        to: axle::domain::Address::Agent(AgentId::new()),
         project_id: None,
     })
     .await

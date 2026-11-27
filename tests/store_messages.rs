@@ -3,12 +3,12 @@ mod common;
 
 use std::sync::Arc;
 
-use coord::clock::{Clock, TestClock};
-use coord::domain::{Actor, Address, Importance, MessageId, ProjectId, SessionId};
-use coord::service::identity::{IdentityInput, IdentityService, Resolved};
-use coord::service::messages::{InboxFilter, MessageError, MessageService, NewMessage};
-use coord::service::tasks::{Caller, ClaimOutcome, NewTask, TaskError, TaskService};
-use coord::store::Store;
+use axle::clock::{Clock, TestClock};
+use axle::domain::{Actor, Address, Importance, MessageId, ProjectId, SessionId};
+use axle::service::identity::{IdentityInput, IdentityService, Resolved};
+use axle::service::messages::{InboxFilter, MessageError, MessageService, NewMessage};
+use axle::service::tasks::{Caller, ClaimOutcome, NewTask, TaskError, TaskService};
+use axle::store::Store;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
@@ -268,7 +268,7 @@ store_matrix!(
         env.send(&iac, Address::Agent(nimbus.agent.id), "unrelated")
             .await;
 
-        let ids = |v: Vec<coord::domain::Message>| v.iter().map(|m| m.id).collect::<Vec<_>>();
+        let ids = |v: Vec<axle::domain::Message>| v.iter().map(|m| m.id).collect::<Vec<_>>();
         // Newest first; case-insensitive.
         assert_eq!(
             ids(env.msgs.search("FAILOVER", None, 10).await.unwrap()),
@@ -362,7 +362,7 @@ store_matrix!(
         assert_eq!(
             env.store
                 .unread_count(
-                    coord::store::Recipient::Agent {
+                    axle::store::Recipient::Agent {
                         agent: y.agent.id,
                         session: y.session.id
                     },
@@ -375,7 +375,7 @@ store_matrix!(
         assert_eq!(
             env.store
                 .unread_count(
-                    coord::store::Recipient::Agent {
+                    axle::store::Recipient::Agent {
                         agent: y.agent.id,
                         session: y.session.id
                     },
@@ -572,7 +572,7 @@ store_matrix!(inbox_filters_and_unknown_recipients, |store: Arc<
         .msgs
         .send(
             &actor(&sender),
-            msg(Address::Agent(coord::domain::AgentId::new()), "x"),
+            msg(Address::Agent(axle::domain::AgentId::new()), "x"),
         )
         .await
         .unwrap_err();
@@ -650,7 +650,7 @@ store_matrix!(
         let m1 = env.send(&a, Address::Agent(b.agent.id), "one").await;
         let m2 = env.send(&a, Address::Project(nimbus), "two").await;
         let m3 = env.send(&b, Address::Human, "three").await;
-        let ids = |ms: Vec<coord::domain::Message>| ms.iter().map(|m| m.id).collect::<Vec<_>>();
+        let ids = |ms: Vec<axle::domain::Message>| ms.iter().map(|m| m.id).collect::<Vec<_>>();
 
         // Newest first, paged by a message cursor.
         let page = env.store.list_messages(None, None, 2).await.unwrap();
@@ -680,7 +680,7 @@ store_matrix!(
                 .is_empty()
         );
 
-        let state = |r: &coord::store::MessageReceipt| r.state();
+        let state = |r: &axle::store::MessageReceipt| r.state();
         let receipts = env.store.message_receipts(&[m1, m2, m3]).await.unwrap();
         assert_eq!(
             receipts.iter().map(|r| r.id).collect::<Vec<_>>(),
@@ -746,7 +746,7 @@ store_matrix!(
             sent.push(env.send(&a, Address::Task(task.id), &format!("m{i}")).await);
         }
         let bodies =
-            |ms: &[coord::domain::Message]| ms.iter().map(|m| m.body.clone()).collect::<Vec<_>>();
+            |ms: &[axle::domain::Message]| ms.iter().map(|m| m.body.clone()).collect::<Vec<_>>();
         let page = env.store.task_thread_page(task.id, None, 2).await.unwrap();
         assert_eq!(bodies(&page), ["m3", "m2"]);
         let rest = env

@@ -1,4 +1,4 @@
-//! `coord bridge`: project resolution, and the real binary driven over stdio by an rmcp
+//! `axl bridge`: project resolution, and the real binary driven over stdio by an rmcp
 //! client, both without a server (fail-open) and against an in-process server.
 
 #[macro_use]
@@ -12,12 +12,12 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use coord::bridge::project::{Env, normalize_origin, resolve_project};
-use coord::clock::SystemClock;
-use coord::config::ServerConfig;
-use coord::http::{AppState, router};
-use coord::mcp::CoordMcp;
-use coord::store::Store;
+use axle::bridge::project::{Env, normalize_origin, resolve_project};
+use axle::clock::SystemClock;
+use axle::config::ServerConfig;
+use axle::http::{AppState, router};
+use axle::mcp::AxleMcp;
+use axle::store::Store;
 use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation};
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
@@ -30,7 +30,7 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("coord-bridge-{}", uuid::Uuid::now_v7()));
+        let path = std::env::temp_dir().join(format!("axle-bridge-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&path).unwrap();
         // Canonical, so paths compare equal to what child processes see (/var vs /private/var).
         Self(path.canonicalize().unwrap())
@@ -110,16 +110,16 @@ fn resolution_order() {
     );
 
     let none = Env::default();
-    let env = Env::from_pairs([("COORD_PROJECT", "env/project")]);
+    let env = Env::from_pairs([("AXL_PROJECT", "env/project")]);
 
     // git origin, from a nested directory
     assert_eq!(
         resolve_project(&nested, &none).as_deref(),
         Some("github.com/reyemtech/iac")
     );
-    // nearest .coordination beats git
+    // nearest .axl beats git
     std::fs::write(
-        repo.join(".coordination"),
+        repo.join(".axl"),
         "project = \"reyemtech/iac-file\"\ndisplay_name = \"IaC\"\n",
     )
     .unwrap();
@@ -127,7 +127,7 @@ fn resolution_order() {
         resolve_project(&nested, &none).as_deref(),
         Some("reyemtech/iac-file")
     );
-    std::fs::write(nested.join(".coordination"), "project = \"nearest\"\n").unwrap();
+    std::fs::write(nested.join(".axl"), "project = \"nearest\"\n").unwrap();
     assert_eq!(resolve_project(&nested, &none).as_deref(), Some("nearest"));
     // env beats the file
     assert_eq!(
@@ -135,7 +135,7 @@ fn resolution_order() {
         Some("env/project")
     );
     // a value outside the safe charset is no project, never an error
-    let bad = Env::from_pairs([("COORD_PROJECT", "has spaces")]);
+    let bad = Env::from_pairs([("AXL_PROJECT", "has spaces")]);
     assert_eq!(resolve_project(&nested, &bad), None);
 
     // no git, no file
@@ -153,10 +153,10 @@ struct Bridge {
     client: Client,
 }
 
-/// Spawns `coord bridge --harness test-harness` in `cwd` with only `env` (plus PATH) set,
+/// Spawns `axl bridge --harness test-harness` in `cwd` with only `env` (plus PATH) set,
 /// and connects an MCP client to its stdio.
 async fn spawn_bridge(cwd: &Path, env: &[(&str, &str)]) -> Bridge {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_coord"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_axl"));
     cmd.args(["bridge", "--harness", "test-harness"])
         .current_dir(cwd)
         .env_clear()
@@ -171,7 +171,7 @@ async fn spawn_bridge(cwd: &Path, env: &[(&str, &str)]) -> Bridge {
     let stdin = child.stdin.take().unwrap();
     let client = ClientConfig::new(
         ClientCapabilities::default(),
-        Implementation::new("coord-bridge-test", "0"),
+        Implementation::new("axle-bridge-test", "0"),
     )
     .serve((stdout, stdin))
     .await
@@ -215,7 +215,7 @@ impl Bridge {
 }
 
 fn session_file(home: &Path) -> PathBuf {
-    home.join(".coord")
+    home.join(".axl")
         .join("sessions")
         .join(format!("{}.json", std::process::id()))
 }
@@ -232,14 +232,14 @@ async fn bridge_without_token_fails_open() {
         &work.0,
         &[
             ("HOME", home.0.to_str().unwrap()),
-            ("COORD_SERVER_URL", "http://127.0.0.1:9"),
+            ("AXL_SERVER_URL", "http://127.0.0.1:9"),
         ],
     )
     .await;
 
     let tools = bridge.client.list_all_tools().await.unwrap();
     let mut names: Vec<_> = tools.iter().map(|t| t.name.to_string()).collect();
-    let mut want: Vec<_> = CoordMcp::tool_definitions()
+    let mut want: Vec<_> = AxleMcp::tool_definitions()
         .iter()
         .map(|t| t.name.to_string())
         .collect();
@@ -250,7 +250,7 @@ async fn bridge_without_token_fails_open() {
 
     let (is_error, text) = bridge.call("whoami").await;
     assert!(is_error);
-    assert!(text.starts_with("coord unavailable:"), "{text}");
+    assert!(text.starts_with("axle unavailable:"), "{text}");
 
     // The session file exists even without a server, so hooks still find the session.
     let file = session_file(&home.0);
@@ -259,7 +259,7 @@ async fn bridge_without_token_fails_open() {
     assert_eq!(saved["project_key"], Value::Null);
     assert_eq!(saved["server_url"], "http://127.0.0.1:9");
     assert_eq!(mode(&file), 0o600);
-    assert_eq!(mode(&home.0.join(".coord").join("sessions")), 0o700);
+    assert_eq!(mode(&home.0.join(".axl").join("sessions")), 0o700);
 
     let (ok, _stderr) = bridge.close().await;
     assert!(ok, "exit code 0 on stdin close");
@@ -269,7 +269,7 @@ async fn bridge_without_token_fails_open() {
 store_matrix!(bridge_end_to_end, |store: Arc<dyn Store>| async move {
     let config = ServerConfig::from_lookup(|k| match k {
         "DATABASE_URL" => Some("sqlite::memory:".into()),
-        "COORD_ADMIN_SECRET" => Some("test-secret-0123456789".into()),
+        "AXL_ADMIN_SECRET" => Some("test-secret-0123456789".into()),
         _ => None,
     })
     .unwrap();
@@ -279,16 +279,16 @@ store_matrix!(bridge_end_to_end, |store: Arc<dyn Store>| async move {
     let server = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(axum::serve(listener, router(state)).into_future());
 
-    // Token from ~/.coord/token, project from the nearest .coordination file.
+    // Token from ~/.axl/token, project from the nearest .axl file.
     let home = TempDir::new();
-    let coord_dir = home.0.join(".coord");
-    std::fs::create_dir_all(&coord_dir).unwrap();
-    let token_file = coord_dir.join("token");
+    let axl_dir = home.0.join(".axl");
+    std::fs::create_dir_all(&axl_dir).unwrap();
+    let token_file = axl_dir.join("token");
     std::fs::write(&token_file, format!("{token}\n")).unwrap();
     std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
     let work = TempDir::new();
     std::fs::write(
-        work.0.join(".coordination"),
+        work.0.join(".axl"),
         "project = \"github.com/reyemtech/bridge-e2e\"\n",
     )
     .unwrap();
@@ -297,7 +297,7 @@ store_matrix!(bridge_end_to_end, |store: Arc<dyn Store>| async move {
         &work.0,
         &[
             ("HOME", home.0.to_str().unwrap()),
-            ("COORD_SERVER_URL", server.as_str()),
+            ("AXL_SERVER_URL", server.as_str()),
         ],
     )
     .await;
@@ -315,7 +315,7 @@ store_matrix!(bridge_end_to_end, |store: Arc<dyn Store>| async move {
     );
 
     // Registered through /v1/register before any MCP call (/mcp would also create it).
-    let sid: coord::domain::SessionId = session_id.parse().unwrap();
+    let sid: axle::domain::SessionId = session_id.parse().unwrap();
     let mut registered = false;
     for _ in 0..100 {
         if store.get_session(sid).await.unwrap().is_some() {
@@ -327,7 +327,7 @@ store_matrix!(bridge_end_to_end, |store: Arc<dyn Store>| async move {
     assert!(registered, "bridge registers its session at startup");
 
     let tools = bridge.client.list_all_tools().await.unwrap();
-    assert_eq!(tools.len(), CoordMcp::tool_definitions().len());
+    assert_eq!(tools.len(), AxleMcp::tool_definitions().len());
 
     let (is_error, text) = bridge.call("whoami").await;
     assert!(!is_error, "{text}");
@@ -346,7 +346,7 @@ store_matrix!(bridge_end_to_end, |store: Arc<dyn Store>| async move {
     for name in ["send_message", "no_such_tool"] {
         let (is_error, text) = bridge.call(name).await;
         assert!(is_error, "{name}: {text}");
-        assert!(!text.starts_with("coord unavailable"), "{name}: {text}");
+        assert!(!text.starts_with("axle unavailable"), "{name}: {text}");
         assert!(!text.is_empty(), "{name}");
     }
     let (is_error, text) = bridge.call("whoami").await;
@@ -356,7 +356,7 @@ store_matrix!(bridge_end_to_end, |store: Arc<dyn Store>| async move {
     assert!(ok, "exit code 0 on stdin close");
     assert!(!file.exists(), "session file removed on exit");
     assert!(!stderr.contains(&token), "token must never be logged");
-    assert!(!stderr.contains("coord unavailable"), "{stderr}");
+    assert!(!stderr.contains("axle unavailable"), "{stderr}");
 });
 
 /// What a fake server saw on `/v1`: (endpoint, authorization header, body).
@@ -422,10 +422,10 @@ async fn bridge_heartbeats_and_reregisters_when_forgotten() {
         &work.0,
         &[
             ("HOME", home.0.to_str().unwrap()),
-            ("COORD_SERVER_URL", server.as_str()),
-            ("COORD_TOKEN", "tok-123"),
-            ("COORD_PROJECT", "github.com/reyemtech/beat"),
-            ("COORD_HEARTBEAT_MS", "50"),
+            ("AXL_SERVER_URL", server.as_str()),
+            ("AXL_TOKEN", "tok-123"),
+            ("AXL_PROJECT", "github.com/reyemtech/beat"),
+            ("AXL_HEARTBEAT_MS", "50"),
         ],
     )
     .await;

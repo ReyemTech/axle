@@ -3,10 +3,10 @@
 {% block content %}
 <div class="page-head">
   <h1 class="page-title">Tokens</h1>
-  <p class="muted">One bearer token per host and harness. Create them with <code>coord token create --label &lt;name&gt;</code>; the secret is shown only then.</p>
+  <p class="muted">One bearer token per host and harness. Create them with <code>axl token create --label &lt;name&gt;</code>; the secret is shown only then.</p>
 </div>
 {% if tokens.is_empty() %}
-<p class="empty">No tokens yet. Create one with <code>coord token create --label &lt;name&gt;</code> on the server.</p>
+<p class="empty">No tokens yet. Create one with <code>axl token create --label &lt;name&gt;</code> on the server.</p>
 {% else %}
 <ul class="rows">
 {% for t in tokens %}

@@ -1,0 +1,23 @@
+Axle {{ .Chart.AppVersion }} is installed as {{ include "axle.fullname" . }}.
+
+Create the first agent token (shown once; store it, never paste it into prompts):
+
+  kubectl exec -n {{ .Release.Namespace }} deploy/{{ include "axle.fullname" . }} -- axl token create --label <name>
+
+{{- if not .Values.adminSecret.existingSecret }}
+
+Read the generated UI sign-in secret:
+
+  kubectl get secret -n {{ .Release.Namespace }} {{ include "axle.fullname" . }} -o jsonpath='{.data.{{ .Values.adminSecret.key }}}' | base64 -d
+{{- end }}
+
+{{- if .Values.ingress.enabled }}
+{{ range .Values.ingress.hosts }}
+Reach Axle at http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}/
+{{- end }}
+{{- else }}
+
+Reach Axle locally:
+
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "axle.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+{{- end }}

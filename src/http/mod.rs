@@ -98,7 +98,7 @@ pub async fn serve(
             tokio::time::sleep(SHUTDOWN_DRAIN).await;
         } => {
             eprintln!(
-                "coord: in-flight requests still open after {}s, exiting anyway",
+                "axl: in-flight requests still open after {}s, exiting anyway",
                 SHUTDOWN_DRAIN.as_secs()
             );
             Ok(())
@@ -215,7 +215,7 @@ async fn readyz(State(state): State<AppState>) -> Response {
     match state.store.ping().await {
         Ok(()) => "ok".into_response(),
         Err(e) => {
-            eprintln!("coord: readiness check failed: {e}");
+            eprintln!("axl: readiness check failed: {e}");
             (StatusCode::SERVICE_UNAVAILABLE, "store unavailable").into_response()
         }
     }
@@ -238,7 +238,7 @@ impl ApiError {
 
     /// A 500 whose detail goes to the server log, not to the client.
     pub fn internal(e: impl std::fmt::Display) -> Self {
-        eprintln!("coord: internal error: {e}");
+        eprintln!("axl: internal error: {e}");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
     }
 }
@@ -255,10 +255,10 @@ mod tests {
 
     #[test]
     fn parses_bearer_header() {
-        assert_eq!(bearer("Bearer coord_abc"), Some("coord_abc"));
-        assert_eq!(bearer("bearer  coord_abc "), Some("coord_abc"));
+        assert_eq!(bearer("Bearer axl_abc"), Some("axl_abc"));
+        assert_eq!(bearer("bearer  axl_abc "), Some("axl_abc"));
         assert_eq!(bearer("Basic Zm9v"), None);
         assert_eq!(bearer("Bearer "), None);
-        assert_eq!(bearer("coord_abc"), None);
+        assert_eq!(bearer("axl_abc"), None);
     }
 }

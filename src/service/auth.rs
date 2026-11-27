@@ -12,7 +12,7 @@ use crate::domain::{TokenId, TokenInfo};
 use crate::store::{Store, StoreError};
 
 /// Every token's plaintext starts with this, so leaked tokens are recognisable.
-pub const TOKEN_PREFIX: &str = "coord_";
+pub const TOKEN_PREFIX: &str = "axl_";
 
 /// Random bytes per token (256 bits).
 const TOKEN_BYTES: usize = 32;

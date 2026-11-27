@@ -1,3 +1,5 @@
+> Note: the project was renamed from coord to Axle (CLI `axl`) on 2026-11-27.
+
 # Agent Coordination Server — Design
 
 Date: 2026-11-27

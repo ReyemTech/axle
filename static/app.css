@@ -1,4 +1,4 @@
-/* coord web UI. Colour tokens switch with prefers-color-scheme.
+/* axle web UI. Colour tokens switch with prefers-color-scheme.
    Signal colours (--sig-*) mark state only: red occupied / blocked / urgent,
    green clear / done / live, amber caution / review / expiring. Text-safe
    variants of the same hues are --danger, --ok and --warn. Each project is a
