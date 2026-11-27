@@ -23,7 +23,7 @@ use time::macros::datetime;
 use tower::ServiceExt;
 
 const SECRET: &str = "test-secret-0123456789";
-const IAC: &str = "github.com/reyemtech/iac";
+const INFRA: &str = "github.com/acme/platform-infra";
 
 struct App {
     state: AppState,
@@ -356,7 +356,7 @@ async fn trusted_header_signs_in_without_secret() {
     let page = app
         .send(
             Request::get("/ui/")
-                .header("x-forwarded-user", "mario")
+                .header("x-forwarded-user", "owner")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -368,7 +368,7 @@ async fn trusted_header_signs_in_without_secret() {
     let page = app
         .send(
             Request::post("/ui/logout")
-                .header("x-forwarded-user", "mario")
+                .header("x-forwarded-user", "owner")
                 .header(header::COOKIE, &cookie)
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(Body::from("csrf=bad"))
@@ -379,7 +379,7 @@ async fn trusted_header_signs_in_without_secret() {
     let page = app
         .send(
             Request::post("/ui/logout")
-                .header("x-forwarded-user", "mario")
+                .header("x-forwarded-user", "owner")
                 .header(header::COOKIE, &cookie)
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(Body::from(format!("csrf={csrf}")))
@@ -554,19 +554,19 @@ async fn secret_mode_still_requires_login_for_any_host() {
 async fn board_columns_and_progress() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let codex = app.agent(IAC, "cac-1", "codex").await;
-    let parent = app.task(&iac, "Rotate DB creds", None).await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let codex = app.agent(INFRA, "build-01", "codex").await;
+    let parent = app.task(&infra, "Rotate DB creds", None).await;
     let a = app
-        .task(&iac, "update Pulumi secret", Some(parent.id))
+        .task(&infra, "update Pulumi secret", Some(parent.id))
         .await;
-    let b = app.task(&iac, "roll CNPG users", Some(parent.id)).await;
+    let b = app.task(&infra, "roll CNPG users", Some(parent.id)).await;
     let _c = app
-        .task(&iac, "update ExternalSecret", Some(parent.id))
+        .task(&infra, "update ExternalSecret", Some(parent.id))
         .await;
     app.complete(&codex, a.id).await;
-    app.claim(&iac, b.id).await;
-    app.claim(&iac, parent.id).await;
+    app.claim(&infra, b.id).await;
+    app.claim(&infra, parent.id).await;
 
     let page = app.get("/ui/board", Some(&cookie)).await;
     assert_eq!(page.status, StatusCode::OK);
@@ -601,7 +601,7 @@ async fn board_columns_and_progress() {
     assert_eq!(children.status, StatusCode::OK);
     let rows = select_texts(&children, ".child");
     assert_eq!(rows.len(), 3, "{rows:?}");
-    assert!(rows[0].contains("update Pulumi secret") && rows[0].contains("codex@cac-1"));
+    assert!(rows[0].contains("update Pulumi secret") && rows[0].contains("codex@build-01"));
     assert!(rows[1].contains("roll CNPG users") && rows[1].contains("claude-code@mac"));
     assert!(rows[2].ends_with("open"), "{rows:?}");
     assert_eq!(
@@ -611,7 +611,11 @@ async fn board_columns_and_progress() {
     );
 
     // A blocked child shows on the parent card without expanding it.
-    app.state.tasks.block(&iac, b.id, "waiting").await.unwrap();
+    app.state
+        .tasks
+        .block(&infra, b.id, "waiting")
+        .await
+        .unwrap();
     let page = app.get("/ui/board", Some(&cookie)).await;
     assert_eq!(
         select_texts(&page, ".column[data-status=claimed] .card .badge-blocked"),
@@ -669,15 +673,15 @@ fn lease_meter(page: &Page) -> (i64, i64, String, String) {
 async fn claimed_card_draws_its_lease() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let task = app.task(&iac, "Hold me", None).await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let task = app.task(&infra, "Hold me", None).await;
     let open = app.get("/ui/board", Some(&cookie)).await;
     assert!(
         select_texts(&open, ".lease-meter").is_empty(),
         "no lease while open"
     );
 
-    app.claim(&iac, task.id).await;
+    app.claim(&infra, task.id).await;
     let page = app.get("/ui/board", Some(&cookie)).await;
     assert_eq!(
         lease_meter(&page),
@@ -712,13 +716,13 @@ async fn claimed_card_draws_its_lease() {
 #[tokio::test]
 async fn board_done_column_shows_last_seven_days() {
     let app = app().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let old = app.task(&iac, "old work", None).await;
-    app.complete(&iac, old.id).await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let old = app.task(&infra, "old work", None).await;
+    app.complete(&infra, old.id).await;
     app.clock.advance(time::Duration::days(8));
-    let recent = app.task(&iac, "recent work", None).await;
-    app.complete(&iac, recent.id).await;
-    let cancelled = app.task(&iac, "dropped", None).await;
+    let recent = app.task(&infra, "recent work", None).await;
+    app.complete(&infra, recent.id).await;
+    let cancelled = app.task(&infra, "dropped", None).await;
     app.state
         .tasks
         .cancel(Caller::Human, cancelled.id)
@@ -737,23 +741,30 @@ async fn board_done_column_shows_last_seven_days() {
 async fn board_filters_by_project() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let nimbus = app
-        .agent("github.com/reyemtech/nimbus", "mac", "claude-code")
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let web_app = app
+        .agent("github.com/acme/web-app", "mac", "claude-code")
         .await;
-    app.task(&iac, "iac work", None).await;
-    app.task(&nimbus, "nimbus work", None).await;
+    app.task(&infra, "infra work", None).await;
+    app.task(&web_app, "web_app work", None).await;
 
     let all = app.get("/ui/board", Some(&cookie)).await;
     let titles = select_texts(&all, ".card-title");
     assert_eq!(titles.len(), 2, "{titles:?}");
 
-    for filter in [IAC.to_string(), iac.agent.project_id.unwrap().to_string()] {
+    for filter in [
+        INFRA.to_string(),
+        infra.agent.project_id.unwrap().to_string(),
+    ] {
         let page = app
             .get(&format!("/ui/board?project={filter}"), Some(&cookie))
             .await;
         assert_eq!(page.status, StatusCode::OK);
-        assert_eq!(select_texts(&page, ".card-title"), ["iac work"], "{filter}");
+        assert_eq!(
+            select_texts(&page, ".card-title"),
+            ["infra work"],
+            "{filter}"
+        );
     }
     let unknown = app
         .get("/ui/board?project=github.com/nobody/nothing", Some(&cookie))
@@ -765,23 +776,23 @@ async fn board_filters_by_project() {
 async fn display_name_not_key() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let parent = app.task(&iac, "Rotate DB creds", None).await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let parent = app.task(&infra, "Rotate DB creds", None).await;
     let child = app
-        .task(&iac, "update Pulumi secret", Some(parent.id))
+        .task(&infra, "update Pulumi secret", Some(parent.id))
         .await;
-    app.claim(&iac, child.id).await;
+    app.claim(&infra, child.id).await;
 
     for path in [
         "/ui/board".to_string(),
-        format!("/ui/board?project={IAC}"),
+        format!("/ui/board?project={INFRA}"),
         "/ui/".to_string(),
         format!("/ui/tasks/{}/children", parent.id),
     ] {
         let page = app.get(&path, Some(&cookie)).await;
         assert_eq!(page.status, StatusCode::OK, "{path}");
         assert!(
-            page.text().contains("reyemtech/iac"),
+            page.text().contains("acme/platform-infra"),
             "{path}: {}",
             page.body
         );
@@ -790,14 +801,14 @@ async fn display_name_not_key() {
         let mut keyed_titles = 0;
         for node in html.root_element().descendants() {
             if let Some(text) = node.value().as_text() {
-                assert!(!text.contains(IAC), "{path}: text {:?}", &**text);
+                assert!(!text.contains(INFRA), "{path}: text {:?}", &**text);
             }
             if let Some(el) = node.value().as_element() {
                 for (name, value) in el.attrs() {
                     if name == "title" {
-                        keyed_titles += usize::from(value.contains(IAC));
+                        keyed_titles += usize::from(value.contains(INFRA));
                     } else {
-                        assert!(!value.contains(IAC), "{path}: {name}={value:?}");
+                        assert!(!value.contains(INFRA), "{path}: {name}={value:?}");
                     }
                 }
             }
@@ -810,13 +821,13 @@ async fn display_name_not_key() {
 async fn peer_content_is_escaped() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
     let parent = app
-        .task(&iac, "<script>alert(1)</script><b>x</b>", None)
+        .task(&infra, "<script>alert(1)</script><b>x</b>", None)
         .await;
-    app.task(&iac, "<img src=x onerror=alert(2)>", Some(parent.id))
+    app.task(&infra, "<img src=x onerror=alert(2)>", Some(parent.id))
         .await;
-    app.claim(&iac, parent.id).await;
+    app.claim(&infra, parent.id).await;
     for path in [
         "/ui/board".to_string(),
         "/ui/".to_string(),
@@ -843,11 +854,11 @@ async fn peer_content_is_escaped() {
 async fn overview_counters_and_agent_cards() {
     let app = app().await;
     let cookie = app.login().await;
-    let _stale = app.agent(IAC, "old-box", "codex").await;
+    let _stale = app.agent(INFRA, "old-box", "codex").await;
     app.clock.advance(time::Duration::seconds(120));
-    let mac = app.agent(IAC, "mac", "claude-code").await;
+    let mac = app.agent(INFRA, "mac", "claude-code").await;
     let _mac2 = app
-        .agent("github.com/reyemtech/nimbus", "mac", "opencode")
+        .agent("github.com/acme/web-app", "mac", "opencode")
         .await;
     let busy = app.task(&mac, "Busy with this", None).await;
     app.claim(&mac, busy.id).await;
@@ -886,7 +897,7 @@ async fn overview_counters_and_agent_cards() {
         .find(|c| c.contains("claude-code") && c.contains("mac"))
         .unwrap();
     assert!(mac_card.contains("Busy with this"), "{mac_card}");
-    assert!(mac_card.contains("reyemtech/iac"), "{mac_card}");
+    assert!(mac_card.contains("acme/platform-infra"), "{mac_card}");
 
     // The panel fragment is what live updates fetch.
     let panel = app.get("/ui/overview/panel", Some(&cookie)).await;
@@ -939,8 +950,8 @@ async fn wait_for_event(
 async fn live_stream_rerenders_changed_cards() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let parent = app.task(&iac, "Parent <one>", None).await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let parent = app.task(&infra, "Parent <one>", None).await;
 
     let res = app
         .router
@@ -961,7 +972,7 @@ async fn live_stream_rerenders_changed_cards() {
         .map(|c| String::from_utf8(c.unwrap().to_vec()).unwrap());
 
     // A child change re-renders the parent's card (its progress) in place.
-    app.task(&iac, "child", Some(parent.id)).await;
+    app.task(&infra, "child", Some(parent.id)).await;
     let card = wait_for_event(
         &mut stream,
         &format!("task-{}", parent.id),
@@ -993,7 +1004,7 @@ async fn live_stream_rerenders_changed_cards() {
     );
 
     // A top-level status change asks the board to re-fetch its columns.
-    app.claim(&iac, parent.id).await;
+    app.claim(&infra, parent.id).await;
     assert!(
         wait_for_event(&mut stream, "board", Duration::from_secs(2))
             .await
@@ -1014,7 +1025,7 @@ async fn live_stream_rerenders_changed_cards() {
         .send(
             &Actor::Human,
             NewMessage {
-                to: Address::Agent(iac.agent.id),
+                to: Address::Agent(infra.agent.id),
                 subject: None,
                 body: "hi".into(),
                 importance: Importance::Normal,
@@ -1120,14 +1131,14 @@ async fn live_stream_ends_on_logout() {
     let app = app().await;
     let cookie = app.login().await;
     let csrf = csrf_of(&app.get("/ui/", Some(&cookie)).await);
-    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
     let mut stream = open_live(&app, &cookie).await;
 
     let page = app
         .post_form("/ui/logout", Some(&cookie), &format!("csrf={csrf}"))
         .await;
     assert_eq!(page.status, StatusCode::SEE_OTHER);
-    app.task(&iac, "secret plans", None).await;
+    app.task(&infra, "secret plans", None).await;
     let sent = drain_until_end(&mut stream, Duration::from_secs(2)).await;
     assert!(!sent.contains("event: task-"), "{sent}");
     assert!(!sent.contains("secret plans"), "{sent}");
@@ -1137,11 +1148,11 @@ async fn live_stream_ends_on_logout() {
 async fn live_stream_ends_when_the_session_expires() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
     let mut stream = open_live(&app, &cookie).await;
     app.clock
         .advance(time::Duration::hours(12) + time::Duration::seconds(1));
-    app.task(&iac, "after expiry", None).await;
+    app.task(&infra, "after expiry", None).await;
     let sent = drain_until_end(&mut stream, Duration::from_secs(2)).await;
     assert!(!sent.contains("after expiry"), "{sent}");
 }
@@ -1244,8 +1255,8 @@ fn form(csrf: &str, fields: &[(&str, &str)]) -> String {
 async fn human_creates_task_visible_on_board() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let project = iac.agent.project_id.unwrap();
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let project = infra.agent.project_id.unwrap();
     let csrf = csrf_for(&app, &cookie).await;
     let mut events = app.state.bus.subscribe();
 
@@ -1360,9 +1371,9 @@ async fn human_creates_task_visible_on_board() {
 async fn force_release_reopens_and_records_event() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let task = app.task(&iac, "Held task", None).await;
-    app.claim(&iac, task.id).await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let task = app.task(&infra, "Held task", None).await;
+    app.claim(&infra, task.id).await;
     let csrf = csrf_for(&app, &cookie).await;
 
     let page_path = format!("/ui/tasks/{}", task.id);
@@ -1430,14 +1441,14 @@ async fn force_release_reopens_and_records_event() {
 async fn task_page_shows_lease_children_evidence_and_paged_history() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let parent = app.task(&iac, "Parent", None).await;
-    let child = app.task(&iac, "The child", Some(parent.id)).await;
-    app.claim(&iac, child.id).await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let parent = app.task(&infra, "Parent", None).await;
+    let child = app.task(&infra, "The child", Some(parent.id)).await;
+    app.claim(&infra, child.id).await;
     app.state
         .tasks
         .complete(
-            &iac,
+            &infra,
             child.id,
             Completion {
                 summary: "Rotated it".into(),
@@ -1470,11 +1481,11 @@ async fn task_page_shows_lease_children_evidence_and_paged_history() {
     );
 
     // Long histories are paged: renew many times, then follow the "older" link.
-    let busy = app.task(&iac, "Busy", None).await;
-    app.claim(&iac, busy.id).await;
+    let busy = app.task(&infra, "Busy", None).await;
+    app.claim(&infra, busy.id).await;
     for _ in 0..60 {
         app.clock.advance(time::Duration::seconds(1));
-        app.state.tasks.renew(&iac, busy.id).await.unwrap();
+        app.state.tasks.renew(&infra, busy.id).await.unwrap();
     }
     let path = format!("/ui/tasks/{}", busy.id);
     let first = app.get(&path, Some(&cookie)).await;
@@ -1500,10 +1511,10 @@ async fn task_page_shows_lease_children_evidence_and_paged_history() {
 async fn message_html_escaped() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let task = app.task(&iac, "Thread", None).await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let task = app.task(&infra, "Thread", None).await;
     let evil = "<script>alert(1)</script>";
-    let from = Actor::Agent(iac.agent.id, iac.session.id);
+    let from = Actor::Agent(infra.agent.id, infra.session.id);
     let to_human = app
         .state
         .messages
@@ -1565,8 +1576,8 @@ async fn message_html_escaped() {
 async fn inbox_split_view_receipts_and_search() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let from = Actor::Agent(iac.agent.id, iac.session.id);
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let from = Actor::Agent(infra.agent.id, infra.session.id);
     let csrf = csrf_for(&app, &cookie).await;
     let question = app
         .state
@@ -1611,7 +1622,7 @@ async fn inbox_split_view_receipts_and_search() {
                 &csrf,
                 &[
                     ("to_kind", "agent"),
-                    ("to", &iac.agent.id.to_string()),
+                    ("to", &infra.agent.id.to_string()),
                     ("subject", "Re: Need a decision"),
                     ("body", "Green."),
                     ("importance", "normal"),
@@ -1632,7 +1643,7 @@ async fn inbox_split_view_receipts_and_search() {
     let got = app
         .state
         .messages
-        .inbox(&iac, axle::service::messages::InboxFilter::default())
+        .inbox(&infra, axle::service::messages::InboxFilter::default())
         .await
         .unwrap();
     assert_eq!(got.len(), 1);
@@ -1647,7 +1658,7 @@ async fn inbox_split_view_receipts_and_search() {
     assert_eq!(receipts, ["delivered", "replied"], "newest first");
     app.state
         .messages
-        .mark_read(Caller::Agent(&iac), &[got[0].message.id])
+        .mark_read(Caller::Agent(&infra), &[got[0].message.id])
         .await
         .unwrap();
     let all = app.get("/ui/inbox?view=all", Some(&cookie)).await;
@@ -1662,7 +1673,7 @@ async fn inbox_split_view_receipts_and_search() {
                 &csrf,
                 &[
                     ("to_kind", "project"),
-                    ("to", &iac.agent.project_id.unwrap().to_string()),
+                    ("to", &infra.agent.project_id.unwrap().to_string()),
                     ("subject", ""),
                     ("body", "Heads up, everyone"),
                     ("importance", "high"),
@@ -1697,8 +1708,8 @@ async fn inbox_split_view_receipts_and_search() {
 async fn inbox_feed_is_paged() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let from = Actor::Agent(iac.agent.id, iac.session.id);
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let from = Actor::Agent(infra.agent.id, infra.session.id);
     for i in 0..55 {
         app.clock.advance(time::Duration::seconds(1));
         app.state
@@ -1706,7 +1717,7 @@ async fn inbox_feed_is_paged() {
             .send(
                 &from,
                 NewMessage {
-                    to: Address::Project(iac.agent.project_id.unwrap()),
+                    to: Address::Project(infra.agent.project_id.unwrap()),
                     subject: Some(format!("note {i}")),
                     body: "x".into(),
                     importance: Importance::Normal,
@@ -1740,8 +1751,8 @@ async fn inbox_feed_is_paged() {
 async fn post_into_thread_as_human() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let task = app.task(&iac, "Thread", None).await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let task = app.task(&infra, "Thread", None).await;
     let csrf = csrf_for(&app, &cookie).await;
     let path = format!("/ui/tasks/{}", task.id);
     let page = app
@@ -1763,7 +1774,7 @@ async fn post_into_thread_as_human() {
     let got = app
         .state
         .messages
-        .inbox(&iac, axle::service::messages::InboxFilter::default())
+        .inbox(&infra, axle::service::messages::InboxFilter::default())
         .await
         .unwrap();
     assert!(got.iter().any(|i| i.message.body == "From the human"));
@@ -1788,13 +1799,13 @@ async fn post_into_thread_as_human() {
 async fn rename_project_sanitises_display_name() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let project = iac.agent.project_id.unwrap();
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let project = infra.agent.project_id.unwrap();
     let csrf = csrf_for(&app, &cookie).await;
     let path = format!("/ui/projects/{project}/rename");
 
     let projects = app.get("/ui/projects", Some(&cookie)).await;
-    assert!(projects.text().contains(IAC), "key shown");
+    assert!(projects.text().contains(INFRA), "key shown");
 
     let page = app
         .post_form(
@@ -1887,12 +1898,12 @@ async fn revoke_token_blocks_api() {
 async fn live_stream_pings_task_pages_and_inbox() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let parent = app.task(&iac, "Parent", None).await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let parent = app.task(&infra, "Parent", None).await;
     let mut stream = open_live(&app, &cookie).await;
 
     // A child's change re-fetches its own page and its parent's.
-    let child = app.task(&iac, "Child", Some(parent.id)).await;
+    let child = app.task(&infra, "Child", Some(parent.id)).await;
     let wait = Duration::from_secs(2);
     assert!(
         wait_for_event(&mut stream, &format!("detail-{}", child.id), wait)
@@ -1933,14 +1944,14 @@ async fn live_stream_pings_task_pages_and_inbox() {
 async fn task_thread_is_paged() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let task = app.task(&iac, "Chatty", None).await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let task = app.task(&infra, "Chatty", None).await;
     for i in 0..60 {
         app.clock.advance(time::Duration::seconds(1));
         app.state
             .messages
             .send(
-                &Actor::Agent(iac.agent.id, iac.session.id),
+                &Actor::Agent(infra.agent.id, infra.session.id),
                 NewMessage {
                     to: Address::Task(task.id),
                     subject: None,
@@ -1978,7 +1989,7 @@ async fn task_thread_is_paged() {
 
 // ---------------------------------------------------------------- plan gate and needs-you
 
-const NIMBUS: &str = "github.com/reyemtech/nimbus";
+const WEB_APP: &str = "github.com/acme/web-app";
 
 /// A human-created gated task in `by`'s project, claimed by `by` and with a plan submitted.
 async fn submitted_plan(app: &App, by: &Resolved, title: &str) -> Task {
@@ -2003,7 +2014,7 @@ async fn submitted_plan(app: &App, by: &Resolved, title: &str) -> Task {
         .propose_plan(
             by,
             task.id,
-            "1. IaC: add the bucket\n2. Nimbus: read it".into(),
+            "1. platform-infra: add the bucket\n2. web-app: read it".into(),
         )
         .await
         .unwrap();
@@ -2014,11 +2025,11 @@ async fn submitted_plan(app: &App, by: &Resolved, title: &str) -> Task {
 async fn new_task_form_has_lead_also_and_plan_first() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let nimbus = app.agent(NIMBUS, "mac", "claude-code").await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let web_app = app.agent(WEB_APP, "mac", "claude-code").await;
     let (lead, other) = (
-        iac.agent.project_id.unwrap(),
-        nimbus.agent.project_id.unwrap(),
+        infra.agent.project_id.unwrap(),
+        web_app.agent.project_id.unwrap(),
     );
     let board = app.get("/ui/board", Some(&cookie)).await;
     assert!(board.text().contains("Lead project"));
@@ -2095,8 +2106,8 @@ async fn new_task_form_has_lead_also_and_plan_first() {
 async fn plan_is_approved_from_the_task_page() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let task = submitted_plan(&app, &iac, "Gated work").await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let task = submitted_plan(&app, &infra, "Gated work").await;
     let path = format!("/ui/tasks/{}", task.id);
 
     let page = app.get(&path, Some(&cookie)).await;
@@ -2104,7 +2115,7 @@ async fn plan_is_approved_from_the_task_page() {
     assert!(page.text().contains("Plan awaiting your approval"));
     assert_eq!(
         select_texts(&page, "#plan .plan-body"),
-        ["1. IaC: add the bucket\n2. Nimbus: read it"]
+        ["1. platform-infra: add the bucket\n2. web-app: read it"]
     );
     assert_eq!(
         select_texts(&page, "#plan button"),
@@ -2133,7 +2144,7 @@ async fn plan_is_approved_from_the_task_page() {
         .post_form(
             &format!("{path}/plan/changes"),
             Some(&cookie),
-            &form(&csrf, &[("note", "Do Nimbus first"), ("plan", &plan)]),
+            &form(&csrf, &[("note", "Do web-app first"), ("plan", &plan)]),
         )
         .await;
     assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
@@ -2144,12 +2155,12 @@ async fn plan_is_approved_from_the_task_page() {
         select_texts(&page, "#plan button").is_empty(),
         "nothing to decide"
     );
-    assert!(page.text().contains("Do Nimbus first"));
+    assert!(page.text().contains("Do web-app first"));
 
     // Resubmitted, then approved.
     app.state
         .tasks
-        .propose_plan(&iac, task.id, "Nimbus first, then IaC".into())
+        .propose_plan(&infra, task.id, "web-app first, then platform-infra".into())
         .await
         .unwrap();
     let plan = input_value(
@@ -2182,10 +2193,10 @@ async fn plan_is_approved_from_the_task_page() {
 async fn human_adds_projects_from_the_task_page() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let nimbus = app.agent(NIMBUS, "mac", "claude-code").await;
-    let other = nimbus.agent.project_id.unwrap();
-    let task = app.task(&iac, "Parent", None).await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let web_app = app.agent(WEB_APP, "mac", "claude-code").await;
+    let other = web_app.agent.project_id.unwrap();
+    let task = app.task(&infra, "Parent", None).await;
     let path = format!("/ui/tasks/{}", task.id);
     let page = app.get(&path, Some(&cookie)).await;
     assert_eq!(select_texts(&page, "#add-project option").len(), 1);
@@ -2213,7 +2224,7 @@ async fn human_adds_projects_from_the_task_page() {
     );
     let page = app.get(&path, Some(&cookie)).await;
     assert!(
-        page.text().contains("Added project reyemtech/nimbus"),
+        page.text().contains("Added project acme/web-app"),
         "{}",
         page.text()
     );
@@ -2227,7 +2238,7 @@ async fn human_adds_projects_from_the_task_page() {
                 &csrf,
                 &[
                     ("project", &other.to_string()),
-                    ("title", "Nimbus part"),
+                    ("title", "web-app part"),
                     ("parent", &task.id.to_string()),
                 ],
             ),
@@ -2241,7 +2252,7 @@ async fn human_adds_projects_from_the_task_page() {
             Some(&cookie),
             &form(
                 &csrf,
-                &[("project", &iac.agent.project_id.unwrap().to_string())],
+                &[("project", &infra.agent.project_id.unwrap().to_string())],
             ),
         )
         .await;
@@ -2252,7 +2263,7 @@ async fn human_adds_projects_from_the_task_page() {
 async fn needs_you_cards_match_the_count() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
 
     // Nothing waiting: the strip is hidden and the count is zero.
     let board = app.get("/ui/board", Some(&cookie)).await;
@@ -2273,24 +2284,24 @@ async fn needs_you_cards_match_the_count() {
     );
 
     // A plan, a review of the human's task, an urgent and a normal message.
-    let plan = submitted_plan(&app, &iac, "Gated work").await;
+    let plan = submitted_plan(&app, &infra, "Gated work").await;
     let review = app
         .state
         .tasks
         .create(
             Caller::Human,
             NewTask {
-                project_id: iac.agent.project_id.unwrap(),
+                project_id: infra.agent.project_id.unwrap(),
                 title: "Check my thing".into(),
                 ..NewTask::default()
             },
         )
         .await
         .unwrap();
-    app.claim(&iac, review.id).await;
+    app.claim(&infra, review.id).await;
     app.state
         .tasks
-        .to_review(&iac, review.id, None)
+        .to_review(&infra, review.id, None)
         .await
         .unwrap();
     for (importance, subject) in [
@@ -2300,7 +2311,7 @@ async fn needs_you_cards_match_the_count() {
         app.state
             .messages
             .send(
-                &Actor::Agent(iac.agent.id, iac.session.id),
+                &Actor::Agent(infra.agent.id, infra.session.id),
                 NewMessage {
                     to: Address::Human,
                     subject: Some(subject.into()),
@@ -2376,8 +2387,8 @@ fn input_value(page: &Page, css: &str) -> String {
 async fn a_stale_plan_decision_shows_the_new_plan() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let task = submitted_plan(&app, &iac, "Gated work").await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let task = submitted_plan(&app, &infra, "Gated work").await;
     let path = format!("/ui/tasks/{}", task.id);
     let page = app.get(&path, Some(&cookie)).await;
     let csrf = csrf_of(&page);
@@ -2388,7 +2399,7 @@ async fn a_stale_plan_decision_shows_the_new_plan() {
     // The agent replaces the plan while the human is reading the old one.
     app.state
         .tasks
-        .propose_plan(&iac, task.id, "A different plan".into())
+        .propose_plan(&infra, task.id, "A different plan".into())
         .await
         .unwrap();
     for (action, extra) in [("approve", None), ("changes", Some("smaller"))] {
@@ -2430,17 +2441,17 @@ async fn a_stale_plan_decision_shows_the_new_plan() {
 async fn needs_you_shows_every_review_and_peeks_without_delivering() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let other = app.agent(IAC, "linux", "codex").await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let other = app.agent(INFRA, "linux", "codex").await;
     // A task an agent created, now in review: it waits on someone too.
-    let t = app.task(&iac, "Agent-made work", None).await;
+    let t = app.task(&infra, "Agent-made work", None).await;
     app.claim(&other, t.id).await;
     app.state.tasks.to_review(&other, t.id, None).await.unwrap();
     let urgent = app
         .state
         .messages
         .send(
-            &Actor::Agent(iac.agent.id, iac.session.id),
+            &Actor::Agent(infra.agent.id, infra.session.id),
             NewMessage {
                 to: Address::Human,
                 subject: Some("Prod is down".into()),
@@ -2500,10 +2511,10 @@ async fn need_titles(app: &App, cookie: &str) -> (Vec<String>, String) {
 async fn replying_or_dismissing_clears_a_reply_card() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let other = app.agent(IAC, "linux", "codex").await;
-    let first = urgent_to_human(&app, &iac, "Prod is down").await;
-    let second = urgent_to_human(&app, &iac, "Heads up").await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let other = app.agent(INFRA, "linux", "codex").await;
+    let first = urgent_to_human(&app, &infra, "Prod is down").await;
+    let second = urgent_to_human(&app, &infra, "Heads up").await;
     assert_eq!(
         need_titles(&app, &cookie).await,
         (
@@ -2552,7 +2563,7 @@ async fn replying_or_dismissing_clears_a_reply_card() {
                 &csrf,
                 &[
                     ("to_kind", "agent"),
-                    ("to", &iac.agent.id.to_string()),
+                    ("to", &infra.agent.id.to_string()),
                     ("reply_to", &first.id.to_string()),
                     ("body", "on it"),
                 ],
@@ -2575,7 +2586,7 @@ async fn replying_or_dismissing_clears_a_reply_card() {
     let agent_mail = app
         .state
         .messages
-        .inbox(&iac, axle::service::messages::InboxFilter::default())
+        .inbox(&infra, axle::service::messages::InboxFilter::default())
         .await
         .unwrap();
     assert!(agent_mail.iter().any(|i| i.message.body == "on it"));
@@ -2616,8 +2627,8 @@ async fn replying_or_dismissing_clears_a_reply_card() {
 async fn live_refreshes_keep_drafts_and_leases_fresh() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let task = submitted_plan(&app, &iac, "Gated work").await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let task = submitted_plan(&app, &infra, "Gated work").await;
     let board = app.get("/ui/board", Some(&cookie)).await;
     // Leases renewed by heartbeat publish nothing, so lease and presence views re-render on
     // a timer as well as on events.
@@ -2654,16 +2665,16 @@ async fn live_refreshes_keep_drafts_and_leases_fresh() {
 async fn live_refresh_keeps_pagination_cursors() {
     let app = app().await;
     let cookie = app.login().await;
-    let iac = app.agent(IAC, "mac", "claude-code").await;
-    let task = app.task(&iac, "Long", None).await;
-    app.claim(&iac, task.id).await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let task = app.task(&infra, "Long", None).await;
+    app.claim(&infra, task.id).await;
     for i in 0..60 {
         app.clock.advance(time::Duration::seconds(1));
-        app.state.tasks.renew(&iac, task.id).await.unwrap();
+        app.state.tasks.renew(&infra, task.id).await.unwrap();
         app.state
             .messages
             .send(
-                &Actor::Agent(iac.agent.id, iac.session.id),
+                &Actor::Agent(infra.agent.id, infra.session.id),
                 NewMessage {
                     to: Address::Task(task.id),
                     subject: None,

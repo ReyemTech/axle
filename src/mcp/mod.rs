@@ -573,7 +573,7 @@ mod tests {
                 (MCP_SESSION_HEADER, "abc"),
                 (HOST_HEADER, " mac "),
                 (HARNESS_HEADER, "claude-code"),
-                (PROJECT_HEADER, "github.com/reyemtech/iac"),
+                (PROJECT_HEADER, "github.com/acme/platform-infra"),
             ]),
             token,
         );
@@ -581,7 +581,7 @@ mod tests {
         assert_eq!(input.host, "mac");
         assert_eq!(
             input.project_key.as_deref(),
-            Some("github.com/reyemtech/iac")
+            Some("github.com/acme/platform-infra")
         );
 
         let named = identity_input(&headers(&[(SESSION_HEADER, "not-a-uuid")]), token);

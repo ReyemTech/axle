@@ -58,7 +58,7 @@ id_type!(ProjectId, AgentId, SessionId, TaskId, MessageId, TokenId);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     pub id: ProjectId,
-    /// Normalised key, e.g. `github.com/reyemtech/iac`. Never changes.
+    /// Normalised key, e.g. `github.com/acme/platform-infra`. Never changes.
     pub key: String,
     /// Human label shown in the UI (editable).
     pub display_name: String,
@@ -366,7 +366,7 @@ pub enum Address {
     Session(SessionId),
     /// The task's thread: delivered to its current owner and its creator.
     Task(TaskId),
-    /// Mario's inbox.
+    /// The owner's inbox.
     Human,
 }
 
@@ -446,7 +446,10 @@ mod tests {
 
     #[test]
     fn display_names_are_cleaned() {
-        assert_eq!(clean_display_name("  IaC  ").unwrap(), "IaC");
+        assert_eq!(
+            clean_display_name("  platform-infra  ").unwrap(),
+            "platform-infra"
+        );
         assert_eq!(
             clean_display_name(&"é".repeat(80)).unwrap().chars().count(),
             80

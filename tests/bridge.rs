@@ -47,12 +47,12 @@ impl Drop for TempDir {
 fn normalize_variants() {
     for (url, want) in [
         (
-            "git@github.com:ReyemTech/IaC.git",
-            Some("github.com/reyemtech/iac"),
+            "git@github.com:Acme/Platform-Infra.git",
+            Some("github.com/acme/platform-infra"),
         ),
         (
-            "https://github.com/reyemtech/iac",
-            Some("github.com/reyemtech/iac"),
+            "https://github.com/acme/platform-infra",
+            Some("github.com/acme/platform-infra"),
         ),
         (
             "ssh://git@git.example.com:2222/team/sub/repo.git",
@@ -62,13 +62,13 @@ fn normalize_variants() {
         ("not a url", None),
         // Extra shapes: credentials, trailing slash, no path, local paths.
         (
-            "https://user:pw@GitHub.com:443/ReyemTech/IaC.git/",
-            Some("github.com/reyemtech/iac"),
+            "https://user:pw@GitHub.com:443/Acme/Platform-Infra.git/",
+            Some("github.com/acme/platform-infra"),
         ),
         ("https://github.com/A/B.GIT", Some("github.com/a/b")),
         (
-            "git@GitHub.com:ReyemTech/IaC.Git",
-            Some("github.com/reyemtech/iac"),
+            "git@GitHub.com:Acme/Platform-Infra.Git",
+            Some("github.com/acme/platform-infra"),
         ),
         ("https://github.com", None),
         ("file:///srv/repo.git", None),
@@ -105,7 +105,7 @@ fn resolution_order() {
             "remote",
             "add",
             "origin",
-            "git@github.com:ReyemTech/IaC.git",
+            "git@github.com:Acme/Platform-Infra.git",
         ],
     );
 
@@ -115,17 +115,17 @@ fn resolution_order() {
     // git origin, from a nested directory
     assert_eq!(
         resolve_project(&nested, &none).as_deref(),
-        Some("github.com/reyemtech/iac")
+        Some("github.com/acme/platform-infra")
     );
     // nearest .axl beats git
     std::fs::write(
         repo.join(".axl"),
-        "project = \"reyemtech/iac-file\"\ndisplay_name = \"IaC\"\n",
+        "project = \"acme/platform-infra-file\"\ndisplay_name = \"Platform-Infra\"\n",
     )
     .unwrap();
     assert_eq!(
         resolve_project(&nested, &none).as_deref(),
-        Some("reyemtech/iac-file")
+        Some("acme/platform-infra-file")
     );
     std::fs::write(nested.join(".axl"), "project = \"nearest\"\n").unwrap();
     assert_eq!(resolve_project(&nested, &none).as_deref(), Some("nearest"));

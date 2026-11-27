@@ -214,7 +214,7 @@ async fn rejects_without_token() {
 async fn rejects_revoked_token() {
     let app = app().await;
     let (id, token) = app.state.auth.create("laptop").await.unwrap();
-    app.register(&token, "github.com/reyemtech/iac").await;
+    app.register(&token, "github.com/acme/platform-infra").await;
 
     app.state.auth.revoke(id).await.unwrap();
 
@@ -242,14 +242,14 @@ async fn register_returns_project_and_rejects_foreign_session() {
                 "session_id": session,
                 "host": "mac",
                 "harness": "claude-code",
-                "project_key": "github.com/reyemtech/iac",
+                "project_key": "github.com/acme/platform-infra",
             }),
         )
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body["project"],
-        json!({"key": "github.com/reyemtech/iac", "display_name": "reyemtech/iac"})
+        json!({"key": "github.com/acme/platform-infra", "display_name": "acme/platform-infra"})
     );
 
     let (status, body) = app
@@ -272,7 +272,7 @@ async fn register_returns_project_and_rejects_foreign_session() {
                 "session_id": session,
                 "host": "mac",
                 "harness": "claude-code",
-                "project_key": "github.com/reyemtech/iac",
+                "project_key": "github.com/acme/platform-infra",
             }),
         )
         .await;
@@ -287,7 +287,7 @@ async fn register_returns_project_and_rejects_foreign_session() {
 async fn register_then_heartbeat_reports_unread() {
     let app = app().await;
     let token = app.token().await;
-    let (session, agent) = app.register(&token, "github.com/reyemtech/iac").await;
+    let (session, agent) = app.register(&token, "github.com/acme/platform-infra").await;
 
     let (status, body) = app
         .post(&token, "/v1/heartbeat", json!({"session_id": session}))
@@ -318,8 +318,8 @@ async fn register_then_heartbeat_reports_unread() {
 async fn heartbeat_lists_held_leases() {
     let app = app().await;
     let token = app.token().await;
-    let (session, _) = app.register(&token, "github.com/reyemtech/iac").await;
-    let project = app.project_id("github.com/reyemtech/iac").await;
+    let (session, _) = app.register(&token, "github.com/acme/platform-infra").await;
+    let project = app.project_id("github.com/acme/platform-infra").await;
     let task = app
         .state
         .tasks
@@ -349,7 +349,7 @@ async fn heartbeat_lists_held_leases() {
 async fn events_stream_delivers_message() {
     let app = app().await;
     let token = app.token().await;
-    let (session, agent) = app.register(&token, "github.com/reyemtech/iac").await;
+    let (session, agent) = app.register(&token, "github.com/acme/platform-infra").await;
     let mut stream = app.events(&token, session).await;
 
     app.send_from_human(Address::Agent(agent), "wake up").await;
@@ -392,8 +392,8 @@ async fn events_not_leaked_across_projects() {
 async fn events_report_task_changes_in_project() {
     let app = app().await;
     let token = app.token().await;
-    let (session, _) = app.register(&token, "github.com/reyemtech/iac").await;
-    let project = app.project_id("github.com/reyemtech/iac").await;
+    let (session, _) = app.register(&token, "github.com/acme/platform-infra").await;
+    let project = app.project_id("github.com/acme/platform-infra").await;
     let mut stream = app.events(&token, session).await;
 
     let task = app
@@ -429,7 +429,7 @@ async fn events_report_task_changes_in_project() {
 async fn inbox_summary_lists_unacked_with_short_preview() {
     let app = app().await;
     let token = app.token().await;
-    let (session, agent) = app.register(&token, "github.com/reyemtech/iac").await;
+    let (session, agent) = app.register(&token, "github.com/acme/platform-infra").await;
     app.send_from_human(Address::Agent(agent), &"x".repeat(500))
         .await;
 
@@ -552,7 +552,7 @@ async fn shutdown_ends_sse_streams_and_returns() {
 
     let app = app().await;
     let token = app.token().await;
-    let (session, _) = app.register(&token, "github.com/reyemtech/iac").await;
+    let (session, _) = app.register(&token, "github.com/acme/platform-infra").await;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

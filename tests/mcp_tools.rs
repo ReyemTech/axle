@@ -891,15 +891,15 @@ store_matrix!(add_projects_via_mcp, |store: Arc<dyn Store>| async move {
     let server = start(store).await;
     let lead = server.agent("mac", "claude-code").await;
     let session = uuid::Uuid::now_v7().to_string();
-    let nimbus = server
+    let web_app = server
         .connect(&[
-            ("x-axl-project", "github.com/reyemtech/nimbus"),
+            ("x-axl-project", "github.com/acme/web-app"),
             ("x-axl-host", "mac"),
             ("x-axl-harness", "claude-code"),
             ("x-axl-session", &session),
         ])
         .await;
-    ok(&nimbus, "whoami", json!({})).await;
+    ok(&web_app, "whoami", json!({})).await;
     let task = ok(&lead, "task_create", json!({"title": "Parent", "body": ""})).await;
     let id = task["id"].as_str().unwrap().to_string();
 
@@ -913,21 +913,21 @@ store_matrix!(add_projects_via_mcp, |store: Arc<dyn Store>| async move {
     ok(
         &lead,
         "task_update",
-        json!({"id": id, "add_projects": ["github.com/reyemtech/nimbus"]}),
+        json!({"id": id, "add_projects": ["github.com/acme/web-app"]}),
     )
     .await;
     // Again: a no-op, not an error.
     ok(
         &lead,
         "task_update",
-        json!({"id": id, "add_projects": ["github.com/reyemtech/nimbus"]}),
+        json!({"id": id, "add_projects": ["github.com/acme/web-app"]}),
     )
     .await;
     let child = ok(
         &lead,
         "task_create",
-        json!({"title": "Nimbus part", "body": "", "parent": id,
-                   "project": "github.com/reyemtech/nimbus"}),
+        json!({"title": "web-app part", "body": "", "parent": id,
+                   "project": "github.com/acme/web-app"}),
     )
     .await;
     let (is_error, text) = call(
@@ -942,9 +942,9 @@ store_matrix!(add_projects_via_mcp, |store: Arc<dyn Store>| async move {
     );
     // A stranger may not extend it.
     let (is_error, text) = call(
-        &nimbus,
+        &web_app,
         "task_update",
-        json!({"id": id, "add_projects": ["github.com/reyemtech/nimbus"]}),
+        json!({"id": id, "add_projects": ["github.com/acme/web-app"]}),
     )
     .await;
     assert!(is_error && text.contains("not the owner"), "{text}");
@@ -957,7 +957,7 @@ store_matrix!(add_projects_via_mcp, |store: Arc<dyn Store>| async move {
             .any(|m| m["kind"] == "system"),
         "{detail}"
     );
-    for c in [lead, nimbus] {
+    for c in [lead, web_app] {
         c.cancel().await.unwrap();
     }
 });

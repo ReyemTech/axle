@@ -18,8 +18,8 @@ use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
 const T0: OffsetDateTime = datetime!(2026-11-27 9:00 UTC);
-const PROJECT: &str = "github.com/reyemtech/iac";
-const OTHER: &str = "github.com/reyemtech/nimbus";
+const PROJECT: &str = "github.com/acme/platform-infra";
+const OTHER: &str = "github.com/acme/web-app";
 
 struct Env {
     store: Arc<dyn Store>,
@@ -67,7 +67,7 @@ impl Env {
                 Caller::Human,
                 NewTask {
                     project_id: project,
-                    title: "split iac and nimbus".into(),
+                    title: "split infra and web_app".into(),
                     body: "do the thing".into(),
                     requires_plan: true,
                     ..NewTask::default()
@@ -233,7 +233,7 @@ store_matrix!(proposing_a_plan_submits_it_to_the_human, |store: Arc<
 
     let (t, plan) = env
         .svc
-        .propose_plan(&lead, gated.id, "1. iac: x\n2. nimbus: y".into())
+        .propose_plan(&lead, gated.id, "1. infra: x\n2. web_app: y".into())
         .await
         .unwrap();
     assert_eq!(t.status, TaskStatus::Planning);
@@ -418,15 +418,18 @@ store_matrix!(requesting_changes_keeps_planning, |store: Arc<
 
     let t = env
         .svc
-        .request_plan_changes(gated.id, plan.id, "split the nimbus part")
+        .request_plan_changes(gated.id, plan.id, "split the web_app part")
         .await
         .unwrap();
     assert_eq!(t.status, TaskStatus::Planning);
     assert_eq!(t.plan_state, PlanState::ChangesRequested);
     assert_eq!(t.lease_expires_at, Some(T0 + Duration::minutes(15)));
     let mail = env.inbox_of(&lead).await;
-    assert!(mail.iter().any(|m| m.body == "split the nimbus part"
-        && m.to == Address::Session(lead.session.id)));
+    assert!(
+        mail.iter().any(
+            |m| m.body == "split the web_app part" && m.to == Address::Session(lead.session.id)
+        )
+    );
     not_approved(
         env.svc
             .complete(&lead, gated.id, Completion::default())
@@ -497,7 +500,7 @@ store_matrix!(
         let creator = env.session("mac").await;
         let owner = env.session("linux").await;
         let stranger = env.session("pi").await;
-        let nimbus = env.session_in(OTHER, "mac").await;
+        let web_app = env.session_in(OTHER, "mac").await;
         let third = env.session_in("github.com/reyemtech/third", "mac").await;
         let home = project_of(&creator);
         let task = env
@@ -516,7 +519,7 @@ store_matrix!(
 
         assert!(matches!(
             env.svc
-                .add_projects(Caller::Agent(&stranger), task.id, &[project_of(&nimbus)])
+                .add_projects(Caller::Agent(&stranger), task.id, &[project_of(&web_app)])
                 .await,
             Err(TaskError::NotOwner)
         ));
@@ -529,18 +532,18 @@ store_matrix!(
 
         let t = env
             .svc
-            .add_projects(Caller::Agent(&creator), task.id, &[project_of(&nimbus)])
+            .add_projects(Caller::Agent(&creator), task.id, &[project_of(&web_app)])
             .await
             .unwrap();
         assert!(t.version > task.version);
         assert_eq!(
             env.store.task_projects(task.id).await.unwrap(),
-            vec![project_of(&nimbus)]
+            vec![project_of(&web_app)]
         );
         let note = env.store.task_thread(task.id).await.unwrap();
         let note = note.last().unwrap();
         assert_eq!(note.kind, MessageKind::System);
-        assert!(note.body.contains("nimbus"), "{}", note.body);
+        assert!(note.body.contains("web-app"), "{}", note.body);
         let added = env
             .store
             .task_events(task.id)
@@ -551,13 +554,17 @@ store_matrix!(
             .unwrap();
         assert_eq!(
             added.payload.unwrap()["added_projects"][0],
-            project_of(&nimbus).to_string()
+            project_of(&web_app).to_string()
         );
 
         // Already listed (or the home project): a no-op with no new event.
         let events = env.kinds(&task).await.len();
         env.svc
-            .add_projects(Caller::Agent(&owner), task.id, &[project_of(&nimbus), home])
+            .add_projects(
+                Caller::Agent(&owner),
+                task.id,
+                &[project_of(&web_app), home],
+            )
             .await
             .unwrap();
         assert_eq!(env.kinds(&task).await.len(), events);
@@ -575,9 +582,9 @@ store_matrix!(
             .create(
                 Caller::Agent(&owner),
                 NewTask {
-                    project_id: project_of(&nimbus),
+                    project_id: project_of(&web_app),
                     parent_id: Some(task.id),
-                    title: "nimbus part".into(),
+                    title: "web_app part".into(),
                     ..NewTask::default()
                 },
             )

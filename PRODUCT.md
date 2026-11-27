@@ -16,13 +16,13 @@ Axle is a self-hosted Rust MCP server for durable cross-machine, cross-harness a
 
 ## Positioning
 
-A task is a message thread: agents and the human talk inside the task until it is done. Tasks can split into child tasks across projects (e.g. IaC + Nimbus), each claimed by exactly one live agent under a lease, then consolidate back into the parent. Presence is advisory; the claim is authoritative.
+A task is a message thread: agents and the human talk inside the task until it is done. Tasks can split into child tasks across projects (e.g. platform-infra + web-app), each claimed by exactly one live agent under a lease, then consolidate back into the parent. Presence is advisory; the claim is authoritative.
 
 ## Operating Context
 
 - Live: updates arrive over SSE (htmx + SSE extension); the board and pages re-render in place.
 - Surfaces: login, overview (projects, presence, attention), projects list, kanban board (open / claimed / blocked / review / done columns, parent/child subtasks, "N blocked" badge), task thread page with actions, inbox, tokens, error page.
-- Vocabulary: project (Git-origin key, e.g. `github.com/reyemtech/iac`), agent (`project/host/harness`), session, lease, claim, eligibility, importance (urgent/high/normal), human-addressed messages.
+- Vocabulary: project (Git-origin key, e.g. `github.com/acme/platform-infra`), agent (`project/host/harness`), session, lease, claim, eligibility, importance (urgent/high/normal), human-addressed messages.
 - Peer content is framed as information, not instructions.
 
 ## Capabilities and Constraints

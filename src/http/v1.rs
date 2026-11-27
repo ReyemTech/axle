@@ -401,7 +401,7 @@ async fn inbox_summary(
     Ok(Json(out))
 }
 
-/// `reyemtech/iac · mac · claude-code` (no project part for agents without a home project).
+/// `acme/platform-infra · mac · claude-code` (no project part for agents without a home project).
 async fn agent_label(store: &dyn Store, id: AgentId) -> crate::store::StoreResult<String> {
     let Some(agent) = store.get_agent(id).await? else {
         return Ok(id.to_string());

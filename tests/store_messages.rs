@@ -13,8 +13,8 @@ use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
 const T0: OffsetDateTime = datetime!(2026-11-27 9:00 UTC);
-const IAC: &str = "github.com/reyemtech/iac";
-const NIMBUS: &str = "github.com/reyemtech/nimbus";
+const INFRA: &str = "github.com/acme/platform-infra";
+const WEB_APP: &str = "github.com/acme/web-app";
 
 struct Env {
     store: Arc<dyn Store>,
@@ -99,9 +99,9 @@ store_matrix!(agent_message_acked_once_for_all_sessions, |store: Arc<
     dyn Store,
 >| async move {
     let env = Env::new(store);
-    let sender = env.session(IAC, "mac").await;
-    let x1 = env.session(NIMBUS, "mbp").await;
-    let x2 = env.session(NIMBUS, "mbp").await;
+    let sender = env.session(INFRA, "mac").await;
+    let x1 = env.session(WEB_APP, "laptop-01").await;
+    let x2 = env.session(WEB_APP, "laptop-01").await;
     assert_eq!(x1.agent.id, x2.agent.id);
     assert_ne!(x1.session.id, x2.session.id);
 
@@ -122,9 +122,9 @@ store_matrix!(session_message_only_that_session, |store: Arc<
     dyn Store,
 >| async move {
     let env = Env::new(store);
-    let sender = env.session(IAC, "mac").await;
-    let x1 = env.session(NIMBUS, "mbp").await;
-    let x2 = env.session(NIMBUS, "mbp").await;
+    let sender = env.session(INFRA, "mac").await;
+    let x1 = env.session(WEB_APP, "laptop-01").await;
+    let x2 = env.session(WEB_APP, "laptop-01").await;
 
     let m = env
         .send(&sender, Address::Session(x1.session.id), "just you")
@@ -142,14 +142,14 @@ store_matrix!(
     project_broadcast_cursor,
     |store: Arc<dyn Store>| async move {
         let env = Env::new(store);
-        let sender = env.session(NIMBUS, "mac").await;
-        let early = env.session(NIMBUS, "early").await;
-        let nimbus = project_of(&sender);
+        let sender = env.session(WEB_APP, "mac").await;
+        let early = env.session(WEB_APP, "early").await;
+        let web_app = project_of(&sender);
 
-        let m1 = env.send(&sender, Address::Project(nimbus), "first").await;
+        let m1 = env.send(&sender, Address::Project(web_app), "first").await;
         env.clock.advance(Duration::seconds(1));
-        let late = env.session(NIMBUS, "late").await;
-        let m2 = env.send(&sender, Address::Project(nimbus), "second").await;
+        let late = env.session(WEB_APP, "late").await;
+        let m2 = env.send(&sender, Address::Project(web_app), "second").await;
 
         assert_eq!(env.inbox_ids(&early).await, vec![m1, m2]);
         assert_eq!(env.inbox_ids(&late).await, vec![m2]);
@@ -162,15 +162,15 @@ store_matrix!(
         assert_eq!(env.inbox_ids(&early).await, vec![m1]);
         assert_eq!(env.inbox_ids(&late).await, vec![m2]);
         // ... and the older history stays browsable for the late agent.
-        let found = env.msgs.search("first", Some(nimbus), 10).await.unwrap();
+        let found = env.msgs.search("first", Some(web_app), 10).await.unwrap();
         assert_eq!(found.iter().map(|m| m.id).collect::<Vec<_>>(), vec![m1]);
     }
 );
 
 store_matrix!(unacked_redelivered, |store: Arc<dyn Store>| async move {
     let env = Env::new(store);
-    let sender = env.session(IAC, "mac").await;
-    let x = env.session(NIMBUS, "mbp").await;
+    let sender = env.session(INFRA, "mac").await;
+    let x = env.session(WEB_APP, "laptop-01").await;
     let m = env.send(&sender, Address::Agent(x.agent.id), "again").await;
 
     let first = env.msgs.inbox(&x, InboxFilter::default()).await.unwrap();
@@ -190,8 +190,8 @@ store_matrix!(unacked_redelivered, |store: Arc<dyn Store>| async move {
 
 store_matrix!(body_cap_bytes, |store: Arc<dyn Store>| async move {
     let env = Env::new(store);
-    let sender = env.session(IAC, "mac").await;
-    let x = env.session(NIMBUS, "mbp").await;
+    let sender = env.session(INFRA, "mac").await;
+    let x = env.session(WEB_APP, "laptop-01").await;
 
     // 16,383 four-byte emoji + 4 ASCII bytes = 65,536 bytes.
     let exact = format!("{}abcd", "🦀".repeat(16_383));
@@ -217,42 +217,46 @@ store_matrix!(body_cap_bytes, |store: Arc<dyn Store>| async move {
 
 store_matrix!(cross_project_send, |store: Arc<dyn Store>| async move {
     let env = Env::new(store);
-    let iac = env.session(IAC, "mac").await;
-    let nimbus = env.session(NIMBUS, "mbp").await;
+    let infra = env.session(INFRA, "mac").await;
+    let web_app = env.session(WEB_APP, "laptop-01").await;
 
     let m = env
-        .send(&iac, Address::Project(project_of(&nimbus)), "rotate creds")
+        .send(
+            &infra,
+            Address::Project(project_of(&web_app)),
+            "rotate creds",
+        )
         .await;
     let items = env
         .msgs
-        .inbox(&nimbus, InboxFilter::default())
+        .inbox(&web_app, InboxFilter::default())
         .await
         .unwrap();
     assert_eq!(items.len(), 1);
     let got = &items[0].message;
     assert_eq!(got.id, m);
-    assert_eq!(got.from, actor(&iac));
-    assert_eq!(got.project_id, Some(project_of(&nimbus)));
-    assert_eq!(got.to, Address::Project(project_of(&nimbus)));
+    assert_eq!(got.from, actor(&infra));
+    assert_eq!(got.project_id, Some(project_of(&web_app)));
+    assert_eq!(got.to, Address::Project(project_of(&web_app)));
     // Not a broadcast to the sender's own project.
-    assert!(env.inbox_ids(&iac).await.is_empty());
+    assert!(env.inbox_ids(&infra).await.is_empty());
 });
 
 store_matrix!(
     search_finds_subject_and_body,
     |store: Arc<dyn Store>| async move {
         let env = Env::new(store);
-        let iac = env.session(IAC, "mac").await;
-        let nimbus = env.session(NIMBUS, "mbp").await;
+        let infra = env.session(INFRA, "mac").await;
+        let web_app = env.session(WEB_APP, "laptop-01").await;
 
         env.clock.advance(Duration::seconds(1));
         let by_subject = env
             .msgs
             .send(
-                &actor(&iac),
+                &actor(&infra),
                 NewMessage {
                     subject: Some("Postgres failover drill".into()),
-                    ..msg(Address::Agent(nimbus.agent.id), "see runbook")
+                    ..msg(Address::Agent(web_app.agent.id), "see runbook")
                 },
             )
             .await
@@ -260,12 +264,12 @@ store_matrix!(
             .id;
         let by_body = env
             .send(
-                &iac,
-                Address::Project(project_of(&nimbus)),
+                &infra,
+                Address::Project(project_of(&web_app)),
                 "the failover finished cleanly",
             )
             .await;
-        env.send(&iac, Address::Agent(nimbus.agent.id), "unrelated")
+        env.send(&infra, Address::Agent(web_app.agent.id), "unrelated")
             .await;
 
         let ids = |v: Vec<axle::domain::Message>| v.iter().map(|m| m.id).collect::<Vec<_>>();
@@ -284,7 +288,7 @@ store_matrix!(
         );
         assert!(
             env.msgs
-                .search("failover", Some(project_of(&iac)), 10)
+                .search("failover", Some(project_of(&infra)), 10)
                 .await
                 .unwrap()
                 .is_empty()
@@ -303,7 +307,7 @@ store_matrix!(
 
 store_matrix!(human_inbox, |store: Arc<dyn Store>| async move {
     let env = Env::new(store);
-    let x = env.session(IAC, "mac").await;
+    let x = env.session(INFRA, "mac").await;
     let m = env.send(&x, Address::Human, "need a decision").await;
 
     let items = env.msgs.human_inbox(InboxFilter::default()).await.unwrap();
@@ -328,8 +332,8 @@ store_matrix!(
     unread_counts_by_importance,
     |store: Arc<dyn Store>| async move {
         let env = Env::new(store);
-        let x = env.session(IAC, "mac").await;
-        let y = env.session(IAC, "cac-1").await;
+        let x = env.session(INFRA, "mac").await;
+        let y = env.session(INFRA, "build-01").await;
         for (to, importance) in [
             (Address::Human, Importance::Normal),
             (Address::Human, Importance::Urgent),
@@ -399,9 +403,9 @@ store_matrix!(
 
 store_matrix!(task_thread_delivery, |store: Arc<dyn Store>| async move {
     let env = Env::new(store);
-    let creator = env.session(IAC, "mac").await;
-    let worker = env.session(IAC, "cac-1").await;
-    let bystander = env.session(IAC, "mbp").await;
+    let creator = env.session(INFRA, "mac").await;
+    let worker = env.session(INFRA, "build-01").await;
+    let bystander = env.session(INFRA, "laptop-01").await;
 
     let task = env
         .tasks
@@ -467,7 +471,7 @@ store_matrix!(
     human_task_thread_and_promotion,
     |store: Arc<dyn Store>| async move {
         let env = Env::new(store);
-        let x = env.session(IAC, "mac").await;
+        let x = env.session(INFRA, "mac").await;
         let source = env.send(&x, Address::Human, "the build is red").await;
 
         let task = env
@@ -525,8 +529,8 @@ store_matrix!(inbox_filters_and_unknown_recipients, |store: Arc<
     dyn Store,
 >| async move {
     let env = Env::new(store);
-    let sender = env.session(IAC, "mac").await;
-    let x = env.session(NIMBUS, "mbp").await;
+    let sender = env.session(INFRA, "mac").await;
+    let x = env.session(WEB_APP, "laptop-01").await;
     env.send(&sender, Address::Agent(x.agent.id), "normal")
         .await;
     let urgent = env
@@ -595,10 +599,10 @@ store_matrix!(
     concurrent_sessions_ack_once,
     |store: Arc<dyn Store>| async move {
         let env = Arc::new(Env::new(store));
-        let sender = env.session(IAC, "mac").await;
+        let sender = env.session(INFRA, "mac").await;
         let mut sessions = Vec::new();
         for _ in 0..8 {
-            sessions.push(env.session(NIMBUS, "mbp").await);
+            sessions.push(env.session(WEB_APP, "laptop-01").await);
         }
         let direct = env
             .send(&sender, Address::Agent(sessions[0].agent.id), "direct")
@@ -644,11 +648,11 @@ store_matrix!(
     feed_pages_and_receipts,
     |store: Arc<dyn Store>| async move {
         let env = Env::new(store);
-        let a = env.session(IAC, "mac").await;
-        let b = env.session(NIMBUS, "mbp").await;
-        let nimbus = project_of(&b);
+        let a = env.session(INFRA, "mac").await;
+        let b = env.session(WEB_APP, "laptop-01").await;
+        let web_app = project_of(&b);
         let m1 = env.send(&a, Address::Agent(b.agent.id), "one").await;
-        let m2 = env.send(&a, Address::Project(nimbus), "two").await;
+        let m2 = env.send(&a, Address::Project(web_app), "two").await;
         let m3 = env.send(&b, Address::Human, "three").await;
         let ids = |ms: Vec<axle::domain::Message>| ms.iter().map(|m| m.id).collect::<Vec<_>>();
 
@@ -667,7 +671,7 @@ store_matrix!(
         assert_eq!(
             ids(env
                 .store
-                .list_messages(Some(nimbus), None, 10)
+                .list_messages(Some(web_app), None, 10)
                 .await
                 .unwrap()),
             vec![m3, m2, m1]
@@ -727,7 +731,7 @@ store_matrix!(
     task_thread_paged_newest_first,
     |store: Arc<dyn Store>| async move {
         let env = Env::new(store);
-        let a = env.session(IAC, "mac").await;
+        let a = env.session(INFRA, "mac").await;
         let task = env
             .tasks
             .create(
@@ -769,10 +773,10 @@ store_matrix!(
     list_agents_newest_first,
     |store: Arc<dyn Store>| async move {
         let env = Env::new(store);
-        let a1 = env.session(IAC, "mac").await;
-        let _again = env.session(IAC, "mac").await; // same agent, second session
+        let a1 = env.session(INFRA, "mac").await;
+        let _again = env.session(INFRA, "mac").await; // same agent, second session
         env.clock.advance(Duration::seconds(1));
-        let b = env.session(NIMBUS, "mbp").await;
+        let b = env.session(WEB_APP, "laptop-01").await;
         let agents = env.store.list_agents(10).await.unwrap();
         assert_eq!(
             agents.iter().map(|a| a.id).collect::<Vec<_>>(),

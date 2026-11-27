@@ -4,7 +4,7 @@
 
 Recorded during the subagent-driven build of feat/mvp (2026-11-27).
 
-## Rulings made without Mario
+## Rulings made without the owner
 - Ruling: skip `git init` in T1 — already done — no cost.
 - Ruling: default bind 127.0.0.1:7420 in T1 — T6/T8 rely on 7420 — trivial to change.
 - Ruling: edit migrations/*/0001_init.sql in place until first release (no prod data) — keeps one migration per phase — if wrong, split into 0002 later.
@@ -53,7 +53,7 @@ Recorded during the subagent-driven build of feat/mvp (2026-11-27).
 - Task 4: minor (deferred): parent-status decision duplicated in pg/sqlite (could be pure helper)
 - Task 4: minor (deferred): tests missing parent blocked/review/done cases, takeover bubbling, repeat children_complete
 - Task 4: minor (deferred): create allows child under done/cancelled parent
-- Task 5: minor (deferred, FINAL REVIEW SHOULD FIX): tests/store_messages.rs:236 cross-project assertion passes via self-exclusion; add 2nd IaC agent
+- Task 5: minor (deferred, FINAL REVIEW SHOULD FIX): tests/store_messages.rs:236 cross-project assertion passes via self-exclusion; add 2nd platform-infra agent
 - Task 5: minor (deferred, FINAL REVIEW SHOULD FIX): PG recipient-row multi-lock without fixed order → possible deadlocks between sibling sessions
 - Task 5: minor (deferred): replace ctid join with unique-key join
 - Task 5: minor (deferred): acked_seq/updated_at naming misleading (start_seq)

@@ -24,7 +24,7 @@ store_matrix!(first_contact_creates_project_agent_session, |store: Arc<
 >| async move {
     let clock = TestClock::new(datetime!(2026-11-27 9:00 UTC));
     let token = common::token(&*store).await;
-    let key = "github.com/reyemtech/iac";
+    let key = "github.com/acme/platform-infra";
 
     let first =
         IdentityService::resolve(&*store, &clock, input(token, Some(key), SessionId::new()))
@@ -32,7 +32,7 @@ store_matrix!(first_contact_creates_project_agent_session, |store: Arc<
             .unwrap();
     let project = first.project.clone().expect("project created");
     assert_eq!(project.key, key);
-    assert_eq!(project.display_name, "reyemtech/iac");
+    assert_eq!(project.display_name, "acme/platform-infra");
     assert_eq!(first.agent.project_id, Some(project.id));
     assert_eq!(first.agent.host, "mac");
     assert_eq!(first.agent.harness, "claude-code");
@@ -80,26 +80,29 @@ store_matrix!(rename_project_changes_display_only, |store: Arc<
 >| async move {
     let clock = TestClock::new(datetime!(2026-11-27 9:00 UTC));
     let token = common::token(&*store).await;
-    let key = "github.com/reyemtech/iac";
+    let key = "github.com/acme/platform-infra";
     let resolved =
         IdentityService::resolve(&*store, &clock, input(token, Some(key), SessionId::new()))
             .await
             .unwrap();
     let project = resolved.project.unwrap();
 
-    store.rename_project(project.id, "IaC").await.unwrap();
+    store
+        .rename_project(project.id, "platform-infra")
+        .await
+        .unwrap();
 
     let renamed = store.get_project_by_key(key).await.unwrap().unwrap();
     assert_eq!(renamed.id, project.id);
     assert_eq!(renamed.key, key);
-    assert_eq!(renamed.display_name, "IaC");
+    assert_eq!(renamed.display_name, "platform-infra");
 
     // A later first-contact upsert must not reset the human-edited name.
     IdentityService::resolve(&*store, &clock, input(token, Some(key), SessionId::new()))
         .await
         .unwrap();
     let after = store.get_project_by_key(key).await.unwrap().unwrap();
-    assert_eq!(after.display_name, "IaC");
+    assert_eq!(after.display_name, "platform-infra");
 });
 
 store_matrix!(resolve_same_session_is_idempotent, |store: Arc<

@@ -4,7 +4,7 @@ Status: approved by the owner on 2026-11-27. Extends `2026-11-27-agent-coordinat
 
 ## Why
 
-The owner creates cross-project work from the web UI (e.g. IaC + Nimbus). Today the UI form only picks one project, so a UI-created task can never be split across projects, because a parent's participating projects are fixed at creation. The owner also wants the lead agent to write a spec or plan and get it approved in the UI before doing the work.
+The owner creates cross-project work from the web UI (e.g. platform-infra + web-app). Today the UI form only picks one project, so a UI-created task can never be split across projects, because a parent's participating projects are fixed at creation. The owner also wants the lead agent to write a spec or plan and get it approved in the UI before doing the work.
 
 ## Part 1 — participating projects
 

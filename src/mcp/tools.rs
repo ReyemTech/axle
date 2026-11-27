@@ -62,7 +62,7 @@ pub struct ProjectListParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AgentListParams {
-    /// Only agents whose home project this is (key, e.g. `github.com/reyemtech/iac`, or
+    /// Only agents whose home project this is (key, e.g. `github.com/acme/platform-infra`, or
     /// display name).
     pub project: Option<String>,
     /// Page size (default 20, at most 100).

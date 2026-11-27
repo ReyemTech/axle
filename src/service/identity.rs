@@ -165,7 +165,7 @@ pub fn check_label(
     Ok(())
 }
 
-/// The last two path segments of a project key: `github.com/reyemtech/iac` → `reyemtech/iac`.
+/// The last two path segments of a project key: `github.com/acme/platform-infra` → `acme/platform-infra`.
 pub fn default_display_name(key: &str) -> String {
     let segments: Vec<&str> = key.split('/').filter(|s| !s.is_empty()).collect();
     match segments.as_slice() {
@@ -198,14 +198,17 @@ mod tests {
     #[test]
     fn display_name_is_last_two_segments() {
         assert_eq!(
-            default_display_name("github.com/reyemtech/iac"),
-            "reyemtech/iac"
+            default_display_name("github.com/acme/platform-infra"),
+            "acme/platform-infra"
         );
         assert_eq!(
             default_display_name("gitlab.com/group/sub/repo"),
             "sub/repo"
         );
-        assert_eq!(default_display_name("reyemtech/iac/"), "reyemtech/iac");
+        assert_eq!(
+            default_display_name("acme/platform-infra/"),
+            "acme/platform-infra"
+        );
         assert_eq!(default_display_name("solo"), "solo");
     }
 }
