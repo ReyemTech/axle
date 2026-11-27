@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+{% block title %}{{ task.title }}{% endblock %}
+{% block content %}
+<div class="task-page">
+<section id="task-live" class="task-live"
+         hx-get="/ui/tasks/{{ task.id }}" hx-select="#task-live" hx-swap="outerHTML"
+         hx-trigger="sse:detail-{{ task.id }} delay:300ms">
+  <header class="task-head" data-status="{{ task.status }}">
+    {% if let Some((pid, ptitle)) = task.parent %}<p class="crumb"><a href="/ui/tasks/{{ pid }}">↑ {{ ptitle }}</a></p>{% endif %}
+    <h1 class="task-title">{{ task.title }}</h1>
+    <div class="task-meta">
+      <span class="status">{{ task.status }}</span>
+      <span class="project" title="{{ task.project.key }}">{{ task.project.name }}</span>
+      <span class="muted">created by {{ task.created_by }} <time datetime="{{ task.created_at.iso }}" title="{{ task.created_at.text }}">{{ task.created_at.ago }}</time></span>
+    </div>
+  </header>
+
+  <section class="panel lease" aria-label="Lease">
+    <h2 class="panel-title">Lease</h2>
+    <p>{{ task.lease }}</p>
+    {% if let Some(e) = task.eligibility %}<p class="muted">Only for {{ e }}.</p>{% endif %}
+  </section>
+
+  {% if let Some(ev) = evidence %}
+  <section class="panel evidence" aria-label="Evidence">
+    <h2 class="panel-title">Evidence</h2>
+    {% if !ev.summary.is_empty() %}<p class="peer-text">{{ ev.summary }}</p>{% endif %}
+    {% if !ev.changed_files.is_empty() %}<h3>Changed files</h3><ul class="mono-list">{% for f in ev.changed_files %}<li>{{ f }}</li>{% endfor %}</ul>{% endif %}
+    {% if !ev.tests.is_empty() %}<h3>Tests</h3><ul class="mono-list">{% for t in ev.tests %}<li>{{ t }}</li>{% endfor %}</ul>{% endif %}
+    {% if !ev.links.is_empty() %}<h3>Links</h3><ul class="mono-list">{% for l in ev.links %}<li>{{ l }}</li>{% endfor %}</ul>{% endif %}
+  </section>
+  {% endif %}
+
+  <section class="panel" aria-label="Subtasks">
+    <h2 class="panel-title">Subtasks <span class="count">{{ children.len() }}</span></h2>
+    {% if children.is_empty() %}<p class="empty">No subtasks.</p>{% else %}
+    <ul class="child-list">
+    {% for c in children %}
+      <li class="child" data-status="{{ c.status }}">
+        <span class="icon" title="{{ c.status }}" aria-label="{{ c.status }}">{{ c.icon }}</span>
+        <a class="child-title" href="/ui/tasks/{{ c.id }}"><span class="project" title="{{ c.project.key }}">{{ c.project.name }}</span>: {{ c.title }}</a>
+        <span class="child-owner">{% if let Some(o) = c.owner %}{{ o }}{% else %}(open){% endif %}</span>
+      </li>
+    {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+
+  <section class="panel" aria-label="Thread">
+    <h2 class="panel-title">Thread <span class="count">{{ thread.len() }}</span></h2>
+    <ol class="thread">
+    {% for m in thread %}
+      <li class="msg" id="msg-{{ m.id }}" data-importance="{{ m.importance }}">
+        <div class="msg-head">
+          <span class="msg-from">{{ m.from }}{% if let Some(p) = m.project %} <span class="muted">in</span> <span class="project" title="{{ p.key }}">{{ p.name }}</span>{% endif %}</span>
+          {% if m.importance != "normal" %}<span class="importance">{{ m.importance }}</span>{% endif %}
+          <time class="muted" datetime="{{ m.at.iso }}" title="{{ m.at.text }}">{{ m.at.ago }}</time>
+        </div>
+        {% if let Some(s) = m.subject %}<p class="msg-subject">{{ s }}</p>{% endif %}
+        <div class="peer-text">{{ m.body }}</div>
+      </li>
+    {% endfor %}
+    </ol>
+  </section>
+
+  <section class="panel" aria-label="History">
+    <h2 class="panel-title">History{% if paged %} <span class="muted">(older)</span>{% endif %}</h2>
+    {% if paged %}<p><a href="/ui/tasks/{{ task.id }}">Newest events</a></p>{% endif %}
+    <ol class="events">
+    {% for e in events %}
+      <li class="event">
+        <span class="event-kind">{{ e.kind }}</span>
+        <span class="event-actor">{{ e.actor }}</span>
+        <time class="muted" datetime="{{ e.at.iso }}" title="{{ e.at.text }}">{{ e.at.ago }}</time>
+        {% if let Some(c) = e.child %}<span class="event-child">{{ c }}</span>{% endif %}
+        {% if let Some(n) = e.note %}<span class="event-note peer-text">{{ n }}</span>{% endif %}
+      </li>
+    {% endfor %}
+    </ol>
+    {% if let Some(href) = older %}<p><a class="older" href="{{ href }}">Older events</a></p>{% endif %}
+  </section>
+</section>
+
+<aside class="task-actions" aria-label="Actions">
+  {% if let Some(token) = csrf %}
+  <section class="panel">
+    <h2 class="panel-title">Post to the thread</h2>
+    <form class="stack" method="post" action="/ui/tasks/{{ task.id }}/post">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <label for="post-body">Message</label>
+      <textarea id="post-body" name="body" rows="4" required></textarea>
+      <label for="post-importance">Importance</label>
+      <select id="post-importance" name="importance">
+        <option value="normal">normal</option><option value="high">high</option><option value="urgent">urgent</option>
+      </select>
+      <button type="submit">Post as you</button>
+    </form>
+  </section>
+  {% if task.can_release || task.can_cancel %}
+  <section class="panel">
+    <h2 class="panel-title">Take over</h2>
+    <div class="button-row">
+    {% if task.can_release %}
+    <form method="post" action="/ui/tasks/{{ task.id }}/force-release" data-confirm="Take this task away from {% if let Some(o) = task.owner %}{{ o }}{% else %}its owner{% endif %} and reopen it?">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <button type="submit" class="secondary">Force release</button>
+    </form>
+    {% endif %}
+    {% if task.can_cancel %}
+    <form method="post" action="/ui/tasks/{{ task.id }}/cancel" data-confirm="Cancel this task?">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <button type="submit" class="danger">Cancel task</button>
+    </form>
+    {% endif %}
+    </div>
+  </section>
+  {% endif %}
+  {% if task.can_cancel %}
+  <section class="panel">
+    <h2 class="panel-title">Add a subtask</h2>
+    <form class="stack" method="post" action="/ui/tasks">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <input type="hidden" name="parent" value="{{ task.id }}">
+      <label for="child-project">Project</label>
+      <select id="child-project" name="project">
+        {% for p in child_projects %}<option value="{{ p.id }}" title="{{ p.key }}"{% if p.selected %} selected{% endif %}>{{ p.name }}</option>{% endfor %}
+      </select>
+      <label for="child-title">Title</label>
+      <input id="child-title" name="title" required>
+      <label for="child-body">Details</label>
+      <textarea id="child-body" name="body" rows="3"></textarea>
+      <button type="submit">Create subtask</button>
+    </form>
+  </section>
+  {% endif %}
+  {% endif %}
+</aside>
+</div>
+{% endblock %}

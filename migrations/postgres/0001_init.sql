@@ -113,6 +113,8 @@ CREATE TABLE messages (
 CREATE INDEX messages_to ON messages (to_kind, to_id, created_at);
 CREATE INDEX messages_task ON messages (task_id, created_at);
 CREATE INDEX messages_project ON messages (project_id, created_at);
+-- Receipts: "replied" is a lookup by reply_to.
+CREATE INDEX messages_reply_to ON messages (reply_to);
 CREATE INDEX messages_search ON messages USING gin (search);
 
 -- Per-recipient delivery. Agent-, session- and human-addressed messages get their row at

@@ -1,11 +1,16 @@
 //! The web UI (spec §12, §7): admin-secret login with a server-side cookie session, CSRF on
-//! every POST, the overview, the board and a live SSE stream that re-renders changed cards.
+//! every POST, the overview, the board, task pages, the unified inbox, projects and tokens,
+//! the human's actions, and a live SSE stream that re-renders changed cards.
 //!
 //! UI routes do not use bearer tokens. A request is signed in by the `coord_ui` cookie (an
 //! in-memory session; the MVP runs one replica) or, in trusted-header mode, by the header an
 //! auth proxy sets. Every non-GET request must carry the session's CSRF token, as the form
 //! field `csrf` or the `X-CSRF-Token` header (what htmx requests send).
 
+pub mod actions;
+pub mod admin;
+pub mod inbox;
+pub mod task_page;
 pub mod views;
 
 use std::collections::HashMap;
@@ -141,7 +146,19 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/ui/overview/panel", get(views::overview_panel))
         .route("/ui/board", get(views::board))
         .route("/ui/board/columns", get(views::board_columns))
+        .route("/ui/tasks", post(actions::create_task))
+        .route("/ui/tasks/{id}", get(task_page::task_page))
         .route("/ui/tasks/{id}/children", get(views::children))
+        .route("/ui/tasks/{id}/post", post(actions::post_to_thread))
+        .route("/ui/tasks/{id}/force-release", post(actions::force_release))
+        .route("/ui/tasks/{id}/cancel", post(actions::cancel))
+        .route("/ui/inbox", get(inbox::inbox))
+        .route("/ui/inbox/{id}/archive", post(actions::archive))
+        .route("/ui/messages", post(actions::send_message))
+        .route("/ui/projects", get(admin::projects))
+        .route("/ui/projects/{id}/rename", post(actions::rename_project))
+        .route("/ui/tokens", get(admin::tokens))
+        .route("/ui/tokens/{id}/revoke", post(actions::revoke_token))
         .route("/ui/live", get(live))
         .route("/ui/logout", post(logout))
         .route_layer(middleware::from_fn_with_state(state, require_session));

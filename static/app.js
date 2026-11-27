@@ -1,4 +1,5 @@
-// coord web UI: CSRF header for htmx requests, j/k selection, "/" search, filter autosubmit.
+// coord web UI: CSRF header for htmx requests, j/k selection, "/" search, filter autosubmit,
+// confirmations on destructive forms.
 (function () {
   "use strict";
 
@@ -90,6 +91,13 @@
       var el = document.getElementById(selectedId);
       if (el) el.classList.add("selected");
     }
+  });
+
+  // Destructive forms ask first (`data-confirm` holds the question).
+  document.addEventListener("submit", function (e) {
+    var f = e.target;
+    var question = f && f.getAttribute && f.getAttribute("data-confirm");
+    if (question && !window.confirm(question)) e.preventDefault();
   });
 
   document.addEventListener("change", function (e) {

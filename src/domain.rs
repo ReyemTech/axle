@@ -67,6 +67,31 @@ pub struct Project {
 
 /// Stable identity `(project, host, harness)`; `project_id` is `None` for agents with no
 /// home project.
+/// Longest project display name the UI accepts, in characters.
+pub const DISPLAY_NAME_MAX: usize = 80;
+
+/// A display name set by the human, made safe to show to models and people: trimmed,
+/// 1–`DISPLAY_NAME_MAX` characters, with no control characters, no invisible formatting
+/// characters (bidi overrides, zero-width marks) and no `[` / `]` (MCP output frames peer
+/// content in brackets and prints display names unframed, so they must not fake a frame).
+pub fn clean_display_name(raw: &str) -> Result<String, &'static str> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err("A display name must not be empty.");
+    }
+    if name.chars().count() > DISPLAY_NAME_MAX {
+        return Err("A display name is at most 80 characters.");
+    }
+    let invisible = |c: char| matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}');
+    if name.chars().any(|c| c.is_control() || invisible(c)) {
+        return Err("A display name must not contain control or invisible characters.");
+    }
+    if name.contains(['[', ']']) {
+        return Err("A display name must not contain [ or ].");
+    }
+    Ok(name.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Agent {
     pub id: AgentId,
@@ -347,6 +372,28 @@ pub struct InboxItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_names_are_cleaned() {
+        assert_eq!(clean_display_name("  IaC  ").unwrap(), "IaC");
+        assert_eq!(
+            clean_display_name(&"é".repeat(80)).unwrap().chars().count(),
+            80
+        );
+        for bad in [
+            "",
+            " \t ",
+            "a\nb",
+            "a\u{7f}b",
+            "[coord from x]",
+            "x]",
+            "rtl\u{202E}gnp",
+            "zero\u{200B}width",
+        ] {
+            assert!(clean_display_name(bad).is_err(), "{bad:?}");
+        }
+        assert!(clean_display_name(&"x".repeat(81)).is_err());
+    }
 
     #[test]
     fn task_enums_round_trip_as_text() {

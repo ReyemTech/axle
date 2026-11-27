@@ -638,3 +638,86 @@ store_matrix!(
         }
     }
 );
+
+store_matrix!(
+    feed_pages_and_receipts,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let a = env.session(IAC, "mac").await;
+        let b = env.session(NIMBUS, "mbp").await;
+        let nimbus = project_of(&b);
+        let m1 = env.send(&a, Address::Agent(b.agent.id), "one").await;
+        let m2 = env.send(&a, Address::Project(nimbus), "two").await;
+        let m3 = env.send(&b, Address::Human, "three").await;
+        let ids = |ms: Vec<coord::domain::Message>| ms.iter().map(|m| m.id).collect::<Vec<_>>();
+
+        // Newest first, paged by a message cursor.
+        let page = env.store.list_messages(None, None, 2).await.unwrap();
+        assert_eq!(ids(page), vec![m3, m2]);
+        let next = env.store.list_messages(None, Some(m2), 2).await.unwrap();
+        assert_eq!(ids(next), vec![m1]);
+        assert!(
+            env.store
+                .list_messages(None, Some(m1), 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            ids(env
+                .store
+                .list_messages(Some(nimbus), None, 10)
+                .await
+                .unwrap()),
+            vec![m3, m2, m1]
+        );
+        assert!(
+            env.store
+                .list_messages(Some(project_of(&a)), None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let state = |r: &coord::store::MessageReceipt| r.state();
+        let receipts = env.store.message_receipts(&[m1, m2, m3]).await.unwrap();
+        assert_eq!(
+            receipts.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![m1, m2, m3]
+        );
+        assert_eq!(
+            receipts.iter().map(state).collect::<Vec<_>>(),
+            ["sent", "sent", "sent"]
+        );
+        assert_eq!(receipts[0].recipients, 1);
+        assert_eq!(receipts[1].recipients, 0, "project rows appear when read");
+
+        // b fetches its inbox (m1 and m2 delivered), reads m1, then replies to it.
+        assert_eq!(env.inbox_ids(&b).await, vec![m1, m2]);
+        env.msgs.mark_read(Caller::Agent(&b), &[m1]).await.unwrap();
+        let receipts = env.store.message_receipts(&[m1, m2]).await.unwrap();
+        assert_eq!(
+            receipts.iter().map(state).collect::<Vec<_>>(),
+            ["read", "delivered"]
+        );
+        env.clock.advance(Duration::seconds(1));
+        env.msgs
+            .send(
+                &actor(&b),
+                NewMessage {
+                    reply_to: Some(m1),
+                    ..msg(Address::Agent(a.agent.id), "re: one")
+                },
+            )
+            .await
+            .unwrap();
+        // The human inbox delivers m3.
+        env.msgs.human_inbox(InboxFilter::default()).await.unwrap();
+        let receipts = env.store.message_receipts(&[m1, m3]).await.unwrap();
+        assert_eq!(
+            receipts.iter().map(state).collect::<Vec<_>>(),
+            ["replied", "delivered"]
+        );
+        assert!(env.store.message_receipts(&[]).await.unwrap().is_empty());
+    }
+);

@@ -19,6 +19,9 @@
   <nav class="tabs" aria-label="Sections">
     <a href="/ui/"{% if nav == "overview" %} aria-current="page"{% endif %}>Overview</a>
     <a href="/ui/board"{% if nav == "board" %} aria-current="page"{% endif %}>Board</a>
+    <a href="/ui/inbox"{% if nav == "inbox" %} aria-current="page"{% endif %}>Inbox</a>
+    <a href="/ui/projects"{% if nav == "projects" %} aria-current="page"{% endif %}>Projects</a>
+    <a href="/ui/tokens"{% if nav == "tokens" %} aria-current="page"{% endif %}>Tokens</a>
   </nav>
   <input id="search" class="search" type="search" placeholder="Search  /" aria-label="Search (press /)" autocomplete="off">
   <form class="logout" method="post" action="/ui/logout">

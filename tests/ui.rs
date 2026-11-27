@@ -888,3 +888,706 @@ fn stylesheet_hides_hidden_elements() {
         "app.css must force [hidden] to display: none"
     );
 }
+
+// ---------------------------------------------------------------- task 10: task page, inbox, actions
+
+/// The session's CSRF token, read from the overview.
+async fn csrf_for(app: &App, cookie: &str) -> String {
+    csrf_of(&app.get("/ui/", Some(cookie)).await)
+}
+
+/// A form body with `csrf` first, values url-encoded.
+fn form(csrf: &str, fields: &[(&str, &str)]) -> String {
+    let mut all = vec![("csrf", csrf)];
+    all.extend_from_slice(fields);
+    serde_urlencoded::to_string(&all).unwrap()
+}
+
+#[tokio::test]
+async fn human_creates_task_visible_on_board() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let project = iac.agent.project_id.unwrap();
+    let csrf = csrf_for(&app, &cookie).await;
+    let mut events = app.state.bus.subscribe();
+
+    // The board offers the create form.
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    assert_eq!(
+        select_texts(&board, "form[action='/ui/tasks'] input[name=title]").len(),
+        1
+    );
+
+    let page = app
+        .post_form(
+            "/ui/tasks",
+            Some(&cookie),
+            &form(
+                &csrf,
+                &[
+                    ("project", &project.to_string()),
+                    ("title", "Rotate the creds"),
+                    ("body", "Please rotate them."),
+                    ("parent", ""),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    let location = page.location.unwrap();
+    let id: TaskId = location
+        .strip_prefix("/ui/tasks/")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let task = app.state.store.get_task(id).await.unwrap().unwrap();
+    assert_eq!(task.created_by, Actor::Human);
+    assert_eq!(task.title, "Rotate the creds");
+    // Published like an agent's create, so agents wake and boards update.
+    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(event, coord::events::Event::TaskChanged { id: e, .. } if e == id),
+        "{event:?}"
+    );
+
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    assert_eq!(
+        select_texts(&board, "[data-status=open] .card-title"),
+        ["Rotate the creds"]
+    );
+    let detail = app.get(&location, Some(&cookie)).await;
+    assert_eq!(detail.status, StatusCode::OK);
+    assert!(detail.text().contains("Please rotate them."));
+
+    // A subtask from the task page.
+    let page = app
+        .post_form(
+            "/ui/tasks",
+            Some(&cookie),
+            &form(
+                &csrf,
+                &[
+                    ("project", &project.to_string()),
+                    ("title", "Child step"),
+                    ("body", ""),
+                    ("parent", &id.to_string()),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    let detail = app.get(&location, Some(&cookie)).await;
+    assert!(
+        select_texts(&detail, ".child-title")
+            .iter()
+            .any(|t| t.ends_with("Child step"))
+    );
+
+    // A blank title is refused, and nothing is created.
+    let page = app
+        .post_form(
+            "/ui/tasks",
+            Some(&cookie),
+            &form(
+                &csrf,
+                &[
+                    ("project", &project.to_string()),
+                    ("title", "  "),
+                    ("body", ""),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::UNPROCESSABLE_ENTITY);
+    // Without CSRF nothing happens.
+    let page = app
+        .post_form("/ui/tasks", Some(&cookie), "project=x&title=y&body=z")
+        .await;
+    assert_eq!(page.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        app.state
+            .store
+            .list_tasks(&coord::store::TaskFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn force_release_reopens_and_records_event() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let task = app.task(&iac, "Held task", None).await;
+    app.claim(&iac, task.id).await;
+    let csrf = csrf_for(&app, &cookie).await;
+
+    let page_path = format!("/ui/tasks/{}", task.id);
+    let detail = app.get(&page_path, Some(&cookie)).await;
+    assert!(
+        detail.text().contains("claude-code@mac"),
+        "lease owner shown"
+    );
+    assert_eq!(
+        select_texts(
+            &detail,
+            &format!("form[action='{page_path}/force-release'] button")
+        )
+        .len(),
+        1
+    );
+
+    let page = app
+        .post_form(
+            &format!("{page_path}/force-release"),
+            Some(&cookie),
+            &form(&csrf, &[]),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    assert_eq!(page.location.as_deref(), Some(page_path.as_str()));
+    let after = app.state.store.get_task(task.id).await.unwrap().unwrap();
+    assert_eq!(after.status, coord::domain::TaskStatus::Open);
+    assert_eq!(after.owner_agent_id, None);
+    let events = app.state.store.task_events(task.id).await.unwrap();
+    let last = events.last().unwrap();
+    assert_eq!(last.kind, coord::domain::TaskEventKind::ForceReleased);
+    assert_eq!(last.actor, Actor::Human);
+    let detail = app.get(&page_path, Some(&cookie)).await;
+    assert!(
+        select_texts(&detail, ".event-kind")
+            .iter()
+            .any(|k| k == "force released")
+    );
+
+    // Releasing an open task is a conflict, shown as an error page.
+    let page = app
+        .post_form(
+            &format!("{page_path}/force-release"),
+            Some(&cookie),
+            &form(&csrf, &[]),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::CONFLICT);
+
+    // Cancel, as the human.
+    let page = app
+        .post_form(
+            &format!("{page_path}/cancel"),
+            Some(&cookie),
+            &form(&csrf, &[]),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER);
+    let after = app.state.store.get_task(task.id).await.unwrap().unwrap();
+    assert_eq!(after.status, coord::domain::TaskStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn task_page_shows_lease_children_evidence_and_paged_history() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let parent = app.task(&iac, "Parent", None).await;
+    let child = app.task(&iac, "The child", Some(parent.id)).await;
+    app.claim(&iac, child.id).await;
+    app.state
+        .tasks
+        .complete(
+            &iac,
+            child.id,
+            Completion {
+                summary: "Rotated it".into(),
+                changed_files: vec!["src/creds.rs".into()],
+                tests: vec!["cargo test creds".into()],
+                links: vec!["https://example.com/pr/1".into()],
+            },
+        )
+        .await
+        .unwrap();
+    let detail = app
+        .get(&format!("/ui/tasks/{}", child.id), Some(&cookie))
+        .await;
+    let evidence = select_texts(&detail, ".evidence").join(" ");
+    for want in [
+        "Rotated it",
+        "src/creds.rs",
+        "cargo test creds",
+        "https://example.com/pr/1",
+    ] {
+        assert!(evidence.contains(want), "{want}: {evidence}");
+    }
+    let parent_page = app
+        .get(&format!("/ui/tasks/{}", parent.id), Some(&cookie))
+        .await;
+    assert!(
+        select_texts(&parent_page, ".child-title")
+            .iter()
+            .any(|t| t.ends_with("The child"))
+    );
+
+    // Long histories are paged: renew many times, then follow the "older" link.
+    let busy = app.task(&iac, "Busy", None).await;
+    app.claim(&iac, busy.id).await;
+    for _ in 0..60 {
+        app.clock.advance(time::Duration::seconds(1));
+        app.state.tasks.renew(&iac, busy.id).await.unwrap();
+    }
+    let path = format!("/ui/tasks/{}", busy.id);
+    let first = app.get(&path, Some(&cookie)).await;
+    let kinds = select_texts(&first, ".event-kind");
+    assert_eq!(kinds.len(), 50, "one page of events");
+    let older = Selector::parse("a.older").unwrap();
+    let href = first
+        .html()
+        .select(&older)
+        .next()
+        .expect("older link")
+        .value()
+        .attr("href")
+        .unwrap()
+        .to_string();
+    let second = app.get(&href, Some(&cookie)).await;
+    let rest = select_texts(&second, ".event-kind");
+    assert_eq!(rest.len(), 12, "60 renewals + claimed + created = 62");
+    assert_eq!(rest.last().unwrap(), "created");
+}
+
+#[tokio::test]
+async fn message_html_escaped() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let task = app.task(&iac, "Thread", None).await;
+    let evil = "<script>alert(1)</script>";
+    let from = Actor::Agent(iac.agent.id, iac.session.id);
+    let to_human = app
+        .state
+        .messages
+        .send(
+            &from,
+            NewMessage {
+                to: Address::Human,
+                subject: Some("<b>subj</b>".into()),
+                body: evil.into(),
+                importance: Importance::Normal,
+                reply_to: None,
+            },
+        )
+        .await
+        .unwrap();
+    app.state
+        .messages
+        .send(
+            &from,
+            NewMessage {
+                to: Address::Task(task.id),
+                subject: None,
+                body: evil.into(),
+                importance: Importance::Normal,
+                reply_to: None,
+            },
+        )
+        .await
+        .unwrap();
+    for path in [
+        format!("/ui/inbox?m={}", to_human.id),
+        "/ui/inbox?view=all".to_string(),
+        "/ui/inbox?q=alert".to_string(),
+        format!("/ui/tasks/{}", task.id),
+    ] {
+        let page = app.get(&path, Some(&cookie)).await;
+        assert_eq!(page.status, StatusCode::OK, "{path}");
+        assert!(!page.body.contains("<script>alert"), "{path}");
+        assert!(!page.body.contains("<b>subj"), "{path}");
+    }
+    let reader = app
+        .get(&format!("/ui/inbox?m={}", to_human.id), Some(&cookie))
+        .await;
+    assert_eq!(select_texts(&reader, ".reader .peer-text"), [evil]);
+    let thread = app
+        .get(&format!("/ui/tasks/{}", task.id), Some(&cookie))
+        .await;
+    let bodies = select_texts(&thread, ".thread .peer-text");
+    assert_eq!(bodies, ["body", evil]);
+    // Each thread message names its sender and project.
+    assert!(
+        select_texts(&thread, ".thread .msg-from")
+            .iter()
+            .all(|f| f.contains("claude-code@mac"))
+    );
+}
+
+#[tokio::test]
+async fn inbox_split_view_receipts_and_search() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let from = Actor::Agent(iac.agent.id, iac.session.id);
+    let csrf = csrf_for(&app, &cookie).await;
+    let question = app
+        .state
+        .messages
+        .send(
+            &from,
+            NewMessage {
+                to: Address::Human,
+                subject: Some("Need a decision".into()),
+                body: "Blue or green?".into(),
+                importance: Importance::Urgent,
+                reply_to: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // The human inbox lists it, unread.
+    let inbox = app.get("/ui/inbox", Some(&cookie)).await;
+    assert_eq!(
+        select_texts(&inbox, "#inbox-list .msg-subject"),
+        ["Need a decision"]
+    );
+    assert_eq!(select_texts(&inbox, "#inbox-list .unread").len(), 1);
+    // Opening it shows the reader and marks it read.
+    let open = app
+        .get(&format!("/ui/inbox?m={}", question.id), Some(&cookie))
+        .await;
+    assert_eq!(
+        select_texts(&open, ".reader .peer-text"),
+        ["Blue or green?"]
+    );
+    assert_eq!(select_texts(&open, "#inbox-list .unread").len(), 0);
+
+    // Reply to the agent as the human: it reaches the agent's inbox, replying to the question.
+    let mut events = app.state.bus.subscribe();
+    let page = app
+        .post_form(
+            "/ui/messages",
+            Some(&cookie),
+            &form(
+                &csrf,
+                &[
+                    ("to_kind", "agent"),
+                    ("to", &iac.agent.id.to_string()),
+                    ("subject", "Re: Need a decision"),
+                    ("body", "Green."),
+                    ("importance", "normal"),
+                    ("reply_to", &question.id.to_string()),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(event, coord::events::Event::MessageCreated { .. }),
+        "{event:?}"
+    );
+    let got = app
+        .state
+        .messages
+        .inbox(&iac, coord::service::messages::InboxFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].message.body, "Green.");
+    assert_eq!(got[0].message.from, Actor::Human);
+    assert_eq!(got[0].message.reply_to, Some(question.id));
+
+    // Receipts in the all-project feed: the reply was delivered (the agent fetched it), the
+    // question was replied to.
+    let all = app.get("/ui/inbox?view=all", Some(&cookie)).await;
+    let receipts = select_texts(&all, "#inbox-list .receipt");
+    assert_eq!(receipts, ["delivered", "replied"], "newest first");
+    app.state
+        .messages
+        .mark_read(Caller::Agent(&iac), &[got[0].message.id])
+        .await
+        .unwrap();
+    let all = app.get("/ui/inbox?view=all", Some(&cookie)).await;
+    assert_eq!(select_texts(&all, "#inbox-list .receipt")[0], "read");
+
+    // A project-wide message nobody fetched yet is only "sent".
+    let page = app
+        .post_form(
+            "/ui/messages",
+            Some(&cookie),
+            &form(
+                &csrf,
+                &[
+                    ("to_kind", "project"),
+                    ("to", &iac.agent.project_id.unwrap().to_string()),
+                    ("subject", ""),
+                    ("body", "Heads up, everyone"),
+                    ("importance", "high"),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    let all = app.get("/ui/inbox?view=all", Some(&cookie)).await;
+    assert_eq!(select_texts(&all, "#inbox-list .receipt")[0], "sent");
+
+    // Search.
+    let found = app.get("/ui/inbox?q=green", Some(&cookie)).await;
+    assert_eq!(found.status, StatusCode::OK);
+    let previews = select_texts(&found, "#inbox-list .msg-preview");
+    assert_eq!(previews.len(), 2, "{previews:?}");
+
+    // Archiving (acking) takes it out of the human inbox.
+    let page = app
+        .post_form(
+            &format!("/ui/inbox/{}/archive", question.id),
+            Some(&cookie),
+            &form(&csrf, &[]),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER);
+    let inbox = app.get("/ui/inbox", Some(&cookie)).await;
+    assert!(select_texts(&inbox, "#inbox-list .msg-subject").is_empty());
+}
+
+#[tokio::test]
+async fn inbox_feed_is_paged() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let from = Actor::Agent(iac.agent.id, iac.session.id);
+    for i in 0..55 {
+        app.clock.advance(time::Duration::seconds(1));
+        app.state
+            .messages
+            .send(
+                &from,
+                NewMessage {
+                    to: Address::Project(iac.agent.project_id.unwrap()),
+                    subject: Some(format!("note {i}")),
+                    body: "x".into(),
+                    importance: Importance::Normal,
+                    reply_to: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let first = app.get("/ui/inbox?view=all", Some(&cookie)).await;
+    let subjects = select_texts(&first, "#inbox-list .msg-subject");
+    assert_eq!(subjects.len(), 50);
+    assert_eq!(subjects[0], "note 54");
+    let older = Selector::parse("a.older").unwrap();
+    let href = first
+        .html()
+        .select(&older)
+        .next()
+        .expect("older link")
+        .value()
+        .attr("href")
+        .unwrap()
+        .replace("&amp;", "&");
+    let second = app.get(&href, Some(&cookie)).await;
+    let subjects = select_texts(&second, "#inbox-list .msg-subject");
+    assert_eq!(subjects, ["note 4", "note 3", "note 2", "note 1", "note 0"]);
+    assert!(second.html().select(&older).next().is_none());
+}
+
+#[tokio::test]
+async fn post_into_thread_as_human() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let task = app.task(&iac, "Thread", None).await;
+    let csrf = csrf_for(&app, &cookie).await;
+    let path = format!("/ui/tasks/{}", task.id);
+    let page = app
+        .post_form(
+            &format!("{path}/post"),
+            Some(&cookie),
+            &form(
+                &csrf,
+                &[("body", "From the human"), ("importance", "normal")],
+            ),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    assert_eq!(page.location.as_deref(), Some(path.as_str()));
+    let thread = app.state.messages.thread(task.id).await.unwrap();
+    assert_eq!(thread.last().unwrap().from, Actor::Human);
+    assert_eq!(thread.last().unwrap().body, "From the human");
+    // The creating agent gets it in its inbox.
+    let got = app
+        .state
+        .messages
+        .inbox(&iac, coord::service::messages::InboxFilter::default())
+        .await
+        .unwrap();
+    assert!(got.iter().any(|i| i.message.body == "From the human"));
+    let detail = app.get(&path, Some(&cookie)).await;
+    assert!(
+        select_texts(&detail, ".thread .msg-from")
+            .iter()
+            .any(|f| f.contains("you"))
+    );
+    // An empty post is refused.
+    let page = app
+        .post_form(
+            &format!("{path}/post"),
+            Some(&cookie),
+            &form(&csrf, &[("body", " ")]),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn rename_project_sanitises_display_name() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let project = iac.agent.project_id.unwrap();
+    let csrf = csrf_for(&app, &cookie).await;
+    let path = format!("/ui/projects/{project}/rename");
+
+    let projects = app.get("/ui/projects", Some(&cookie)).await;
+    assert!(projects.text().contains(IAC), "key shown");
+
+    let page = app
+        .post_form(
+            &path,
+            Some(&cookie),
+            &form(&csrf, &[("display_name", "  Infra as Code  ")]),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    assert_eq!(page.location.as_deref(), Some("/ui/projects"));
+    let stored = app.state.store.get_project(project).await.unwrap().unwrap();
+    assert_eq!(stored.display_name, "Infra as Code");
+
+    let too_long = "x".repeat(81);
+    for bad in [
+        "",
+        "   ",
+        "line\nbreak",
+        "tab\there",
+        "[coord from x]",
+        "a]b",
+        too_long.as_str(),
+    ] {
+        let page = app
+            .post_form(&path, Some(&cookie), &form(&csrf, &[("display_name", bad)]))
+            .await;
+        assert_eq!(page.status, StatusCode::UNPROCESSABLE_ENTITY, "{bad:?}");
+    }
+    let ok80 = "é".repeat(80);
+    let page = app
+        .post_form(
+            &path,
+            Some(&cookie),
+            &form(&csrf, &[("display_name", &ok80)]),
+        )
+        .await;
+    assert_eq!(
+        page.status,
+        StatusCode::SEE_OTHER,
+        "80 characters (not bytes) is fine"
+    );
+    let stored = app.state.store.get_project(project).await.unwrap().unwrap();
+    assert_eq!(stored.display_name, ok80);
+}
+
+#[tokio::test]
+async fn revoke_token_blocks_api() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let (id, plaintext) = app.state.auth.create("mac-claude").await.unwrap();
+    let heartbeat = || {
+        Request::post("/v1/heartbeat")
+            .header(header::AUTHORIZATION, format!("Bearer {plaintext}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"session_id":"{}"}}"#,
+                SessionId::new()
+            )))
+            .unwrap()
+    };
+    // Accepted (an unknown session, but not unauthorised).
+    let before = app.send(heartbeat()).await;
+    assert_ne!(before.status, StatusCode::UNAUTHORIZED, "{}", before.body);
+
+    let tokens = app.get("/ui/tokens", Some(&cookie)).await;
+    assert!(tokens.text().contains("mac-claude"));
+    assert!(!tokens.body.contains(&plaintext), "never shows the secret");
+    let csrf = csrf_of(&tokens);
+    let page = app
+        .post_form(
+            &format!("/ui/tokens/{id}/revoke"),
+            Some(&cookie),
+            &form(&csrf, &[]),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    assert_eq!(page.location.as_deref(), Some("/ui/tokens"));
+
+    let after = app.send(heartbeat()).await;
+    assert_eq!(after.status, StatusCode::UNAUTHORIZED);
+    let tokens = app.get("/ui/tokens", Some(&cookie)).await;
+    assert!(
+        select_texts(&tokens, ".token-state")
+            .iter()
+            .any(|s| s.starts_with("revoked"))
+    );
+}
+
+#[tokio::test]
+async fn live_stream_pings_task_pages_and_inbox() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let parent = app.task(&iac, "Parent", None).await;
+    let mut stream = open_live(&app, &cookie).await;
+
+    // A child's change re-fetches its own page and its parent's.
+    let child = app.task(&iac, "Child", Some(parent.id)).await;
+    let wait = Duration::from_secs(2);
+    assert!(
+        wait_for_event(&mut stream, &format!("detail-{}", child.id), wait)
+            .await
+            .is_some()
+    );
+    assert!(
+        wait_for_event(&mut stream, &format!("detail-{}", parent.id), wait)
+            .await
+            .is_some()
+    );
+
+    // A thread post re-fetches the task page; any message re-fetches the inbox.
+    app.state
+        .messages
+        .send(
+            &Actor::Human,
+            NewMessage {
+                to: Address::Task(parent.id),
+                subject: None,
+                body: "hi".into(),
+                importance: Importance::Normal,
+                reply_to: None,
+            },
+        )
+        .await
+        .unwrap();
+    // Frames come in order: `inbox`, then the thread's `detail-<id>`.
+    assert!(wait_for_event(&mut stream, "inbox", wait).await.is_some());
+    assert!(
+        wait_for_event(&mut stream, &format!("detail-{}", parent.id), wait)
+            .await
+            .is_some()
+    );
+}

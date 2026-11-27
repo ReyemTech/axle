@@ -10,13 +10,14 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 use time::{Duration as TimeDuration, OffsetDateTime};
 
 use super::{
-    ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate, Recipient, Store,
-    StoreError, StoreResult, TaskFilter, TransitionRequest, child_event, children_complete_event,
-    claim_event, closes_child, edit_payload, send_time_recipient,
+    ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate, MessageReceipt, Recipient,
+    Store, StoreError, StoreResult, TaskFilter, TransitionRequest, child_event,
+    children_complete_event, claim_event, closes_child, edit_payload, send_time_recipient,
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, Eligibility, Importance, InboxItem, Message, MessageId,
-    Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskId, TokenId, TokenInfo,
+    Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TokenId,
+    TokenInfo,
 };
 
 /// Write transactions take the write lock up front, so a read-then-update inside one is
@@ -953,6 +954,33 @@ impl Store for SqliteStore {
         .collect()
     }
 
+    async fn task_events_page(
+        &self,
+        id: TaskId,
+        kind: Option<TaskEventKind>,
+        before: Option<uuid::Uuid>,
+        limit: u32,
+    ) -> StoreResult<Vec<TaskEvent>> {
+        sqlx::query(
+            "SELECT id, task_id, kind, actor_agent_id, actor_session_id, note, payload, created_at
+             FROM task_events
+             WHERE task_id = ?1 AND (?2 IS NULL OR kind = ?2)
+               AND (?3 IS NULL
+                    OR (created_at, id) < (SELECT b.created_at, b.id FROM task_events b
+                                           WHERE b.id = ?3))
+             ORDER BY created_at DESC, id DESC LIMIT ?4",
+        )
+        .bind(id.to_string())
+        .bind(kind.map(|k| k.as_str()))
+        .bind(before.map(|b| b.to_string()))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(event_from)
+        .collect()
+    }
+
     async fn claim_task(&self, task: TaskId, req: &ClaimRequest) -> StoreResult<ClaimAttempt> {
         let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
         let attempt = claim_locked(&mut tx, task, req).await?;
@@ -1306,5 +1334,56 @@ impl Store for SqliteStore {
         .iter()
         .map(message_from)
         .collect()
+    }
+
+    async fn list_messages(
+        &self,
+        project: Option<ProjectId>,
+        before: Option<MessageId>,
+        limit: u32,
+    ) -> StoreResult<Vec<Message>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            message_cols!(),
+            " FROM messages m
+             WHERE (?1 IS NULL OR m.project_id = ?1)
+               AND (?2 IS NULL OR m.seq < (SELECT b.seq FROM messages b WHERE b.id = ?2))
+             ORDER BY m.seq DESC LIMIT ?3"
+        ))
+        .bind(project.map(|p| p.to_string()))
+        .bind(before.map(|b| b.to_string()))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(message_from)
+        .collect()
+    }
+
+    async fn message_receipts(&self, ids: &[MessageId]) -> StoreResult<Vec<MessageReceipt>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let row = sqlx::query(
+                "SELECT COUNT(*) AS n_rows, COUNT(delivered_at) AS n_delivered,
+                        COUNT(read_at) AS n_read,
+                        EXISTS (SELECT 1 FROM messages r WHERE r.reply_to = ?1) AS replied
+                 FROM message_recipients WHERE message_id = ?1",
+            )
+            .bind(id.to_string())
+            .fetch_one(&self.pool)
+            .await?;
+            let count = |name: &str| -> StoreResult<u32> {
+                let n: i64 = row.try_get(name)?;
+                Ok(u32::try_from(n).unwrap_or(u32::MAX))
+            };
+            out.push(MessageReceipt {
+                id: *id,
+                recipients: count("n_rows")?,
+                delivered: count("n_delivered")?,
+                read: count("n_read")?,
+                replied: row.try_get::<i64, _>("replied")? != 0,
+            });
+        }
+        Ok(out)
     }
 }

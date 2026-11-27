@@ -141,6 +141,15 @@ pub trait Store: Send + Sync {
     async fn list_tasks(&self, filter: &TaskFilter) -> StoreResult<Vec<Task>>;
     /// A task's history, oldest first.
     async fn task_events(&self, id: TaskId) -> StoreResult<Vec<TaskEvent>>;
+    /// A page of a task's history, newest first: only events of `kind` when set, and only
+    /// events older than the event `before` (in `(at, id)` order) when set.
+    async fn task_events_page(
+        &self,
+        id: TaskId,
+        kind: Option<TaskEventKind>,
+        before: Option<uuid::Uuid>,
+        limit: u32,
+    ) -> StoreResult<Vec<TaskEvent>>;
 
     /// The spec §8 guarded claim. In one transaction: locks and reads the task, runs the
     /// guarded `UPDATE … RETURNING`, and on success appends the event from `claim_event`.
@@ -222,6 +231,43 @@ pub trait Store: Send + Sync {
     ) -> StoreResult<Vec<Message>>;
     /// A task's thread, oldest first.
     async fn task_thread(&self, task: TaskId) -> StoreResult<Vec<Message>>;
+    /// Every message (or only those whose `project_id` is `project`), newest first; with
+    /// `before`, only messages sent before that one. An unknown `before` gives nothing.
+    async fn list_messages(
+        &self,
+        project: Option<ProjectId>,
+        before: Option<MessageId>,
+        limit: u32,
+    ) -> StoreResult<Vec<Message>>;
+    /// Delivery receipts for `ids`, in the same order (an unknown id gets an empty receipt).
+    async fn message_receipts(&self, ids: &[MessageId]) -> StoreResult<Vec<MessageReceipt>>;
+}
+
+/// How far a message has got, from its recipient rows (spec §9 receipts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageReceipt {
+    pub id: MessageId,
+    /// Recipient rows so far (project and task messages get theirs when read).
+    pub recipients: u32,
+    pub delivered: u32,
+    pub read: u32,
+    /// Some message has `reply_to` = this one.
+    pub replied: bool,
+}
+
+impl MessageReceipt {
+    /// The furthest stage reached: `sent`, `delivered`, `read` or `replied`.
+    pub fn state(&self) -> &'static str {
+        if self.replied {
+            "replied"
+        } else if self.read > 0 {
+            "read"
+        } else if self.delivered > 0 {
+            "delivered"
+        } else {
+            "sent"
+        }
+    }
 }
 
 /// Whose inbox an operation works on.

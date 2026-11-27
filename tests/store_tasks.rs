@@ -1160,3 +1160,55 @@ store_matrix!(
         assert_eq!(page(Some(ids[2])).await, Vec::<TaskId>::new());
     }
 );
+
+store_matrix!(
+    task_events_paged_newest_first,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let me = env.session("mac", "claude-code").await;
+        let task = env.task(&me, Eligibility::default()).await;
+        env.clock.advance(Duration::seconds(1));
+        assert!(matches!(
+            env.svc.claim(&me, task.id).await.unwrap(),
+            ClaimOutcome::Claimed(_)
+        ));
+        for _ in 0..3 {
+            env.clock.advance(Duration::seconds(1));
+            env.svc.renew(&me, task.id).await.unwrap();
+        }
+        let kinds = |es: &[coord::domain::TaskEvent]| es.iter().map(|e| e.kind).collect::<Vec<_>>();
+        let first = env
+            .store
+            .task_events_page(task.id, None, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            kinds(&first),
+            [TaskEventKind::Renewed, TaskEventKind::Renewed]
+        );
+        let rest = env
+            .store
+            .task_events_page(task.id, None, Some(first[1].id), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            kinds(&rest),
+            [
+                TaskEventKind::Renewed,
+                TaskEventKind::Claimed,
+                TaskEventKind::Created
+            ]
+        );
+        let claims = env
+            .store
+            .task_events_page(task.id, Some(TaskEventKind::Claimed), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(kinds(&claims), [TaskEventKind::Claimed]);
+        // The whole history, oldest first, is the same events reversed.
+        let all = env.store.task_events(task.id).await.unwrap();
+        let mut paged: Vec<_> = first.into_iter().chain(rest).collect();
+        paged.reverse();
+        assert_eq!(paged, all);
+    }
+);

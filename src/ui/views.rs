@@ -14,7 +14,9 @@ use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 
 use super::SessionCtx;
-use crate::domain::{Agent, AgentId, Importance, Project, ProjectId, Task, TaskId, TaskStatus};
+use crate::domain::{
+    Actor, Address, Agent, AgentId, Importance, Project, ProjectId, Task, TaskId, TaskStatus,
+};
 use crate::events::Event;
 use crate::http::AppState;
 use crate::service::tasks::Progress;
@@ -42,6 +44,12 @@ const COLUMNS: [(TaskStatus, &str); 5] = [
 pub enum UiError {
     #[error("not found: {0}")]
     NotFound(&'static str),
+    /// A form value the action cannot use (422).
+    #[error("{0}")]
+    Invalid(String),
+    /// The action does not fit the current state, like releasing an open task (409).
+    #[error("{0}")]
+    Conflict(String),
     #[error("{0}")]
     Internal(String),
 }
@@ -62,6 +70,8 @@ impl IntoResponse for UiError {
     fn into_response(self) -> Response {
         match self {
             UiError::NotFound(what) => error_page(StatusCode::NOT_FOUND, what),
+            UiError::Invalid(why) => error_page(StatusCode::UNPROCESSABLE_ENTITY, &why),
+            UiError::Conflict(why) => error_page(StatusCode::CONFLICT, &why),
             UiError::Internal(e) => {
                 eprintln!("coord: ui error: {e}");
                 error_page(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong.")
@@ -70,7 +80,7 @@ impl IntoResponse for UiError {
     }
 }
 
-type UiResult<T> = Result<T, UiError>;
+pub(super) type UiResult<T> = Result<T, UiError>;
 
 #[derive(Template)]
 #[template(path = "error.html")]
@@ -86,7 +96,7 @@ pub fn error_page(status: StatusCode, message: &str) -> Response {
     }
 }
 
-fn html(t: &impl Template) -> UiResult<Response> {
+pub(super) fn html(t: &impl Template) -> UiResult<Response> {
     Ok(Html(t.render()?).into_response())
 }
 
@@ -121,14 +131,14 @@ pub struct ProjectLabel {
 }
 
 /// Caches project and agent lookups for one render.
-struct Labels<'a> {
-    store: &'a dyn Store,
-    projects: HashMap<ProjectId, Project>,
+pub(super) struct Labels<'a> {
+    pub(super) store: &'a dyn Store,
+    pub(super) projects: HashMap<ProjectId, Project>,
     agents: HashMap<AgentId, Option<Agent>>,
 }
 
 impl<'a> Labels<'a> {
-    async fn load(store: &'a dyn Store) -> StoreResult<Self> {
+    pub(super) async fn load(store: &'a dyn Store) -> StoreResult<Self> {
         let projects = store
             .list_projects()
             .await?
@@ -142,7 +152,7 @@ impl<'a> Labels<'a> {
         })
     }
 
-    fn project(&self, id: ProjectId) -> ProjectLabel {
+    pub(super) fn project(&self, id: ProjectId) -> ProjectLabel {
         match self.projects.get(&id) {
             Some(p) => ProjectLabel {
                 name: p.display_name.clone(),
@@ -164,10 +174,38 @@ impl<'a> Labels<'a> {
     }
 
     /// `harness@host`, like `claude-code@mac`.
-    async fn agent_label(&mut self, id: AgentId) -> StoreResult<String> {
+    pub(super) async fn agent_label(&mut self, id: AgentId) -> StoreResult<String> {
         Ok(match self.agent(id).await? {
             Some(a) => format!("{}@{}", a.harness, a.host),
             None => "unknown agent".into(),
+        })
+    }
+
+    /// An agent's label, or `you` for the human.
+    pub(super) async fn actor_label(&mut self, actor: Actor) -> StoreResult<String> {
+        match actor {
+            Actor::Agent(a, _) => self.agent_label(a).await,
+            Actor::Human => Ok("you".into()),
+        }
+    }
+
+    /// Who a message is addressed to, for people.
+    pub(super) async fn address_label(&mut self, to: Address) -> StoreResult<String> {
+        Ok(match to {
+            Address::Project(p) => format!("everyone in {}", self.project(p).name),
+            Address::Agent(a) => self.agent_label(a).await?,
+            Address::Session(s) => match self.store.get_session(s).await? {
+                Some(session) => format!(
+                    "{} (one session)",
+                    self.agent_label(session.agent_id).await?
+                ),
+                None => "unknown session".into(),
+            },
+            Address::Task(t) => match self.store.get_task(t).await? {
+                Some(task) => format!("thread: {}", task.title),
+                None => "unknown task".into(),
+            },
+            Address::Human => "you".into(),
         })
     }
 }
@@ -253,6 +291,7 @@ pub struct ColumnView {
     pub cards: Vec<CardView>,
 }
 
+#[derive(Clone)]
 pub struct ProjectOption {
     pub id: String,
     pub name: String,
@@ -282,6 +321,25 @@ pub struct BoardQuery {
     /// A project key or id.
     #[serde(default)]
     pub project: Option<String>,
+}
+
+/// Every project as a `<select>` option, by name (`selected`: the chosen one).
+pub(super) fn project_options(
+    labels: &Labels<'_>,
+    selected: Option<ProjectId>,
+) -> Vec<ProjectOption> {
+    let mut projects: Vec<ProjectOption> = labels
+        .projects
+        .values()
+        .map(|p| ProjectOption {
+            id: p.id.to_string(),
+            name: p.display_name.clone(),
+            key: p.key.clone(),
+            selected: selected == Some(p.id),
+        })
+        .collect();
+    projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.key.cmp(&b.key)));
+    projects
 }
 
 /// The project named by `?project=` (its id or its key); `None` when absent or blank.
@@ -346,17 +404,7 @@ pub async fn board(
     let filter = board_filter(&*state.store, &q).await?;
     let mut labels = Labels::load(&*state.store).await?;
     let columns = columns(&state, &mut labels, filter.as_ref().map(|p| p.id)).await?;
-    let mut projects: Vec<ProjectOption> = labels
-        .projects
-        .values()
-        .map(|p| ProjectOption {
-            id: p.id.to_string(),
-            name: p.display_name.clone(),
-            key: p.key.clone(),
-            selected: filter.as_ref().is_some_and(|f| f.id == p.id),
-        })
-        .collect();
-    projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.key.cmp(&b.key)));
+    let projects = project_options(&labels, filter.as_ref().map(|f| f.id));
     html(&BoardPage {
         csrf: Some(session.csrf),
         nav: "board",
@@ -392,7 +440,7 @@ struct ChildrenFragment {
     children: Vec<ChildView>,
 }
 
-fn status_icon(status: TaskStatus) -> &'static str {
+pub(super) fn status_icon(status: TaskStatus) -> &'static str {
     match status {
         TaskStatus::Open => "○",
         TaskStatus::Claimed => "●",
@@ -471,7 +519,7 @@ struct OverviewPanel {
 }
 
 /// "12s ago", "5m ago", "3h ago", "2d ago".
-fn ago(now: OffsetDateTime, t: OffsetDateTime) -> String {
+pub(super) fn ago(now: OffsetDateTime, t: OffsetDateTime) -> String {
     let secs = (now - t).whole_seconds().max(0);
     match secs {
         s if s < 60 => format!("{s}s ago"),
@@ -594,11 +642,13 @@ const PING: &str = "1";
 /// `(event name, data)` pairs for the UI stream; see `super::live`.
 pub type Frames = Vec<(String, String)>;
 
-/// What every page should re-fetch after missed events.
+/// What every page should re-fetch after missed events. (A task page re-fetches on its
+/// own `detail-<id>` frames only; after a lag it catches up on the next change.)
 pub fn refresh_frames() -> Frames {
     vec![
         ("board".into(), PING.into()),
         ("overview".into(), PING.into()),
+        ("inbox".into(), PING.into()),
     ]
 }
 
@@ -614,15 +664,25 @@ pub async fn live_frames(state: &AppState, event: &Event) -> Frames {
 }
 
 async fn task_frames(state: &AppState, event: &Event) -> UiResult<Frames> {
-    let Event::TaskChanged { id, kind, .. } = *event else {
-        return Ok(vec![("overview".into(), PING.into())]);
+    let (id, kind) = match *event {
+        Event::TaskChanged { id, kind, .. } => (id, kind),
+        Event::MessageCreated { to, .. } => {
+            let mut frames = vec![("inbox".to_string(), PING.to_string())];
+            if let Address::Task(t) = to {
+                frames.push((format!("detail-{t}"), PING.into()));
+            }
+            frames.push(("overview".into(), PING.into()));
+            return Ok(frames);
+        }
     };
-    // The card on the board is the task's top-level ancestor.
+    // The card on the board is the task's top-level ancestor; the task page of the task and
+    // of every ancestor (their children lists) re-fetch.
     let mut root = state
         .store
         .get_task(id)
         .await?
         .ok_or(UiError::NotFound("task"))?;
+    let mut frames = vec![(format!("detail-{id}"), PING.to_string())];
     for _ in 0..MAX_DEPTH {
         let Some(parent) = root.parent_id else { break };
         root = state
@@ -630,8 +690,8 @@ async fn task_frames(state: &AppState, event: &Event) -> UiResult<Frames> {
             .get_task(parent)
             .await?
             .ok_or(UiError::NotFound("task"))?;
+        frames.push((format!("detail-{parent}"), PING.into()));
     }
-    let mut frames = Vec::with_capacity(3);
     if root.id == id && kind != crate::domain::TaskEventKind::Edited {
         frames.push(("board".into(), PING.into()));
     }

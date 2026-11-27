@@ -10,6 +10,23 @@
     </select>
     <noscript><button type="submit">Filter</button></noscript>
   </form>
+  {% if let Some(token) = csrf %}{% if !projects.is_empty() %}
+  <details class="new-task">
+    <summary>New task</summary>
+    <form class="stack" method="post" action="/ui/tasks">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <label for="new-project">Project</label>
+      <select id="new-project" name="project" required>
+        {% for p in projects %}<option value="{{ p.id }}" title="{{ p.key }}"{% if p.selected %} selected{% endif %}>{{ p.name }}</option>{% endfor %}
+      </select>
+      <label for="new-title">Title</label>
+      <input id="new-title" name="title" required>
+      <label for="new-body">Details</label>
+      <textarea id="new-body" name="body" rows="4"></textarea>
+      <button type="submit">Create task</button>
+    </form>
+  </details>
+  {% endif %}{% endif %}
 </div>
 <div id="columns" class="columns"
      hx-get="/ui/board/columns{% if let Some(id) = filter %}?project={{ id }}{% endif %}"

@@ -7,13 +7,14 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use super::{
-    ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate, Recipient, Store,
-    StoreError, StoreResult, TaskFilter, TransitionRequest, child_event, children_complete_event,
-    claim_event, closes_child, edit_payload, send_time_recipient,
+    ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate, MessageReceipt, Recipient,
+    Store, StoreError, StoreResult, TaskFilter, TransitionRequest, child_event,
+    children_complete_event, claim_event, closes_child, edit_payload, send_time_recipient,
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, Eligibility, Importance, InboxItem, Message, MessageId,
-    Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskId, TokenId, TokenInfo,
+    Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TokenId,
+    TokenInfo,
 };
 
 pub struct PostgresStore {
@@ -879,6 +880,34 @@ impl Store for PostgresStore {
         .collect()
     }
 
+    async fn task_events_page(
+        &self,
+        id: TaskId,
+        kind: Option<TaskEventKind>,
+        before: Option<Uuid>,
+        limit: u32,
+    ) -> StoreResult<Vec<TaskEvent>> {
+        sqlx::query(
+            "SELECT id, task_id, kind, actor_agent_id, actor_session_id, note,
+                    payload::text AS payload, created_at
+             FROM task_events
+             WHERE task_id = $1 AND ($2::text IS NULL OR kind = $2)
+               AND ($3::uuid IS NULL
+                    OR (created_at, id) < (SELECT b.created_at, b.id FROM task_events b
+                                           WHERE b.id = $3))
+             ORDER BY created_at DESC, id DESC LIMIT $4",
+        )
+        .bind(id.as_uuid())
+        .bind(kind.map(|k| k.as_str()))
+        .bind(before)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(event_from)
+        .collect()
+    }
+
     async fn claim_task(&self, task: TaskId, req: &ClaimRequest) -> StoreResult<ClaimAttempt> {
         let mut tx = self.pool.begin().await?;
         let attempt = claim_locked(&mut tx, task, req).await?;
@@ -1216,4 +1245,55 @@ impl Store for PostgresStore {
         .map(message_from)
         .collect()
     }
+
+    async fn list_messages(
+        &self,
+        project: Option<ProjectId>,
+        before: Option<MessageId>,
+        limit: u32,
+    ) -> StoreResult<Vec<Message>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            message_cols!(),
+            " FROM messages m
+             WHERE ($1::uuid IS NULL OR m.project_id = $1)
+               AND ($2::uuid IS NULL OR m.seq < (SELECT b.seq FROM messages b WHERE b.id = $2))
+             ORDER BY m.seq DESC LIMIT $3"
+        ))
+        .bind(project.map(|p| p.as_uuid()))
+        .bind(before.map(|b| b.as_uuid()))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(message_from)
+        .collect()
+    }
+
+    async fn message_receipts(&self, ids: &[MessageId]) -> StoreResult<Vec<MessageReceipt>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let row = sqlx::query(
+                "SELECT COUNT(*) AS n_rows, COUNT(delivered_at) AS n_delivered,
+                        COUNT(read_at) AS n_read,
+                        EXISTS (SELECT 1 FROM messages r WHERE r.reply_to = $1) AS replied
+                 FROM message_recipients WHERE message_id = $1",
+            )
+            .bind(id.as_uuid())
+            .fetch_one(&self.pool)
+            .await?;
+            out.push(MessageReceipt {
+                id: *id,
+                recipients: count(row.try_get("n_rows")?),
+                delivered: count(row.try_get("n_delivered")?),
+                read: count(row.try_get("n_read")?),
+                replied: row.try_get("replied")?,
+            });
+        }
+        Ok(out)
+    }
+}
+
+fn count(n: i64) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
 }

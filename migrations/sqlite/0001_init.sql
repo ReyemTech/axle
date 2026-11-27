@@ -114,6 +114,8 @@ CREATE TABLE messages (
 CREATE INDEX messages_to ON messages (to_kind, to_id, created_at);
 CREATE INDEX messages_task ON messages (task_id, created_at);
 CREATE INDEX messages_project ON messages (project_id, created_at);
+-- Receipts: "replied" is a lookup by reply_to.
+CREATE INDEX messages_reply_to ON messages (reply_to);
 
 CREATE VIRTUAL TABLE messages_fts USING fts5(
     subject, body, content = 'messages', content_rowid = 'seq'
