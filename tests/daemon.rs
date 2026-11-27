@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::TcpListener;
 use std::os::unix::process::ExitStatusExt;
@@ -34,6 +35,7 @@ impl Drop for TempHome {
     }
 }
 
+type Script = Arc<Mutex<HashMap<&'static str, VecDeque<bool>>>>;
 type Calls = Arc<Mutex<Vec<Vec<String>>>>;
 
 /// Records every command; nothing real runs. Programs in `fail` exit 1 for any args that
@@ -44,9 +46,19 @@ struct Recorder {
     fail_on: Vec<&'static str>,
     fail_all: bool,
     stdout: Vec<(&'static str, &'static str)>,
+    /// Per-subcommand scripted outcomes (true = exit 0), consumed in order.
+    script: Script,
 }
 
 impl Recorder {
+    fn script(self, key: &'static str, outcomes: &[bool]) -> Self {
+        self.script
+            .lock()
+            .unwrap()
+            .insert(key, outcomes.iter().copied().collect());
+        self
+    }
+
     fn calls(&self) -> Vec<Vec<String>> {
         self.calls.lock().unwrap().clone()
     }
@@ -57,7 +69,15 @@ impl Runner for Recorder {
         let mut call = vec![prog.to_string()];
         call.extend(args.iter().map(|a| a.to_string()));
         self.calls.lock().unwrap().push(call);
-        let failed = self.fail_all || args.iter().any(|a| self.fail_on.contains(a));
+        let scripted = {
+            let mut map = self.script.lock().unwrap();
+            args.iter()
+                .find_map(|a| map.get_mut(*a).and_then(|q| q.pop_front()))
+        };
+        let failed = match scripted {
+            Some(ok) => !ok,
+            None => self.fail_all || args.iter().any(|a| self.fail_on.contains(a)),
+        };
         let stdout = self
             .stdout
             .iter()
@@ -311,4 +331,84 @@ fn uninstall_keeps_db_unless_purge() {
         dir.root.join("token").exists(),
         "purge touches only the database"
     );
+}
+
+type SleepFn = Box<dyn Fn(std::time::Duration)>;
+
+fn no_sleep() -> (SleepFn, Arc<Mutex<u32>>) {
+    let n = Arc::new(Mutex::new(0));
+    let n2 = n.clone();
+    (Box::new(move |_| *n2.lock().unwrap() += 1), n)
+}
+
+fn verbs(calls: &[Vec<String>]) -> Vec<&str> {
+    calls.iter().map(|c| c[1].as_str()).collect()
+}
+
+#[test]
+fn launchd_reinstall_boots_out_polls_then_bootstraps() {
+    let home = TempHome::new();
+    // print: loaded (install check), loaded (poll 1), loaded (poll 2), gone (poll 3).
+    let rec = Recorder::default().script("print", &[true, true, true, false]);
+    let (sleep, slept) = no_sleep();
+    let ctl = Launchd::new(home.path(), Box::new(rec.clone()), 501).with_sleep(sleep);
+    ctl.install(&spec(home.path())).unwrap();
+    assert_eq!(
+        verbs(&rec.calls()),
+        ["print", "bootout", "print", "print", "print", "bootstrap"]
+    );
+    assert_eq!(
+        *slept.lock().unwrap(),
+        2,
+        "slept between the two still-loaded polls"
+    );
+}
+
+#[test]
+fn launchd_bootstrap_is_retried_after_io_error() {
+    let home = TempHome::new();
+    let rec = Recorder::default()
+        .script("print", &[false])
+        .script("bootstrap", &[false, false, true]);
+    let (sleep, slept) = no_sleep();
+    let ctl = Launchd::new(home.path(), Box::new(rec.clone()), 501).with_sleep(sleep);
+    ctl.install(&spec(home.path())).unwrap();
+    assert_eq!(
+        verbs(&rec.calls()),
+        ["print", "bootstrap", "bootstrap", "bootstrap"]
+    );
+    assert_eq!(*slept.lock().unwrap(), 2);
+
+    // Gives up (with the error) after a bounded number of attempts.
+    let rec = Recorder::default()
+        .script("print", &[false])
+        .script("bootstrap", &[false; 10]);
+    let (sleep, _) = no_sleep();
+    let ctl = Launchd::new(home.path(), Box::new(rec.clone()), 501).with_sleep(sleep);
+    assert!(ctl.install(&spec(home.path())).is_err());
+    assert_eq!(
+        rec.calls().iter().filter(|c| c[1] == "bootstrap").count(),
+        5
+    );
+}
+
+#[test]
+fn dollar_in_home_is_literal_in_environment_but_doubled_in_exec_start() {
+    let mut s = default_spec("/home/we$ird");
+    s.axl = PathBuf::from("/home/we$ird/bin/axl");
+    let unit = systemd_unit(&s);
+    assert!(unit.contains("Environment=\"DATABASE_URL=sqlite:///home/we$ird/.axl/axl.db\"\n"));
+    assert!(unit.contains("ExecStart=\"/home/we$$ird/bin/axl\" serve\n"));
+}
+
+#[test]
+fn purge_leaves_other_files_alike_axl_db_bak() {
+    let home = TempHome::new();
+    let dir = AxlDir::new(home.path());
+    dir.ensure().unwrap();
+    std::fs::write(dir.root.join("axl.db"), b"x").unwrap();
+    std::fs::write(dir.root.join("axl.db.bak"), b"keep").unwrap();
+    axle::daemon::purge_db(&dir).unwrap();
+    assert!(!dir.db_path().exists());
+    assert!(dir.root.join("axl.db.bak").exists());
 }

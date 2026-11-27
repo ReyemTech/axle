@@ -1,6 +1,7 @@
 //! macOS: a LaunchAgent at `~/Library/LaunchAgents/com.reyemtech.axle.plist`.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use super::{DaemonError, LABEL, Runner, ServiceControl, ServiceState, UnitSpec, run_ok};
 use crate::install::fsutil::write_atomic;
@@ -48,10 +49,18 @@ pub fn launchd_plist(spec: &UnitSpec) -> String {
     )
 }
 
+/// How long to wait for a booted-out job to disappear, and how often to look.
+const UNLOAD_POLLS: u32 = 25;
+const UNLOAD_POLL_EVERY: Duration = Duration::from_millis(200);
+/// `bootstrap` right after `bootout` can fail with "Input/output error"; retry a few times.
+const BOOTSTRAP_ATTEMPTS: u32 = 5;
+const BOOTSTRAP_RETRY_EVERY: Duration = Duration::from_millis(500);
+
 pub struct Launchd {
     home: PathBuf,
     runner: Box<dyn Runner>,
     uid: u32,
+    sleep: Box<dyn Fn(Duration)>,
 }
 
 impl Launchd {
@@ -60,7 +69,14 @@ impl Launchd {
             home: home.to_path_buf(),
             runner,
             uid,
+            sleep: Box::new(std::thread::sleep),
         }
+    }
+
+    /// Replaces the delay between polls and retries, so tests do not wait.
+    pub fn with_sleep(mut self, sleep: Box<dyn Fn(Duration)>) -> Self {
+        self.sleep = sleep;
+        self
     }
 
     fn domain(&self) -> String {
@@ -83,12 +99,31 @@ impl Launchd {
     }
 
     fn bootstrap(&self) -> Result<(), DaemonError> {
-        run_ok(
-            self.runner.as_ref(),
-            "launchctl",
-            &["bootstrap", &self.domain(), &self.plist()],
-        )
-        .map(|_| ())
+        let mut last = None;
+        for attempt in 0..BOOTSTRAP_ATTEMPTS {
+            if attempt > 0 {
+                (self.sleep)(BOOTSTRAP_RETRY_EVERY);
+            }
+            match run_ok(
+                self.runner.as_ref(),
+                "launchctl",
+                &["bootstrap", &self.domain(), &self.plist()],
+            ) {
+                Ok(_) => return Ok(()),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.expect("at least one attempt"))
+    }
+
+    /// Waits (bounded) until launchd no longer reports the job.
+    fn wait_unloaded(&self) {
+        for _ in 0..UNLOAD_POLLS {
+            if !self.loaded() {
+                return;
+            }
+            (self.sleep)(UNLOAD_POLL_EVERY);
+        }
     }
 }
 
@@ -100,6 +135,7 @@ impl ServiceControl for Launchd {
         // that also makes a re-install pick up a changed binary or port.
         if self.loaded() {
             let _ = self.runner.run("launchctl", &["bootout", &self.target()]);
+            self.wait_unloaded();
         }
         self.bootstrap()
     }

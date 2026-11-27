@@ -12,15 +12,16 @@ pub fn unit_path(home: &Path) -> PathBuf {
         .join(UNIT_NAME)
 }
 
-/// A value inside double quotes: `\`, `"` and `%` (a specifier) escaped.
-fn quote(s: &str) -> String {
+/// A value inside double quotes: `\`, `"` and `%` (a specifier) escaped. `$` is doubled
+/// only when `expand_dollar` (command lines expand it; `Environment=` values do not).
+fn quote(s: &str, expand_dollar: bool) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
         match c {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '%' => out.push_str("%%"),
-            '$' => out.push_str("$$"),
+            '$' if expand_dollar => out.push_str("$$"),
             c => out.push(c),
         }
     }
@@ -35,14 +36,17 @@ fn exec_word(s: &str) -> String {
     {
         s.to_string()
     } else {
-        quote(s)
+        quote(s, true)
     }
 }
 
 pub fn systemd_unit(spec: &UnitSpec) -> String {
     let mut env = String::new();
     for (k, v) in spec.env() {
-        env.push_str(&format!("Environment={}\n", quote(&format!("{k}={v}"))));
+        env.push_str(&format!(
+            "Environment={}\n",
+            quote(&format!("{k}={v}"), false)
+        ));
     }
     let log = spec.log_path().display().to_string().replace('%', "%%");
     format!(

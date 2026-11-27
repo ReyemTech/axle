@@ -178,14 +178,14 @@ fn save_port(dir: &AxlDir, port: u16) -> Result<(), ClientError> {
     save_config(dir, &cfg)
 }
 
-/// Deletes `axl.db` and its `-wal` / `-shm` / `-journal` companions.
+/// Deletes `axl.db` and its `-wal` / `-shm` companions, and nothing else (a user's
+/// `axl.db.bak` stays).
 pub fn purge_db(dir: &AxlDir) -> io::Result<()> {
-    let Ok(entries) = std::fs::read_dir(&dir.root) else {
-        return Ok(());
-    };
-    for e in entries.flatten() {
-        if e.file_name().to_string_lossy().starts_with("axl.db") {
-            std::fs::remove_file(e.path())?;
+    for name in ["axl.db", "axl.db-wal", "axl.db-shm"] {
+        match std::fs::remove_file(dir.root.join(name)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(())
