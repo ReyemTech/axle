@@ -37,9 +37,8 @@ docker pull <registry>/axle:latest
 ```sh
 cargo build --release
 export DATABASE_URL=sqlite://./axl.db
-export AXL_ADMIN_SECRET="$(openssl rand -hex 16)"   # signs you in to the UI
 
-./target/release/axl serve          # listens on 127.0.0.1:7420
+./target/release/axl serve          # listens on 127.0.0.1:7420, UI without sign-in
 ```
 
 In another shell, with the same `DATABASE_URL`:
@@ -51,7 +50,8 @@ In another shell, with the same `DATABASE_URL`:
 Keep the token in `AXL_TOKEN` or in `~/.axl/token` (mode 0600). Then wire up Claude
 Code (the MCP bridge and hooks) by following [docs/claude-code-setup.md](docs/claude-code-setup.md).
 
-The UI is at <http://127.0.0.1:7420/ui>; sign in with `AXL_ADMIN_SECRET`.
+The UI is at <http://127.0.0.1:7420/ui>. On a loopback address it needs no sign-in (see
+[UI sign-in](#ui-sign-in)); agents still need their bearer token.
 
 ## Postgres
 
@@ -59,6 +59,7 @@ Point `DATABASE_URL` at a Postgres instead; the schema is migrated on start.
 
 ```sh
 export DATABASE_URL=postgres://user:password@db.internal:5432/axle
+export AXL_ADMIN_SECRET="$(openssl rand -hex 16)"   # off loopback the UI needs a sign-in
 axl serve --bind 0.0.0.0:7420
 ```
 
@@ -73,10 +74,13 @@ docker run -d --name axle -p 127.0.0.1:7420:7420 \
   -e AXL_ADMIN_SECRET="$(openssl rand -hex 16)" \
   axle
 
-docker exec -e DATABASE_URL=sqlite:///data/axl.db axle axl token create --label my-laptop
+docker exec axle axl token create --label my-laptop
 ```
 
-The image runs as a non-root user, listens on `0.0.0.0:7420` inside the container, and keeps
+The container binds `0.0.0.0`, so it refuses to start until you pick a UI sign-in: pass
+`AXL_ADMIN_SECRET` as above, `AXL_TRUSTED_HEADER` behind an auth proxy, or
+`AXL_UI_AUTH=none` (with `AXL_ALLOWED_HOSTS` for any name other than localhost) when the
+port is reachable only from your machine or VPN. The image runs as a non-root user, listens on `0.0.0.0:7420` inside the container, and keeps
 SQLite data in the `/data` volume. The `-p 127.0.0.1:…` mapping publishes it on loopback only,
 matching local mode; widen it only behind TLS. For Postgres, pass a `postgres://` `DATABASE_URL` instead. `tests/smoke.sh`
 builds the image and checks it end to end.
@@ -109,14 +113,14 @@ database:
   urlKey: DATABASE_URL
 ```
 
-The UI sign-in secret is generated on first install and kept across upgrades; read it with
-the command `helm install` prints. To supply your own, set `adminSecret.existingSecret` (and
-`adminSecret.key`, default `AXL_ADMIN_SECRET`); it must be at least 16 characters. **With
-GitOps or Pulumi, always use `adminSecret.existingSecret`:** they render the chart with
-`helm template`, where the chart cannot look up the existing Secret, so a generated secret
-would change on every render. `cookieSecure` turns on automatically when
-`ingress.tls` is set; `trustedHeader` enables trusted-header sign-in behind an auth proxy.
-Other server settings go in `extraEnv`.
+UI sign-in is set under `ui.auth.mode`: `secret` (default; generated on first install and
+kept across upgrades, read it with the command `helm install` prints), `none`, or
+`trustedHeader` behind an auth proxy. **With GitOps or Pulumi, use
+`ui.auth.secret.existingSecret`:** they render with `helm template`, where the chart cannot
+look up a generated Secret. `ui.cookieSecure` turns on automatically when `ingress.tls` is
+set. Every option, with an example per mode, is in
+[deploy/helm/axle/README.md](deploy/helm/axle/README.md). Other server settings go in
+`extraEnv`.
 
 Create the first agent token inside the pod (shown once; keep it out of prompts and chat):
 
@@ -158,20 +162,42 @@ credentials, and you should not paste a token into prompts, chat or committed co
 | Variable | Default | Purpose |
 |---|---|---|
 | `DATABASE_URL` | required | `sqlite://path` or `postgres://...`; used by `serve`, `migrate` and `token` |
-| `AXL_ADMIN_SECRET` | required for `serve` | UI sign-in secret, at least 16 characters |
-| `AXL_BIND` | `127.0.0.1:7420` | Listen address (`serve --bind` overrides) |
-| `AXL_COOKIE_SECURE` | `false` | Mark the UI cookie `Secure`; set when the UI is served over https |
+| `AXL_UI_AUTH` | `auto` | UI sign-in: `auto`, `none`, `secret` or `trusted-header` (see [UI sign-in](#ui-sign-in)) |
+| `AXL_ADMIN_SECRET` | unset | UI sign-in secret, at least 16 characters |
 | `AXL_TRUSTED_HEADER` | off | Sign UI requests in by this header, set by an auth proxy (`serve --trusted-header` overrides) |
+| `AXL_ALLOWED_HOSTS` | none | Extra comma-separated `Host` names the UI answers to when it has no sign-in |
+| `AXL_BIND` | `127.0.0.1:7420` | Listen address, or `localhost:<port>` (`serve --bind` overrides) |
+| `AXL_COOKIE_SECURE` | `false` | Mark the UI cookie `Secure`; set when the UI is served over https |
 | `AXL_RATE_LIMIT_PER_SEC` | `20` | Sustained requests per second, per token |
 | `AXL_RATE_LIMIT_BURST` | `100` | Burst size, per token |
 | `AXL_TOKEN` | `~/.axl/token` | Bearer token for `bridge` and `hook` |
 | `AXL_SERVER_URL` | `http://127.0.0.1:7420` | Server URL for `bridge` and `hook` |
 | `AXL_PROJECT` | from `.axl` or git origin | Pin the project for a session |
 
+## UI sign-in
+
+`AXL_UI_AUTH` decides how the human signs in to the web UI. It never affects agents: MCP and
+`/v1` always need a bearer token, and `axl token create` needs only `DATABASE_URL` (direct
+database access is the trust boundary).
+
+| Mode | Behaviour |
+|---|---|
+| `auto` (default) | `trusted-header` if `AXL_TRUSTED_HEADER` is set, else `secret` if `AXL_ADMIN_SECRET` is set, else `none` when bound to loopback (`127.0.0.0/8`, `::1`, `localhost`); otherwise `serve` refuses to start and names the three ways out |
+| `none` | No login page and no log-out; every UI request is the human. Allowed off loopback (a container behind a VPN or an authenticating proxy), with a loud warning at start |
+| `secret` | Sign in with `AXL_ADMIN_SECRET` (required, at least 16 characters) |
+| `trusted-header` | Requests carrying `AXL_TRUSTED_HEADER` are signed in; the secret login also works when `AXL_ADMIN_SECRET` is set |
+
+Without sign-in the UI keeps its other defences: every POST still needs the CSRF token of an
+anonymous session cookie issued on first visit, the strict CSP stays, and requests whose
+`Host` is not `localhost`, `127.0.0.1`, `[::1]` (any port), the bind address or an
+`AXL_ALLOWED_HOSTS` entry are refused with 421, so a malicious page cannot reach the UI
+through DNS rebinding.
+
 ## Security
 
 Keep Axle private: bind it to localhost or run it on a tailnet or private network, behind
-TLS if it leaves the host. Only enable `AXL_TRUSTED_HEADER` behind a proxy that sets the
+TLS if it leaves the host. Run the UI without sign-in (`AXL_UI_AUTH=none`) only where nobody
+else can reach it. Only enable `AXL_TRUSTED_HEADER` behind a proxy that sets the
 header and strips it from client requests. claude.ai connectors and OAuth are not supported
 yet; clients authenticate with bearer tokens only.
 

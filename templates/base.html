@@ -27,10 +27,10 @@
   <div id="pulse" class="pulse" hx-get="/ui/pulse" hx-trigger="sse:overview delay:300ms, every 30s" hx-swap="innerHTML" aria-live="polite">
 {% if let Some(p) = pulse %}{% include "_pulse.html" %}{% endif %}
   </div>
-  <form class="logout" method="post" action="/ui/logout">
+  {% if logout %}<form class="logout" method="post" action="/ui/logout">
     <input type="hidden" name="csrf" value="{{ token }}">
     <button type="submit" class="link">Log out</button>
-  </form>
+  </form>{% endif %}
 </header>
 <main class="page">
 {% block content %}{% endblock %}

@@ -1,10 +1,12 @@
-//! The web UI (spec §12, §7): admin-secret login with a server-side cookie session, CSRF on
+//! The web UI (spec §12, §7): sign-in per `AXL_UI_AUTH` (none, admin secret or trusted
+//! header) with a server-side cookie session, CSRF on
 //! every POST, the overview, the board, task pages, the unified inbox, projects and tokens,
 //! the human's actions, and a live SSE stream that re-renders changed cards.
 //!
 //! UI routes do not use bearer tokens. A request is signed in by the `axl_ui` cookie (an
 //! in-memory session; the MVP runs one replica) or, in trusted-header mode, by the header an
-//! auth proxy sets. Every non-GET request must carry the session's CSRF token, as the form
+//! auth proxy sets, or, with no sign-in, by an anonymous session started on first visit (which
+//! only serves allowlisted `Host` headers, against DNS rebinding). Every non-GET request must carry the session's CSRF token, as the form
 //! field `csrf` or the `X-CSRF-Token` header (what htmx requests send).
 
 pub mod actions;
@@ -34,6 +36,7 @@ use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::broadcast::error::RecvError;
 
+use crate::config::UiAuth;
 use crate::http::AppState;
 use crate::http::rate_limit::RateLimiter;
 
@@ -65,6 +68,8 @@ struct UiSession {
 pub struct SessionCtx {
     pub id: String,
     pub csrf: String,
+    /// Whether the page offers "Log out" (not when the UI has no sign-in).
+    pub logout: bool,
 }
 
 impl Default for UiState {
@@ -90,6 +95,7 @@ impl UiState {
         let ctx = SessionCtx {
             id: random_hex(),
             csrf: random_hex(),
+            logout: true,
         };
         let mut sessions = self.sessions();
         sessions.retain(|_, s| s.expires_at > now);
@@ -110,6 +116,7 @@ impl UiState {
             Some(s) if s.expires_at > now => Some(SessionCtx {
                 id: id.to_string(),
                 csrf: s.csrf.clone(),
+                logout: true,
             }),
             Some(_) => {
                 sessions.remove(id);
@@ -142,6 +149,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 pub fn routes(state: AppState) -> Router<AppState> {
+    let session_state = state.clone();
     let signed_in = Router::new()
         .route("/ui/", get(views::overview))
         .route("/ui/overview/panel", get(views::overview_panel))
@@ -171,13 +179,37 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/ui/tokens/{id}/revoke", post(actions::revoke_token))
         .route("/ui/live", get(live))
         .route("/ui/logout", post(logout))
-        .route_layer(middleware::from_fn_with_state(state, require_session));
+        .route_layer(middleware::from_fn_with_state(
+            session_state,
+            require_session,
+        ));
     Router::new()
         .route("/ui", get(|| async { Redirect::to("/ui/") }))
         .route("/ui/login", get(login_page).post(login))
         .route("/ui/static/{file}", get(asset))
         .merge(signed_in)
+        .route_layer(middleware::from_fn_with_state(state, allowed_host))
         .route_layer(middleware::from_fn(security_headers))
+}
+
+/// With no UI sign-in, serves only requests for an allowlisted `Host` (421 otherwise), so a
+/// hostile page cannot rebind its own name to this server and drive the UI.
+async fn allowed_host(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if state.config.ui_auth == UiAuth::None {
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| req.uri().authority().map(|a| a.to_string()));
+        if !host.is_some_and(|h| state.config.host_allowed(&h)) {
+            return views::error_page(
+                StatusCode::MISDIRECTED_REQUEST,
+                "This host name is not allowed. Add it to AXL_ALLOWED_HOSTS.",
+            );
+        }
+    }
+    next.run(req).await
 }
 
 /// No framing, no inline script or style, and nothing loaded from other origins.
@@ -244,7 +276,7 @@ fn clear_cookie(state: &AppState) -> HeaderValue {
 
 /// Whether the request carries the trusted-header-mode header (non-empty).
 fn trusted(state: &AppState, headers: &HeaderMap) -> bool {
-    state.config.trusted_header.as_deref().is_some_and(|name| {
+    state.config.ui_auth.trusted_header().is_some_and(|name| {
         headers
             .get(name)
             .and_then(|v| v.to_str().ok())
@@ -252,21 +284,24 @@ fn trusted(state: &AppState, headers: &HeaderMap) -> bool {
     })
 }
 
-/// Signed-in routes: loads the session (or starts one for a trusted-header request), sends
+/// Signed-in routes: loads the session (or starts one for a trusted-header request, or for
+/// anyone when the UI has no sign-in), sends
 /// anyone else to the login page, and rejects a non-GET request without the session's CSRF
 /// token with 403.
 async fn require_session(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let now = state.clock.now();
     let mut session = session_cookie(req.headers()).and_then(|id| state.ui.get(id, now));
     let mut new_cookie = None;
-    if session.is_none() && trusted(&state, req.headers()) {
+    let open = state.config.ui_auth == UiAuth::None;
+    if session.is_none() && (open || trusted(&state, req.headers())) {
         let ctx = state.ui.create(now);
         new_cookie = Some(session_set_cookie(&state, &ctx.id));
         session = Some(ctx);
     }
-    let Some(session) = session else {
+    let Some(mut session) = session else {
         return to_login(req.headers());
     };
+    session.logout = !open;
     let mut req = req;
     if !matches!(*req.method(), Method::GET | Method::HEAD) {
         let (ok, rebuilt) = csrf_ok(req, &session.csrf).await;
@@ -330,7 +365,9 @@ async fn csrf_ok(req: Request, expected: &str) -> (bool, Request) {
 
 async fn login_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let now = state.clock.now();
-    if session_cookie(&headers).is_some_and(|id| state.ui.get(id, now).is_some()) {
+    if state.config.ui_auth == UiAuth::None
+        || session_cookie(&headers).is_some_and(|id| state.ui.get(id, now).is_some())
+    {
         return Redirect::to("/ui/").into_response();
     }
     views::login_page(StatusCode::OK, None)
@@ -356,6 +393,9 @@ async fn login(
     Form(form): Form<LoginForm>,
 ) -> Response {
     let now = state.clock.now();
+    if state.config.ui_auth == UiAuth::None {
+        return Redirect::to("/ui/").into_response();
+    }
     if let Err(retry_after) = state.ui.login_limit.check(client_ip(&extensions), now) {
         let mut res = views::login_page(
             StatusCode::TOO_MANY_REQUESTS,
@@ -365,7 +405,13 @@ async fn login(
             .insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
         return res;
     }
-    if !constant_time_eq(&form.secret, &state.config.admin_secret) {
+    let Some(secret) = state.config.ui_auth.secret() else {
+        return views::login_page(
+            StatusCode::UNAUTHORIZED,
+            Some("Sign in through your auth proxy; no admin secret is configured."),
+        );
+    };
+    if !constant_time_eq(&form.secret, secret) {
         return views::login_page(StatusCode::UNAUTHORIZED, Some("Wrong admin secret."));
     }
     let ctx = state.ui.create(now);

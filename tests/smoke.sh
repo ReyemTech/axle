@@ -36,7 +36,7 @@ done
 [ -n "$ready" ] || fail "/healthz never returned 200"
 echo "ok /healthz 200"
 
-token="$(docker exec -e AXL_ADMIN_SECRET="$SECRET" "$NAME" axl token create --label smoke)" \
+token="$(docker exec "$NAME" axl token create --label smoke)" \
   || fail "token creation failed"
 [ -n "$token" ] || fail "empty token"
 echo "ok token created"
@@ -51,5 +51,15 @@ echo "ok /v1/register 200"
 status="$(code "$base/ui/login")"
 [ "$status" = "200" ] || fail "/ui/login returned $status"
 echo "ok /ui/login 200"
+
+# The image binds 0.0.0.0, so with no UI sign-in configured it must refuse to start.
+if out="$(docker run --rm -e DATABASE_URL=sqlite:///tmp/axl.db "$IMAGE" 2>&1)"; then
+  fail "the image started without any UI sign-in configured"
+fi
+case "$out" in
+  *AXL_ADMIN_SECRET*AXL_TRUSTED_HEADER*AXL_UI_AUTH=none*) ;;
+  *) fail "unclear refusal: $out" ;;
+esac
+echo "ok refuses to start without UI sign-in"
 
 echo "smoke test passed"

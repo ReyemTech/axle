@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use axle::clock::{Clock, SystemClock};
-use axle::config::{ServerConfig, backend_from_env, trusted_header_name};
+use axle::config::{Overrides, ServerConfig, backend_from_env};
 use axle::domain::TokenId;
 use axle::http::AppState;
 use axle::service::auth::AuthService;
@@ -20,7 +20,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the coordination server (needs DATABASE_URL and AXL_ADMIN_SECRET)
+    /// Run the coordination server (needs DATABASE_URL; see AXL_UI_AUTH for UI sign-in)
     Serve {
         /// Address to listen on; overrides AXL_BIND (default 127.0.0.1:7420)
         #[arg(long)]
@@ -145,12 +145,19 @@ async fn hook(event: axle::hook::Event) {
 }
 
 async fn serve(bind: Option<SocketAddr>, trusted_header: Option<String>) -> CliResult {
-    let mut config = ServerConfig::from_env()?;
-    if let Some(bind) = bind {
-        config.bind = bind;
-    }
-    if let Some(raw) = trusted_header {
-        config.trusted_header = trusted_header_name(&raw)?;
+    let config = ServerConfig::from_env_with(Overrides {
+        bind,
+        trusted_header,
+    })?;
+    eprintln!("axl: UI sign-in: {}", config.ui_auth.name());
+    if config.ui_exposed_without_auth() {
+        eprintln!(
+            "axl: WARNING: the web UI has NO SIGN-IN and listens on {}. Anyone who can reach \
+             it acts as the human. Only run this behind a VPN or an authenticating proxy; \
+             the UI answers only these Host names: {} (add more with AXL_ALLOWED_HOSTS).",
+            config.bind,
+            config.allowed_hosts.join(", ")
+        );
     }
     let store = open_store(&config.backend).await?;
     let addr = config.bind;

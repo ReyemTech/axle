@@ -24,6 +24,7 @@ pub struct ProjectRow {
 #[template(path = "projects.html")]
 struct ProjectsPage {
     csrf: Option<String>,
+    logout: bool,
     /// The top bar's counts (`None` when signed out).
     pulse: Option<Pulse>,
     nav: &'static str,
@@ -50,6 +51,7 @@ pub async fn projects(
         .collect();
     projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.key.cmp(&b.key)));
     html(&ProjectsPage {
+        logout: session.logout,
         csrf: Some(session.csrf),
         pulse: Some(pulse_counts(&state).await?),
         nav: "projects",
@@ -70,6 +72,7 @@ pub struct TokenRow {
 #[template(path = "tokens.html")]
 struct TokensPage {
     csrf: Option<String>,
+    logout: bool,
     /// The top bar's counts (`None` when signed out).
     pulse: Option<Pulse>,
     nav: &'static str,
@@ -99,6 +102,7 @@ pub async fn tokens(
     tokens.reverse();
     tokens.sort_by_key(|t| t.revoked.is_some());
     html(&TokensPage {
+        logout: session.logout,
         csrf: Some(session.csrf),
         pulse: Some(pulse_counts(&state).await?),
         nav: "tokens",

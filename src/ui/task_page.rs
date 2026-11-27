@@ -186,6 +186,7 @@ pub struct TaskView {
 #[template(path = "task.html")]
 struct TaskPage {
     csrf: Option<String>,
+    logout: bool,
     /// The top bar's counts (`None` when signed out).
     pulse: Option<Pulse>,
     nav: &'static str,
@@ -458,6 +459,7 @@ pub async fn task_page(
         .collect();
 
     html(&TaskPage {
+        logout: session.logout,
         csrf: Some(session.csrf),
         pulse: Some(pulse_counts(&state).await?),
         nav: "board",

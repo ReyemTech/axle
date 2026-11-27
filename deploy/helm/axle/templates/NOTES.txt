@@ -4,11 +4,29 @@ Create the first agent token (shown once; store it, never paste it into prompts)
 
   kubectl exec -n {{ .Release.Namespace }} deploy/{{ include "axle.fullname" . }} -- axl token create --label <name>
 
-{{- if not .Values.adminSecret.existingSecret }}
+{{- $auth := .Values.ui.auth }}
+{{- if and (eq $auth.mode "secret") (not $auth.secret.existingSecret) (not $auth.secret.value) }}
 
 Read the generated UI sign-in secret:
 
-  kubectl get secret -n {{ .Release.Namespace }} {{ include "axle.fullname" . }} -o jsonpath='{.data.{{ .Values.adminSecret.key }}}' | base64 -d
+  kubectl get secret -n {{ .Release.Namespace }} {{ include "axle.fullname" . }} -o jsonpath='{.data.{{ $auth.secret.key }}}' | base64 -d
+{{- end }}
+{{- if eq $auth.mode "none" }}
+
+##########################################################################################
+WARNING: ui.auth.mode=none. The web UI has NO SIGN-IN: anyone who can reach it acts as the
+human (approves plans, cancels tasks, revokes tokens). Only run this where the UI is reachable
+solely over a VPN or through an authenticating proxy. It answers only these Host names:
+  {{ include "axle.allowedHosts" . }}
+##########################################################################################
+{{- end }}
+{{- if and (eq $auth.mode "trustedHeader") (not .Values.ingress.enabled) }}
+
+##########################################################################################
+WARNING: ui.auth.mode=trustedHeader without an ingress. Anyone who reaches the pod or service
+directly can send the {{ $auth.trustedHeader.name }} header and sign in. Route all UI traffic
+through the auth proxy that sets and strips it, and block direct access (e.g. NetworkPolicy).
+##########################################################################################
 {{- end }}
 
 {{- if .Values.ingress.enabled }}

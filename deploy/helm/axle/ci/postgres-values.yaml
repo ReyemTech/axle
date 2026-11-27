@@ -2,5 +2,8 @@ database:
   mode: postgres
   existingSecret: axle-db
   urlKey: DATABASE_URL
-adminSecret:
-  existingSecret: axle-admin
+ui:
+  auth:
+    mode: secret
+    secret:
+      existingSecret: axle-admin

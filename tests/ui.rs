@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axle::clock::TestClock;
-use axle::config::ServerConfig;
+use axle::config::{ServerConfig, UiAuth};
 use axle::domain::{Actor, Address, Importance, SessionId, Task, TaskId};
 use axle::http::{AppState, router};
 use axle::service::identity::{IdentityInput, IdentityService, Resolved};
@@ -342,7 +342,13 @@ async fn login_attempts_are_rate_limited() {
 
 #[tokio::test]
 async fn trusted_header_signs_in_without_secret() {
-    let app = app_with(|c| c.trusted_header = Some("x-forwarded-user".into())).await;
+    let app = app_with(|c| {
+        c.ui_auth = UiAuth::TrustedHeader {
+            header: "x-forwarded-user".into(),
+            secret: Some(SECRET.into()),
+        }
+    })
+    .await;
     assert_eq!(
         app.get("/ui/", None).await.location.as_deref(),
         Some("/ui/login")
@@ -381,6 +387,167 @@ async fn trusted_header_signs_in_without_secret() {
         )
         .await;
     assert_eq!(page.status, StatusCode::SEE_OTHER);
+}
+
+/// An app whose UI has no sign-in (`AXL_UI_AUTH=none`), resolved from the environment.
+async fn open_app(vars: &'static [(&'static str, &'static str)]) -> App {
+    app_with(|c| {
+        *c = ServerConfig::from_lookup(|k| {
+            if k == "DATABASE_URL" {
+                return Some("sqlite::memory:".into());
+            }
+            vars.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        })
+        .unwrap();
+        assert_eq!(c.ui_auth, UiAuth::None);
+    })
+    .await
+}
+
+fn get_host(path: &str, host: &str, cookie: Option<&str>) -> Request<Body> {
+    let mut req = Request::get(path).header(header::HOST, host);
+    if let Some(c) = cookie {
+        req = req.header(header::COOKIE, c);
+    }
+    req.body(Body::empty()).unwrap()
+}
+
+#[tokio::test]
+async fn no_auth_mode_serves_the_board_without_login_and_keeps_csrf() {
+    // Nothing configured on the default loopback bind: no sign-in.
+    let app = open_app(&[]).await;
+    let page = app
+        .send(get_host("/ui/board", "127.0.0.1:7420", None))
+        .await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    // An anonymous session carries the CSRF token; there is no log-out button.
+    let set_cookie = page.set_cookie.clone().expect("anonymous session cookie");
+    assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("SameSite=Strict"));
+    let cookie = cookie_pair(&set_cookie);
+    let csrf = csrf_of(&page);
+    assert!(
+        select_texts(&page, "form.logout").is_empty(),
+        "{}",
+        page.body
+    );
+    // The session is reused, not replaced.
+    let again = app
+        .send(get_host("/ui/", "localhost:7420", Some(&cookie)))
+        .await;
+    assert_eq!(again.status, StatusCode::OK);
+    assert!(again.set_cookie.is_none());
+    assert_eq!(csrf_of(&again), csrf);
+
+    // The login page is gone.
+    for page in [
+        app.send(get_host("/ui/login", "localhost", None)).await,
+        app.send(
+            Request::post("/ui/login")
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("secret=x"))
+                .unwrap(),
+        )
+        .await,
+    ] {
+        assert_eq!(page.status, StatusCode::SEE_OTHER);
+        assert_eq!(page.location.as_deref(), Some("/ui/"));
+    }
+
+    // POSTs still need the session's CSRF token: none, a wrong one, or no cookie at all.
+    let post = |cookie: Option<&str>, form: &str| {
+        let mut req = Request::post("/ui/messages")
+            .header(header::HOST, "127.0.0.1:7420")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(c) = cookie {
+            req = req.header(header::COOKIE, c);
+        }
+        req.body(Body::from(form.to_string())).unwrap()
+    };
+    for (cookie, form) in [
+        (Some(cookie.as_str()), "to=x&body=hi".to_string()),
+        (Some(cookie.as_str()), "csrf=wrong&to=x&body=hi".to_string()),
+        (None, format!("csrf={csrf}&to=x&body=hi")),
+    ] {
+        let page = app.send(post(cookie, &form)).await;
+        assert_eq!(page.status, StatusCode::FORBIDDEN, "{cookie:?} {form}");
+    }
+    // With the token the action runs (whatever it makes of the form, it is not a 403).
+    let page = app
+        .send(post(Some(&cookie), &format!("csrf={csrf}&to=x&body=hi")))
+        .await;
+    assert_ne!(page.status, StatusCode::FORBIDDEN, "{}", page.body);
+
+    // The strict CSP stays.
+    let res = app
+        .router
+        .clone()
+        .oneshot(get_host("/ui/", "localhost", None))
+        .await
+        .unwrap();
+    let csp = res.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap();
+    assert!(csp.contains("script-src 'self'") && csp.contains("frame-ancestors 'none'"));
+}
+
+#[tokio::test]
+async fn no_auth_mode_rejects_unlisted_hosts() {
+    let app = open_app(&[
+        ("AXL_UI_AUTH", "none"),
+        ("AXL_BIND", "0.0.0.0:7420"),
+        ("AXL_ALLOWED_HOSTS", "axle.internal"),
+    ])
+    .await;
+    for path in [
+        "/ui/",
+        "/ui/board",
+        "/ui/live",
+        "/ui/login",
+        "/ui/static/app.css",
+    ] {
+        for host in ["evil.example", "evil.example:7420", "0.0.0.0:7420"] {
+            let page = app.send(get_host(path, host, None)).await;
+            assert_eq!(
+                page.status,
+                StatusCode::MISDIRECTED_REQUEST,
+                "{path} {host}"
+            );
+            assert!(page.set_cookie.is_none(), "no session for {host}");
+        }
+    }
+    // No Host header at all is rejected too.
+    let page = app.get("/ui/", None).await;
+    assert_eq!(page.status, StatusCode::MISDIRECTED_REQUEST);
+    for host in [
+        "axle.internal",
+        "axle.internal:443",
+        "[::1]:7420",
+        "localhost",
+    ] {
+        let page = app.send(get_host("/ui/board", host, None)).await;
+        assert_eq!(page.status, StatusCode::OK, "{host}");
+    }
+}
+
+#[tokio::test]
+async fn secret_mode_still_requires_login_for_any_host() {
+    let app = app().await;
+    assert_eq!(app.state.config.ui_auth, UiAuth::Secret(SECRET.into()));
+    // The host allowlist only applies without sign-in; the login wall stays.
+    let page = app
+        .send(get_host("/ui/board", "axle.example.com", None))
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER);
+    assert_eq!(page.location.as_deref(), Some("/ui/login"));
+    let cookie = app.login().await;
+    let page = app
+        .send(get_host("/ui/board", "axle.example.com", Some(&cookie)))
+        .await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert_eq!(select_texts(&page, "form.logout button"), ["Log out"]);
 }
 
 #[tokio::test]

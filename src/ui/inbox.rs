@@ -60,6 +60,7 @@ pub struct AgentOption {
 #[template(path = "inbox.html")]
 struct InboxPage {
     csrf: Option<String>,
+    logout: bool,
     /// The top bar's counts (`None` when signed out).
     pulse: Option<Pulse>,
     nav: &'static str,
@@ -262,6 +263,7 @@ pub async fn inbox(
     agents.sort_by(|a, b| a.label.cmp(&b.label));
 
     html(&InboxPage {
+        logout: session.logout,
         csrf: Some(session.csrf),
         pulse: Some(pulse_counts(&state).await?),
         nav: "inbox",

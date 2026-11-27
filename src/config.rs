@@ -20,6 +20,160 @@ pub enum ConfigError {
     BadHeader(String),
     #[error("AXL_ADMIN_SECRET must be at least {0} characters")]
     ShortSecret(usize),
+    #[error("AXL_UI_AUTH must be auto, none, secret or trusted-header, got {0:?}")]
+    BadUiAuth(String),
+    #[error("AXL_UI_AUTH={0} needs {1} to be set")]
+    ModeNeeds(&'static str, &'static str),
+    #[error(
+        "the web UI has no sign-in configured and {0} is not a loopback address. Set \
+         AXL_ADMIN_SECRET (at least 16 characters) to sign in with a secret, set \
+         AXL_TRUSTED_HEADER behind an auth proxy that sets it, or set AXL_UI_AUTH=none to \
+         run the UI without sign-in (only behind a VPN or a proxy that authenticates)"
+    )]
+    NoUiAuth(SocketAddr),
+}
+
+/// The requested UI sign-in mode (`AXL_UI_AUTH`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiAuthMode {
+    /// Trusted header if set, else the admin secret if set, else none on a loopback bind,
+    /// else refuse to start.
+    Auto,
+    None,
+    Secret,
+    TrustedHeader,
+}
+
+impl UiAuthMode {
+    pub fn parse(raw: &str) -> Result<Self, ConfigError> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Ok(Self::Auto),
+            "none" => Ok(Self::None),
+            "secret" => Ok(Self::Secret),
+            "trusted-header" => Ok(Self::TrustedHeader),
+            _ => Err(ConfigError::BadUiAuth(raw.to_string())),
+        }
+    }
+}
+
+/// How a human signs in to the web UI (agent bearer tokens are unaffected).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiAuth {
+    /// No sign-in: every UI request is the human. An anonymous session still carries the
+    /// CSRF token, and only allowlisted `Host` headers are served (DNS-rebinding guard).
+    None,
+    /// The login form checks this admin secret.
+    Secret(String),
+    /// A request carrying `header` (set by an auth proxy) is signed in; the login form takes
+    /// `secret` when one is configured.
+    TrustedHeader {
+        header: String,
+        secret: Option<String>,
+    },
+}
+
+impl UiAuth {
+    /// The secret the login form accepts, if any.
+    pub fn secret(&self) -> Option<&str> {
+        match self {
+            UiAuth::None => None,
+            UiAuth::Secret(s) => Some(s),
+            UiAuth::TrustedHeader { secret, .. } => secret.as_deref(),
+        }
+    }
+
+    /// The trusted-header-mode header name, if in that mode.
+    pub fn trusted_header(&self) -> Option<&str> {
+        match self {
+            UiAuth::TrustedHeader { header, .. } => Some(header),
+            _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            UiAuth::None => "none",
+            UiAuth::Secret(_) => "secret",
+            UiAuth::TrustedHeader { .. } => "trusted-header",
+        }
+    }
+}
+
+/// Picks the UI sign-in mode from the request, the bind address and what is configured.
+pub fn resolve_ui_auth(
+    mode: UiAuthMode,
+    bind: SocketAddr,
+    secret: Option<String>,
+    trusted_header: Option<String>,
+) -> Result<UiAuth, ConfigError> {
+    match mode {
+        UiAuthMode::None => Ok(UiAuth::None),
+        UiAuthMode::Secret => secret
+            .map(UiAuth::Secret)
+            .ok_or(ConfigError::ModeNeeds("secret", "AXL_ADMIN_SECRET")),
+        UiAuthMode::TrustedHeader => trusted_header
+            .map(|header| UiAuth::TrustedHeader { header, secret })
+            .ok_or(ConfigError::ModeNeeds(
+                "trusted-header",
+                "AXL_TRUSTED_HEADER",
+            )),
+        UiAuthMode::Auto => match (trusted_header, secret) {
+            (Some(header), secret) => Ok(UiAuth::TrustedHeader { header, secret }),
+            (None, Some(secret)) => Ok(UiAuth::Secret(secret)),
+            (None, None) if bind.ip().is_loopback() => Ok(UiAuth::None),
+            (None, None) => Err(ConfigError::NoUiAuth(bind)),
+        },
+    }
+}
+
+/// The host part of a `Host` header or allowlist entry, lowercased and without the port
+/// (`[::1]:7420` is `[::1]`, `Example.com:80` is `example.com`).
+pub fn host_without_port(raw: &str) -> String {
+    let raw = raw.trim();
+    let host = if raw.starts_with('[') {
+        raw.split_inclusive(']').next().unwrap_or(raw)
+    } else {
+        match raw.rsplit_once(':') {
+            Some((host, port))
+                if !host.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                host
+            }
+            _ => raw,
+        }
+    };
+    host.to_ascii_lowercase()
+}
+
+/// Hosts the UI answers to with any port: loopback names, the bind host (unless it is a
+/// wildcard) and `AXL_ALLOWED_HOSTS` (comma-separated).
+fn allowed_hosts(bind: SocketAddr, extra: Option<&str>) -> Vec<String> {
+    let mut hosts: Vec<String> = ["localhost", "127.0.0.1", "[::1]"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    if !bind.ip().is_unspecified() {
+        hosts.push(match bind {
+            SocketAddr::V4(a) => a.ip().to_string(),
+            SocketAddr::V6(a) => format!("[{}]", a.ip()),
+        });
+    }
+    for entry in extra.unwrap_or_default().split(',') {
+        let host = host_without_port(entry);
+        if !host.is_empty() {
+            hosts.push(host);
+        }
+    }
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// Command-line values that take precedence over the environment (`axl serve` flags).
+#[derive(Debug, Clone, Default)]
+pub struct Overrides {
+    pub bind: Option<SocketAddr>,
+    pub trusted_header: Option<String>,
 }
 
 /// Shortest accepted `AXL_ADMIN_SECRET`, in characters (ignoring surrounding whitespace).
@@ -58,7 +212,10 @@ impl Backend {
 pub struct ServerConfig {
     pub backend: Backend,
     pub bind: SocketAddr,
-    pub admin_secret: String,
+    /// How a human signs in to the web UI (`AXL_UI_AUTH`, see [`resolve_ui_auth`]).
+    pub ui_auth: UiAuth,
+    /// Hosts (lowercase, no port) the UI answers to when `ui_auth` is none.
+    pub allowed_hosts: Vec<String>,
     pub lease_ttl: Duration,
     pub presence_stale: Duration,
     pub idle_renew_cap: Duration,
@@ -69,10 +226,6 @@ pub struct ServerConfig {
     /// Mark the UI session cookie `Secure` (`AXL_COOKIE_SECURE`, default false). Set it
     /// whenever the UI is reached over https, e.g. behind a TLS ingress.
     pub cookie_secure: bool,
-    /// Trusted-header mode (`AXL_TRUSTED_HEADER` or `serve --trusted-header`): a UI
-    /// request carrying this header is signed in without the admin secret. Only safe
-    /// behind a proxy (e.g. oauth2-proxy) that sets it and strips it from client requests.
-    pub trusted_header: Option<String>,
 }
 
 const DEFAULT_BIND: &str = "127.0.0.1:7420";
@@ -137,31 +290,82 @@ impl ServerConfig {
 
     /// Builds config from an arbitrary variable lookup (testable without mutating the process env).
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        Self::from_lookup_with(get, Overrides::default())
+    }
+
+    /// Like [`ServerConfig::from_env`], with `axl serve` flags taking precedence.
+    pub fn from_env_with(overrides: Overrides) -> Result<Self, ConfigError> {
+        Self::from_lookup_with(|k| std::env::var(k).ok(), overrides)
+    }
+
+    pub fn from_lookup_with(
+        get: impl Fn(&str) -> Option<String>,
+        overrides: Overrides,
+    ) -> Result<Self, ConfigError> {
         let url = required(&get, "DATABASE_URL")?;
-        let admin_secret = required(&get, "AXL_ADMIN_SECRET")?;
-        if admin_secret.trim().chars().count() < ADMIN_SECRET_MIN {
-            return Err(ConfigError::ShortSecret(ADMIN_SECRET_MIN));
-        }
-        let bind_raw = get("AXL_BIND").unwrap_or_else(|| DEFAULT_BIND.to_string());
-        let bind = bind_raw
-            .parse()
-            .map_err(|_| ConfigError::BadBind(bind_raw))?;
+        let mode = match get("AXL_UI_AUTH") {
+            Some(raw) => UiAuthMode::parse(&raw)?,
+            None => UiAuthMode::Auto,
+        };
+        // A set secret must be usable, unless the UI is explicitly without sign-in.
+        let admin_secret = match get("AXL_ADMIN_SECRET") {
+            Some(_) if mode == UiAuthMode::None => None,
+            Some(_) => {
+                let secret = required(&get, "AXL_ADMIN_SECRET")?;
+                if secret.trim().chars().count() < ADMIN_SECRET_MIN {
+                    return Err(ConfigError::ShortSecret(ADMIN_SECRET_MIN));
+                }
+                Some(secret)
+            }
+            None => None,
+        };
+        let bind = match overrides.bind {
+            Some(bind) => bind,
+            None => parse_bind(&get("AXL_BIND").unwrap_or_else(|| DEFAULT_BIND.to_string()))?,
+        };
+        let trusted_header = match overrides
+            .trusted_header
+            .or_else(|| get("AXL_TRUSTED_HEADER"))
+        {
+            Some(raw) => trusted_header_name(&raw)?,
+            None => None,
+        };
         Ok(Self {
             backend: Backend::from_url(&url)?,
             bind,
-            admin_secret,
+            ui_auth: resolve_ui_auth(mode, bind, admin_secret, trusted_header)?,
+            allowed_hosts: allowed_hosts(bind, get("AXL_ALLOWED_HOSTS").as_deref()),
             lease_ttl: Duration::minutes(15),
             presence_stale: Duration::seconds(90),
             idle_renew_cap: Duration::hours(2),
             rate_limit_per_sec: positive(&get, "AXL_RATE_LIMIT_PER_SEC", 20)?,
             rate_limit_burst: positive(&get, "AXL_RATE_LIMIT_BURST", 100)?,
             cookie_secure: boolean(&get, "AXL_COOKIE_SECURE", false)?,
-            trusted_header: match get("AXL_TRUSTED_HEADER") {
-                Some(raw) => trusted_header_name(&raw)?,
-                None => None,
-            },
         })
     }
+
+    /// Whether the UI answers a request for `host` (a `Host` header value, port allowed).
+    pub fn host_allowed(&self, host: &str) -> bool {
+        let host = host_without_port(host);
+        self.allowed_hosts.contains(&host)
+    }
+
+    /// The UI has no sign-in and is reachable beyond this machine.
+    pub fn ui_exposed_without_auth(&self) -> bool {
+        self.ui_auth == UiAuth::None && !self.bind.ip().is_loopback()
+    }
+}
+
+/// An `AXL_BIND` value: a socket address, or `localhost:<port>` (loopback IPv4).
+fn parse_bind(raw: &str) -> Result<SocketAddr, ConfigError> {
+    if let Ok(addr) = raw.trim().parse() {
+        return Ok(addr);
+    }
+    raw.trim()
+        .strip_prefix("localhost:")
+        .and_then(|port| port.parse::<u16>().ok())
+        .map(|port| SocketAddr::from(([127, 0, 0, 1], port)))
+        .ok_or_else(|| ConfigError::BadBind(raw.to_string()))
 }
 
 #[cfg(test)]
@@ -203,7 +407,7 @@ mod tests {
         assert_eq!(c.rate_limit_per_sec, 20);
         assert_eq!(c.rate_limit_burst, 100);
         assert!(!c.cookie_secure);
-        assert_eq!(c.trusted_header, None);
+        assert_eq!(c.ui_auth, UiAuth::Secret("s3cret-s3cret-s3cret".into()));
     }
 
     #[test]
@@ -222,13 +426,15 @@ mod tests {
         ])
         .unwrap();
         assert!(c.cookie_secure);
-        assert_eq!(c.trusted_header.as_deref(), Some("X-Forwarded-User"));
+        assert_eq!(c.ui_auth.trusted_header(), Some("X-Forwarded-User"));
+        assert_eq!(c.ui_auth.secret(), Some("s3cret-s3cret-s3cret"));
         assert!(!with(&[("AXL_COOKIE_SECURE", "0")]).unwrap().cookie_secure);
         assert_eq!(
             with(&[("AXL_TRUSTED_HEADER", "  ")])
                 .unwrap()
-                .trusted_header,
-            None
+                .ui_auth
+                .name(),
+            "secret"
         );
         let e = with(&[("AXL_TRUSTED_HEADER", "x user")]).unwrap_err();
         assert!(
@@ -354,8 +560,184 @@ mod tests {
             Err(ConfigError::ShortSecret(16))
         ));
         assert_eq!(
-            with("sixteen-chars-xx").unwrap().admin_secret,
-            "sixteen-chars-xx"
+            with("sixteen-chars-xx").unwrap().ui_auth.secret(),
+            Some("sixteen-chars-xx")
         );
+    }
+
+    const SECRET: &str = "s3cret-s3cret-s3cret";
+
+    /// The resolved UI sign-in mode name (or the error) for these variables plus a DB URL.
+    fn ui_auth(vars: &[(&str, &str)]) -> Result<&'static str, ConfigError> {
+        let all: Vec<(&str, &str)> = [("DATABASE_URL", "sqlite://./axl.db")]
+            .iter()
+            .chain(vars)
+            .copied()
+            .collect();
+        ServerConfig::from_lookup(lookup(&all)).map(|c| c.ui_auth.name())
+    }
+
+    #[test]
+    fn ui_auth_resolution_table() {
+        let lo = ("AXL_BIND", "127.0.0.1:7420");
+        let lo6 = ("AXL_BIND", "[::1]:7420");
+        let lo_name = ("AXL_BIND", "localhost:7420");
+        let lo_other = ("AXL_BIND", "127.0.0.2:7420");
+        let any = ("AXL_BIND", "0.0.0.0:7420");
+        let lan = ("AXL_BIND", "192.168.1.5:7420");
+        let secret = ("AXL_ADMIN_SECRET", SECRET);
+        let header = ("AXL_TRUSTED_HEADER", "X-Forwarded-User");
+        let mode = |m| ("AXL_UI_AUTH", m);
+        let ok: &[(&[(&str, &str)], &str)] = &[
+            // auto: nothing set, loopback (and the default bind) -> none
+            (&[], "none"),
+            (&[lo], "none"),
+            (&[lo6], "none"),
+            (&[lo_name], "none"),
+            (&[lo_other], "none"),
+            (&[mode("AUTO"), lo], "none"),
+            (&[mode(""), lo], "none"),
+            // auto: secret, then trusted header wins
+            (&[secret, lo], "secret"),
+            (&[secret, any], "secret"),
+            (&[header, any], "trusted-header"),
+            (&[header, secret, lan], "trusted-header"),
+            // explicit none anywhere, even with a secret set (even a short one)
+            (&[mode("none"), any], "none"),
+            (&[mode("none"), lan, secret], "none"),
+            (&[mode("none"), ("AXL_ADMIN_SECRET", "short")], "none"),
+            (&[mode("none"), header, any], "none"),
+            // explicit secret / trusted-header
+            (&[mode("secret"), secret, any], "secret"),
+            (&[mode("secret"), secret, header, any], "secret"),
+            (&[mode("trusted-header"), header, any], "trusted-header"),
+        ];
+        for (vars, want) in ok {
+            assert_eq!(ui_auth(vars).unwrap(), *want, "{vars:?}");
+        }
+
+        // auto with nothing configured off loopback refuses, naming the three ways out.
+        for bind in [any, lan, ("AXL_BIND", "[::]:7420")] {
+            let e = ui_auth(&[bind]).unwrap_err();
+            assert!(matches!(e, ConfigError::NoUiAuth(_)), "{e}");
+            let msg = e.to_string();
+            for way in ["AXL_ADMIN_SECRET", "AXL_TRUSTED_HEADER", "AXL_UI_AUTH=none"] {
+                assert!(msg.contains(way), "{msg}");
+            }
+        }
+        // explicit modes need their setting, even on loopback
+        let e = ui_auth(&[mode("secret"), lo]).unwrap_err();
+        assert!(
+            matches!(e, ConfigError::ModeNeeds("secret", "AXL_ADMIN_SECRET")),
+            "{e}"
+        );
+        let e = ui_auth(&[mode("trusted-header"), secret]).unwrap_err();
+        assert!(
+            matches!(e, ConfigError::ModeNeeds(_, "AXL_TRUSTED_HEADER")),
+            "{e}"
+        );
+        // a bad mode, and a short secret still rejected outside none mode
+        let e = ui_auth(&[mode("open")]).unwrap_err();
+        assert!(
+            matches!(e, ConfigError::BadUiAuth(ref m) if m == "open"),
+            "{e}"
+        );
+        assert!(matches!(
+            ui_auth(&[mode("secret"), ("AXL_ADMIN_SECRET", "short")]),
+            Err(ConfigError::ShortSecret(16))
+        ));
+        assert!(matches!(
+            ui_auth(&[("AXL_ADMIN_SECRET", "short"), lo]),
+            Err(ConfigError::ShortSecret(16))
+        ));
+    }
+
+    #[test]
+    fn cli_overrides_feed_ui_auth_resolution() {
+        let vars = [("DATABASE_URL", "sqlite://./axl.db")];
+        // --bind off loopback with nothing configured refuses ...
+        let e = ServerConfig::from_lookup_with(
+            lookup(&vars),
+            Overrides {
+                bind: Some("0.0.0.0:7420".parse().unwrap()),
+                trusted_header: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(e, ConfigError::NoUiAuth(_)), "{e}");
+        // ... and --trusted-header is a way out.
+        let c = ServerConfig::from_lookup_with(
+            lookup(&vars),
+            Overrides {
+                bind: Some("0.0.0.0:7420".parse().unwrap()),
+                trusted_header: Some("X-User".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(c.ui_auth.trusted_header(), Some("X-User"));
+        assert_eq!(c.bind.to_string(), "0.0.0.0:7420");
+    }
+
+    #[test]
+    fn exposed_without_auth() {
+        let c = |vars: &[(&str, &str)]| {
+            let all: Vec<(&str, &str)> = [("DATABASE_URL", "sqlite://./axl.db")]
+                .iter()
+                .chain(vars)
+                .copied()
+                .collect();
+            ServerConfig::from_lookup(lookup(&all)).unwrap()
+        };
+        assert!(!c(&[]).ui_exposed_without_auth());
+        assert!(
+            c(&[("AXL_UI_AUTH", "none"), ("AXL_BIND", "0.0.0.0:7420")]).ui_exposed_without_auth()
+        );
+        assert!(
+            !c(&[("AXL_ADMIN_SECRET", SECRET), ("AXL_BIND", "0.0.0.0:7420")])
+                .ui_exposed_without_auth()
+        );
+    }
+
+    #[test]
+    fn host_allowlist() {
+        let c = ServerConfig::from_lookup(lookup(&[
+            ("DATABASE_URL", "sqlite://./axl.db"),
+            ("AXL_UI_AUTH", "none"),
+            ("AXL_BIND", "10.0.0.7:7420"),
+            ("AXL_ALLOWED_HOSTS", " Axle.Internal , axle.lan:8443,, "),
+        ]))
+        .unwrap();
+        for host in [
+            "localhost",
+            "localhost:7420",
+            "127.0.0.1:9",
+            "[::1]",
+            "[::1]:7420",
+            "10.0.0.7:7420",
+            "axle.internal",
+            "AXLE.INTERNAL:443",
+            "axle.lan",
+        ] {
+            assert!(c.host_allowed(host), "{host}");
+        }
+        for host in [
+            "",
+            "evil.example",
+            "localhost.evil.example",
+            "127.0.0.2",
+            "10.0.0.8:7420",
+            "axle.internal.evil",
+        ] {
+            assert!(!c.host_allowed(host), "{host}");
+        }
+        // A wildcard bind adds no host of its own.
+        let c = ServerConfig::from_lookup(lookup(&[
+            ("DATABASE_URL", "sqlite://./axl.db"),
+            ("AXL_UI_AUTH", "none"),
+            ("AXL_BIND", "0.0.0.0:7420"),
+        ]))
+        .unwrap();
+        assert!(!c.host_allowed("0.0.0.0:7420"));
+        assert_eq!(c.allowed_hosts, ["127.0.0.1", "[::1]", "localhost"]);
     }
 }

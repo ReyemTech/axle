@@ -108,6 +108,7 @@ pub(super) fn html(t: &impl Template) -> UiResult<Response> {
 #[template(path = "login.html")]
 struct LoginPage<'a> {
     csrf: Option<String>,
+    logout: bool,
     /// The top bar's counts (`None` when signed out).
     pulse: Option<Pulse>,
     nav: &'static str,
@@ -117,6 +118,7 @@ struct LoginPage<'a> {
 pub fn login_page(status: StatusCode, error: Option<&str>) -> Response {
     let page = LoginPage {
         csrf: None,
+        logout: false,
         pulse: None,
         nav: "",
         error,
@@ -465,6 +467,7 @@ pub struct ProjectOption {
 #[template(path = "board.html")]
 struct BoardPage {
     csrf: Option<String>,
+    logout: bool,
     /// The top bar's counts (`None` when signed out).
     pulse: Option<Pulse>,
     nav: &'static str,
@@ -594,6 +597,7 @@ pub async fn board(
     let projects = project_options(&labels, filter.as_ref().map(|f| f.id));
     let needs = needs_you(&state, &mut labels).await?;
     html(&BoardPage {
+        logout: session.logout,
         csrf: Some(session.csrf),
         pulse: Some(pulse_counts(&state).await?),
         nav: "board",
@@ -684,6 +688,7 @@ pub struct AgentCard {
 #[template(path = "overview.html")]
 struct OverviewPage {
     csrf: Option<String>,
+    logout: bool,
     /// The top bar's counts (`None` when signed out).
     pulse: Option<Pulse>,
     nav: &'static str,
@@ -808,6 +813,7 @@ pub async fn overview(
     let mut labels = Labels::load(&*state.store).await?;
     let needs = needs_you(&state, &mut labels).await?;
     html(&OverviewPage {
+        logout: session.logout,
         csrf: Some(session.csrf),
         pulse: Some(pulse_counts(&state).await?),
         nav: "overview",

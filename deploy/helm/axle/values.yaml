@@ -25,22 +25,37 @@ persistence:
   # Leave empty for the cluster default storage class.
   storageClass: ""
 
-adminSecret:
-  # Name of an existing Secret holding the UI sign-in secret (at least 16 characters). When
-  # empty the chart generates one (kept across upgrades) and stores it under `key` in a Secret
-  # named after the release. Set this for GitOps or Pulumi: they render with `helm template`,
-  # where the chart cannot look up the existing Secret, so a generated one changes every render.
-  existingSecret: ""
-  key: AXL_ADMIN_SECRET
-
-# Mark the UI session cookie Secure (AXL_COOKIE_SECURE). Leave null to enable it
-# automatically when ingress.tls is set; set true/false to force it.
-cookieSecure: null
-
-# Header set by an authenticating proxy (e.g. oauth2-proxy) that signs UI requests in without
-# the admin secret (AXL_TRUSTED_HEADER). Empty = off. Only safe behind a proxy that sets
-# the header and strips it from client requests.
-trustedHeader: ""
+# How a human signs in to the web UI. Agent bearer tokens (MCP and /v1) are separate and
+# always required. Examples for every mode are in the chart README.
+ui:
+  auth:
+    # secret        - sign in with an admin secret (AXL_UI_AUTH=secret).
+    # none          - no sign-in: everyone who reaches the UI acts as the human. Only for
+    #                 deploys reachable solely over a VPN or through an authenticating proxy.
+    # trustedHeader - an auth proxy (e.g. oauth2-proxy) signs requests in by setting a header.
+    mode: secret
+    # mode: secret only.
+    secret:
+      # Use an existing Secret instead of creating one. Set this for GitOps or Pulumi: they
+      # render with `helm template`, where the chart cannot look up a generated Secret, so a
+      # generated value would change on every render.
+      existingSecret: ""
+      # Key inside the Secret (the existing one, or the one the chart creates).
+      key: admin-secret
+      # Optional fixed value (at least 16 characters). Empty: the chart generates one once
+      # and keeps it across upgrades. Cannot be combined with existingSecret.
+      value: ""
+    # mode: trustedHeader only.
+    trustedHeader:
+      # The header your auth proxy sets (AXL_TRUSTED_HEADER), e.g. X-Auth-Request-Email.
+      # Required in this mode. The proxy must strip it from client requests.
+      name: ""
+  # Extra Host names the UI answers to (AXL_ALLOWED_HOSTS). Ingress hosts and the in-cluster
+  # service names are added automatically. Enforced when the UI has no sign-in, against DNS
+  # rebinding.
+  allowedHosts: []
+  # Mark the UI session cookie Secure (AXL_COOKIE_SECURE). null: on when the ingress has TLS.
+  cookieSecure: null
 
 service:
   type: ClusterIP

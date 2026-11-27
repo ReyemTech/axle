@@ -1,4 +1,6 @@
+{{- include "axle.validateUi" . }}
 {{- $sqlite := eq .Values.database.mode "sqlite" }}
+{{- $auth := .Values.ui.auth }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -58,17 +60,22 @@ spec:
                   name: {{ .Values.database.existingSecret }}
                   key: {{ .Values.database.urlKey }}
               {{- end }}
+            - name: AXL_UI_AUTH
+              value: {{ include "axle.uiAuth" . | quote }}
+            {{- if eq $auth.mode "secret" }}
             - name: AXL_ADMIN_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "axle.adminSecretName" . }}
-                  key: {{ .Values.adminSecret.key }}
+                  key: {{ $auth.secret.key }}
+            {{- else if eq $auth.mode "trustedHeader" }}
+            - name: AXL_TRUSTED_HEADER
+              value: {{ trim $auth.trustedHeader.name | quote }}
+            {{- end }}
+            - name: AXL_ALLOWED_HOSTS
+              value: {{ include "axle.allowedHosts" . | quote }}
             - name: AXL_COOKIE_SECURE
               value: {{ include "axle.cookieSecure" . | quote }}
-            {{- with .Values.trustedHeader }}
-            - name: AXL_TRUSTED_HEADER
-              value: {{ . | quote }}
-            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

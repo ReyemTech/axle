@@ -46,12 +46,77 @@ url="$(doc Deployment -f "$f" | yq '.spec.template.spec.containers[0].env[] | se
 expect "$(echo "$url" | yq '.name')" axle-db "postgres secret name"
 expect "$(echo "$url" | yq '.key')" DATABASE_URL "postgres secret key"
 
-# admin secret: generated when none is given, not rendered when an existing one is named
-expect "$(count Secret -f "$CHART/ci/sqlite-values.yaml")" 1 "generated admin secret"
-expect "$(count Secret -f "$CHART/ci/sqlite-values.yaml" --set adminSecret.existingSecret=mine)" 0 "no secret with existingSecret"
-expect "$(doc Deployment -f "$CHART/ci/sqlite-values.yaml" --set adminSecret.existingSecret=mine --set adminSecret.key=K \
-  | yq '.spec.template.spec.containers[0].env[] | select(.name == "AXL_ADMIN_SECRET") | .valueFrom.secretKeyRef | .name + "/" + .key')" \
+# UI sign-in modes: env vars only for the active mode, the Secret only for a generated one
+S="$CHART/ci/sqlite-values.yaml"
+env_of() { doc Deployment -f "$S" "$@" | yq '.spec.template.spec.containers[0].env'; }
+env_val() { local name="$1"; shift; env_of "$@" | yq ".[] | select(.name == \"$name\") | .value"; }
+has_env() { local name="$1"; shift; env_of "$@" | yq "[.[] | select(.name == \"$name\")] | length"; }
+
+# secret (default): generated Secret, referenced by key
+expect "$(env_val AXL_UI_AUTH)" secret "default mode"
+expect "$(count Secret -f "$S")" 1 "generated admin secret"
+expect "$(env_of | yq '.[] | select(.name == "AXL_ADMIN_SECRET") | .valueFrom.secretKeyRef | .name + "/" + .key')" \
+  t-axle/admin-secret "generated admin secret ref"
+expect "$(has_env AXL_TRUSTED_HEADER)" 0 "no trusted header in secret mode"
+# secret with an explicit value: rendered into the Secret
+expect "$(doc Secret -f "$S" --set ui.auth.secret.value=sixteen-chars-xx | yq '.data.admin-secret' | base64 -d)" \
+  sixteen-chars-xx "explicit secret value"
+# secret with existingSecret: no Secret, ref to it
+expect "$(count Secret -f "$S" --set ui.auth.secret.existingSecret=mine)" 0 "no secret with existingSecret"
+expect "$(env_of --set ui.auth.secret.existingSecret=mine --set ui.auth.secret.key=K \
+  | yq '.[] | select(.name == "AXL_ADMIN_SECRET") | .valueFrom.secretKeyRef | .name + "/" + .key')" \
   mine/K "existing admin secret ref"
+
+# none: no secret, no Secret, a loud warning in the notes
+expect "$(env_val AXL_UI_AUTH --set ui.auth.mode=none)" none "none mode"
+expect "$(has_env AXL_ADMIN_SECRET --set ui.auth.mode=none)" 0 "no admin secret in none mode"
+expect "$(has_env AXL_TRUSTED_HEADER --set ui.auth.mode=none)" 0 "no trusted header in none mode"
+expect "$(count Secret -f "$S" --set ui.auth.mode=none)" 0 "no Secret in none mode"
+# (output captured first: `grep -q` closing the pipe early would trip pipefail)
+notes() { helm install t "$CHART" --dry-run=client -f "$S" "$@" 2>/dev/null; }
+has() { [[ "$1" == *"$2"* ]]; }
+has "$(notes --set ui.auth.mode=none)" "WARNING: ui.auth.mode=none" || fail "none mode warning missing from NOTES"
+if has "$(notes)" WARNING; then fail "secret mode printed a warning"; fi
+
+# trustedHeader: the header, no secret, no Secret; warns without an ingress
+TH=(--set ui.auth.mode=trustedHeader --set ui.auth.trustedHeader.name=X-Auth-Request-Email)
+expect "$(env_val AXL_UI_AUTH "${TH[@]}")" trusted-header "trustedHeader mode"
+expect "$(env_val AXL_TRUSTED_HEADER "${TH[@]}")" X-Auth-Request-Email "trusted header name"
+expect "$(has_env AXL_ADMIN_SECRET "${TH[@]}")" 0 "no admin secret in trustedHeader mode"
+expect "$(count Secret -f "$S" "${TH[@]}")" 0 "no Secret in trustedHeader mode"
+has "$(notes "${TH[@]}")" "WARNING: ui.auth.mode=trustedHeader without an ingress" || fail "trustedHeader warning missing"
+if has "$(notes "${TH[@]}" --set ingress.enabled=true --set 'ingress.hosts[0].host=a.example.com')" WARNING; then
+  fail "trustedHeader behind an ingress printed a warning"
+fi
+
+# allowed hosts: service names + ingress hosts + ui.allowedHosts, deduplicated
+expect "$(env_val AXL_ALLOWED_HOSTS --set ingress.enabled=true \
+  --set 'ingress.hosts[0].host=axle.example.com' --set 'ingress.hosts[1].host=axle.internal' \
+  --set 'ui.allowedHosts[0]=axle.internal' --set 'ui.allowedHosts[1]=10.0.0.7')" \
+  "t-axle,t-axle.default,t-axle.default.svc,t-axle.default.svc.cluster.local,axle.example.com,axle.internal,10.0.0.7" \
+  "allowed hosts merge"
+expect "$(env_val AXL_ALLOWED_HOSTS --namespace ops)" \
+  "t-axle,t-axle.ops,t-axle.ops.svc,t-axle.ops.svc.cluster.local" "allowed hosts namespace"
+
+# cookieSecure: auto from ingress TLS, or forced
+expect "$(env_val AXL_COOKIE_SECURE)" false "cookie not secure without TLS"
+expect "$(env_val AXL_COOKIE_SECURE --set ingress.enabled=true --set 'ingress.hosts[0].host=a' \
+  --set 'ingress.tls[0].secretName=t' --set 'ingress.tls[0].hosts[0]=a')" true "cookie secure with TLS"
+expect "$(env_val AXL_COOKIE_SECURE --set ui.cookieSecure=true)" true "cookie secure forced"
+
+# invalid UI settings are rejected (schema or template)
+rejects() { local why="$1"; shift; if helm template t "$CHART" -f "$S" "$@" >/dev/null 2>&1; then fail "$why was accepted"; fi; }
+rejects "ui.auth.mode=open" --set ui.auth.mode=open
+rejects "trustedHeader without a name" --set ui.auth.mode=trustedHeader
+rejects "a bad trusted header name" "${TH[@]}" --set "ui.auth.trustedHeader.name=x user"
+rejects "secret value and existingSecret" --set ui.auth.secret.value=sixteen-chars-xx --set ui.auth.secret.existingSecret=mine
+rejects "a short secret value" --set ui.auth.secret.value=short
+rejects "a trusted header name in secret mode" --set ui.auth.trustedHeader.name=X-User
+rejects "an unknown ui key" --set ui.auth.secrets.value=x
+rejects "the old adminSecret block" --set adminSecret.existingSecret=mine
+has "$(helm template t "$CHART" -f "$S" --set ui.auth.secret.value=sixteen-chars-xx \
+  --set ui.auth.secret.existingSecret=mine 2>&1 || true)" "set either value or existingSecret, not both" \
+  || fail "combo error message"
 
 # ingress is off by default and renders when enabled
 expect "$(count Ingress -f "$CHART/ci/sqlite-values.yaml")" 0 "ingress off by default"

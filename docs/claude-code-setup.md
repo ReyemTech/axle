@@ -6,8 +6,9 @@ fail-open: with Axle down, Claude Code behaves as if neither were installed.
 
 ## Token
 
-Create one on the server (`axl token create --label my-laptop`) and give it to the bridge
-and hooks in either of two ways. Never paste the token value into a config file that is
+Create one on the server (`axl token create --label my-laptop`; it needs only
+`DATABASE_URL`, not the UI admin secret) and give it to the bridge and hooks in either of
+two ways. Never paste the token value into a config file that is
 shared or committed.
 
 - environment variable `AXL_TOKEN`, or
