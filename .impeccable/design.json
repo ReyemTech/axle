@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-11-27T16:34:17.078220Z",
+  "generatedAt": "2026-11-27T16:36:27.562239+00:00",
   "title": "Design System: coord",
   "extensions": {
     "colorMeta": {
@@ -146,7 +146,7 @@
     "typographyMeta": {
       "page-title": {
         "displayName": "Page title",
-        "purpose": "Task page headline (22px); list pages 20px."
+        "purpose": "Task page headline (22px)."
       },
       "headline": {
         "displayName": "Headline",
@@ -171,6 +171,14 @@
       "mono": {
         "displayName": "Mono",
         "purpose": "Agent ids, lease time left, keys."
+      },
+      "page-title-list": {
+        "displayName": "Page title, list",
+        "purpose": "List page headings (20px)."
+      },
+      "emphasis": {
+        "displayName": "Emphasis",
+        "purpose": "Wordmark and counter values (15px/700)."
       }
     },
     "shadows": [],
@@ -184,6 +192,11 @@
         "name": "lease-tick",
         "value": "JS updates --lease between renders",
         "purpose": "Occupancy bar shrinks as the lease runs down."
+      },
+      {
+        "name": "mask-fade",
+        "value": "mask-image: linear-gradient(90deg, #000 calc(100% - 32px), transparent)",
+        "purpose": "Phone project-filter scroll fade; #000 is an alpha-mask stop, not a colour."
       }
     ],
     "breakpoints": [
@@ -207,8 +220,8 @@
       "kind": "card",
       "refersTo": "card",
       "description": "Bordered card on a column band with state glyph plus word, project line swatch, owner and lease meter.",
-      "html": "<article class=\"ds-card\"><h3 class=\"ds-card-title\">Rotate staging credentials</h3><div class=\"ds-meta\"><span class=\"ds-state\"><span class=\"ds-aspect\"></span>claimed</span><span class=\"ds-project\">iac</span></div><div class=\"ds-owner\">Held by <span class=\"ds-mono\">iac/mac/claude</span> <span class=\"ds-live\">live</span></div><div class=\"ds-lease\"><span class=\"ds-lease-text\">lease 12m</span><span class=\"ds-track\"><span class=\"ds-occ\"></span></span></div></article>",
-      "css": ".ds-card{display:grid;gap:5px;padding:10px 12px;background:var(--card);border:1px solid var(--card-border);border-radius:6px;font:14px/1.45 var(--font);color:var(--text)}.ds-card:hover{border-color:var(--rule-strong)}.ds-card-title{margin:0;font-size:14px;font-weight:600;line-height:1.35}.ds-meta{display:flex;gap:12px;align-items:center;font-size:12.5px;color:var(--muted)}.ds-state{display:inline-flex;gap:5px;align-items:center;font-weight:600;color:var(--text)}.ds-aspect{width:10px;height:10px;border-radius:50%;border:1.5px solid var(--sig-red);background:linear-gradient(90deg,var(--sig-red) 50%,transparent 50%)}.ds-project::before{content:'';display:inline-block;width:10px;height:3px;margin-right:5px;background:var(--line-1);vertical-align:middle}.ds-owner{font-size:12.5px;color:var(--muted)}.ds-mono{font:12px var(--mono);color:var(--text)}.ds-live{font-size:12px;font-weight:600;color:var(--ok)}.ds-lease{display:flex;gap:10px;align-items:center}.ds-lease-text{font-size:12px;color:var(--muted)}.ds-track{position:relative;flex:1;height:2px;background:var(--line-1)}.ds-occ{position:absolute;left:0;top:-3px;height:8px;width:70%;background:var(--sig-red)}"
+      "html": "<article class=\"ds-card\"><h3 class=\"ds-card-title\"><a href=\"#\">Rotate staging credentials</a></h3><div class=\"ds-meta\"><span class=\"ds-state\"><span class=\"ds-aspect\"></span>claimed</span><span class=\"ds-project\">iac</span></div><div class=\"ds-owner\">Held by <span class=\"ds-mono\">iac/mac/claude</span> <span class=\"ds-live\">live</span></div><div class=\"ds-lease\"><span class=\"ds-lease-text\">lease 12m</span><span class=\"ds-track\"><span class=\"ds-occ\"></span></span></div></article>",
+      "css": ".ds-card{display:grid;gap:5px;padding:10px 12px;background:var(--card);border:1px solid var(--card-border);border-radius:6px;font:14px/1.45 var(--font);color:var(--text)}.ds-card:hover{border-color:var(--rule-strong)}.ds-card-title{margin:0;font-size:14px;font-weight:600;line-height:1.35}.ds-card-title a{color:var(--text);text-decoration:underline;text-decoration-thickness:1px;text-decoration-color:var(--rule-strong);text-underline-offset:3px}.ds-card:hover .ds-card-title a{text-decoration-color:currentColor}.ds-meta{display:flex;gap:12px;align-items:center;font-size:12.5px;color:var(--muted)}.ds-state{display:inline-flex;gap:5px;align-items:center;font-weight:600;color:var(--text)}.ds-aspect{width:10px;height:10px;border-radius:50%;border:1.5px solid var(--sig-red);background:linear-gradient(90deg,var(--sig-red) 50%,transparent 50%)}.ds-project::before{content:'';display:inline-block;width:10px;height:3px;margin-right:5px;background:var(--line-1);vertical-align:middle}.ds-owner{font-size:12.5px;color:var(--muted)}.ds-mono{font:12px var(--mono);color:var(--text)}.ds-live{font-size:12px;font-weight:600;color:var(--ok)}.ds-lease{display:flex;gap:10px;align-items:center}.ds-lease-text{font-size:12px;color:var(--muted)}.ds-track{position:relative;flex:1;height:2px;background:var(--line-1)}.ds-occ{position:absolute;left:0;top:-3px;height:8px;width:70%;background:var(--sig-red)}"
     },
     {
       "name": "Blocked Card",
@@ -222,9 +235,9 @@
       "name": "Column Head",
       "kind": "custom",
       "refersTo": "column-head",
-      "description": "Band header with aspect glyph, uppercase label and count; count grows when blocked holds work.",
-      "html": "<div class=\"ds-col\"><header class=\"ds-head\"><span class=\"ds-sq\"></span><h2>Blocked</h2><span class=\"ds-count\">2</span></header></div>",
-      "css": ".ds-col{background:var(--band);border-radius:6px;font:14px var(--font);color:var(--text)}.ds-head{display:flex;align-items:center;gap:8px;height:40px;padding:0 12px;border-bottom:2px solid var(--text)}.ds-head h2{margin:0;font-size:12.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em}.ds-sq{width:14px;height:14px;border-radius:1px;background:var(--sig-red)}.ds-count{margin-left:auto;font-size:18px;font-weight:700;color:var(--danger)}"
+      "description": "Band header with aspect glyph, uppercase label and count; count grows when blocked holds work. Head rules join across the board via 8px gutter extensions with a 2px by 10px joint.",
+      "html": "<div class=\"ds-col\" style=\"margin-right:8px\"><header class=\"ds-head\"><span class=\"ds-sq\"></span><h2>Blocked</h2><span class=\"ds-count\">2</span></header></div>",
+      "css": ".ds-col{background:var(--band);border-radius:6px;font:14px var(--font);color:var(--text)}.ds-head{display:flex;align-items:center;gap:8px;height:40px;padding:0 12px;border-bottom:2px solid var(--text)}.ds-head h2{margin:0;font-size:12.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em}.ds-sq{width:14px;height:14px;border-radius:1px;background:var(--sig-red)}.ds-count{margin-left:auto;font-size:18px;font-weight:700;color:var(--danger)}.ds-col{position:relative}.ds-head{position:relative}.ds-head::after{content:'';position:absolute;right:-8px;bottom:-2px;width:8px;height:2px;background:var(--text)}.ds-head::before{content:'';position:absolute;right:-5px;bottom:-6px;width:2px;height:10px;background:var(--text)}"
     },
     {
       "name": "Primary Button",
@@ -265,6 +278,14 @@
       "description": "Dark bar with mark, tabs and live pulse.",
       "html": "<div class=\"ds-bar\"><span class=\"ds-brand\"><span class=\"ds-mark\"></span>coord</span><nav class=\"ds-tabs\"><a class=\"ds-on\">Board</a><a>Inbox</a><a>Projects</a></nav></div>",
       "css": ".ds-bar{display:flex;align-items:center;gap:20px;padding:0 16px;min-height:44px;background:var(--bar);color:var(--bar-text);font:14px var(--font)}.ds-brand{display:inline-flex;align-items:center;gap:8px;font-weight:700;font-size:15px}.ds-mark{position:relative;width:22px;height:2px;background:currentColor}.ds-mark::after{content:'';position:absolute;left:7px;top:-3px;width:8px;height:8px;background:var(--sig-red)}.ds-tabs{display:flex;align-self:stretch}.ds-tabs a{display:flex;align-items:center;padding:0 10px;color:var(--bar-muted);border-bottom:2px solid transparent}.ds-tabs a.ds-on{color:var(--bar-text);font-weight:600;border-bottom-color:var(--bar-text)}"
+    },
+    {
+      "name": "Key Button",
+      "kind": "button",
+      "refersTo": "button-key",
+      "description": "Secondary-style summary that opens the glyph key popover.",
+      "html": "<button class=\"ds-key\">Key</button>",
+      "css": ".ds-key{height:30px;padding:0 12px;font:600 13px var(--font);border:1px solid var(--rule-strong);border-radius:4px;background:var(--card);color:var(--text);cursor:pointer}.ds-key:hover{background:var(--surface-2);border-color:var(--text)}.ds-key:focus-visible{outline:2px solid var(--focus);outline-offset:2px}"
     }
   ],
   "narrative": {

@@ -69,11 +69,21 @@ typography:
     fontWeight: 600
     lineHeight: 1.25
     letterSpacing: "-0.01em"
+  page-title-list:
+    fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
+    fontSize: "20px"
+    fontWeight: 600
+    lineHeight: 1.45
   headline:
     fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
     fontSize: "18px"
     fontWeight: 600
     lineHeight: 1.3
+  emphasis:
+    fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
+    fontSize: "15px"
+    fontWeight: 700
+    lineHeight: 1.45
   title:
     fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
     fontSize: "14px"
@@ -100,6 +110,7 @@ typography:
     fontWeight: 400
     lineHeight: 1.45
 rounded:
+  hairline: "1px"
   sm: "3px"
   md: "4px"
   lg: "6px"
@@ -116,6 +127,12 @@ components:
     textColor: "{colors.ink}"
     rounded: "{rounded.lg}"
     padding: "10px 12px"
+  button-key:
+    backgroundColor: "{colors.card}"
+    textColor: "{colors.ink}"
+    rounded: "{rounded.md}"
+    padding: "0 12px"
+    height: "30px"
   card-blocked:
     backgroundColor: "{colors.danger-soft}"
     textColor: "{colors.ink}"
@@ -225,7 +242,8 @@ A warm neutral field with graphite ink, three signal hues that mean state, and s
 **Character:** Plain, native and legible at a glance. One family at one dominant size, differentiated by weight, case and the mono face rather than by scale.
 
 ### Hierarchy
-- **Page title** (600, 22px, 1.25, -0.01em): task page headline; list pages use 20px.
+- **Page title** (600, 22px, 1.25, -0.01em): task page headline. **Page title, list** (600, 20px): list page headings.
+- **Emphasis** (700, 15px): wordmark and overview counter values.
 - **Headline** (600, 18px, 1.3): inbox reader subject.
 - **Title** (600, 14px, 1.35): card titles, message subjects.
 - **Body** (400, 14px, 1.45): default. Peer text is capped near 80ch, page heads near 75ch.
@@ -255,7 +273,7 @@ Flat. There are no shadows anywhere. Depth is tonal: ground, then the band (a da
 
 ## Shapes
 
-Quiet geometry. Cards, panels, columns, lists and the reader use a 6px radius; buttons and the segmented control 4px; form fields and the error bar 3px. State glyphs are 10px circles, except blocked and urgent which become a 1px-radius square, so shape carries state without colour. Track rules and line swatches are straight bars (2px track, 4px swatch, 8px lease occupancy bar). Dividers are 1px rules; nothing is rounded beyond 6px except the circular glyphs.
+Quiet geometry. Cards, panels, columns, lists and the reader use a 6px radius; buttons and the segmented control 4px; form fields and the error bar 3px. State glyphs are 10px circles, except blocked and urgent which become a 1px-radius square, so shape carries state without colour. Track rules and line swatches are straight bars (2px track, 4px swatch, 8px lease occupancy bar). Dividers are 1px rules; nothing is rounded beyond 6px except the circular glyphs. The 1px `hairline` radius is used only on the blocked square glyph. The one literal `#000` in the stylesheet is the opaque stop of the phone project-filter fade mask (`mask-image`); it is an alpha mask, not a colour.
 
 ### Named Rules
 **The Shape Carries State Rule.** Ring is open, half-filled is claimed, square is blocked, ringed centre is review, solid is done or live, diagonal slash is cancelled. Do not reuse these shapes for non-state meaning.
@@ -268,23 +286,24 @@ Quiet geometry. Cards, panels, columns, lists and the reader use a 6px radius; b
 - **Secondary:** card fill, ink text, Rule Strong border; hover to Surface 2 with ink border. Used for Force release, New task when open.
 - **Danger:** soft red fill, danger text and border; hover fills solid danger. Used for Cancel task.
 - **Link:** bare muted text for Log out and low-stakes actions.
+- **Key button:** the board Key control is a `summary` styled as a secondary button; open, it takes the band fill and an ink border, and its popover (card fill, Rule Strong border, 6px below the button) lists every glyph with a word.
 - **Always labelled:** every button carries a verb label ("Post as you", "Create subtask", "Cancel task"). Never an icon-only button. Destructive forms confirm via JS.
 
 ### Cards (task card)
 - **Corner / border:** 6px radius, 1px Card Border, Card fill, 10px 12px padding, 5px internal gap.
-- **Content order:** title link (600), optional "Subtask of ..." line, state + project row, owner row ("Held by" or "Done by" + mono agent id + live/stale), lease meter, subtask progress.
-- **State:** a blocked card is soft red with a red border. Hover darkens the border and underlines the title.
+- **Content order:** title link (600, persistent 1px Rule Strong underline offset 3px that turns to ink on card or link hover), optional "Subtask of ..." line, state + project row, owner row ("Held by" or "Done by" + mono agent id + live/stale), lease meter, subtask progress.
+- **State:** a blocked card is soft red with a red border. Hover darkens the border and the title underline.
 - **Selection:** j/k moves a 2px outline between `[data-nav]` cards.
 
 ### Columns
-- **Band:** tinted wash, 6px radius, min-height 160px. Header is 40px with a 2px ink bottom rule, the column's aspect glyph, an uppercase label and a count at the right.
+- **Band:** tinted wash, 6px radius, min-height 160px. Header is 40px with a 2px ink bottom rule, the column's aspect glyph, an uppercase label and a count at the right. The 2px head rules join into one continuous line across the board: each non-last head extends 8px into the gutter with a 2px by 10px vertical joint, so gutters read as junctions between blocks.
 - **Waiting work shouts:** when the blocked or review column has cards, its glyph grows to 14px and its count to 18px bold in danger or warn. Empty columns stay quiet with a sentence of explanation.
 
 ### Lease meter
 A project-coloured 2px track with an 8px occupancy bar whose length is time left on the lease (red; amber when under a fifth remains; zero when expired), beside text "lease" plus mono time left. JS decrements it between server renders.
 
 ### Subtask stations
-A row of 10px station glyphs joined by 2px ink segments, one per child, followed by "N of M subtasks done" and, when relevant, "N blocked" with the blocked glyph. "Show N subtasks" expands a vertical station list joined by a 2px rule.
+A row of 10px station glyphs joined by 2px ink segments, one per child, followed by "N of M subtasks done" (child rows show the status word plus owner only when one exists, with no "(open)" filler) and, when relevant, "N blocked" with the blocked glyph. "Show N subtasks" expands a vertical station list joined by a 2px rule.
 
 ### Signal aspect + label
 The universal state mark: a 10px glyph followed by its word (`.state`, `.presence`, `.importance`, `.token-state`). Text colour uses the text-safe twin for blocked, review, done and stale.
@@ -295,7 +314,7 @@ The universal state mark: a 10px glyph followed by its word (`.state`, `.presenc
 - **Error:** soft red bar with danger text, 8px 10px padding.
 
 ### Navigation
-Dark top bar, 44px: wordmark with a track-and-red-square mark, text tabs (active has a 2px bottom rule and 600 weight), a filter field, a live pulse of counts with glyphs, and Log out. On phones the tabs wrap to their own row. Board project filters are a row of "line swatch + project name" links; the current one gets a card fill and a thicker swatch. A "Key" popover explains every glyph in words.
+Dark top bar, 44px: wordmark with a track-and-red-square mark, text tabs (active has a 2px bottom rule and 600 weight), a filter field, a live pulse of counts with glyphs, and Log out. On phones the tabs wrap to their own row. Board project filters are a row of "line swatch + project name" links; the current one gets a card fill and a thicker swatch. The Key button opens a popover explaining every glyph in words.
 
 ### Counters and lists
 Overview counters are one ruled line of label/value pairs inside a card; an alert counter turns danger. Agent rows, project rows, message lists and event logs are card-filled lists with 1px row dividers; unread messages are bold with a dot, urgent messages carry the soft red wash.
