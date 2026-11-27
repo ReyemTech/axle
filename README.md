@@ -179,3 +179,5 @@ yet; clients authenticate with bearer tokens only.
 
 Axle is source-available under the [Elastic License 2.0](LICENSE): free to use, modify and
 self-host. You may not provide Axle to third parties as a hosted or managed service.
+
+Contributions need a signed CLA; see [CONTRIBUTING.md](CONTRIBUTING.md).
