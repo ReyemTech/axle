@@ -62,6 +62,28 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Set up this machine: connect to a server (or run one locally), then configure every
+    /// detected harness (Claude Code, Codex, OpenCode)
+    Install {
+        /// Connect to this server, logging in first if this machine has no token for it
+        #[arg(long, value_name = "URL", conflicts_with = "local")]
+        server: Option<String>,
+        /// One-time code from the web UI (XXXXX-XXXXX), used with --server
+        #[arg(long, requires = "server")]
+        code: Option<String>,
+        /// Only configure this harness (repeatable)
+        #[arg(long, value_enum, value_name = "NAME")]
+        harness: Vec<axle::install::Harness>,
+        /// Run the server on this machine as a background service
+        #[arg(long)]
+        local: bool,
+        /// Print the planned changes as a diff and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Ask nothing: without a configured server or --server, use local mode
+        #[arg(long)]
+        yes: bool,
+    },
     /// Forget this machine's token (optionally revoking it on the server)
     Logout {
         /// Also revoke the token on the server
@@ -164,6 +186,24 @@ async fn main() -> ExitCode {
                 force,
             })
             .await
+        }
+        Command::Install {
+            server,
+            code,
+            harness,
+            local,
+            dry_run,
+            yes,
+        } => {
+            return install(axle::cli::InstallArgs {
+                server,
+                code,
+                harness,
+                local,
+                dry_run,
+                yes,
+            })
+            .await;
         }
         Command::Logout { revoke } => logout(revoke).await,
         Command::Service { command } => service(command),
@@ -272,6 +312,37 @@ fn home_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
 async fn login(args: axle::cli::LoginArgs) -> CliResult {
     axle::cli::login(&home_dir()?, args, &mut std::io::stdout()).await?;
     Ok(())
+}
+
+async fn install(args: axle::cli::InstallArgs) -> ExitCode {
+    use std::io::IsTerminal;
+    let run = async {
+        let home = home_dir()?;
+        let service_home = home.clone();
+        let service =
+            move || axle::daemon::platform(&service_home, Box::new(axle::daemon::SystemRunner));
+        let mut stdout = std::io::stdout();
+        let mut env = axle::cli::InstallEnv {
+            home,
+            path_env: std::env::var_os("PATH"),
+            current_exe: std::env::current_exe()?,
+            interactive: std::io::stdin().is_terminal(),
+            prompt: &axle::cli::TerminalPrompt,
+            out: &mut stdout,
+            service: &service,
+            login_hooks: axle::cli::LoginHooks::default(),
+            now: time::OffsetDateTime::now_utc(),
+        };
+        let report = axle::cli::install(&mut env, args).await?;
+        Ok::<_, Box<dyn std::error::Error>>(report.exit_code())
+    };
+    match run.await {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("axl: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 async fn logout(revoke: bool) -> CliResult {

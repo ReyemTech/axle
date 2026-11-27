@@ -101,7 +101,7 @@ fn usage(msg: impl Into<String>) -> ClientError {
 }
 
 /// A server URL as the user typed it, without trailing slashes; must be http(s).
-fn normalise_url(raw: &str) -> Result<String, ClientError> {
+pub(crate) fn normalise_url(raw: &str) -> Result<String, ClientError> {
     let url = raw.trim().trim_end_matches('/');
     let ok = ["http://", "https://"]
         .iter()
