@@ -1,24 +1,27 @@
 #!/usr/bin/env bash
 # Builds the image, runs it, and checks the basics end to end. Exits non-zero on any failure.
+# Set AXL_SMOKE_IMAGE to test an image that is already built (CI builds it with a layer cache).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-IMAGE="axle-smoke:$$"
+IMAGE="${AXL_SMOKE_IMAGE:-axle-smoke:$$}"
 NAME="axle-smoke-$$"
 PORT="${AXL_SMOKE_PORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')}"
 SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
 
 cleanup() {
   docker rm -f "$NAME" >/dev/null 2>&1 || true
-  docker rmi -f "$IMAGE" >/dev/null 2>&1 || true
+  [ -n "${AXL_SMOKE_IMAGE:-}" ] || docker rmi -f "$IMAGE" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 fail() { echo "FAIL: $*" >&2; docker logs "$NAME" >&2 2>&1 || true; exit 1; }
 
-echo "building image"
-docker build -q -t "$IMAGE" . >/dev/null
+if [ -z "${AXL_SMOKE_IMAGE:-}" ]; then
+  echo "building image"
+  docker build -q -t "$IMAGE" . >/dev/null
+fi
 
 docker run -d --name "$NAME" -p "127.0.0.1:$PORT:7420" \
   -e DATABASE_URL=sqlite:///data/axl.db \

@@ -1,9 +1,17 @@
 name: ci
 
+# Docs-only changes skip CI. Any change outside these paths runs everything.
 on:
   push:
     branches: [main]
+    paths-ignore: &docs
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/pull_request_template.md"
   pull_request:
+    paths-ignore: *docs
 
 permissions:
   contents: read
@@ -17,6 +25,9 @@ env:
 
 jobs:
   rust:
+    # Release PRs only bump the version and changelog of code main already tested,
+    # and the tag build compiles everything again.
+    if: ${{ !startsWith(github.head_ref, 'release-plz-') }}
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -37,20 +48,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+          # PRs restore main's cache but never save their own, so it stays small and fresh.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo clippy --all-targets --features pg-tests -- -D warnings
+      # pg-tests only adds the Postgres tests, so this one run covers SQLite too.
       - run: cargo test --features pg-tests
 
   helm:
+    if: ${{ !startsWith(github.head_ref, 'release-plz-') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,8 +74,19 @@ jobs:
         run: bash tests/helm.sh
 
   smoke:
+    if: ${{ !startsWith(github.head_ref, 'release-plz-') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
+      - name: Build the image (layer cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: axle-smoke:ci
+          cache-from: type=gha,scope=smoke
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max,scope=smoke' || '' }}
       - run: bash tests/smoke.sh
+        env:
+          AXL_SMOKE_IMAGE: axle-smoke:ci
