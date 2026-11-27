@@ -114,6 +114,8 @@ enum Command {
         #[command(subcommand)]
         command: ServiceCommand,
     },
+    /// Show whether this machine is connected: server, token, local service, each harness
+    Status,
     /// Run database migrations (needs DATABASE_URL)
     Migrate,
     /// Manage projects
@@ -239,6 +241,7 @@ async fn main() -> ExitCode {
             })
             .await;
         }
+        Command::Status => return status().await,
         Command::Logout { revoke } => logout(revoke).await,
         Command::Service { command } => service(command),
         Command::Migrate => migrate().await,
@@ -369,6 +372,36 @@ async fn install(args: axle::cli::InstallArgs) -> ExitCode {
             now: time::OffsetDateTime::now_utc(),
         };
         let report = axle::cli::install(&mut env, args).await?;
+        Ok::<_, Box<dyn std::error::Error>>(report.exit_code())
+    };
+    match run.await {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("axl: {}", axle::cli::install::redact(&e.to_string()));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn status() -> ExitCode {
+    let run = async {
+        let home = home_dir()?;
+        let service_home = home.clone();
+        let service =
+            move || axle::daemon::platform(&service_home, Box::new(axle::daemon::SystemRunner));
+        let mut stdout = std::io::stdout();
+        let mut env = axle::cli::InstallEnv {
+            home,
+            path_env: std::env::var_os("PATH"),
+            current_exe: std::env::current_exe()?,
+            interactive: false,
+            prompt: &axle::cli::TerminalPrompt,
+            out: &mut stdout,
+            service: &service,
+            login_hooks: axle::cli::LoginHooks::default(),
+            now: time::OffsetDateTime::now_utc(),
+        };
+        let report = axle::cli::status::run(&mut env).await;
         Ok::<_, Box<dyn std::error::Error>>(report.exit_code())
     };
     match run.await {

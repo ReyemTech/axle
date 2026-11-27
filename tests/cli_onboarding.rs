@@ -14,7 +14,7 @@ use std::time::Duration;
 use axle::bridge::short_hostname;
 use axle::cli::{
     HarnessRow, InstallArgs, InstallEnv, InstallReport, LoginArgs, LoginHooks, Outcome, Prompt,
-    UninstallArgs, install, login, uninstall,
+    StatusReport, UninstallArgs, install, login, status, uninstall,
 };
 use axle::client::{Api, AxlDir, ClientConfig, load_config, save_config, write_token};
 use axle::clock::{Clock, SystemClock};
@@ -136,6 +136,8 @@ struct FakeService {
     running: Arc<Mutex<bool>>,
     /// Serve a stand-in whose `/readyz` works and `/v1/whoami` answers 500.
     whoami_fails: bool,
+    /// Report the unit as installed but not running.
+    stopped: bool,
 }
 
 impl ServiceControl for FakeService {
@@ -194,6 +196,9 @@ impl ServiceControl for FakeService {
         Ok(())
     }
     fn status(&self) -> Result<ServiceState, DaemonError> {
+        if self.stopped {
+            return Ok(ServiceState::Stopped);
+        }
         Ok(if *self.running.lock().unwrap() {
             ServiceState::Running
         } else {
@@ -1464,4 +1469,218 @@ async fn corrupt_manifest_stops_uninstall() {
     );
     assert!(service.calls.lock().unwrap().is_empty());
     assert!(AxlDir::new(home.path()).token_path().exists());
+}
+
+// ---- axl status ----
+
+async fn run_status(
+    home: &TempHome,
+    service: &FakeService,
+    exe: PathBuf,
+) -> (StatusReport, String) {
+    let mut out = Vec::new();
+    let svc = service.clone();
+    let factory =
+        move || -> Result<Box<dyn ServiceControl>, NoServiceManager> { Ok(Box::new(svc.clone())) };
+    let env = InstallEnv {
+        home: home.path().to_path_buf(),
+        path_env: Some(OsString::new()),
+        current_exe: exe,
+        interactive: false,
+        prompt: &NoPrompt,
+        out: &mut out,
+        service: &factory,
+        login_hooks: hooks(),
+        now: T2,
+    };
+    let report = status(&env).await;
+    (report.clone(), report.render())
+}
+
+fn value_of<'a>(report: &'a StatusReport, label: &str) -> &'a axle::cli::StatusLine {
+    report
+        .lines
+        .iter()
+        .find(|l| l.label == label)
+        .unwrap_or_else(|| panic!("no {label} line: {:?}", report.lines))
+}
+
+#[tokio::test]
+async fn status_all_good() {
+    let srv = server().await;
+    let home = full_home(&srv).await;
+    let service = FakeService::default();
+    let (installed, _) = run(&home, args(), &NoPrompt, false, &service, T1).await;
+    installed.unwrap();
+    let token = std::fs::read_to_string(AxlDir::new(home.path()).token_path()).unwrap();
+
+    let (report, text) = run_status(&home, &service, home.exe("bin/axl")).await;
+    assert!(report.ok, "{text}");
+    assert_eq!(report.exit_code(), ExitCode::SUCCESS);
+    assert!(text.contains(&srv.base), "{text}");
+    assert!(value_of(&report, "reachable").value.starts_with("yes"));
+    assert!(
+        value_of(&report, "token").value.starts_with("valid ("),
+        "{text}"
+    );
+    for name in ["Claude Code", "Codex", "OpenCode"] {
+        assert_eq!(value_of(&report, name).value, "configured", "{text}");
+    }
+    assert!(!text.contains("fix:"), "{text}");
+    assert!(!text.contains(token.trim()), "token leaked: {text}");
+
+    // A harness that is not on this machine is reported, not failed.
+    let bare = TempHome::new();
+    bare.mkdir(".claude");
+    connect(&bare, &srv).await;
+    let (report, text) = run_status(&bare, &FakeService::default(), bare.exe("bin/axl")).await;
+    assert_eq!(value_of(&report, "Codex").value, "not found", "{text}");
+    assert_eq!(value_of(&report, "OpenCode").value, "not found", "{text}");
+    assert_eq!(
+        value_of(&report, "Claude Code").value.split(',').next(),
+        Some("not configured")
+    );
+}
+
+#[tokio::test]
+async fn status_reports_missing_token_with_fix() {
+    let srv = server().await;
+    let home = TempHome::new();
+    home.mkdir(".claude");
+    save_config(
+        &AxlDir::new(home.path()),
+        &ClientConfig {
+            server_url: Some(srv.base.clone()),
+            port: None,
+        },
+    )
+    .unwrap();
+    let (report, text) = run_status(&home, &FakeService::default(), home.exe("bin/axl")).await;
+    assert!(!report.ok);
+    assert_eq!(report.exit_code(), ExitCode::FAILURE);
+    assert!(
+        text.contains(&format!("fix: axl login {}", srv.base)),
+        "{text}"
+    );
+    assert!(
+        value_of(&report, "Claude Code")
+            .fix
+            .as_deref()
+            .is_some_and(|f| f == "axl install --harness claude-code"),
+        "{text}"
+    );
+
+    // An unreachable server gets the same login fix; a stopped service its own.
+    let dead = format!("http://127.0.0.1:{}", free_port());
+    let home = TempHome::new();
+    save_config(
+        &AxlDir::new(home.path()),
+        &ClientConfig {
+            server_url: Some(dead.clone()),
+            port: None,
+        },
+    )
+    .unwrap();
+    write_token(&AxlDir::new(home.path()), "axl_0123456789abcdef").unwrap();
+    let service = FakeService {
+        stopped: true,
+        ..FakeService::default()
+    };
+    let (report, text) = run_status(&home, &service, home.exe("bin/axl")).await;
+    assert!(
+        value_of(&report, "reachable").value.starts_with("no"),
+        "{text}"
+    );
+    assert!(text.contains(&format!("fix: axl login {dead}")), "{text}");
+    assert_eq!(
+        value_of(&report, "service").fix.as_deref(),
+        Some("axl service start")
+    );
+    assert!(!text.contains("axl_0123456789abcdef"), "{text}");
+}
+
+#[tokio::test]
+async fn status_reports_stale_binary_path() {
+    let srv = server().await;
+    let home = full_home(&srv).await;
+    let service = FakeService::default();
+    let old = home.exe("bin/axl");
+    let (installed, _) = run(&home, args(), &NoPrompt, false, &service, T1).await;
+    installed.unwrap();
+    let new = home.exe("newbin/axl");
+    std::fs::remove_file(&old).unwrap();
+
+    let (report, text) = run_status(&home, &service, new).await;
+    assert!(!report.ok, "{text}");
+    for name in ["Claude Code", "Codex", "OpenCode"] {
+        let l = value_of(&report, name);
+        assert!(l.value.contains("no longer exists"), "{name}: {text}");
+        assert!(
+            l.value.contains(&old.display().to_string()),
+            "{name}: {text}"
+        );
+        assert_eq!(l.fix.as_deref(), Some("axl install"), "{name}: {text}");
+    }
+    assert!(text.contains("fix: axl install\n"), "{text}");
+}
+
+#[tokio::test]
+async fn status_flags_version_mismatch() {
+    use axum::{Json, Router, routing::get};
+    let app = Router::new()
+        .route("/readyz", get(|| async { "ok" }))
+        .route(
+            "/v1/whoami",
+            get(|| async { Json(serde_json::json!({"label": "stub", "version": "0.0.1"})) }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let home = TempHome::new();
+    let dir = AxlDir::new(home.path());
+    save_config(
+        &dir,
+        &ClientConfig {
+            server_url: Some(base),
+            port: None,
+        },
+    )
+    .unwrap();
+    write_token(&dir, "axl_0123456789abcdef").unwrap();
+    let (report, text) = run_status(&home, &FakeService::default(), home.exe("bin/axl")).await;
+    let v = value_of(&report, "version");
+    assert!(v.value.contains("0.0.1"), "{text}");
+    assert!(v.value.contains(env!("CARGO_PKG_VERSION")), "{text}");
+    assert_eq!(v.fix.as_deref(), Some("axl service restart"), "{text}");
+    assert!(!report.ok);
+    assert!(value_of(&report, "token").value.contains("stub"));
+}
+
+#[tokio::test]
+async fn status_is_read_only() {
+    let srv = server().await;
+    let home = full_home(&srv).await;
+    let service = FakeService::default();
+    let (installed, _) = run(&home, args(), &NoPrompt, false, &service, T1).await;
+    installed.unwrap();
+    // Make it a messy home: a stale path, a missing config entry.
+    let old = home.exe("bin/axl");
+    let new = home.exe("newbin/axl");
+    std::fs::remove_file(&old).unwrap();
+    std::fs::write(home.path().join(".codex/config.toml"), "model = \"o3\"\n").unwrap();
+
+    let before = snapshot(home.path());
+    let stopped = FakeService {
+        stopped: true,
+        ..FakeService::default()
+    };
+    let (report, _) = run_status(&home, &stopped, new).await;
+    assert!(!report.ok);
+    assert_eq!(
+        snapshot(home.path()),
+        before,
+        "status changed the home tree"
+    );
+    assert!(service.calls.lock().unwrap().is_empty());
 }
