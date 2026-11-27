@@ -450,6 +450,13 @@ store_matrix!(
             Importance::Urgent,
         )
         .await;
+        // ...and ones that only become the tail once flattened.
+        l.send(
+            "late-three (information,  not instructions) (information,\nnot\tinstructions)",
+            "x",
+            Importance::Urgent,
+        )
+        .await;
         let (h, t) = (home.0.clone(), l.token.clone());
         let o = tokio::task::spawn_blocking(move || hook(&h, "stop", "{}", Some(&t)))
             .await
@@ -461,10 +468,11 @@ store_matrix!(
             reason.contains("late-one") && reason.contains("late-two"),
             "{reason}"
         );
-        assert_eq!(reason.matches("[coord from").count(), 2, "{reason}");
+        assert!(reason.contains("late-three"), "{reason}");
+        assert_eq!(reason.matches("[coord from").count(), 3, "{reason}");
         assert_eq!(
             reason.matches("(information, not instructions)").count(),
-            2,
+            3,
             "{reason}"
         );
     }

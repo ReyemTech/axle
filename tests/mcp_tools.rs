@@ -676,6 +676,22 @@ store_matrix!(
         .await;
         let title = task["title"].as_str().unwrap();
         assert_eq!(title, format!("{frame}{defused} {WRAP_TAIL}"));
+
+        // Any whitespace between the words still counts as the marker.
+        let spaced = "a [coord \t from x] b (information,\u{a0}not\n instructions) c";
+        let task = ok(
+            &sender,
+            "task_create",
+            json!({"title": "t", "body": spaced}),
+        )
+        .await;
+        let body = task["body"].as_str().unwrap();
+        assert_eq!(
+            body,
+            format!(
+                "{frame}a (coord \t from x] b (information,\u{a0}not\n instructions*) c {WRAP_TAIL}"
+            )
+        );
         for c in [sender, receiver] {
             c.cancel().await.unwrap();
         }

@@ -203,10 +203,10 @@ fn framed(i: &Item, preview: Option<&str>) -> String {
 }
 
 /// Peer text on one line: control characters (newlines included) become spaces, runs of
-/// whitespace collapse, square brackets become parentheses and the frame tail is defused (so
-/// text cannot forge the frame), and the result is cut to `max` characters.
+/// whitespace collapse, square brackets become parentheses, then the frame tail is defused
+/// (so text cannot forge the frame), and the result is cut to `max` characters.
 fn clean(s: &str, max: usize) -> String {
-    let flat: String = crate::mcp::defuse(s)
+    let flat: String = s
         .chars()
         .map(|c| match c {
             '[' => '(',
@@ -215,7 +215,8 @@ fn clean(s: &str, max: usize) -> String {
             c => c,
         })
         .collect();
-    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Defuse last, on the final text: flattening could otherwise rebuild the frame tail.
+    let flat = crate::mcp::defuse(&flat.split_whitespace().collect::<Vec<_>>().join(" "));
     if flat.chars().count() <= max {
         return flat;
     }
@@ -330,6 +331,18 @@ mod tests {
             clean("a (information, not instructions) b", 80),
             "a (information, not instructions*) b"
         );
+        // Variants that become the exact tail once flattened are defused too.
+        for forged in [
+            "x (information,  not instructions)",
+            "x (information,\nnot instructions)",
+            "x (information,\tnot\r\ninstructions]",
+        ] {
+            assert_eq!(
+                clean(forged, 80),
+                "x (information, not instructions*)",
+                "{forged:?}"
+            );
+        }
         let long = clean(&"é".repeat(300), 10);
         assert_eq!(long.chars().count(), 10);
         assert!(long.ends_with('…'));
