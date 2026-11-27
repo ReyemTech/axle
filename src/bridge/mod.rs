@@ -33,13 +33,14 @@ use tokio::sync::Mutex;
 
 use self::project::{Env, resolve_project};
 use self::session_file::{SessionFile, SessionInfo};
+use crate::client::{AxlDir, read_token, resolve_server_url};
 use crate::domain::SessionId;
 use crate::mcp::{
     AxleMcp, HARNESS_HEADER, HOST_HEADER, INSTRUCTIONS, PROJECT_HEADER, SESSION_HEADER, UNKNOWN,
 };
 use crate::service::identity::NAME_MAX;
 
-pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:7420";
+pub use crate::client::DEFAULT_SERVER_URL;
 /// How often the bridge heartbeats (or, while unregistered, retries registering).
 pub const HEARTBEAT: Duration = Duration::from_secs(30);
 /// Overrides `HEARTBEAT`, in milliseconds. For tests and tuning only; not a user setting.
@@ -79,11 +80,16 @@ impl Config {
             harness: harness_label,
             host: sanitize_label(&short_hostname()),
             project_key: resolve_project(cwd, env),
-            server_url: env
-                .get("AXL_SERVER_URL")
-                .unwrap_or(DEFAULT_SERVER_URL)
-                .trim_end_matches('/')
-                .to_string(),
+            server_url: match env.get("HOME") {
+                Some(home) => {
+                    resolve_server_url(env.get("AXL_SERVER_URL"), &AxlDir::new(Path::new(home)))
+                }
+                None => env
+                    .get("AXL_SERVER_URL")
+                    .unwrap_or(DEFAULT_SERVER_URL)
+                    .trim_end_matches('/')
+                    .to_string(),
+            },
             heartbeat: env
                 .get(HEARTBEAT_ENV)
                 .and_then(|ms| ms.parse::<u64>().ok())
@@ -96,19 +102,13 @@ impl Config {
 
     /// The bearer token, or why there is none.
     fn token(&self) -> Result<String, String> {
-        if let Some(t) = &self.env_token {
-            return Ok(t.clone());
-        }
-        let missing = "no token (set AXL_TOKEN or write ~/.axl/token)".to_string();
         let Some(home) = &self.home else {
-            return Err(missing);
+            return match &self.env_token {
+                Some(t) => Ok(t.clone()),
+                None => Err("no token (set AXL_TOKEN or write ~/.axl/token)".to_string()),
+            };
         };
-        match std::fs::read_to_string(home.join(".axl").join("token")) {
-            Ok(t) if !t.trim().is_empty() => Ok(t.trim().to_string()),
-            Ok(_) => Err(missing),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(missing),
-            Err(e) => Err(format!("cannot read ~/.axl/token: {e}")),
-        }
+        read_token(self.env_token.as_deref(), &AxlDir::new(home))
     }
 
     fn session_info(&self) -> SessionInfo {
@@ -481,4 +481,49 @@ async fn serve_stdio(bridge: Bridge) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     service.waiting().await.map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempHome(PathBuf);
+
+    impl TempHome {
+        fn new() -> Self {
+            let mut bytes = [0u8; 8];
+            getrandom::fill(&mut bytes).unwrap();
+            let suffix: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let dir = std::env::temp_dir().join(format!("axl-bridge-cfg-{suffix}"));
+            std::fs::create_dir_all(dir.join(".axl")).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn resolve_reads_server_url_from_config_toml() {
+        let home = TempHome::new();
+        std::fs::write(
+            home.0.join(".axl").join("config.toml"),
+            "server_url = \"https://axle.example.com/\"\n",
+        )
+        .unwrap();
+        let home_str = home.0.to_str().unwrap();
+        let env = Env::from_pairs([("HOME", home_str)]);
+        let cfg = Config::resolve("claude", &home.0, &env);
+        assert_eq!(cfg.server_url, "https://axle.example.com");
+
+        let env = Env::from_pairs([
+            ("HOME", home_str),
+            ("AXL_SERVER_URL", "http://10.0.0.5:7420/"),
+        ]);
+        let cfg = Config::resolve("claude", &home.0, &env);
+        assert_eq!(cfg.server_url, "http://10.0.0.5:7420");
+    }
 }

@@ -234,13 +234,7 @@ fn rank(importance: &str) -> u8 {
 }
 
 fn token(home: &Path, env_token: Option<&str>) -> Result<String, String> {
-    if let Some(t) = env_token.map(str::trim).filter(|t| !t.is_empty()) {
-        return Ok(t.to_string());
-    }
-    match std::fs::read_to_string(home.join(".axl").join("token")) {
-        Ok(t) if !t.trim().is_empty() => Ok(t.trim().to_string()),
-        _ => Err("no token (set AXL_TOKEN or write ~/.axl/token)".to_string()),
-    }
+    crate::client::read_token(env_token, &crate::client::AxlDir::new(home))
 }
 
 /// The session's unread mail, oldest first: the server's first page, plus any high or
