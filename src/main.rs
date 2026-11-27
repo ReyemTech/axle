@@ -41,8 +41,9 @@ enum Command {
     /// Claude Code hook: reads the hook JSON on stdin, prints hook JSON on stdout. Always
     /// exits 0 (fail-open); problems are one line on stderr.
     Hook {
-        #[arg(value_enum)]
-        event: coord::hook::Event,
+        /// session-start | user-prompt-submit | post-tool-use | stop (anything else is ignored)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Run database migrations (needs DATABASE_URL)
     Migrate,
@@ -72,6 +73,21 @@ type CliResult = Result<(), Box<dyn std::error::Error>>;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Hooks run inside the harness, where exit 2 blocks the user's prompt: bypass clap
+    // (whose usage errors exit 2) and never exit non-zero.
+    if std::env::args().nth(1).as_deref() == Some("hook") {
+        std::panic::set_hook(Box::new(|_| {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "coord hook: internal error");
+        }));
+        let event = std::env::args()
+            .nth(2)
+            .and_then(|a| <coord::hook::Event as clap::ValueEnum>::from_str(&a, true).ok());
+        if let Some(event) = event {
+            hook(event).await;
+        }
+        std::process::exit(0);
+    }
     let result = match Cli::parse().command {
         Command::Bridge { harness } => {
             coord::bridge::run(&harness, stop_signal()).await;
@@ -79,10 +95,7 @@ async fn main() -> ExitCode {
             // shutdown after a signal. The bridge fails open, so this is always success.
             std::process::exit(0);
         }
-        Command::Hook { event } => {
-            hook(event).await;
-            std::process::exit(0);
-        }
+        Command::Hook { .. } => unreachable!("handled before argument parsing"),
         Command::Serve {
             bind,
             trusted_header,
@@ -102,7 +115,7 @@ async fn main() -> ExitCode {
 
 /// Never fails: every problem is at most one stderr line, and stdout stays empty.
 async fn hook(event: coord::hook::Event) {
-    use std::io::Read;
+    use std::io::{Read, Write};
     let work = async move {
         let stdin = tokio::task::spawn_blocking(|| {
             let mut buf = String::new();
@@ -117,11 +130,17 @@ async fn hook(event: coord::hook::Event) {
     };
     // Hard ceiling on total runtime, including a stdin that never closes.
     match tokio::time::timeout(std::time::Duration::from_secs(5), tokio::spawn(work)).await {
-        Ok(Ok(Ok(Some(out)))) => println!("{out}"),
+        Ok(Ok(Ok(Some(out)))) => {
+            let _ = writeln!(std::io::stdout(), "{out}");
+        }
         Ok(Ok(Ok(None))) => {}
-        Ok(Ok(Err(e))) => eprintln!("coord hook: {e}"),
-        Ok(Err(_)) => eprintln!("coord hook: internal error"),
-        Err(_) => eprintln!("coord hook: timed out"),
+        Ok(Ok(Err(e))) => {
+            let _ = writeln!(std::io::stderr(), "coord hook: {e}");
+        }
+        Ok(Err(_)) => {} // the panic hook already wrote the one line
+        Err(_) => {
+            let _ = writeln!(std::io::stderr(), "coord hook: timed out");
+        }
     }
 }
 

@@ -90,6 +90,39 @@ fn write_session(home: &Path, session: SessionId, server_url: &str, project: &st
     path
 }
 
+fn raw(home: &Path, args: &[&str]) -> Out {
+    let out = Command::new(env!("CARGO_BIN_EXE_coord"))
+        .arg("hook")
+        .args(args)
+        .env_clear()
+        .env("HOME", home)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    Out {
+        code: out.status.code().unwrap(),
+        stdout: String::from_utf8(out.stdout).unwrap(),
+        stderr: String::from_utf8(out.stderr).unwrap(),
+    }
+}
+
+#[test]
+fn bad_arguments_never_exit_nonzero() {
+    let home = TempDir::new();
+    for args in [
+        &[][..],
+        &["bogus"],
+        &["--help"],
+        &["--nope", "stop"],
+        &["stop", "extra", "--garbage"],
+        &["SESSION-START", "x"],
+    ] {
+        let o = raw(&home.0, args);
+        assert_eq!(o.code, 0, "{args:?}");
+        assert_eq!(o.stdout, "", "{args:?}");
+    }
+}
+
 #[test]
 fn stop_active_exits_first() {
     let home = TempDir::new();
@@ -357,3 +390,67 @@ store_matrix!(lists_at_most_five, |store: Arc<dyn Store>| async move {
         "{ctx}"
     );
 });
+
+store_matrix!(
+    prompt_submit_dedupes_and_orders,
+    |store: Arc<dyn Store>| async move {
+        let home = TempDir::new();
+        let l = live(store, &home.0).await;
+        let run = |h: PathBuf, t: String, ev: &'static str| async move {
+            tokio::task::spawn_blocking(move || hook(&h, ev, "{}", Some(&t)))
+                .await
+                .unwrap()
+        };
+        for i in 0..6 {
+            l.send(&format!("old{i}"), "x", Importance::Normal).await;
+        }
+        l.send("pageme", "x", Importance::Urgent).await;
+        let o = run(home.0.clone(), l.token.clone(), "user-prompt-submit").await;
+        let v: Value = serde_json::from_str(&o.stdout).unwrap();
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        let lines: Vec<&str> = ctx.lines().collect();
+        assert!(lines[1].contains("pageme"), "urgent first: {ctx}");
+        assert!(lines[2].contains("old5"), "then newest: {ctx}");
+        assert!(ctx.contains("and 2 more"), "{ctx}");
+
+        // The next prompt shows only what was not shown yet, not the same list again.
+        let o = run(home.0.clone(), l.token.clone(), "user-prompt-submit").await;
+        let v: Value = serde_json::from_str(&o.stdout).unwrap();
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(!ctx.contains("pageme") && !ctx.contains("old5"), "{ctx}");
+        assert_eq!(ctx.matches("[coord from").count(), 2, "{ctx}");
+        let o = run(home.0.clone(), l.token.clone(), "user-prompt-submit").await;
+        assert_eq!(o.stdout, "");
+        // SessionStart always shows the current unread.
+        let o = run(home.0.clone(), l.token.clone(), "session-start").await;
+        assert!(o.stdout.contains("pageme"));
+    }
+);
+
+store_matrix!(
+    stop_sees_urgent_beyond_twenty_and_names_all,
+    |store: Arc<dyn Store>| async move {
+        let home = TempDir::new();
+        let l = live(store, &home.0).await;
+        for i in 0..25 {
+            l.send(&format!("n{i}"), "x", Importance::Normal).await;
+        }
+        l.send("late-one", "x", Importance::Urgent).await;
+        l.send("late-two", "x", Importance::Urgent).await;
+        let (h, t) = (home.0.clone(), l.token.clone());
+        let o = tokio::task::spawn_blocking(move || hook(&h, "stop", "{}", Some(&t)))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&o.stdout).unwrap();
+        assert_eq!(v["decision"], "block");
+        let reason = v["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("late-one") && reason.contains("late-two"),
+            "{reason}"
+        );
+    }
+);

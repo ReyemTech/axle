@@ -27,6 +27,8 @@ const SUBJECT_CHARS: usize = 80;
 const PREVIEW_CHARS: usize = 160;
 const LABEL_CHARS: usize = 80;
 /// The seen file keeps this many of the most recent ids.
+/// The server's page maximum, so a new urgent message is not hidden behind old ones.
+const SUMMARY_LIMIT: u32 = 100;
 const SEEN_KEEP: usize = 500;
 /// How many process ancestors to try when looking for the session file.
 const ANCESTOR_DEPTH: usize = 4;
@@ -97,17 +99,31 @@ pub async fn run(
 
     let (output, surfaced): (Option<Value>, Vec<&Item>) = match event {
         Event::SessionStart | Event::UserPromptSubmit | Event::PostToolUse => {
-            let picked: Vec<&Item> = items
+            // SessionStart shows everything unread; the others only what was not shown yet
+            // (PostToolUse, being frequent, only high and urgent).
+            let mut picked: Vec<&Item> = items
                 .iter()
-                .filter(|i| {
-                    event != Event::PostToolUse
-                        || (matches!(i.importance.as_str(), "high" | "urgent")
-                            && !seen.contains(&i.id))
+                .filter(|i| match event {
+                    Event::SessionStart => true,
+                    Event::UserPromptSubmit => !seen.contains(&i.id),
+                    _ => {
+                        matches!(i.importance.as_str(), "high" | "urgent") && !seen.contains(&i.id)
+                    }
                 })
                 .collect();
             if picked.is_empty() {
                 return Ok(None);
             }
+            // Most important first, then newest (the inbox is oldest-first), so a cut
+            // never hides the urgent or the latest message.
+            let mut order: Vec<(usize, &Item)> = picked.drain(..).enumerate().collect();
+            order.sort_by_key(|(idx, i)| {
+                (
+                    std::cmp::Reverse(rank(&i.importance)),
+                    std::cmp::Reverse(*idx),
+                )
+            });
+            let picked: Vec<&Item> = order.into_iter().map(|(_, i)| i).collect();
             let listed: Vec<&Item> = picked.iter().copied().take(MAX_LISTED).collect();
             let context = context_text(&listed, picked.len(), info.project_key.as_deref());
             let out = json!({"hookSpecificOutput": {
@@ -117,22 +133,37 @@ pub async fn run(
             (Some(out), listed)
         }
         Event::Stop => {
+            // Name every urgent message this block covers; only those count as surfaced,
+            // so none is consumed silently (any beyond the cap block on a later stop).
             let urgent: Vec<&Item> = items
                 .iter()
                 .filter(|i| i.importance == "urgent" && !seen.contains(&i.id))
+                .take(MAX_LISTED)
                 .collect();
-            let Some(first) = urgent.first() else {
+            if urgent.is_empty() {
                 return Ok(None);
+            }
+            let subjects: Vec<String> = urgent
+                .iter()
+                .map(
+                    |i| match i.subject.as_deref().map(|s| clean(s, SUBJECT_CHARS)) {
+                        Some(s) if !s.is_empty() => s,
+                        _ => "(no subject)".to_string(),
+                    },
+                )
+                .collect();
+            let reason = if urgent.len() == 1 {
+                format!(
+                    "Urgent coord message: {}. Read it with fetch_inbox.",
+                    subjects[0]
+                )
+            } else {
+                format!(
+                    "Urgent coord messages: {}. Read them with fetch_inbox.",
+                    subjects.join("; ")
+                )
             };
-            let subject = match first.subject.as_deref().map(|s| clean(s, SUBJECT_CHARS)) {
-                Some(s) if !s.is_empty() => s,
-                _ => "(no subject)".to_string(),
-            };
-            let out = json!({
-                "decision": "block",
-                "reason": format!("Urgent coord message: {subject}. Read it with fetch_inbox."),
-            });
-            (Some(out), urgent)
+            (Some(json!({"decision": "block", "reason": reason})), urgent)
         }
     };
 
@@ -187,6 +218,14 @@ fn clean(s: &str, max: usize) -> String {
     cut
 }
 
+fn rank(importance: &str) -> u8 {
+    match importance {
+        "urgent" => 2,
+        "high" => 1,
+        _ => 0,
+    }
+}
+
 fn token(home: &Path, env_token: Option<&str>) -> Result<String, String> {
     if let Some(t) = env_token.map(str::trim).filter(|t| !t.is_empty()) {
         return Ok(t.to_string());
@@ -203,7 +242,7 @@ async fn fetch(info: &SessionInfo, token: &str) -> Result<Vec<Item>, String> {
         .build()
         .map_err(|e| format!("http client: {e}"))?;
     let url = format!(
-        "{}/v1/inbox/summary?session={}",
+        "{}/v1/inbox/summary?session={}&limit={SUMMARY_LIMIT}",
         info.server_url.trim_end_matches('/'),
         info.session_id
     );

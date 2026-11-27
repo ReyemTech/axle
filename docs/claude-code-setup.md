@@ -63,7 +63,8 @@ What each does (all read the hook JSON on stdin, talk to the server with a 2 s t
 
 | Hook | Behaviour |
 | --- | --- |
-| `session-start`, `user-prompt-submit` | Adds up to 5 unread messages as `additionalContext`. |
+| `session-start` | Adds up to 5 unread messages (urgent first, then newest) as `additionalContext`. |
+| `user-prompt-submit` | Same, but only messages not shown before. |
 | `post-tool-use` | Same, but only `high` / `urgent` messages, and each at most once. |
 | `stop` | Blocks the stop once per `urgent` message so the agent reads it; never blocks when `stop_hook_active` is true. |
 
