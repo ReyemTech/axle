@@ -576,6 +576,26 @@ store_matrix!(
         // The task is still claimed, so a valid transition still works.
         let done = ok(&agent, "task_update", json!({"id": id, "status": "review"})).await;
         assert_eq!(done["status"], "review");
+
+        // A child task cannot take extra projects: refused before the transition.
+        let child = ok(
+            &agent,
+            "task_create",
+            json!({"title": "kid", "body": "b", "parent": id}),
+        )
+        .await;
+        let cid = child["id"].as_str().unwrap();
+        ok(&agent, "task_claim", json!({"id": cid})).await;
+        let before = ok(&agent, "task_get", json!({"id": cid})).await;
+        let (is_error, text) = call(
+            &agent,
+            "task_update",
+            json!({"id": cid, "status": "review", "add_projects": [PROJECT]}),
+        )
+        .await;
+        assert!(is_error, "{text}");
+        let after = ok(&agent, "task_get", json!({"id": cid})).await;
+        assert_eq!(after, before, "child task changed after a rejected update");
         agent.cancel().await.unwrap();
     }
 );
