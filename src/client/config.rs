@@ -44,7 +44,7 @@ impl AxlDir {
     }
 
     pub fn manifest_path(&self) -> PathBuf {
-        self.root.join("manifest.json")
+        self.root.join("install-manifest.json")
     }
 
     pub fn db_path(&self) -> PathBuf {

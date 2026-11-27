@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use axle::client::AxlDir;
 use axle::install::{
-    EntryKind, FileEdit, Harness, INSTRUCTIONS, LinkEdit, Manifest, ManifestEntry, Plan, apply,
-    axl_path, is_axl_hook_command, remove_block, render_diff, upsert_block,
+    BlockError, EntryKind, FileEdit, Harness, INSTRUCTIONS, LinkEdit, Manifest, ManifestEntry,
+    Plan, apply, axl_path, is_axl_hook_command, remove_block, render_diff, upsert_block,
 };
 use time::macros::datetime;
 
@@ -98,23 +98,23 @@ fn cellar_path_maps_to_prefix_bin() {
 #[test]
 fn block_upsert_is_idempotent_and_removable() {
     let orig = "# mine\nkeep = 1\n";
-    let once = upsert_block(orig, "x");
+    let once = upsert_block(orig, "x").unwrap();
     assert!(once.contains("# >>> axle >>>\nx\n# <<< axle <<<\n"));
-    assert_eq!(upsert_block(&once, "x"), once);
-    assert_eq!(remove_block(&once), orig);
+    assert_eq!(upsert_block(&once, "x").unwrap(), once);
+    assert_eq!(remove_block(&once).unwrap(), orig);
 }
 
 #[test]
 fn block_replaced_in_place_and_empty_file() {
     let text = "a\n\n# >>> axle >>>\nold\n# <<< axle <<<\nz\n";
     assert_eq!(
-        upsert_block(text, "new\n"),
+        upsert_block(text, "new\n").unwrap(),
         "a\n\n# >>> axle >>>\nnew\n# <<< axle <<<\nz\n"
     );
-    let from_empty = upsert_block("", "x");
+    let from_empty = upsert_block("", "x").unwrap();
     assert_eq!(from_empty, "# >>> axle >>>\nx\n# <<< axle <<<\n");
-    assert_eq!(remove_block(&from_empty), "");
-    assert_eq!(remove_block("no block\n"), "no block\n");
+    assert_eq!(remove_block(&from_empty).unwrap(), "");
+    assert_eq!(remove_block("no block\n").unwrap(), "no block\n");
 }
 
 #[test]
@@ -327,7 +327,7 @@ fn harness_names_and_serde() {
 fn manifest_roundtrip_dedupes_and_is_private() {
     let t = Temp::new();
     let dir = AxlDir::new(t.path());
-    assert!(Manifest::load(&dir).entries.is_empty());
+    assert!(Manifest::load(&dir).unwrap().entries.is_empty());
     let entry = |kind, original: Option<serde_json::Value>| ManifestEntry {
         harness: Harness::Codex,
         file: PathBuf::from("/h/.codex/config.toml"),
@@ -343,7 +343,7 @@ fn manifest_roundtrip_dedupes_and_is_private() {
     ));
     m.record(entry(EntryKind::Added, None)); // same key: first record wins
     m.save(&dir).unwrap();
-    let loaded = Manifest::load(&dir);
+    let loaded = Manifest::load(&dir).unwrap();
     assert_eq!(loaded.entries.len(), 1);
     assert_eq!(loaded.entries[0].kind, EntryKind::Replaced);
     assert_eq!(
@@ -362,4 +362,101 @@ fn manifest_roundtrip_dedupes_and_is_private() {
 fn instructions_text_is_shared_source() {
     assert!(INSTRUCTIONS.starts_with("## Axle\n"));
     assert!(INSTRUCTIONS.contains("`whoami`"));
+}
+
+#[test]
+fn manifest_file_name_is_install_manifest() {
+    let t = Temp::new();
+    let dir = AxlDir::new(t.path());
+    assert!(dir.manifest_path().ends_with(".axl/install-manifest.json"));
+}
+
+#[test]
+fn corrupt_or_newer_manifest_is_an_error_and_is_not_clobbered() {
+    let t = Temp::new();
+    let dir = AxlDir::new(t.path());
+    dir.ensure().unwrap();
+    let p = dir.manifest_path();
+    std::fs::write(&p, "{ not json").unwrap();
+    let err = Manifest::load(&dir).unwrap_err().to_string();
+    assert!(err.contains("install-manifest.json"), "{err}");
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), "{ not json");
+    std::fs::write(&p, r#"{"version":2,"entries":[]}"#).unwrap();
+    let err = Manifest::load(&dir).unwrap_err().to_string();
+    assert!(
+        err.contains("version 2") && err.contains("install-manifest.json"),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&p).unwrap(),
+        r#"{"version":2,"entries":[]}"#
+    );
+}
+
+#[test]
+fn link_over_regular_file_is_backed_up_and_directory_refused() {
+    let t = Temp::new();
+    let now = datetime!(2026-11-27 09:00:00 UTC);
+    let link = t.path().join("axle");
+    std::fs::write(&link, "mine").unwrap();
+    let target = t.path().join("target");
+    let plan = Plan {
+        links: vec![LinkEdit {
+            path: link.clone(),
+            target: Some(target.clone()),
+            before: None,
+        }],
+        ..Plan::default()
+    };
+    apply(&plan, now).unwrap();
+    assert_eq!(std::fs::read_link(&link).unwrap(), target);
+    let b = t.path().join("axle.axl-backup-20261127T090000Z");
+    assert_eq!(std::fs::read_to_string(b).unwrap(), "mine");
+
+    let dir_link = t.path().join("adir");
+    std::fs::create_dir_all(dir_link.join("inner")).unwrap();
+    let plan = Plan {
+        links: vec![LinkEdit {
+            path: dir_link.clone(),
+            target: Some(target),
+            before: None,
+        }],
+        ..Plan::default()
+    };
+    let err = apply(&plan, now).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(dir_link.join("inner").is_dir());
+}
+
+#[test]
+fn orphan_start_marker_is_an_error_naming_the_line() {
+    let text = "keep
+# >>> axle >>>
+user content below
+";
+    assert_eq!(upsert_block(text, "x"), Err(BlockError { line: 2 }));
+    assert_eq!(remove_block(text), Err(BlockError { line: 2 }));
+    let msg = BlockError { line: 2 }.describe(Path::new("/h/AGENTS.md"));
+    assert!(msg.starts_with("/h/AGENTS.md:2:"), "{msg}");
+    // An end marker alone is just text.
+    assert_eq!(
+        remove_block("a\n# <<< axle <<<\n").unwrap(),
+        "a\n# <<< axle <<<\n"
+    );
+}
+
+#[test]
+fn axl_path_ignores_relative_path_entries_and_is_absolute() {
+    let t = Temp::new();
+    let real = t.path().join("real/axl");
+    exe_file(&real);
+    let cwd = std::env::current_dir().unwrap();
+    // A relative PATH entry that would resolve to the same file from the cwd.
+    let rel = real.strip_prefix("/").unwrap();
+    let up: PathBuf = cwd.components().skip(1).map(|_| "..").collect();
+    let rel_dir = up.join(rel.parent().unwrap());
+    let path_env = std::env::join_paths([rel_dir.as_path(), Path::new("")]).unwrap();
+    assert_eq!(axl_path(&real, Some(&path_env)), real);
+    let got = axl_path(Path::new("relative/axl"), None);
+    assert!(got.is_absolute(), "{got:?}");
 }

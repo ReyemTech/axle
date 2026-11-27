@@ -1,4 +1,4 @@
-//! What install changed, so uninstall can undo exactly that. Lives at `~/.axl/manifest.json`.
+//! What install changed, so uninstall can undo exactly that. Lives at `~/.axl/install-manifest.json`.
 
 use std::io;
 use std::path::PathBuf;
@@ -45,12 +45,39 @@ impl Default for Manifest {
 }
 
 impl Manifest {
-    /// A missing or unreadable manifest is an empty one.
-    pub fn load(dir: &AxlDir) -> Manifest {
-        std::fs::read_to_string(dir.manifest_path())
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+    /// A missing manifest is an empty one. An unreadable, corrupt or newer-version
+    /// manifest is an error naming the file: replacing it would lose the record of what
+    /// install changed, so callers must stop rather than save over it.
+    pub fn load(dir: &AxlDir) -> io::Result<Manifest> {
+        let path = dir.manifest_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Manifest::default()),
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("cannot read {}: {e}", path.display()),
+                ));
+            }
+        };
+        let bad = |why: String| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} is {why}; fix or move it aside (it records what `axl install` changed), then re-run",
+                    path.display()
+                ),
+            )
+        };
+        let m: Manifest =
+            serde_json::from_str(&text).map_err(|e| bad(format!("not a valid manifest ({e})")))?;
+        if m.version != 1 {
+            return Err(bad(format!(
+                "manifest version {}, which this axl does not understand (it supports 1); upgrade axl",
+                m.version
+            )));
+        }
+        Ok(m)
     }
 
     pub fn save(&self, dir: &AxlDir) -> io::Result<()> {

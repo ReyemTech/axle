@@ -13,7 +13,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 pub use fsutil::{
-    BLOCK_END, BLOCK_START, FileEdit, LinkEdit, Plan, apply, remove_block, render_diff,
+    BLOCK_END, BLOCK_START, BlockError, FileEdit, LinkEdit, Plan, apply, remove_block, render_diff,
     upsert_block,
 };
 pub use manifest::{EntryKind, Manifest, ManifestEntry};

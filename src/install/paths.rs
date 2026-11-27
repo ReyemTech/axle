@@ -12,6 +12,13 @@ use std::path::{Component, Path, PathBuf};
 /// to `<prefix>/bin/axl`.
 pub fn axl_path(current_exe: &Path, path_env: Option<&OsStr>) -> PathBuf {
     let chosen = same_file_on_path(current_exe, path_env).unwrap_or_else(|| current_exe.into());
+    let chosen = if chosen.is_absolute() {
+        chosen
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&chosen))
+            .unwrap_or(chosen)
+    };
     cellar_to_prefix(&chosen).unwrap_or(chosen)
 }
 
@@ -19,7 +26,7 @@ fn same_file_on_path(current_exe: &Path, path_env: Option<&OsStr>) -> Option<Pat
     let want = std::fs::metadata(current_exe).ok()?;
     let key = (want.dev(), want.ino());
     std::env::split_paths(path_env?)
-        .filter(|d| !d.as_os_str().is_empty())
+        .filter(|d| d.is_absolute())
         .map(|d| d.join("axl"))
         .find(|cand| {
             std::fs::metadata(cand)

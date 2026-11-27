@@ -87,6 +87,17 @@ pub fn apply(plan: &Plan, now: OffsetDateTime) -> io::Result<()> {
         now.second()
     );
     let mut backed_up: HashSet<PathBuf> = HashSet::new();
+    let mut back_up = |path: &Path| -> io::Result<()> {
+        if backed_up.insert(path.to_path_buf()) {
+            let mut name = path.as_os_str().to_owned();
+            name.push(format!(".axl-backup-{stamp}"));
+            let backup = PathBuf::from(name);
+            if backup.symlink_metadata().is_err() {
+                std::fs::copy(path, &backup)?;
+            }
+        }
+        Ok(())
+    };
     for e in &plan.edits {
         if e.before == e.after {
             continue;
@@ -99,13 +110,8 @@ pub fn apply(plan: &Plan, now: OffsetDateTime) -> io::Result<()> {
         } else if !exists {
             continue;
         }
-        if exists && backed_up.insert(e.path.clone()) {
-            let mut name = e.path.as_os_str().to_owned();
-            name.push(format!(".axl-backup-{stamp}"));
-            let backup = PathBuf::from(name);
-            if backup.symlink_metadata().is_err() {
-                std::fs::copy(&e.path, &backup)?;
-            }
+        if exists {
+            back_up(&e.path)?;
         }
         match &e.after {
             Some(after) => write_atomic(&e.path, after.as_bytes(), 0o644)?,
@@ -113,19 +119,31 @@ pub fn apply(plan: &Plan, now: OffsetDateTime) -> io::Result<()> {
         }
     }
     for l in &plan.links {
-        apply_link(l)?;
+        apply_link(l, &mut back_up)?;
     }
     Ok(())
 }
 
-fn apply_link(l: &LinkEdit) -> io::Result<()> {
+fn apply_link(l: &LinkEdit, back_up: &mut impl FnMut(&Path) -> io::Result<()>) -> io::Result<()> {
     let current = std::fs::read_link(&l.path).ok();
     match &l.target {
         Some(target) => {
             if current.as_ref() == Some(target) {
                 return Ok(());
             }
-            if l.path.symlink_metadata().is_ok() {
+            if let Ok(meta) = l.path.symlink_metadata() {
+                if meta.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "{} is a directory; move it aside so axl can link it",
+                            l.path.display()
+                        ),
+                    ));
+                }
+                if !meta.file_type().is_symlink() {
+                    back_up(&l.path)?; // a regular file the user put there
+                }
                 std::fs::remove_file(&l.path)?;
             }
             if let Some(parent) = l.path.parent() {
@@ -184,31 +202,66 @@ pub fn write_atomic(path: &Path, bytes: &[u8], default_mode: u32) -> io::Result<
     result
 }
 
-fn block_range(lines: &[&str]) -> Option<(usize, usize)> {
-    let start = lines
+/// A start marker with no end marker after it. Treating the rest of the file as the
+/// block would swallow the user's content, so callers must stop and ask for a fix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockError {
+    /// 1-based line of the orphan start marker.
+    pub line: usize,
+}
+
+impl BlockError {
+    pub fn describe(&self, file: &Path) -> String {
+        format!(
+            "{}:{}: `{BLOCK_START}` has no matching `{BLOCK_END}`; add the end line or remove the start line, then re-run",
+            file.display(),
+            self.line
+        )
+    }
+}
+
+impl std::fmt::Display for BlockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "line {}: `{BLOCK_START}` has no matching `{BLOCK_END}`",
+            self.line
+        )
+    }
+}
+
+impl std::error::Error for BlockError {}
+
+fn is_marker(line: &str, marker: &str) -> bool {
+    line.trim_end_matches(['\r', '\n']) == marker
+}
+
+fn block_range(lines: &[&str]) -> Result<Option<(usize, usize)>, BlockError> {
+    let Some(start) = lines.iter().position(|l| is_marker(l, BLOCK_START)) else {
+        return Ok(None);
+    };
+    match lines[start + 1..]
         .iter()
-        .position(|l| l.trim_end_matches(['\r', '\n']) == BLOCK_START)?;
-    let end = lines[start + 1..]
-        .iter()
-        .position(|l| l.trim_end_matches(['\r', '\n']) == BLOCK_END)?
-        + start
-        + 1;
-    Some((start, end))
+        .position(|l| is_marker(l, BLOCK_END))
+    {
+        Some(off) => Ok(Some((start, start + 1 + off))),
+        None => Err(BlockError { line: start + 1 }),
+    }
 }
 
 /// Puts `body` between the axle markers: replaced in place when a block exists, otherwise
-/// appended after one blank line. Idempotent.
-pub fn upsert_block(text: &str, body: &str) -> String {
+/// appended after one blank line. Idempotent. Errors on an orphan start marker.
+pub fn upsert_block(text: &str, body: &str) -> Result<String, BlockError> {
     let block = format!(
         "{BLOCK_START}\n{}\n{BLOCK_END}\n",
         body.trim_end_matches('\n')
     );
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    if let Some((start, end)) = block_range(&lines) {
+    if let Some((start, end)) = block_range(&lines)? {
         let mut out: String = lines[..start].concat();
         out.push_str(&block);
         out.push_str(&lines[end + 1..].concat());
-        return out;
+        return Ok(out);
     }
     let mut out = text.to_string();
     if !out.is_empty() {
@@ -218,20 +271,21 @@ pub fn upsert_block(text: &str, body: &str) -> String {
         out.push('\n');
     }
     out.push_str(&block);
-    out
+    Ok(out)
 }
 
 /// Removes the axle block and the one blank separator line before it. Undoes
 /// `upsert_block` exactly when the original text ended in a newline (or was empty).
-pub fn remove_block(text: &str) -> String {
+/// Errors on an orphan start marker.
+pub fn remove_block(text: &str) -> Result<String, BlockError> {
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    let Some((mut start, end)) = block_range(&lines) else {
-        return text.to_string();
+    let Some((mut start, end)) = block_range(&lines)? else {
+        return Ok(text.to_string());
     };
     if start > 0 && lines[start - 1].trim_end_matches(['\r', '\n']).is_empty() {
         start -= 1;
     }
     let mut out: String = lines[..start].concat();
     out.push_str(&lines[end + 1..].concat());
-    out
+    Ok(out)
 }
