@@ -1,0 +1,18 @@
+# syntax=docker/dockerfile:1
+# Release image: packages the `axl` binaries that the Release workflow already built and
+# published, so nothing compiles here. docker.yml downloads them into bin/<arch>/axl.
+# For a local build from source, use ./Dockerfile.
+
+# Runs on the build machine's own arch, so no emulation is needed for either platform.
+FROM --platform=$BUILDPLATFORM busybox:1.37 AS fs
+RUN mkdir -p /out/data
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+ARG TARGETARCH
+COPY --chmod=755 bin/${TARGETARCH}/axl /usr/local/bin/axl
+COPY --from=fs --chown=65532:65532 /out/data /data
+VOLUME /data
+EXPOSE 7420
+USER nonroot
+ENTRYPOINT ["axl"]
+CMD ["serve", "--bind", "0.0.0.0:7420"]
