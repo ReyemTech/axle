@@ -153,6 +153,17 @@ kbd {
   background: var(--sig-green);
 }
 :is(.aspect[data-aspect="open"], .station[data-status="open"]) { border-color: var(--text); }
+/* Planning: a dashed ring, the block reserved but not yet occupied. Awaiting you: the same
+   dashed ring in amber with a centre, like review (finished thinking, waiting on a check). */
+:is(.aspect[data-aspect="planning"], .station[data-status="planning"]) {
+  border-style: dashed;
+  border-color: var(--sig-red);
+}
+.aspect[data-aspect="plan-submitted"] {
+  border-style: dashed;
+  border-color: var(--sig-amber);
+  background: radial-gradient(circle, var(--sig-amber) 0 30%, transparent 34%);
+}
 :is(.aspect[data-aspect="cancelled"], .station[data-status="cancelled"]) {
   border-color: var(--rule-strong);
   background: linear-gradient(135deg, transparent 44%, var(--rule-strong) 44% 56%, transparent 56%);
@@ -260,6 +271,8 @@ a.pulse-item:hover { color: var(--bar-text); }
 .topbar .aspect { border-color: var(--bar-muted); }
 .topbar .aspect[data-aspect="live"] { border-color: var(--sig-green); }
 .topbar .aspect[data-aspect="blocked"] { border-color: var(--sig-red); }
+.topbar .aspect[data-aspect="plan-submitted"] { border-color: var(--sig-amber); }
+.pulse-item[href*="needs-you"].is-alert { color: var(--sig-amber); font-weight: 600; }
 .logout { margin: 0; }
 .topbar button.link { color: var(--bar-muted); }
 .topbar button.link:hover { color: var(--bar-text); }
@@ -323,7 +336,16 @@ textarea { resize: vertical; width: 100%; line-height: 1.4; }
 .stack label { color: var(--muted); font-size: 12px; font-weight: 600; margin-top: 6px; }
 .stack label:first-of-type { margin-top: 0; }
 .stack > button { justify-self: start; margin-top: 10px; }
-.stack input:not([type=hidden]) { width: 100%; }
+.stack input:not([type=hidden]):not([type=checkbox]) { width: 100%; }
+input[type=checkbox] { width: 16px; height: 16px; padding: 0; margin: 0; accent-color: var(--text); flex: none; }
+.stack label.check, label.check {
+  display: inline-flex; gap: 8px; align-items: center;
+  color: var(--text); font-size: 13px; font-weight: 400; margin-top: 6px; cursor: pointer;
+}
+.checks { display: flex; flex-wrap: wrap; gap: 2px 16px; margin: 6px 0 0; padding: 0; border: 0; min-width: 0; }
+.checks legend { padding: 0; margin-bottom: 2px; color: var(--muted); font-size: 12px; font-weight: 600; }
+.checks .hint { flex-basis: 100%; }
+.hint { color: var(--muted); font-size: 12px; margin: 0; }
 .button-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .stack .button-row { margin-top: 10px; }
 .error {
@@ -554,7 +576,7 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
 .card-meta { display: flex; flex-wrap: wrap; gap: 2px 12px; align-items: center; font-size: 12.5px; color: var(--muted); }
 .state { display: inline-flex; align-items: center; gap: 5px; font-weight: 600; color: var(--text); }
 .state[data-status="blocked"] { color: var(--danger); }
-.state[data-status="review"] { color: var(--warn); }
+.state[data-status="review"], .state[data-aspect="plan-submitted"] { color: var(--warn); }
 .state[data-status="done"] { color: var(--ok); }
 .card-meta .project { color: var(--muted); }
 .card-owner { display: flex; flex-wrap: wrap; gap: 2px 6px; align-items: baseline; font-size: 12.5px; color: var(--muted); }
@@ -653,6 +675,78 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
 .receipt[data-receipt="read"], .receipt[data-receipt="replied"] { color: var(--ok); }
 .receipt[data-receipt="delivered"] { color: var(--text); }
 
+/* ---------------------------------------------------------------- needs you
+   Work waiting on the human: an amber band above everything else, one attention card per
+   thing to do, each saying the verb in words beside its glyph. */
+.needs-you {
+  margin-bottom: 16px;
+  padding: 0 0 10px;
+  background: var(--warn-soft);
+  border: 1px solid var(--sig-amber);
+  border-radius: 6px;
+  scroll-margin-top: 12px;
+}
+.needs-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  min-height: 40px;
+  padding: 0 12px;
+  border-bottom: 2px solid var(--sig-amber);
+}
+.needs-head .aspect { width: 14px; height: 14px; }
+.needs-head h2 { font-size: 12.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
+.needs-head .count { font-size: 18px; font-weight: 700; color: var(--warn); }
+.needs-note { font-size: 12.5px; }
+.need-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr));
+  gap: 8px;
+  padding: 10px 10px 0;
+}
+.need-card {
+  display: grid;
+  gap: 6px;
+  align-content: start;
+  min-width: 0;
+  padding: 10px 12px 12px;
+  overflow-wrap: anywhere;
+  background: var(--card);
+  border: 2px solid var(--sig-amber);
+  border-radius: 6px;
+}
+.need-card[data-importance="urgent"] { border-color: var(--sig-red); background: var(--danger-soft); }
+.need-what {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--warn);
+}
+.need-card[data-importance="urgent"] .need-what { color: var(--danger); }
+.need-importance { font-weight: 600; text-transform: none; letter-spacing: 0; }
+.need-wait { color: var(--text); font-weight: 600; white-space: nowrap; }
+.need-preview {
+  font-size: 12.5px;
+  color: var(--muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: normal;
+}
+.need-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 2px; }
+.need-actions a.button-like { text-decoration: none; }
+.need-open { font-size: 12.5px; color: var(--text); }
+.need-changes > summary { list-style: none; }
+.need-changes > summary::-webkit-details-marker { display: none; }
+.need-changes[open] { flex-basis: 100%; order: 3; }
+.need-changes[open] > summary { margin-bottom: 8px; background: var(--band); border-color: var(--text); }
+
 /* ---------------------------------------------------------------- task page */
 .task-page { display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, 340px); gap: 32px; align-items: start; }
 .task-live { display: grid; gap: 10px; min-width: 0; }
@@ -664,7 +758,11 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
 .task-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; font-size: 13px; }
 .task-meta .status { display: inline-flex; gap: 6px; align-items: center; font-weight: 600; text-transform: capitalize; }
 .task-head[data-status="blocked"] .status { color: var(--danger); }
-.task-head[data-status="review"] .status { color: var(--warn); }
+.task-head[data-status="review"] .status, .task-head .status[data-aspect="plan-submitted"] { color: var(--warn); }
+.plan-flag { font-size: 12.5px; color: var(--muted); }
+.task-meta .status[data-aspect="plan-submitted"], .task-meta .status[data-aspect="planning"] { text-transform: none; }
+label.check:has(input:disabled) { color: var(--muted); cursor: default; }
+.also { display: inline-flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; }
 .task-head[data-status="done"] .status { color: var(--ok); }
 .lease-wide { margin: 2px 0 8px; max-width: 520px; }
 .lease-wide .lease-left { font-size: 13px; }
@@ -687,6 +785,14 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
 .event-child { color: var(--text); }
 .event-note { flex-basis: 100%; color: var(--muted); }
 .task-actions { display: grid; gap: 10px; min-width: 0; }
+.plan.is-waiting { background: var(--warn-soft); border: 2px solid var(--sig-amber); }
+.plan.is-waiting .panel-title { color: var(--warn); align-items: center; }
+.plan-body { margin: 8px 0 4px; padding: 10px 12px; background: var(--card); border: 1px solid var(--card-border); border-radius: 3px; }
+.plan-actions { display: flex; flex-wrap: wrap; gap: 12px 16px; align-items: start; margin-top: 10px; }
+.plan-actions > form:first-child button { height: 34px; }
+.plan-changes { flex: 1 1 260px; }
+.msg-kind { font-size: 12px; font-weight: 600; color: var(--warn); text-transform: uppercase; letter-spacing: .05em; }
+.msg-kind[data-kind="system"] { color: var(--muted); }
 
 
 /* ---------------------------------------------------------------- inbox */

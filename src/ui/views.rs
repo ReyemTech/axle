@@ -14,8 +14,10 @@ use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 
 use super::SessionCtx;
+use super::needs::{NeedCard, needs_you};
 use crate::domain::{
-    Actor, Address, Agent, AgentId, Importance, Project, ProjectId, Task, TaskId, TaskStatus,
+    Actor, Address, Agent, AgentId, Importance, PlanState, Project, ProjectId, Task, TaskId,
+    TaskStatus,
 };
 use crate::events::Event;
 use crate::http::AppState;
@@ -254,6 +256,9 @@ pub struct CardView {
     pub id: String,
     pub title: String,
     pub status: &'static str,
+    /// The signal aspect and the word beside it (a planning task's plan state shows here).
+    pub aspect: &'static str,
+    pub label: &'static str,
     pub project: ProjectLabel,
     /// The agent holding the task (or that finished it).
     pub owner: Option<String>,
@@ -284,13 +289,24 @@ pub(super) fn lease_left_text(left: i64) -> String {
     }
 }
 
-/// The lease of a `claimed` task (`None` for any other status, or without an expiry).
+/// A task's state as a signal aspect and its word: the status, except that a planning task
+/// whose plan waits on the human reads "plan awaiting you".
+pub fn state_mark(task: &Task) -> (&'static str, &'static str) {
+    match (task.status, task.plan_state) {
+        (TaskStatus::Planning, PlanState::Submitted) => ("plan-submitted", "plan awaiting you"),
+        (TaskStatus::Planning, PlanState::ChangesRequested) => ("planning", "plan in revision"),
+        (status, _) => (status.as_str(), status.as_str()),
+    }
+}
+
+/// The lease of a `claimed` or `planning` task (`None` for any other status, or without an
+/// expiry, like a plan awaiting approval).
 pub(super) fn lease_view(
     now: OffsetDateTime,
     default_ttl: Duration,
     task: &Task,
 ) -> Option<LeaseView> {
-    if task.status != TaskStatus::Claimed {
+    if !matches!(task.status, TaskStatus::Claimed | TaskStatus::Planning) {
         return None;
     }
     let until = task.lease_expires_at?;
@@ -406,10 +422,13 @@ async fn card(labels: &mut Labels<'_>, ctx: CardCtx, task: &Task) -> StoreResult
             .map(|title| (p.to_string(), title)),
         None => None,
     };
+    let (aspect, label) = state_mark(task);
     Ok(CardView {
         id: task.id.to_string(),
         title: task.title.clone(),
         status: task.status.as_str(),
+        aspect,
+        label,
         project: labels.project(task.project_id),
         owner,
         owner_live,
@@ -453,6 +472,8 @@ struct BoardPage {
     /// The filtered project's id (for the columns re-fetch URL).
     filter: Option<String>,
     columns: Vec<ColumnView>,
+    needs: Vec<NeedCard>,
+    back: &'static str,
 }
 
 #[derive(Template)]
@@ -507,7 +528,8 @@ async fn board_filter(store: &dyn Store, q: &BoardQuery) -> UiResult<Option<Proj
 
 /// Tasks per column. Open, Claimed and Done hold top-level tasks (subtasks show on their
 /// parent's card); Blocked and Review also hold subtasks, so everything waiting on someone is
-/// in its column. Done holds tasks finished within `DONE_WINDOW`, newest first.
+/// in its column. Claimed also holds `planning` tasks (the block is occupied, the work not yet
+/// started). Done holds tasks finished within `DONE_WINDOW`, newest first.
 async fn columns(
     state: &AppState,
     labels: &mut Labels<'_>,
@@ -524,7 +546,21 @@ async fn columns(
                 status: Some(status),
                 ..TaskFilter::default()
             })
-            .await?
+            .await?;
+        if status == TaskStatus::Claimed {
+            tasks.extend(
+                state
+                    .store
+                    .list_tasks(&TaskFilter {
+                        project,
+                        status: Some(TaskStatus::Planning),
+                        ..TaskFilter::default()
+                    })
+                    .await?,
+            );
+            tasks.sort_by_key(|t| (t.created_at, t.id));
+        }
+        let mut tasks: Vec<Task> = tasks
             .into_iter()
             .filter(|t| {
                 t.parent_id.is_none() || matches!(status, TaskStatus::Blocked | TaskStatus::Review)
@@ -556,6 +592,7 @@ pub async fn board(
     let mut labels = Labels::load(&*state.store).await?;
     let columns = columns(&state, &mut labels, filter.as_ref().map(|p| p.id)).await?;
     let projects = project_options(&labels, filter.as_ref().map(|f| f.id));
+    let needs = needs_you(&state, &mut labels).await?;
     html(&BoardPage {
         csrf: Some(session.csrf),
         pulse: Some(pulse_counts(&state).await?),
@@ -563,6 +600,8 @@ pub async fn board(
         projects,
         filter: filter.map(|p| p.id.to_string()),
         columns,
+        needs,
+        back: "/ui/board",
     })
 }
 
@@ -650,6 +689,8 @@ struct OverviewPage {
     nav: &'static str,
     counters: Counters,
     agents: Vec<AgentCard>,
+    needs: Vec<NeedCard>,
+    back: &'static str,
 }
 
 #[derive(Template)]
@@ -764,12 +805,16 @@ pub async fn overview(
     Extension(session): Extension<SessionCtx>,
 ) -> UiResult<Response> {
     let (counters, agents) = overview_data(&state).await?;
+    let mut labels = Labels::load(&*state.store).await?;
+    let needs = needs_you(&state, &mut labels).await?;
     html(&OverviewPage {
         csrf: Some(session.csrf),
         pulse: Some(pulse_counts(&state).await?),
         nav: "overview",
         counters,
         agents,
+        needs,
+        back: "/ui/",
     })
 }
 
@@ -780,11 +825,12 @@ pub async fn overview_panel(State(state): State<AppState>) -> UiResult<Response>
 
 // ---------------------------------------------------------------- pulse
 
-/// The top bar's live state: agents with a live session, and blocked tasks (at any depth,
-/// the same tasks the board's Blocked column shows).
+/// The top bar's live state: agents with a live session, blocked tasks (at any depth, the
+/// same tasks the board's Blocked column shows) and how many "Needs you" cards there are.
 pub struct Pulse {
     pub live: usize,
     pub blocked: usize,
+    pub need: usize,
 }
 
 pub async fn pulse_counts(state: &AppState) -> StoreResult<Pulse> {
@@ -805,9 +851,12 @@ pub async fn pulse_counts(state: &AppState) -> StoreResult<Pulse> {
         })
         .await?
         .len();
+    let mut labels = Labels::load(&*state.store).await?;
+    let need = needs_you(state, &mut labels).await?.len();
     Ok(Pulse {
         live: live.len(),
         blocked,
+        need,
     })
 }
 

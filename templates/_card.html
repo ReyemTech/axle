@@ -3,7 +3,7 @@
   <h3 class="card-title"><a class="card-link" href="/ui/tasks/{{ card.id }}">{{ card.title }}</a></h3>
   {% if let Some((pid, ptitle)) = card.parent %}<p class="card-parent">Subtask of <a href="/ui/tasks/{{ pid }}">{{ ptitle }}</a></p>{% endif %}
   <div class="card-meta">
-    <span class="state" data-status="{{ card.status }}"><span class="aspect" data-aspect="{{ card.status }}" aria-hidden="true"></span><span class="status">{{ card.status }}</span></span>
+    <span class="state" data-status="{{ card.status }}" data-aspect="{{ card.aspect }}"><span class="aspect" data-aspect="{{ card.aspect }}" aria-hidden="true"></span><span class="status">{{ card.label }}</span></span>
     <span class="project" data-line="{{ card.project.line }}" title="{{ card.project.key }}">{{ card.project.name }}</span>
   </div>
   {% if let Some(owner) = card.owner %}

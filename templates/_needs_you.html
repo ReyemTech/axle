@@ -1,0 +1,52 @@
+<section id="needs-you" class="needs-you" aria-label="Needs you"{% if needs.is_empty() %} hidden{% endif %}
+         hx-get="/ui/needs-you?back={{ back }}" hx-trigger="sse:overview delay:300ms, every 30s" hx-swap="outerHTML">
+{% if !needs.is_empty() %}
+  <header class="needs-head">
+    <span class="aspect" data-aspect="plan-submitted" aria-hidden="true"></span>
+    <h2>Needs you</h2>
+    <span class="count">{{ needs.len() }}</span>
+    <span class="muted needs-note">Oldest first. These are waiting on you, not on an agent.</span>
+  </header>
+  <div class="need-cards">
+  {% for n in needs %}
+    <article class="need-card" id="need-{{ loop.index }}" data-need="{{ n.need.key() }}" data-importance="{{ n.importance }}" data-nav tabindex="-1">
+      <p class="need-what"><span class="aspect" data-aspect="{{ n.aspect }}" aria-hidden="true"></span>{{ n.need.label() }}{% if n.need.key() == "reply" %} <span class="need-importance">{{ n.importance }}</span>{% endif %}</p>
+      <h3 class="card-title"><a class="card-link" href="{{ n.href }}">{{ n.title }}</a></h3>
+      <div class="card-meta">
+        {% if let Some(p) = n.project %}<span class="project" data-line="{{ p.line }}" title="{{ p.key }}">{{ p.name }}</span>{% endif %}
+        {% if let Some(a) = n.agent %}<span class="need-agent"><span class="visually-hidden">from </span><span class="owner">{{ a }}</span></span>{% endif %}
+        <span class="need-wait">waiting <time datetime="{{ n.since }}" title="{{ n.since }}">{{ n.waited }}</time></span>
+      </div>
+      {% if let Some(t) = n.task_title %}<p class="card-parent">In the thread of {{ t }}</p>{% endif %}
+      {% if let Some(pv) = n.preview %}<p class="need-preview peer-text">{{ pv }}</p>{% endif %}
+      {% if let Some(token) = csrf %}
+      <div class="need-actions">
+      {% if let Some(tid) = n.task_id %}
+        <form method="post" action="/ui/tasks/{{ tid }}/plan/approve">
+          <input type="hidden" name="csrf" value="{{ token }}">
+          <input type="hidden" name="back" value="{{ back }}">
+          <button type="submit">Approve plan</button>
+        </form>
+        <details class="need-changes">
+          <summary class="button-like">Request changes</summary>
+          <form class="stack" method="post" action="/ui/tasks/{{ tid }}/plan/changes">
+            <input type="hidden" name="csrf" value="{{ token }}">
+            <input type="hidden" name="back" value="{{ back }}">
+            <label for="changes-{{ tid }}">What should change</label>
+            <textarea id="changes-{{ tid }}" name="note" rows="3" required></textarea>
+            <button type="submit" class="secondary">Send to the agent</button>
+          </form>
+        </details>
+        <a class="need-open" href="{{ n.href }}">Read the full plan</a>
+      {% else if n.need.key() == "review" %}
+        <a class="button-like" href="{{ n.href }}">Review the work</a>
+      {% else %}
+        <a class="button-like" href="{{ n.href }}">Open and reply</a>
+      {% endif %}
+      </div>
+      {% endif %}
+    </article>
+  {% endfor %}
+  </div>
+{% endif %}
+</section>

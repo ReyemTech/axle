@@ -145,6 +145,30 @@
       if (el) el.classList.add("selected");
     }
   }
+  // A live refresh of "Needs you" must not wipe a change request being written.
+  document.addEventListener("htmx:beforeRequest", function (e) {
+    var strip = document.getElementById("needs-you");
+    if (!strip || e.detail.elt !== strip) return;
+    if (strip.querySelector("details[open]") || strip.contains(document.activeElement)) {
+      e.preventDefault();
+    }
+  });
+
+  // New task: the lead project cannot also be an extra project.
+  function syncLead() {
+    var lead = document.getElementById("new-project");
+    if (!lead) return;
+    document.querySelectorAll('input[name="also"]').forEach(function (box) {
+      var isLead = box.value === lead.value;
+      box.disabled = isLead;
+      if (isLead) box.checked = false;
+    });
+  }
+  document.addEventListener("change", function (e) {
+    if (e.target && e.target.id === "new-project") syncLead();
+  });
+  syncLead();
+
   document.addEventListener("htmx:afterSettle", afterSwap);
   document.addEventListener("htmx:sseMessage", afterSwap);
 

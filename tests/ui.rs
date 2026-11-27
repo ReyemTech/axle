@@ -470,7 +470,10 @@ async fn board_columns_and_progress() {
     let pulse = app.get("/ui/pulse", Some(&cookie)).await;
     assert_eq!(pulse.status, StatusCode::OK);
     assert!(!pulse.body.contains("<html"));
-    assert_eq!(select_texts(&pulse, ".pulse-item"), ["2 live", "1 blocked"]);
+    assert_eq!(
+        select_texts(&pulse, ".pulse-item"),
+        ["2 live", "1 blocked", "0 need you"]
+    );
 
     let missing = app
         .get(
@@ -1804,4 +1807,382 @@ async fn task_thread_is_paged() {
     assert_eq!(bodies.first().unwrap(), "body");
     assert_eq!(bodies.last().unwrap(), "post 9");
     assert!(second.html().select(&earlier).next().is_none());
+}
+
+// ---------------------------------------------------------------- plan gate and needs-you
+
+const NIMBUS: &str = "github.com/reyemtech/nimbus";
+
+/// A human-created gated task in `by`'s project, claimed by `by` and with a plan submitted.
+async fn submitted_plan(app: &App, by: &Resolved, title: &str) -> Task {
+    let task = app
+        .state
+        .tasks
+        .create(
+            Caller::Human,
+            NewTask {
+                project_id: by.agent.project_id.unwrap(),
+                title: title.into(),
+                body: "split the work".into(),
+                requires_plan: true,
+                ..NewTask::default()
+            },
+        )
+        .await
+        .unwrap();
+    app.claim(by, task.id).await;
+    app.state
+        .tasks
+        .propose_plan(
+            by,
+            task.id,
+            "1. IaC: add the bucket\n2. Nimbus: read it".into(),
+        )
+        .await
+        .unwrap();
+    task
+}
+
+#[tokio::test]
+async fn new_task_form_has_lead_also_and_plan_first() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let nimbus = app.agent(NIMBUS, "mac", "claude-code").await;
+    let (lead, other) = (
+        iac.agent.project_id.unwrap(),
+        nimbus.agent.project_id.unwrap(),
+    );
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    assert!(board.text().contains("Lead project"));
+    assert!(board.text().contains("Also involves"));
+    assert_eq!(select_texts(&board, "input[name=also]").len(), 2);
+    assert_eq!(
+        select_texts(&board, "input[name=plan_first][checked]").len(),
+        1,
+        "plan first is ticked by default"
+    );
+    assert!(board.text().contains("Plan first"));
+
+    let csrf = csrf_of(&board);
+    let page = app
+        .post_form(
+            "/ui/tasks",
+            Some(&cookie),
+            &form(
+                &csrf,
+                &[
+                    ("project", &lead.to_string()),
+                    ("also", &other.to_string()),
+                    ("also", &lead.to_string()),
+                    ("title", "Cross-project"),
+                    ("body", ""),
+                    ("plan_first", "on"),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    let id: TaskId = page
+        .location
+        .unwrap()
+        .strip_prefix("/ui/tasks/")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let task = app.state.store.get_task(id).await.unwrap().unwrap();
+    assert!(task.requires_plan);
+    assert_eq!(task.project_id, lead);
+    assert_eq!(
+        app.state.store.task_projects(id).await.unwrap(),
+        vec![other]
+    );
+
+    // Unticked: no gate.
+    let page = app
+        .post_form(
+            "/ui/tasks",
+            Some(&cookie),
+            &form(&csrf, &[("project", &lead.to_string()), ("title", "Plain")]),
+        )
+        .await;
+    let id: TaskId = page
+        .location
+        .unwrap()
+        .strip_prefix("/ui/tasks/")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        !app.state
+            .store
+            .get_task(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .requires_plan
+    );
+}
+
+#[tokio::test]
+async fn plan_is_approved_from_the_task_page() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let task = submitted_plan(&app, &iac, "Gated work").await;
+    let path = format!("/ui/tasks/{}", task.id);
+
+    let page = app.get(&path, Some(&cookie)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.text().contains("Plan awaiting your approval"));
+    assert_eq!(
+        select_texts(&page, "#plan .plan-body"),
+        ["1. IaC: add the bucket\n2. Nimbus: read it"]
+    );
+    assert_eq!(
+        select_texts(&page, "#plan button"),
+        ["Approve plan", "Request changes"]
+    );
+    assert_eq!(select_texts(&page, ".msg-kind"), ["plan"]);
+    assert!(select_texts(&page, ".task-meta .status")[0].contains("plan awaiting you"));
+
+    // CSRF is required; a note is required to request changes.
+    let csrf = csrf_of(&page);
+    let refused = app
+        .post_form(&format!("{path}/plan/approve"), Some(&cookie), "")
+        .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    let refused = app
+        .post_form(
+            &format!("{path}/plan/changes"),
+            Some(&cookie),
+            &form(&csrf, &[("note", " ")]),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let page = app
+        .post_form(
+            &format!("{path}/plan/changes"),
+            Some(&cookie),
+            &form(&csrf, &[("note", "Do Nimbus first")]),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    let t = app.state.store.get_task(task.id).await.unwrap().unwrap();
+    assert_eq!(t.plan_state, axle::domain::PlanState::ChangesRequested);
+    let page = app.get(&path, Some(&cookie)).await;
+    assert!(
+        select_texts(&page, "#plan button").is_empty(),
+        "nothing to decide"
+    );
+    assert!(page.text().contains("Do Nimbus first"));
+
+    // Resubmitted, then approved.
+    app.state
+        .tasks
+        .propose_plan(&iac, task.id, "Nimbus first, then IaC".into())
+        .await
+        .unwrap();
+    let page = app
+        .post_form(
+            &format!("{path}/plan/approve"),
+            Some(&cookie),
+            &form(&csrf, &[]),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    assert_eq!(page.location.as_deref(), Some(path.as_str()));
+    let t = app.state.store.get_task(task.id).await.unwrap().unwrap();
+    assert_eq!(t.status, axle::domain::TaskStatus::Claimed);
+    // Approving again is a conflict.
+    let page = app
+        .post_form(
+            &format!("{path}/plan/approve"),
+            Some(&cookie),
+            &form(&csrf, &[]),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn human_adds_projects_from_the_task_page() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let nimbus = app.agent(NIMBUS, "mac", "claude-code").await;
+    let other = nimbus.agent.project_id.unwrap();
+    let task = app.task(&iac, "Parent", None).await;
+    let path = format!("/ui/tasks/{}", task.id);
+    let page = app.get(&path, Some(&cookie)).await;
+    assert_eq!(select_texts(&page, "#add-project option").len(), 1);
+    let csrf = csrf_of(&page);
+
+    let without = app
+        .post_form(
+            &format!("{path}/projects"),
+            Some(&cookie),
+            &format!("project={other}"),
+        )
+        .await;
+    assert_eq!(without.status, StatusCode::FORBIDDEN);
+    let page = app
+        .post_form(
+            &format!("{path}/projects"),
+            Some(&cookie),
+            &form(&csrf, &[("project", &other.to_string())]),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    assert_eq!(
+        app.state.store.task_projects(task.id).await.unwrap(),
+        vec![other]
+    );
+    let page = app.get(&path, Some(&cookie)).await;
+    assert!(
+        page.text().contains("Added project reyemtech/nimbus"),
+        "{}",
+        page.text()
+    );
+    assert!(select_texts(&page, "#add-project option").is_empty());
+    // A subtask can now go to the added project; a child cannot take projects.
+    let child = app
+        .post_form(
+            "/ui/tasks",
+            Some(&cookie),
+            &form(
+                &csrf,
+                &[
+                    ("project", &other.to_string()),
+                    ("title", "Nimbus part"),
+                    ("parent", &task.id.to_string()),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(child.status, StatusCode::SEE_OTHER, "{}", child.body);
+    let child_path = child.location.unwrap();
+    let page = app
+        .post_form(
+            &format!("{child_path}/projects"),
+            Some(&cookie),
+            &form(
+                &csrf,
+                &[("project", &iac.agent.project_id.unwrap().to_string())],
+            ),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn needs_you_cards_match_the_count() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+
+    // Nothing waiting: the strip is hidden and the count is zero.
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    assert_eq!(select_texts(&board, "#needs-you[hidden]").len(), 1);
+    // It re-fetches itself on every live event, like the overview.
+    assert_eq!(
+        select_texts(
+            &board,
+            "#needs-you[hx-trigger*='sse:overview'][hx-get^='/ui/needs-you']"
+        )
+        .len(),
+        1
+    );
+    assert!(
+        select_texts(&board, "#pulse")
+            .join(" ")
+            .contains("0 need you")
+    );
+
+    // A plan, a review of the human's task, an urgent and a normal message.
+    let plan = submitted_plan(&app, &iac, "Gated work").await;
+    let review = app
+        .state
+        .tasks
+        .create(
+            Caller::Human,
+            NewTask {
+                project_id: iac.agent.project_id.unwrap(),
+                title: "Check my thing".into(),
+                ..NewTask::default()
+            },
+        )
+        .await
+        .unwrap();
+    app.claim(&iac, review.id).await;
+    app.state
+        .tasks
+        .to_review(&iac, review.id, None)
+        .await
+        .unwrap();
+    for (importance, subject) in [
+        (Importance::Urgent, "Prod is down"),
+        (Importance::Normal, "fyi"),
+    ] {
+        app.state
+            .messages
+            .send(
+                &Actor::Agent(iac.agent.id, iac.session.id),
+                NewMessage {
+                    to: Address::Human,
+                    subject: Some(subject.into()),
+                    body: "details".into(),
+                    importance,
+                    reply_to: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    app.clock.advance(time::Duration::minutes(12));
+
+    for path in ["/ui/board", "/ui/"] {
+        let page = app.get(path, Some(&cookie)).await;
+        assert_eq!(select_texts(&page, "#needs-you[hidden]").len(), 0, "{path}");
+        let whats = select_texts(&page, "#needs-you .need-what");
+        assert_eq!(whats.len(), 3, "{path}: {whats:?} {}", page.text());
+        assert!(whats[0].starts_with("Approve plan"));
+        assert!(whats[1].starts_with("Review"));
+        assert!(whats[2].starts_with("Reply"));
+        assert_eq!(
+            select_texts(&page, "#needs-you .card-title"),
+            ["Gated work", "Check my thing", "Prod is down"]
+        );
+        assert!(select_texts(&page, ".need-wait")[0].contains("12m"));
+        assert!(
+            select_texts(&page, "#pulse")
+                .join(" ")
+                .contains("3 need you")
+        );
+        let link = Selector::parse("#pulse a[href='/ui/board#needs-you']").unwrap();
+        assert_eq!(page.html().select(&link).count(), 1);
+    }
+    // The board's Claimed column shows the planning task with its plan state in words.
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    assert_eq!(
+        select_texts(&board, ".column[data-status=claimed] .card .status"),
+        ["plan awaiting you"]
+    );
+    // The fragment (live re-fetch) is the same strip; approving inline returns to the board.
+    let fragment = app.get("/ui/needs-you?back=/ui/board", Some(&cookie)).await;
+    assert_eq!(select_texts(&fragment, ".need-card").len(), 3);
+    let csrf = csrf_of(&board);
+    let page = app
+        .post_form(
+            &format!("/ui/tasks/{}/plan/approve", plan.id),
+            Some(&cookie),
+            &form(&csrf, &[("back", "/ui/board")]),
+        )
+        .await;
+    assert_eq!(page.location.as_deref(), Some("/ui/board#needs-you"));
+    let fragment = app.get("/ui/needs-you", Some(&cookie)).await;
+    assert_eq!(select_texts(&fragment, ".need-card").len(), 2);
+    let pulse = app.get("/ui/pulse", Some(&cookie)).await;
+    assert_eq!(select_texts(&pulse, ".pulse-item")[2], "2 need you");
 }

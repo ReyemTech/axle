@@ -10,14 +10,16 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::SessionCtx;
+use super::needs::latest_plan;
 use super::views::{
     Labels, LeaseView, ProjectLabel, ProjectOption, Pulse, UiError, UiResult, ago, html,
-    lease_view, pulse_counts,
+    lease_view, project_options, pulse_counts, state_mark,
 };
 use crate::domain::{
     Message, MessageId, PlanState, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus,
 };
 use crate::http::AppState;
+use crate::service::tasks::plan_words;
 use crate::store::{StoreResult, TaskFilter};
 
 /// Events per page of a task's history.
@@ -69,6 +71,8 @@ pub struct MessageView {
     pub unread: bool,
     /// Link to open it in the inbox reader.
     pub href: String,
+    /// `message`, `plan` or `system`.
+    pub kind: &'static str,
 }
 
 /// The first 140 characters of a body, on one line.
@@ -106,6 +110,7 @@ pub(super) async fn message_view(
         receipt: None,
         unread: false,
         href: format!("/ui/inbox?view=all&m={}", m.id),
+        kind: m.kind.as_str(),
     })
 }
 
@@ -139,10 +144,28 @@ pub struct ChildLink {
     pub owner: Option<String>,
 }
 
+/// The latest plan of a task, for the plan panel.
+pub struct PlanView {
+    pub from: String,
+    pub at: Stamp,
+    pub body: String,
+}
+
 pub struct TaskView {
     pub id: String,
     pub title: String,
     pub status: &'static str,
+    pub aspect: &'static str,
+    pub label: &'static str,
+    /// Whether the task has the plan gate, and where its plan is, in words.
+    pub requires_plan: bool,
+    pub plan_words: &'static str,
+    /// The plan awaits the human's decision.
+    pub can_decide: bool,
+    /// Participating projects besides the lead.
+    pub also: Vec<ProjectLabel>,
+    /// A top-level task that is not closed: projects can be added.
+    pub can_add_project: bool,
     pub project: ProjectLabel,
     pub created_by: String,
     pub created_at: Stamp,
@@ -177,6 +200,9 @@ struct TaskPage {
     thread_paged: bool,
     children: Vec<ChildLink>,
     evidence: Option<Evidence>,
+    plan: Option<PlanView>,
+    /// Projects that can still be added.
+    addable: Vec<ProjectOption>,
     /// Projects a subtask may be created in.
     child_projects: Vec<ProjectOption>,
 }
@@ -292,10 +318,20 @@ pub async fn task_page(
             host.as_deref().unwrap_or("any host")
         )),
     };
+    let extra = store.task_projects(id).await?;
+    let (aspect, label) = state_mark(&task);
+    let open = !matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled);
     let view = TaskView {
         id: task.id.to_string(),
         title: task.title.clone(),
         status: task.status.as_str(),
+        aspect,
+        label,
+        requires_plan: task.requires_plan,
+        plan_words: plan_words(task.plan_state),
+        can_decide: task.status == TaskStatus::Planning && task.plan_state == PlanState::Submitted,
+        also: extra.iter().map(|p| labels.project(*p)).collect(),
+        can_add_project: task.parent_id.is_none() && open,
         project: labels.project(task.project_id),
         created_by: labels.actor_label(task.created_by).await?,
         created_at: Stamp::new(now, task.created_at),
@@ -383,9 +419,22 @@ pub async fn task_page(
         });
     }
 
+    let plan = match latest_plan(&state, id).await? {
+        Some(m) => Some(PlanView {
+            from: labels.actor_label(m.from).await?,
+            at: Stamp::new(now, m.created_at),
+            body: m.body,
+        }),
+        None => None,
+    };
+    let mut addable = project_options(&labels, None);
+    addable.retain(|p| {
+        p.id != task.project_id.to_string() && !extra.iter().any(|e| e.to_string() == p.id)
+    });
+
     // A subtask lives in the task's project or one of its extra projects.
     let mut allowed = vec![task.project_id];
-    allowed.extend(store.task_projects(id).await?);
+    allowed.extend(extra.iter().copied());
     let child_projects = allowed
         .into_iter()
         .map(|p| {
@@ -414,6 +463,8 @@ pub async fn task_page(
         children,
         evidence,
         child_projects,
+        plan,
+        addable,
     })
 }
 

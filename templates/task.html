@@ -9,12 +9,40 @@
     {% if let Some((pid, ptitle)) = task.parent %}<p class="crumb"><a href="/ui/tasks/{{ pid }}"><span class="crumb-label">Subtask of</span> {{ ptitle }}</a></p>{% endif %}
     <h1 class="task-title">{{ task.title }}</h1>
     <div class="task-meta">
-      <span class="status"><span class="aspect" data-aspect="{{ task.status }}" aria-hidden="true"></span>{{ task.status }}</span>
+      <span class="status" data-aspect="{{ task.aspect }}"><span class="aspect" data-aspect="{{ task.aspect }}" aria-hidden="true"></span>{{ task.label }}</span>
       <span class="project" data-line="{{ task.project.line }}" title="{{ task.project.key }}">{{ task.project.name }}</span>
+      {% if !task.also.is_empty() %}<span class="also"><span class="muted">also</span> {% for p in task.also %}<span class="project" data-line="{{ p.line }}" title="{{ p.key }}">{{ p.name }}</span>{% endfor %}</span>{% endif %}
+      {% if task.requires_plan %}<span class="plan-flag">plan first: {{ task.plan_words }}</span>{% endif %}
       {% if let Some(o) = task.owner %}<span class="owner">{{ o }}</span>{% endif %}
       <span class="muted">created by {{ task.created_by }} <time datetime="{{ task.created_at.iso }}" title="{{ task.created_at.text }}">{{ task.created_at.ago }}</time></span>
     </div>
   </header>
+
+  {% if task.requires_plan || plan.is_some() %}
+  <section id="plan" class="panel plan{% if task.can_decide %} is-waiting{% endif %}" aria-label="Plan">
+    <h2 class="panel-title">{% if task.can_decide %}<span class="aspect" data-aspect="plan-submitted" aria-hidden="true"></span>Plan awaiting your approval{% else %}Plan <span class="muted">{{ task.plan_words }}</span>{% endif %}</h2>
+    {% if let Some(p) = plan %}
+    <p class="muted">Latest plan from <span class="owner">{{ p.from }}</span>, <time datetime="{{ p.at.iso }}" title="{{ p.at.text }}">{{ p.at.ago }}</time>. Agent-written text, shown as written; earlier plans stay in the thread.</p>
+    <div class="peer-text plan-body">{{ p.body }}</div>
+    {% else %}
+    <p class="empty">{% if task.status == "planning" %}The agent is writing the plan. It will appear here for you to approve.{% else %}No plan yet. The agent that claims this task writes one first.{% endif %}</p>
+    {% endif %}
+    {% if task.can_decide %}{% if let Some(token) = csrf %}
+    <div class="plan-actions">
+      <form method="post" action="/ui/tasks/{{ task.id }}/plan/approve">
+        <input type="hidden" name="csrf" value="{{ token }}">
+        <button type="submit">Approve plan</button>
+      </form>
+      <form class="stack plan-changes" method="post" action="/ui/tasks/{{ task.id }}/plan/changes">
+        <input type="hidden" name="csrf" value="{{ token }}">
+        <label for="plan-note">Or ask for changes</label>
+        <textarea id="plan-note" name="note" rows="3" required placeholder="What should change in the plan"></textarea>
+        <button type="submit" class="secondary">Request changes</button>
+      </form>
+    </div>
+    {% endif %}{% endif %}
+  </section>
+  {% endif %}
 
   <section class="panel lease" aria-label="Lease">
     <h2 class="panel-title">Lease</h2>
@@ -63,6 +91,7 @@
         <div class="msg-head">
           <span class="msg-from">{{ m.from }}</span>{% if let Some(p) = m.project %}<span class="project" data-line="{{ p.line }}" title="{{ p.key }}">{{ p.name }}</span>{% endif %}
           {% if m.importance != "normal" %}<span class="importance"><span class="aspect" data-aspect="{{ m.importance }}" aria-hidden="true"></span>{{ m.importance }}</span>{% endif %}
+          {% if m.kind != "message" %}<span class="msg-kind" data-kind="{{ m.kind }}">{% if m.kind == "plan" %}plan{% else %}note from axle{% endif %}</span><span class="msg-to">to {{ m.to }}</span>{% endif %}
           <time class="muted" datetime="{{ m.at.iso }}" title="{{ m.at.text }}">{{ m.at.ago }}</time>
         </div>
         {% if let Some(s) = m.subject %}<p class="msg-subject">{{ s }}</p>{% endif %}
@@ -124,7 +153,25 @@
     </div>
   </section>
   {% endif %}
-  {% if task.can_cancel %}
+  {% if task.can_add_project %}
+  <section class="panel">
+    <h2 class="panel-title">Projects</h2>
+    <p><span class="muted">Lead</span> <span class="project" data-line="{{ task.project.line }}" title="{{ task.project.key }}">{{ task.project.name }}</span></p>
+    {% if !task.also.is_empty() %}<p><span class="muted">Also</span> {% for p in task.also %}<span class="project" data-line="{{ p.line }}" title="{{ p.key }}">{{ p.name }}</span> {% endfor %}</p>{% endif %}
+    {% if !addable.is_empty() %}
+    <form class="stack" method="post" action="/ui/tasks/{{ task.id }}/projects">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <label for="add-project">Add a project</label>
+      <select id="add-project" name="project">
+        {% for p in addable %}<option value="{{ p.id }}" title="{{ p.key }}">{{ p.name }}</option>{% endfor %}
+      </select>
+      <button type="submit" class="secondary">+ Add project</button>
+    </form>
+    <p class="hint">Projects are never removed, so subtasks already made stay valid.</p>
+    {% endif %}
+  </section>
+  {% endif %}
+  {% if task.can_cancel && task.status != "planning" %}
   <section class="panel">
     <h2 class="panel-title">Add a subtask</h2>
     <form class="stack" method="post" action="/ui/tasks">

@@ -10,6 +10,7 @@
 pub mod actions;
 pub mod admin;
 pub mod inbox;
+pub mod needs;
 pub mod task_page;
 pub mod views;
 
@@ -153,6 +154,13 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/ui/tasks/{id}/post", post(actions::post_to_thread))
         .route("/ui/tasks/{id}/force-release", post(actions::force_release))
         .route("/ui/tasks/{id}/cancel", post(actions::cancel))
+        .route("/ui/tasks/{id}/plan/approve", post(actions::approve_plan))
+        .route(
+            "/ui/tasks/{id}/plan/changes",
+            post(actions::request_plan_changes),
+        )
+        .route("/ui/tasks/{id}/projects", post(actions::add_project))
+        .route("/ui/needs-you", get(needs::needs_fragment))
         .route("/ui/inbox", get(inbox::inbox))
         .route("/ui/inbox/{id}/archive", post(actions::archive))
         .route("/ui/messages", post(actions::send_message))

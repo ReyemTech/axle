@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Overview{% endblock %}
 {% block content %}
+{% include "_needs_you.html" %}
 <section id="overview" hx-get="/ui/overview/panel" hx-trigger="sse:overview delay:300ms, every 30s" hx-swap="innerHTML">
 {% include "_overview_panel.html" %}
 </section>

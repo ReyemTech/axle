@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Board{% endblock %}
 {% block content %}
+{% include "_needs_you.html" %}
 <div class="board-bar">
   <nav class="lines" aria-label="Projects">
     <a href="/ui/board"{% if filter.is_none() %} aria-current="page"{% endif %}><span class="line-swatch" data-line="all" aria-hidden="true"></span>All projects</a>
@@ -10,6 +11,8 @@
     <summary class="button-like">Key</summary>
     <dl class="key-list">
       <div><dt><span class="aspect" data-aspect="open" aria-hidden="true"></span>open</dt><dd>Waiting for an agent to claim it.</dd></div>
+      <div><dt><span class="aspect" data-aspect="planning" aria-hidden="true"></span>planning</dt><dd>Held by an agent writing a plan; no work starts until you approve it.</dd></div>
+      <div><dt><span class="aspect" data-aspect="plan-submitted" aria-hidden="true"></span>plan awaiting you</dt><dd>The plan is waiting for your Approve or Request changes; its lease does not run.</dd></div>
       <div><dt><span class="aspect" data-aspect="claimed" aria-hidden="true"></span>claimed</dt><dd>One agent holds it under a lease.</dd></div>
       <div><dt><span class="aspect" data-aspect="blocked" aria-hidden="true"></span>blocked</dt><dd>Stuck; waiting on someone.</dd></div>
       <div><dt><span class="aspect" data-aspect="review" aria-hidden="true"></span>review</dt><dd>Finished work awaiting a check.</dd></div>
@@ -25,14 +28,23 @@
     <summary class="button-like">New task</summary>
     <form class="stack" method="post" action="/ui/tasks">
       <input type="hidden" name="csrf" value="{{ token }}">
-      <label for="new-project">Project</label>
+      <label for="new-project">Lead project</label>
       <select id="new-project" name="project" required>
         {% for p in projects %}<option value="{{ p.id }}" title="{{ p.key }}"{% if p.selected %} selected{% endif %}>{{ p.name }}</option>{% endfor %}
       </select>
+      <p class="hint">The lead project's agents claim and coordinate the task.</p>
+      {% if projects.len() > 1 %}
+      <fieldset class="checks">
+        <legend>Also involves</legend>
+        {% for p in projects %}<label class="check"><input type="checkbox" name="also" value="{{ p.id }}"> <span class="project" data-line="{{ p.line }}" title="{{ p.key }}">{{ p.name }}</span></label>{% endfor %}
+        <p class="hint">Subtasks can go to these projects too. You can add more later.</p>
+      </fieldset>
+      {% endif %}
       <label for="new-title">Title</label>
       <input id="new-title" name="title" required>
       <label for="new-body">Details</label>
       <textarea id="new-body" name="body" rows="4"></textarea>
+      <label class="check"><input type="checkbox" name="plan_first" value="on" checked> Plan first — I approve before work starts</label>
       <button type="submit">Create task</button>
     </form>
   </details>

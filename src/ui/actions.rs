@@ -3,7 +3,7 @@
 //! a message and publishes it like an agent's write) and answers with a 303 back to a page.
 
 use axum::Form;
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawForm, State};
 use axum::response::{IntoResponse, Redirect, Response};
 use serde::Deserialize;
 
@@ -101,22 +101,44 @@ fn subject(raw: &str) -> Option<String> {
 
 // ---------------------------------------------------------------- tasks
 
-#[derive(Deserialize)]
-pub struct CreateTaskForm {
-    #[serde(default)]
+/// The new-task form: `project` (the lead), repeated `also` (other participating projects,
+/// top-level tasks only), `plan_first` (a ticked checkbox sends `on`), `title`, `body` and
+/// `parent`. Parsed by hand because a checkbox list repeats its field name.
+#[derive(Default)]
+struct CreateTaskForm {
     project: String,
-    #[serde(default)]
+    also: Vec<String>,
+    plan_first: bool,
     title: String,
-    #[serde(default)]
     body: String,
-    #[serde(default)]
     parent: String,
+}
+
+impl CreateTaskForm {
+    fn parse(raw: &[u8]) -> UiResult<Self> {
+        let fields: Vec<(String, String)> =
+            serde_urlencoded::from_bytes(raw).map_err(|_| UiError::Invalid("Bad form.".into()))?;
+        let mut form = CreateTaskForm::default();
+        for (k, v) in fields {
+            match k.as_str() {
+                "project" => form.project = v,
+                "also" => form.also.push(v),
+                "plan_first" => form.plan_first = v == "on",
+                "title" => form.title = v,
+                "body" => form.body = v,
+                "parent" => form.parent = v,
+                _ => {}
+            }
+        }
+        Ok(form)
+    }
 }
 
 pub async fn create_task(
     State(state): State<AppState>,
-    Form(form): Form<CreateTaskForm>,
+    RawForm(raw): RawForm,
 ) -> UiResult<Response> {
+    let form = CreateTaskForm::parse(&raw)?;
     let title = form.title.trim();
     if title.is_empty() {
         return Err(UiError::Invalid("A task needs a title.".into()));
@@ -127,6 +149,18 @@ pub async fn create_task(
         return Err(UiError::Invalid("That project does not exist.".into()));
     }
     let parent = opt_id::<TaskId>(&form.parent, "parent task")?;
+    let mut extra_projects = Vec::new();
+    for raw in &form.also {
+        let Some(id) = opt_id::<ProjectId>(raw, "project")? else {
+            continue;
+        };
+        if state.store.get_project(id).await?.is_none() {
+            return Err(UiError::Invalid("That project does not exist.".into()));
+        }
+        if id != project && !extra_projects.contains(&id) {
+            extra_projects.push(id);
+        }
+    }
     let task = state
         .tasks
         .create(
@@ -136,12 +170,81 @@ pub async fn create_task(
                 parent_id: parent,
                 title: title.to_string(),
                 body: form.body,
+                extra_projects,
+                requires_plan: form.plan_first,
                 ..NewTask::default()
             },
         )
         .await
         .map_err(task_error)?;
     Ok(see_other(&format!("/ui/tasks/{}", task.id)))
+}
+
+#[derive(Deserialize)]
+pub struct DecisionForm {
+    #[serde(default)]
+    note: String,
+    /// The page to return to: the board or the overview (anything else: the task page).
+    #[serde(default)]
+    back: String,
+}
+
+/// Where a decision returns to: one of the pages that show "Needs you", else the task.
+fn back_to(back: &str, id: TaskId) -> String {
+    match back {
+        "/ui/board" => "/ui/board#needs-you".into(),
+        "/ui/" => "/ui/#needs-you".into(),
+        _ => format!("/ui/tasks/{id}"),
+    }
+}
+
+/// The human approves the submitted plan; the task becomes `claimed`.
+pub async fn approve_plan(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<DecisionForm>,
+) -> UiResult<Response> {
+    let id = task_id(&id)?;
+    state.tasks.approve_plan(id).await.map_err(task_error)?;
+    Ok(see_other(&back_to(&form.back, id)))
+}
+
+/// The human asks for changes to the submitted plan (a note is required).
+pub async fn request_plan_changes(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<DecisionForm>,
+) -> UiResult<Response> {
+    let id = task_id(&id)?;
+    state
+        .tasks
+        .request_plan_changes(id, &form.note)
+        .await
+        .map_err(task_error)?;
+    Ok(see_other(&back_to(&form.back, id)))
+}
+
+#[derive(Deserialize)]
+pub struct AddProjectForm {
+    #[serde(default)]
+    project: String,
+}
+
+/// Adds a participating project to a top-level task.
+pub async fn add_project(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<AddProjectForm>,
+) -> UiResult<Response> {
+    let id = task_id(&id)?;
+    let project: ProjectId = opt_id(&form.project, "project")?
+        .ok_or_else(|| UiError::Invalid("Pick a project.".into()))?;
+    state
+        .tasks
+        .add_projects(Caller::Human, id, &[project])
+        .await
+        .map_err(task_error)?;
+    Ok(see_other(&format!("/ui/tasks/{id}")))
 }
 
 #[derive(Deserialize)]
