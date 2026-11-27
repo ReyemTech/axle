@@ -76,6 +76,10 @@ spec:
               value: {{ include "axle.allowedHosts" . | quote }}
             - name: AXL_COOKIE_SECURE
               value: {{ include "axle.cookieSecure" . | quote }}
+            {{- with include "axle.publicUrl" . }}
+            - name: AXL_PUBLIC_URL
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

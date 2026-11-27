@@ -57,6 +57,11 @@ ui:
   # Mark the UI session cookie Secure (AXL_COOKIE_SECURE). null: on when the ingress has TLS.
   cookieSecure: null
 
+# The address clients use to reach Axle (AXL_PUBLIC_URL), served in /install.sh and handed out
+# by /v1/enroll. Empty: derived from the first ingress host (https with ingress.tls, else http);
+# with no ingress host the variable is left unset and a non-loopback server answers 503.
+publicUrl: ""
+
 service:
   type: ClusterIP
   port: 7420

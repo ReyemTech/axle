@@ -104,6 +104,17 @@ expect "$(env_val AXL_COOKIE_SECURE --set ingress.enabled=true --set 'ingress.ho
   --set 'ingress.tls[0].secretName=t' --set 'ingress.tls[0].hosts[0]=a')" true "cookie secure with TLS"
 expect "$(env_val AXL_COOKIE_SECURE --set ui.cookieSecure=true)" true "cookie secure forced"
 
+# publicUrl: AXL_PUBLIC_URL is explicit, else derived from the first ingress host, else absent
+expect "$(has_env AXL_PUBLIC_URL)" 0 "no AXL_PUBLIC_URL by default"
+expect "$(env_val AXL_PUBLIC_URL --set ingress.enabled=true --set 'ingress.hosts[0].host=axle.example.com' \
+  --set 'ingress.tls[0].hosts[0]=axle.example.com')" https://axle.example.com "AXL_PUBLIC_URL from TLS ingress"
+expect "$(env_val AXL_PUBLIC_URL --set ingress.enabled=true --set 'ingress.hosts[0].host=axle.example.com')" \
+  http://axle.example.com "AXL_PUBLIC_URL from plain ingress"
+expect "$(env_val AXL_PUBLIC_URL --set publicUrl=https://x.test)" https://x.test "explicit publicUrl"
+expect "$(env_val AXL_PUBLIC_URL --set publicUrl=https://x.test --set ingress.enabled=true \
+  --set 'ingress.hosts[0].host=axle.example.com')" https://x.test "explicit publicUrl wins over ingress"
+expect "$(has_env AXL_PUBLIC_URL --set ingress.enabled=true)" 0 "no AXL_PUBLIC_URL for an ingress without hosts"
+
 # invalid UI settings are rejected (schema or template)
 rejects() { local why="$1"; shift; if helm template t "$CHART" -f "$S" "$@" >/dev/null 2>&1; then fail "$why was accepted"; fi; }
 rejects "ui.auth.mode=open" --set ui.auth.mode=open

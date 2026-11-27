@@ -2,6 +2,7 @@
 //! endpoint and the web UI.
 
 pub mod enroll;
+pub mod install_script;
 pub mod rate_limit;
 pub mod v1;
 
@@ -158,6 +159,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/install.sh", get(install_script::install_sh))
         .nest(
             "/v1",
             v1::routes()

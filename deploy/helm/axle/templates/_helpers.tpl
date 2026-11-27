@@ -89,3 +89,13 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- .Values.ui.cookieSecure -}}
 {{- end -}}
 {{- end }}
+
+{{/* AXL_PUBLIC_URL: explicit publicUrl, else derived from the first ingress host, else empty. */}}
+{{- define "axle.publicUrl" -}}
+{{- if .Values.publicUrl -}}
+{{- .Values.publicUrl -}}
+{{- else if and .Values.ingress.enabled .Values.ingress.hosts -}}
+{{- $host := (first .Values.ingress.hosts).host -}}
+{{- if .Values.ingress.tls }}https{{ else }}http{{ end }}://{{ $host }}
+{{- end -}}
+{{- end }}
