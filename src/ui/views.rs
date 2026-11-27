@@ -905,6 +905,12 @@ pub async fn live_frames(state: &AppState, event: &Event) -> Frames {
 async fn task_frames(state: &AppState, event: &Event) -> UiResult<Frames> {
     let (id, kind) = match *event {
         Event::TaskChanged { id, kind, .. } => (id, kind),
+        Event::HumanArchived { .. } => {
+            return Ok(vec![
+                ("inbox".to_string(), PING.to_string()),
+                ("overview".into(), PING.into()),
+            ]);
+        }
         Event::MessageCreated { to, .. } => {
             let mut frames = vec![("inbox".to_string(), PING.to_string())];
             if let Address::Task(t) = to {

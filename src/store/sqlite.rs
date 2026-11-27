@@ -1338,6 +1338,26 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn insert_human_reply(&self, message: &Message, now: OffsetDateTime) -> StoreResult<()> {
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        insert_message(&mut tx, message, None).await?;
+        if let Some(original) = message.reply_to {
+            sqlx::query(
+                "UPDATE message_recipients
+                    SET acked_at = ?1, delivered_at = COALESCE(delivered_at, ?1),
+                        read_at = COALESCE(read_at, ?1)
+                  WHERE message_id = ?2 AND recipient_agent_id IS NULL
+                    AND recipient_session_id IS NULL AND acked_at IS NULL",
+            )
+            .bind(ts::enc(now))
+            .bind(original.to_string())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn get_message(&self, id: MessageId) -> StoreResult<Option<Message>> {
         sqlx::query(concat!(
             "SELECT ",

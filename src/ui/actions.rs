@@ -28,6 +28,7 @@ fn message_error(e: MessageError) -> UiError {
         }
         e @ MessageError::TooLong { .. } => UiError::Invalid(capitalise(&e.to_string())),
         MessageError::NotFound(what) => UiError::Invalid(format!("That {what} does not exist.")),
+        e @ MessageError::MismatchedReply => UiError::Invalid(capitalise(&e.to_string())),
         MessageError::Store(e) => e.into(),
     }
 }
@@ -372,23 +373,52 @@ pub async fn send_message(
         kind => address(kind, &form.to)?,
     };
     let reply_to = opt_id::<MessageId>(&form.reply_to, "message id")?;
+    // A reply to the human's mail archives the human's copy of it in the same write.
     let sent = state
         .messages
-        .send(
-            &Actor::Human,
-            NewMessage {
-                to,
-                subject: subject(&form.subject),
-                body: form.body,
-                importance: importance(&form.importance)?,
-                reply_to,
-            },
-        )
+        .send_as_human(NewMessage {
+            to,
+            subject: subject(&form.subject),
+            body: form.body,
+            importance: importance(&form.importance)?,
+            reply_to,
+        })
         .await
         .map_err(message_error)?;
     Ok(see_other(&match reply_to {
         Some(original) => format!("/ui/inbox?m={original}"),
         None => format!("/ui/inbox?view=all&m={}", sent.id),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct DismissForm {
+    #[serde(default)]
+    back: String,
+}
+
+/// Marks a message handled without answering it: archived for the human only, then back
+/// to the page that showed it.
+pub async fn dismiss(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<DismissForm>,
+) -> UiResult<Response> {
+    let id: MessageId = id
+        .parse()
+        .map_err(|_| UiError::NotFound("No such message."))?;
+    if state.store.get_message(id).await?.is_none() {
+        return Err(UiError::NotFound("No such message."));
+    }
+    state
+        .messages
+        .ack(Caller::Human, &[id])
+        .await
+        .map_err(message_error)?;
+    Ok(see_other(match form.back.as_str() {
+        "/ui/" => "/ui/#needs-you",
+        "/ui/inbox" => "/ui/inbox",
+        _ => "/ui/board#needs-you",
     }))
 }
 

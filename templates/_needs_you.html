@@ -46,6 +46,13 @@
         <a class="button-like" href="{{ n.href }}">Review the work</a>
       {% else %}
         <a class="button-like" href="{{ n.href }}">Open and reply</a>
+        {% if let Some(mid) = n.message_id %}
+        <form method="post" action="/ui/inbox/{{ mid }}/dismiss">
+          <input type="hidden" name="csrf" value="{{ token }}">
+          <input type="hidden" name="back" value="{{ back }}">
+          <button type="submit" class="link" title="Mark handled: archive it for you without replying">Dismiss</button>
+        </form>
+        {% endif %}
       {% endif %}
       </div>
       {% endif %}

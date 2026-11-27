@@ -731,3 +731,46 @@ store_matrix!(human_attention_is_a_read_only_peek, |store: Arc<
     let receipts = env.store.message_receipts(&[urgent.id]).await.unwrap();
     assert_eq!(receipts[0].delivered, 0, "peeking delivers nothing");
 });
+
+store_matrix!(a_human_reply_archives_the_original, |store: Arc<
+    dyn Store,
+>| async move {
+    use axle::service::messages::{MessageError, MessageService, NewMessage};
+    let env = Env::new(store);
+    let lead = env.session("mac").await;
+    let other = env.session("linux").await;
+    let messages = MessageService::new(env.store.clone(), env.clock.clone());
+    let original = messages
+        .send(
+            &Actor::Agent(lead.agent.id, lead.session.id),
+            NewMessage {
+                to: Address::Human,
+                subject: None,
+                body: "help".into(),
+                importance: Importance::Urgent,
+                reply_to: None,
+            },
+        )
+        .await
+        .unwrap();
+    let reply = |to: Address| NewMessage {
+        to,
+        subject: None,
+        body: "on it".into(),
+        importance: Importance::Normal,
+        reply_to: Some(original.id),
+    };
+    assert!(matches!(
+        messages
+            .send_as_human(reply(Address::Agent(other.agent.id)))
+            .await,
+        Err(MessageError::MismatchedReply)
+    ));
+    assert_eq!(env.store.human_attention(10).await.unwrap().len(), 1);
+    messages
+        .send_as_human(reply(Address::Agent(lead.agent.id)))
+        .await
+        .unwrap();
+    assert!(env.store.human_attention(10).await.unwrap().is_empty());
+    assert!(env.inbox_of(&lead).await.iter().any(|m| m.body == "on it"));
+});

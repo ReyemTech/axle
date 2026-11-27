@@ -72,6 +72,8 @@ pub struct NeedCard {
     /// For plan cards: the task to decide on and the plan shown (sent with the decision).
     pub task_id: Option<String>,
     pub plan_id: Option<String>,
+    /// For reply cards: the message, which can be dismissed.
+    pub message_id: Option<String>,
     pub importance: &'static str,
 }
 
@@ -152,6 +154,7 @@ pub(super) async fn needs_you(
             since: since(at),
             task_id: Some(t.id.to_string()),
             plan_id: plan.map(|p| p.id.to_string()),
+            message_id: None,
             importance: "high",
         });
     }
@@ -182,6 +185,7 @@ pub(super) async fn needs_you(
             since: since(t.updated_at),
             task_id: None,
             plan_id: None,
+            message_id: None,
             importance: "high",
         });
     }
@@ -216,6 +220,7 @@ pub(super) async fn needs_you(
             since: since(m.created_at),
             task_id: None,
             plan_id: None,
+            message_id: Some(m.id.to_string()),
             importance: m.importance.as_str(),
         });
     }

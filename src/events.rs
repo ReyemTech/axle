@@ -32,6 +32,8 @@ pub enum Event {
         status: TaskStatus,
         kind: TaskEventKind,
     },
+    /// Messages left the human's inbox (archived, dismissed or answered).
+    HumanArchived { archived: Vec<MessageId> },
 }
 
 impl Event {
@@ -40,6 +42,7 @@ impl Event {
         match self {
             Event::MessageCreated { .. } => "MessageCreated",
             Event::TaskChanged { .. } => "TaskChanged",
+            Event::HumanArchived { .. } => "HumanArchived",
         }
     }
 
@@ -47,6 +50,7 @@ impl Event {
         match *self {
             Event::MessageCreated { project_id, .. } => project_id,
             Event::TaskChanged { project_id, .. } => Some(project_id),
+            Event::HumanArchived { .. } => None,
         }
     }
 }

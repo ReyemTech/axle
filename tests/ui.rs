@@ -2302,3 +2302,145 @@ async fn needs_you_shows_every_review_and_peeks_without_delivering() {
         "showing the strip delivers nothing"
     );
 }
+
+/// An urgent message from `from` to the human.
+async fn urgent_to_human(app: &App, from: &Resolved, subject: &str) -> axle::domain::Message {
+    app.state
+        .messages
+        .send(
+            &Actor::Agent(from.agent.id, from.session.id),
+            NewMessage {
+                to: Address::Human,
+                subject: Some(subject.into()),
+                body: "please look".into(),
+                importance: Importance::Urgent,
+                reply_to: None,
+            },
+        )
+        .await
+        .unwrap()
+}
+
+async fn need_titles(app: &App, cookie: &str) -> (Vec<String>, String) {
+    let board = app.get("/ui/board", Some(cookie)).await;
+    (
+        select_texts(&board, "#needs-you .card-title"),
+        select_texts(&board, "#pulse .pulse-item")[2].clone(),
+    )
+}
+
+#[tokio::test]
+async fn replying_or_dismissing_clears_a_reply_card() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let other = app.agent(IAC, "linux", "codex").await;
+    let first = urgent_to_human(&app, &iac, "Prod is down").await;
+    let second = urgent_to_human(&app, &iac, "Heads up").await;
+    assert_eq!(
+        need_titles(&app, &cookie).await,
+        (
+            vec!["Prod is down".to_string(), "Heads up".to_string()],
+            "2 need you".to_string()
+        )
+    );
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    let csrf = csrf_of(&board);
+    assert_eq!(
+        select_texts(&board, ".need-card[data-need=reply] button"),
+        ["Dismiss", "Dismiss"]
+    );
+
+    // A reply to someone other than the sender is refused and clears nothing.
+    let page = app
+        .post_form(
+            "/ui/messages",
+            Some(&cookie),
+            &form(
+                &csrf,
+                &[
+                    ("to_kind", "agent"),
+                    ("to", &other.agent.id.to_string()),
+                    ("reply_to", &first.id.to_string()),
+                    ("body", "wrong person"),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(
+        page.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        page.body
+    );
+    assert_eq!(need_titles(&app, &cookie).await.0.len(), 2);
+
+    // Replying to the sender archives the human's copy in the same write.
+    let mut events = app.state.bus.subscribe();
+    let page = app
+        .post_form(
+            "/ui/messages",
+            Some(&cookie),
+            &form(
+                &csrf,
+                &[
+                    ("to_kind", "agent"),
+                    ("to", &iac.agent.id.to_string()),
+                    ("reply_to", &first.id.to_string()),
+                    ("body", "on it"),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .is_ok(),
+        "the strip refreshes live"
+    );
+    assert_eq!(
+        need_titles(&app, &cookie).await,
+        (vec!["Heads up".to_string()], "1 need you".to_string())
+    );
+    let receipt = app.state.store.message_receipts(&[first.id]).await.unwrap();
+    assert!(receipt[0].replied);
+    let agent_mail = app
+        .state
+        .messages
+        .inbox(&iac, axle::service::messages::InboxFilter::default())
+        .await
+        .unwrap();
+    assert!(agent_mail.iter().any(|i| i.message.body == "on it"));
+
+    // Dismiss archives for the human only; it needs CSRF and goes back to the board.
+    let path = format!("/ui/inbox/{}/dismiss", second.id);
+    let refused = app.post_form(&path, Some(&cookie), "back=/ui/board").await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    let mut events = app.state.bus.subscribe();
+    let page = app
+        .post_form(&path, Some(&cookie), &form(&csrf, &[("back", "/ui/board")]))
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    assert_eq!(page.location.as_deref(), Some("/ui/board#needs-you"));
+    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("a live event")
+        .unwrap();
+    let frames = axle::ui::views::live_frames(&app.state, &event).await;
+    assert!(
+        frames.iter().any(|(name, _)| name == "overview"),
+        "{frames:?}"
+    );
+    assert_eq!(
+        need_titles(&app, &cookie).await,
+        (vec![], "0 need you".to_string())
+    );
+    let receipt = app
+        .state
+        .store
+        .message_receipts(&[second.id])
+        .await
+        .unwrap();
+    assert!(!receipt[0].replied);
+}

@@ -163,6 +163,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/ui/needs-you", get(needs::needs_fragment))
         .route("/ui/inbox", get(inbox::inbox))
         .route("/ui/inbox/{id}/archive", post(actions::archive))
+        .route("/ui/inbox/{id}/dismiss", post(actions::dismiss))
         .route("/ui/messages", post(actions::send_message))
         .route("/ui/projects", get(admin::projects))
         .route("/ui/projects/{id}/rename", post(actions::rename_project))

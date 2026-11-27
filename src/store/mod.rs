@@ -209,6 +209,9 @@ pub trait Store: Send + Sync {
     /// Inserts the message and, for agent-, session- and human-addressed messages, its
     /// recipient row. Project and task messages get recipient rows when read.
     async fn insert_message(&self, message: &Message, token: Option<TokenId>) -> StoreResult<()>;
+    /// Inserts the human's reply `message` and, in the same transaction, archives (acks) the
+    /// human's copy of the message it answers (`message.reply_to`).
+    async fn insert_human_reply(&self, message: &Message, now: OffsetDateTime) -> StoreResult<()>;
     async fn get_message(&self, id: MessageId) -> StoreResult<Option<Message>>;
     /// The recipient's unacked messages matching `filter`, oldest first. In one write
     /// transaction: first gives the recipient a row for every project / task message now

@@ -48,6 +48,9 @@ pub enum MessageError {
     /// The sender, recipient or replied-to message does not exist.
     #[error("{0} not found")]
     NotFound(&'static str),
+    /// A reply to a message for the human goes to its sender or its thread.
+    #[error("a reply goes to the message's sender or its task thread")]
+    MismatchedReply,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -93,6 +96,57 @@ impl MessageService {
     }
 
     pub async fn send(&self, caller: &Actor, new: NewMessage) -> Result<Message, MessageError> {
+        self.send_inner(caller, new, false).await
+    }
+
+    /// The human sends a message. When it replies to a message addressed to the human, it
+    /// must go to that message's sending agent or its task thread, and the human's copy of
+    /// the original is archived in the same transaction (answered mail stops waiting).
+    pub async fn send_as_human(&self, new: NewMessage) -> Result<Message, MessageError> {
+        let answers_human = match new.reply_to {
+            Some(id) => {
+                let original = self
+                    .store
+                    .get_message(id)
+                    .await?
+                    .ok_or(MessageError::NotFound("message"))?;
+                if original.to == Address::Human {
+                    let to_sender = matches!(
+                        (original.from, new.to),
+                        (Actor::Agent(a, _), Address::Agent(b)) if a == b
+                    );
+                    let to_thread = original.task_id.is_some_and(|t| new.to == Address::Task(t));
+                    if !to_sender && !to_thread {
+                        return Err(MessageError::MismatchedReply);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        };
+        let message = self.send_inner(&Actor::Human, new, answers_human).await?;
+        if answers_human {
+            self.archived(message.reply_to.into_iter().collect()).await;
+        }
+        Ok(message)
+    }
+
+    async fn archived(&self, ids: Vec<MessageId>) {
+        if let Some(bus) = &self.events
+            && !ids.is_empty()
+        {
+            bus.emit(Event::HumanArchived { archived: ids }).await;
+        }
+    }
+
+    async fn send_inner(
+        &self,
+        caller: &Actor,
+        new: NewMessage,
+        archive_original: bool,
+    ) -> Result<Message, MessageError> {
         check_body(&new.body)?;
         if let Some(subject) = &new.subject {
             check_subject("subject", subject)?;
@@ -117,7 +171,13 @@ impl MessageService {
             created_at: self.clock.now(),
             kind: crate::domain::MessageKind::Message,
         };
-        self.store.insert_message(&message, token).await?;
+        if archive_original {
+            self.store
+                .insert_human_reply(&message, self.clock.now())
+                .await?;
+        } else {
+            self.store.insert_message(&message, token).await?;
+        }
         if let Some(bus) = &self.events {
             bus.emit(Event::MessageCreated {
                 id: message.id,
@@ -152,11 +212,16 @@ impl MessageService {
 
     /// Acknowledges messages in the caller's inbox; returns how many were newly acked.
     /// Agent-addressed (and project / task) messages are acked for the whole agent.
+    /// The human's acks publish `HumanArchived`, so open pages drop the mail live.
     pub async fn ack(&self, caller: Caller<'_>, ids: &[MessageId]) -> Result<u64, MessageError> {
-        Ok(self
+        let n = self
             .store
             .ack_messages(caller_recipient(caller), ids, self.clock.now())
-            .await?)
+            .await?;
+        if n > 0 && matches!(caller, Caller::Human) {
+            self.archived(ids.to_vec()).await;
+        }
+        Ok(n)
     }
 
     /// Records that the caller read these messages; returns how many were newly marked.
