@@ -19,8 +19,8 @@ on `ubuntu-24.04-arm`, so aws-lc-rs needs no cross toolchain.
 
 ## One-time owner setup
 
-- [ ] Create the empty repo `ReyemTech/homebrew-tap`.
-- [ ] Create a fine-grained PAT limited to `ReyemTech/homebrew-tap` with **Contents: read and write**. Save it in `ReyemTech/axle` as secret `HOMEBREW_TAP_TOKEN`.
+- [x] `ReyemTech/homebrew-tap` already exists (it holds the stint casks). dist adds `Formula/axle.rb` next to them, so `brew install reyemtech/tap/axle` works.
+- [ ] Create a fine-grained PAT limited to `ReyemTech/homebrew-tap` with **Contents: read and write**. Save it in `ReyemTech/axle` as secret `HOMEBREW_TAP_TOKEN`. The stint repo already has a secret with this name; you can reuse the same token if it is scoped to the tap, or make it an org-level secret shared by both repos.
 - [ ] Create a crates.io API token (scope: publish-new and publish-update) and save it as secret `CARGO_REGISTRY_TOKEN`.
 - [ ] Optional ECR mirror (nothing happens until `ECR_REGISTRY` is set):
   - [ ] Create the ECR repository (`axle`, or any name you put in `ECR_REPOSITORY`).
