@@ -3,7 +3,7 @@
 {% block content %}
 <div class="task-page">
 <section id="task-live" class="task-live" data-keep-drafts
-         hx-get="/ui/tasks/{{ task.id }}" hx-select="#task-live" hx-swap="outerHTML"
+         hx-get="{{ refresh }}" hx-select="#task-live" hx-swap="outerHTML"
          hx-trigger="sse:detail-{{ task.id }} delay:300ms, every 60s, axl:refresh">
   <header class="task-head" data-status="{{ task.status }}" data-line="{{ task.project.line }}">
     {% if let Some((pid, ptitle)) = task.parent %}<p class="crumb"><a href="/ui/tasks/{{ pid }}"><span class="crumb-label">Subtask of</span> {{ ptitle }}</a></p>{% endif %}

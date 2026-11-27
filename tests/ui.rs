@@ -2649,3 +2649,81 @@ async fn live_refreshes_keep_drafts_and_leases_fresh() {
     assert!(js.contains("[data-keep-drafts]") || js.contains("keepDrafts"));
     assert!(js.contains("hasDraft") && js.contains("axl:refresh"));
 }
+
+#[tokio::test]
+async fn live_refresh_keeps_pagination_cursors() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let task = app.task(&iac, "Long", None).await;
+    app.claim(&iac, task.id).await;
+    for i in 0..60 {
+        app.clock.advance(time::Duration::seconds(1));
+        app.state.tasks.renew(&iac, task.id).await.unwrap();
+        app.state
+            .messages
+            .send(
+                &Actor::Agent(iac.agent.id, iac.session.id),
+                NewMessage {
+                    to: Address::Task(task.id),
+                    subject: None,
+                    body: format!("post {i}"),
+                    importance: Importance::Normal,
+                    reply_to: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let live = Selector::parse("#task-live").unwrap();
+    let refresh = |page: &Page| {
+        page.html()
+            .select(&live)
+            .next()
+            .expect("live section")
+            .value()
+            .attr("hx-get")
+            .unwrap()
+            .to_string()
+    };
+    let link = |page: &Page, css: &str| {
+        page.html()
+            .select(&Selector::parse(css).unwrap())
+            .next()
+            .expect(css)
+            .value()
+            .attr("href")
+            .unwrap()
+            .to_string()
+    };
+    let path = format!("/ui/tasks/{}", task.id);
+    let first = app.get(&path, Some(&cookie)).await;
+    assert_eq!(refresh(&first), path, "the newest page refreshes as itself");
+
+    // An earlier thread page and an older history page each refresh as themselves.
+    let thread_href = link(&first, "a.earlier");
+    let thread_page = app.get(&thread_href, Some(&cookie)).await;
+    assert_eq!(refresh(&thread_page), thread_href);
+    let history_href = link(&first, "a.older");
+    let history_page = app.get(&history_href, Some(&cookie)).await;
+    assert_eq!(refresh(&history_page), history_href);
+
+    // Both cursors at once survive, and the refresh re-renders that same older page.
+    let thread_cursor = thread_href.split_once('?').unwrap().1;
+    let history_cursor = history_href.split_once('?').unwrap().1;
+    let both = format!("{path}?{thread_cursor}&{history_cursor}");
+    let both_page = app.get(&both, Some(&cookie)).await;
+    let again = app.get(&refresh(&both_page), Some(&cookie)).await;
+    assert_eq!(refresh(&again), both);
+    let bodies = select_texts(&again, ".thread .peer-text");
+    assert_eq!(
+        bodies.last().unwrap(),
+        "post 9",
+        "still the earlier thread page"
+    );
+    assert_eq!(
+        select_texts(&again, ".event-kind").last().unwrap(),
+        "created",
+        "still the older history page"
+    );
+}

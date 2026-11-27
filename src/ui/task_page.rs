@@ -191,6 +191,8 @@ struct TaskPage {
     pulse: Option<Pulse>,
     nav: &'static str,
     task: TaskView,
+    /// What the live region re-fetches: this page, with its pagination cursors.
+    refresh: String,
     thread: Vec<MessageView>,
     events: Vec<EventView>,
     /// Link to the next (older) page of events.
@@ -458,7 +460,22 @@ pub async fn task_page(
         })
         .collect();
 
+    // The live refresh re-renders the page being viewed, not the newest one.
+    let cursors: Vec<String> = [
+        thread_before.map(|m| format!("thread_before={m}")),
+        before.map(|e| format!("before={e}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let refresh = if cursors.is_empty() {
+        format!("/ui/tasks/{id}")
+    } else {
+        format!("/ui/tasks/{id}?{}", cursors.join("&"))
+    };
+
     html(&TaskPage {
+        refresh,
         logout: session.logout,
         csrf: Some(session.csrf),
         pulse: Some(pulse_counts(&state).await?),
