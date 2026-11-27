@@ -284,6 +284,7 @@ fn plain_http_warns_unless_the_host_is_exactly_loopback() {
         "http://evil.com#@localhost",
         "http://evil.com?x@localhost",
         "http://evil.com/p@localhost",
+        "http://evil.com\\@localhost",
     ] {
         let r = run_script(url, "1000", "Linux", false, &[]);
         assert!(r.stderr.contains("plain http"), "{url}: {}", r.stderr);

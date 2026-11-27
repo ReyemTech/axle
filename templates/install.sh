@@ -44,6 +44,7 @@ version_ge() {
 is_loopback_host() {
   host=${1#*://}
   host=${host%%/*}
+  host=${host%%\\*}
   host=${host%%\?*}
   host=${host%%\#*}
   host=${host##*@}
