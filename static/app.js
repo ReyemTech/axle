@@ -150,6 +150,15 @@
   // an open disclosure or a typed but unsent field, the refresh waits, and runs once the
   // draft is gone (sent, cleared or abandoned with focus elsewhere).
   function hasDraft(region) {
+    return regionHasDraft(region) || alsoRegions(region).some(regionHasDraft);
+  }
+  // A region may name sibling regions refreshed together with it (data-drafts-also), such as
+  // the task page's actions sidebar; a draft or focus there defers the refresh too.
+  function alsoRegions(region) {
+    var sel = region.getAttribute("data-drafts-also");
+    return sel ? Array.prototype.slice.call(document.querySelectorAll(sel)) : [];
+  }
+  function regionHasDraft(region) {
     if (region.contains(document.activeElement) && document.activeElement !== region) {
       return true;
     }

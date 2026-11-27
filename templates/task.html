@@ -3,7 +3,8 @@
 {% block content %}
 <div class="task-page">
 <section id="task-live" class="task-live" data-keep-drafts
-         hx-get="{{ refresh }}" hx-select="#task-live" hx-swap="outerHTML"
+         hx-get="{{ refresh }}" hx-select="#task-live" hx-select-oob="#task-actions" hx-swap="outerHTML"
+         data-drafts-also="#task-actions"
          hx-trigger="sse:detail-{{ task.id }} delay:300ms, every 60s, axl:refresh">
   <header class="task-head" data-status="{{ task.status }}" data-line="{{ task.project.line }}">
     {% if let Some((pid, ptitle)) = task.parent %}<p class="crumb"><a href="/ui/tasks/{{ pid }}"><span class="crumb-label">Subtask of</span> {{ ptitle }}</a></p>{% endif %}
@@ -122,7 +123,7 @@
   </section>
 </section>
 
-<aside class="task-actions" aria-label="Actions">
+<aside id="task-actions" class="task-actions" aria-label="Actions">
   {% if let Some(token) = csrf %}
   <section class="panel">
     <h2 class="panel-title">Post to the thread</h2>

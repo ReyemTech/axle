@@ -2738,3 +2738,74 @@ async fn live_refresh_keeps_pagination_cursors() {
         "still the older history page"
     );
 }
+
+#[tokio::test]
+async fn live_refresh_updates_task_actions() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let task = app.task(&infra, "Actionable", None).await;
+    let path = format!("/ui/tasks/{}", task.id);
+    let page = app.get(&path, Some(&cookie)).await;
+    assert!(
+        select_texts(&page, "#task-actions").len() == 1,
+        "the actions sidebar is addressable"
+    );
+    assert_eq!(
+        select_texts(&page, "#task-live[hx-select-oob*='#task-actions']").len(),
+        1,
+        "every live refresh also swaps the sidebar"
+    );
+    assert!(
+        select_texts(&page, "#task-live[data-drafts-also='#task-actions']").len() == 1,
+        "sidebar drafts defer the refresh"
+    );
+    let js = include_str!("../static/app.js");
+    assert!(js.contains("data-drafts-also") || js.contains("draftsAlso"));
+    let actions = |p: &Page| select_texts(p, "#task-actions").join(" ");
+    assert!(!actions(&page).contains("Force release"), "open task");
+
+    // An agent claims it: the refresh response now carries Force release.
+    app.claim(&infra, task.id).await;
+    let live = Selector::parse("#task-live").unwrap();
+    let hx_get = page
+        .html()
+        .select(&live)
+        .next()
+        .unwrap()
+        .value()
+        .attr("hx-get")
+        .unwrap()
+        .to_string();
+    let refreshed = app.get(&hx_get, Some(&cookie)).await;
+    assert!(
+        actions(&refreshed).contains("Force release"),
+        "{}",
+        actions(&refreshed)
+    );
+
+    // Completion removes the stale actions again.
+    app.state
+        .tasks
+        .complete(
+            &infra,
+            task.id,
+            Completion {
+                summary: "done".into(),
+                ..Completion::default()
+            },
+        )
+        .await
+        .unwrap();
+    let done = app.get(&hx_get, Some(&cookie)).await;
+    assert!(
+        !actions(&done).contains("Force release"),
+        "{}",
+        actions(&done)
+    );
+    assert!(
+        !actions(&done).contains("Cancel task"),
+        "{}",
+        actions(&done)
+    );
+}
