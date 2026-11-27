@@ -5,13 +5,14 @@ use std::sync::Arc;
 
 use coord::clock::{Clock, TestClock};
 use coord::domain::{
-    Actor, Eligibility, ProjectId, SessionId, Task, TaskEventKind, TaskId, TaskStatus,
+    Actor, Address, Eligibility, Importance, ProjectId, SessionId, Task, TaskEventKind, TaskId,
+    TaskStatus,
 };
 use coord::service::identity::{IdentityInput, IdentityService, Resolved};
 use coord::service::tasks::{
     Caller, ClaimOutcome, Completion, NewTask, Progress, TaskError, TaskService,
 };
-use coord::store::{Store, TaskFilter};
+use coord::store::{InboxFilter, Recipient, Store, TaskFilter};
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
@@ -1014,6 +1015,101 @@ store_matrix!(parent_moves_to_review_when_children_finish, |store: Arc<
         .await
         .unwrap();
     assert_eq!(closed.status, TaskStatus::Done);
+});
+
+store_matrix!(coordinator_is_notified_in_parent_thread, |store: Arc<
+    dyn Store,
+>| async move {
+    let env = Env::new(store);
+    let coordinator = env.session("mac", "claude-code").await;
+    let worker = env.session("linux", "codex").await;
+    let parent = env.task(&coordinator, Eligibility::default()).await;
+    claimed(env.svc.claim(&coordinator, parent.id).await.unwrap());
+    let c1 = child_of(&env, &parent).await;
+    let c2 = child_of(&env, &parent).await;
+    let c3 = child_of(&env, &parent).await;
+
+    // Claiming is not a notification; blocked, done and cancelled are.
+    claimed(env.svc.claim(&worker, c1.id).await.unwrap());
+    claimed(env.svc.claim(&worker, c2.id).await.unwrap());
+    env.svc.block(&worker, c1.id, "needs creds").await.unwrap();
+    env.svc
+        .complete(&worker, c2.id, done("shipped it"))
+        .await
+        .unwrap();
+    env.svc.to_review(&worker, c1.id, None).await.unwrap();
+    env.svc.complete(&worker, c1.id, done("")).await.unwrap();
+    env.svc.cancel(Caller::Human, c3.id).await.unwrap();
+
+    let thread = env.store.task_thread(parent.id).await.unwrap();
+    // The first message is the task itself; the rest are the automatic notices.
+    let notes: Vec<(Option<&str>, &str, Actor, Importance)> = thread[1..]
+        .iter()
+        .map(|m| (m.subject.as_deref(), m.body.as_str(), m.from, m.importance))
+        .collect();
+    let w = Actor::Agent(worker.agent.id, worker.session.id);
+    let title = "child";
+    assert_eq!(
+        notes,
+        vec![
+            (
+                Some("child task blocked"),
+                format!("Child task \"{title}\" ({}) is blocked: needs creds", c1.id).as_str(),
+                w,
+                Importance::High,
+            ),
+            (
+                Some("child task done"),
+                format!("Child task \"{title}\" ({}) is done: shipped it", c2.id).as_str(),
+                w,
+                Importance::Normal,
+            ),
+            (
+                Some("child task done"),
+                format!("Child task \"{title}\" ({}) is done.", c1.id).as_str(),
+                w,
+                Importance::Normal,
+            ),
+            (
+                Some("child task cancelled"),
+                format!("Child task \"{title}\" ({}) is cancelled.", c3.id).as_str(),
+                Actor::Human,
+                Importance::Normal,
+            ),
+            (
+                Some("child tasks complete"),
+                "All child tasks are done or cancelled; the parent task is review.",
+                Actor::Human,
+                Importance::High,
+            ),
+        ]
+    );
+    for m in &thread[1..] {
+        assert_eq!(m.to, Address::Task(parent.id));
+        assert_eq!(m.task_id, Some(parent.id));
+        assert_eq!(m.project_id, Some(parent.project_id));
+    }
+
+    // They reach the coordinator's inbox (the parent's owner and creator).
+    let inbox = env
+        .store
+        .inbox(
+            Recipient::Agent {
+                agent: coordinator.agent.id,
+                session: coordinator.session.id,
+            },
+            &InboxFilter::default(),
+            env.clock.now(),
+        )
+        .await
+        .unwrap();
+    let subjects: Vec<_> = inbox
+        .iter()
+        .filter(|i| i.message.task_id == Some(parent.id))
+        .filter_map(|i| i.message.subject.clone())
+        .collect();
+    assert_eq!(subjects.len(), 5, "{subjects:?}");
+    assert_eq!(subjects.last().unwrap(), "child tasks complete");
 });
 
 store_matrix!(parent_open_stays_open, |store: Arc<dyn Store>| async move {

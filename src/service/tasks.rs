@@ -629,25 +629,124 @@ impl TaskService {
         }
     }
 
-    /// Publishes the change and, when a child closed, the parent's move to `review` that the
-    /// store makes in the same transaction once every child is closed.
-    async fn after_transition(&self, task: &Task, kind: TaskEventKind) {
-        if self.events.is_none() {
-            return;
-        }
-        self.changed(task, kind).await;
-        let Some(parent) = task.parent_id else {
+    /// After a committed transition: publishes the change and, for a child, tells the
+    /// coordinator (spec §8). A child that is blocked, done or cancelled posts a message into
+    /// the parent's thread (delivered to the parent's owner and creator), as does the closing
+    /// of the last open child; the parent's move to `review` that the store makes then is
+    /// published too. The transition has already committed, so failures here are logged.
+    async fn after_transition(&self, task: &Task, event: &TaskEvent, token: Option<TokenId>) {
+        self.changed(task, event.kind).await;
+        let Some(parent_id) = task.parent_id else {
             return;
         };
+        if !matches!(
+            event.kind,
+            TaskEventKind::Blocked | TaskEventKind::Done | TaskEventKind::Cancelled
+        ) {
+            return;
+        }
+        let parent = match self.store.get_task(parent_id).await {
+            Ok(Some(p)) => p,
+            Ok(None) => return,
+            Err(e) => {
+                eprintln!("coord: failed to read parent task {parent_id}: {e}");
+                return;
+            }
+        };
+        let (status, detail) = match event.kind {
+            TaskEventKind::Blocked => ("blocked", event.note.as_deref()),
+            TaskEventKind::Done => ("done", event.note.as_deref()),
+            _ => ("cancelled", None),
+        };
+        let body = match detail.map(str::trim).filter(|d| !d.is_empty()) {
+            Some(d) => format!(
+                "Child task \"{}\" ({}) is {status}: {d}",
+                task.title, task.id
+            ),
+            None => format!("Child task \"{}\" ({}) is {status}.", task.title, task.id),
+        };
+        let importance = if event.kind == TaskEventKind::Blocked {
+            Importance::High
+        } else {
+            Importance::Normal
+        };
+        self.notify_parent(
+            &parent,
+            event.actor,
+            token,
+            &format!("child task {status}"),
+            body,
+            importance,
+        )
+        .await;
         if !matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled) {
             return;
         }
-        match self.store.get_task(parent).await {
-            Ok(Some(p)) if p.status == TaskStatus::Review => {
-                self.changed(&p, TaskEventKind::ChildrenComplete).await;
+        // The store records `children_complete` (at this event's time) in the same
+        // transaction when this child was the last open one.
+        let completed = match self.store.task_events(parent_id).await {
+            Ok(events) => events
+                .iter()
+                .any(|e| e.kind == TaskEventKind::ChildrenComplete && e.at == event.at),
+            Err(e) => {
+                eprintln!("coord: failed to read parent task {parent_id}: {e}");
+                return;
             }
-            Ok(_) => {}
-            Err(e) => eprintln!("coord: failed to read parent task {parent}: {e}"),
+        };
+        if !completed {
+            return;
+        }
+        if parent.status == TaskStatus::Review {
+            self.changed(&parent, TaskEventKind::ChildrenComplete).await;
+        }
+        let body = format!(
+            "All child tasks are done or cancelled; the parent task is {}.",
+            parent.status
+        );
+        self.notify_parent(
+            &parent,
+            event.actor,
+            token,
+            "child tasks complete",
+            body,
+            Importance::High,
+        )
+        .await;
+    }
+
+    /// Posts an automatic message into the parent task's thread.
+    async fn notify_parent(
+        &self,
+        parent: &Task,
+        from: Actor,
+        token: Option<TokenId>,
+        subject: &str,
+        body: String,
+        importance: Importance,
+    ) {
+        let message = Message {
+            id: MessageId::new(),
+            project_id: Some(parent.project_id),
+            from,
+            to: Address::Task(parent.id),
+            subject: Some(subject.to_string()),
+            body,
+            importance,
+            task_id: Some(parent.id),
+            reply_to: None,
+            created_at: self.clock.now(),
+        };
+        if let Err(e) = self.store.insert_message(&message, token).await {
+            eprintln!("coord: failed to notify parent task {}: {e}", parent.id);
+            return;
+        }
+        if let Some(bus) = &self.events {
+            bus.emit(Event::MessageCreated {
+                id: message.id,
+                to: message.to,
+                project_id: message.project_id,
+            })
+            .await;
         }
     }
 
@@ -719,7 +818,7 @@ impl TaskService {
             };
             if let Some(task) = self.store.transition_task(&req).await? {
                 if kind != TaskEventKind::Renewed {
-                    self.after_transition(&task, kind).await;
+                    self.after_transition(&task, &req.event, req.token).await;
                 }
                 return Ok(task);
             }
@@ -767,7 +866,7 @@ impl TaskService {
         };
         match self.store.transition_task(&req).await? {
             Some(task) => {
-                self.after_transition(&task, kind).await;
+                self.after_transition(&task, &req.event, req.token).await;
                 Ok(task)
             }
             None => {
