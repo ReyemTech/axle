@@ -158,13 +158,13 @@ Postgres. Columns:
   3. Gets a matching `axl`. If `axl` is already on PATH at the server's version or newer, it
      uses that. Otherwise it runs the dist shell installer for **the server's own version**,
      which installs into `~/.cargo/bin` (the existing dist config).
-  4. Runs `axl login <server> --code "$1"`, then `axl install`.
+  4. Runs `axl install --server <server> --code "$1"`, which logs in first.
   5. Prints the `axl status` summary.
 - **Release pinning.** The version comes from the server (`env!("CARGO_PKG_VERSION")`), so a
   machine gets a CLI that matches its server. The download URL is GitHub Releases,
   `https://github.com/ReyemTech/axle/releases/download/v<ver>/axle-mcp-installer.sh`.
-- **Without a code** (`curl … | sh`): the script installs `axl` and then runs the device-flow
-  `axl login`.
+- **Without a code** (`curl … | sh`): the script runs `axl install --server <server>`, and
+  install's login step uses the device flow.
 - **Transport check.** If the server URL is plain `http://` and not loopback, the script
   prints a warning and asks for confirmation. When stdin is not a terminal, it reads the
   answer from `/dev/tty`.
@@ -182,7 +182,7 @@ Postgres. Columns:
 - `axl logout` deletes the local token (and, with `--revoke`, revokes it on the server
   first).
 
-### 5. `axl install [--harness NAME]... [--project] [--local] [--dry-run] [--yes]`
+### 5. `axl install [--server URL] [--code CODE] [--harness NAME]... [--local] [--dry-run] [--yes]`
 
 **Step 1: make sure there's a server.**
 - If a server is configured, check it with `/readyz`.
@@ -191,7 +191,18 @@ Postgres. Columns:
     the summary with the likely fixes: check the VPN or URL, run `axl status`, run
     `axl login` again.
   - **Never switch to local mode silently.** Only `--local` does that.
-- If none is configured, or `--local` is given, go into local mode:
+- **Login when needed** (owner's call). Login runs inside install, so a beginner never has to
+  know about `axl login`:
+  - **`--server URL`** (optionally with `--code`): if this machine has no token for that
+    server, install runs the `axl login` flow first. That is the code exchange, or the
+    device flow when there's no code.
+  - **No server configured, interactive terminal:** install asks **"Run Axle on this
+    machine, or connect to a server?"**
+    - **This machine:** local mode, below.
+    - **A server:** prompt for the URL, then run the device-flow login inline.
+  - **No server configured, non-interactive** (`--yes` or no TTY): local mode, unless
+    `--server` is given.
+- In local mode (chosen above, or `--local`):
   1. Run `axl service install`.
   2. Wait for `/readyz`.
   3. Mint a host token straight from the local SQLite database (the same code path as
