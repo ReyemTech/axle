@@ -5,7 +5,10 @@
 Releases are automated with [release-plz](https://release-plz.dev) (`release-plz.toml`,
 `.github/workflows/release-plz.yml`):
 
-1. Every push to `main` opens or updates a **release PR**. It bumps `version` in
+1. A push to `main` with a releasable commit opens or updates a **release PR**. Releasable
+   means `feat`, `fix`, `perf`, `refactor`, `revert`, or any breaking change (`type!:`);
+   `docs`, `chore`, `ci`, `test` and `style` commits alone never start one (`release_commits`
+   in `release-plz.toml`). The PR bumps `version` in
    `Cargo.toml` and `Cargo.lock` and adds a `CHANGELOG.md` section built from the
    conventional commit messages (`feat:`, `fix:`, `feat!:` …). Edit the changelog in that PR
    if the wording needs work.
@@ -42,6 +45,12 @@ Three workflows run on the tag:
 After changing `dist-workspace.toml`, regenerate with `dist generate` and commit the result.
 Pull requests run `dist plan` to catch breakage early. The arm64 Linux binary builds natively
 on `ubuntu-24.04-arm`, so aws-lc-rs needs no cross toolchain.
+
+## CI
+
+`ci.yml` skips docs-only changes (`*.md`, `docs/**`, `LICENSE`, issue and PR templates) and
+release PRs (branches starting with `release-plz-`). Rust builds share a cache saved from
+`main`; the smoke test builds its image with a GitHub Actions layer cache.
 
 ## One-time owner setup
 

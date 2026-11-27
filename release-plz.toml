@@ -10,3 +10,7 @@ git_tag_name = "v{{ version }}"
 changelog_update = true
 semver_check = false
 release_always = false       # only tag when a release-plz PR is merged
+# Only feat, fix, perf, refactor and revert commits, or any breaking change (`type!:`),
+# start a release. docs, chore, ci, test and style commits never do on their own, though
+# they still appear in the changelog of the next release.
+release_commits = "^((feat|fix|perf|refactor|revert)(\\([^)]*\\))?!?|[a-z]+(\\([^)]*\\))?!):"
