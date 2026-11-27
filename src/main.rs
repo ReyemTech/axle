@@ -26,6 +26,13 @@ enum Command {
         #[arg(long)]
         bind: Option<SocketAddr>,
     },
+    /// Stdio MCP bridge a harness spawns per session (reads COORD_TOKEN or ~/.coord/token,
+    /// COORD_SERVER_URL, COORD_PROJECT)
+    Bridge {
+        /// The harness this session runs in, e.g. claude-code, codex, opencode
+        #[arg(long)]
+        harness: String,
+    },
     /// Run database migrations (needs DATABASE_URL)
     Migrate,
     /// Manage projects
@@ -55,6 +62,12 @@ type CliResult = Result<(), Box<dyn std::error::Error>>;
 #[tokio::main]
 async fn main() -> ExitCode {
     let result = match Cli::parse().command {
+        Command::Bridge { harness } => {
+            coord::bridge::run(&harness, stop_signal()).await;
+            // Exit now: a pending blocking read of stdin would otherwise hold up runtime
+            // shutdown after a signal. The bridge fails open, so this is always success.
+            std::process::exit(0);
+        }
         Command::Serve { bind } => serve(bind).await,
         Command::Migrate => migrate().await,
         Command::Token { command } => token(command).await,
