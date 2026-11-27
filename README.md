@@ -52,6 +52,68 @@ The image runs as a non-root user, listens on `0.0.0.0:7420`, and keeps SQLite d
 `/data` volume. For Postgres, pass a `postgres://` `DATABASE_URL` instead. `tests/smoke.sh`
 builds the image and checks it end to end.
 
+## Kubernetes (Helm)
+
+The chart is published as an OCI artifact next to the image (`ghcr.io/reyemtech/coord`):
+
+```sh
+helm install coord oci://ghcr.io/reyemtech/charts/coord --version 0.1.0 \
+  --namespace coord --create-namespace
+```
+
+coord runs as a single replica (the chart rejects anything else). Pick a database mode:
+
+```yaml
+# SQLite (default): a 1Gi ReadWriteOnce PVC at /data, Recreate rollouts.
+database:
+  mode: sqlite
+persistence:
+  size: 1Gi
+  # storageClass: fast-ssd
+```
+
+```yaml
+# Postgres: the URL comes from an existing Secret; no PVC.
+database:
+  mode: postgres
+  existingSecret: coord-db     # holds the connection URL
+  urlKey: DATABASE_URL
+```
+
+The UI sign-in secret is generated on first install and kept across upgrades; read it with
+the command `helm install` prints. To supply your own, set `adminSecret.existingSecret` (and
+`adminSecret.key`, default `COORD_ADMIN_SECRET`). `cookieSecure` turns on automatically when
+`ingress.tls` is set; `trustedHeader` enables trusted-header sign-in behind an auth proxy.
+Other server settings go in `extraEnv`.
+
+Create the first agent token inside the pod (shown once; keep it out of prompts and chat):
+
+```sh
+kubectl exec -n coord deploy/coord -- coord token create --label my-laptop
+```
+
+(`deploy/coord` assumes release name `coord`; the install notes print the exact name.)
+
+coord streams events over SSE, so an ingress must not buffer responses and must keep idle
+connections open. For ingress-nginx:
+
+```yaml
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+  hosts:
+    - host: coord.example.com
+  tls:
+    - secretName: coord-tls
+      hosts: [coord.example.com]
+```
+
+`bash tests/helm.sh` lints and renders the chart and asserts the manifests.
+
 ## The identity rule
 
 No token and no agent or session id is ever placed in the model's context. The bridge and

@@ -1,0 +1,117 @@
+{{- $sqlite := eq .Values.database.mode "sqlite" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "coord.fullname" . }}
+  labels:
+    {{- include "coord.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  {{- if $sqlite }}
+  strategy:
+    type: Recreate
+  {{- else }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "coord.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "coord.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "coord.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: coord
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve", "--bind", "0.0.0.0:7420"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 7420
+              protocol: TCP
+          env:
+            - name: DATABASE_URL
+              {{- if $sqlite }}
+              value: sqlite:///data/coord.db
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret }}
+                  key: {{ .Values.database.urlKey }}
+              {{- end }}
+            - name: COORD_ADMIN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "coord.adminSecretName" . }}
+                  key: {{ .Values.adminSecret.key }}
+            - name: COORD_COOKIE_SECURE
+              value: {{ include "coord.cookieSecure" . | quote }}
+            {{- with .Values.trustedHeader }}
+            - name: COORD_TRUSTED_HEADER
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 7420
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 7420
+            periodSeconds: 5
+            failureThreshold: 3
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if $sqlite }}
+            - name: data
+              mountPath: /data
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if $sqlite }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "coord.fullname" . }}-data
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

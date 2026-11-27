@@ -1,0 +1,6 @@
+database:
+  mode: postgres
+  existingSecret: coord-db
+  urlKey: DATABASE_URL
+adminSecret:
+  existingSecret: coord-admin

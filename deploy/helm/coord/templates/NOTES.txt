@@ -1,0 +1,23 @@
+coord {{ .Chart.AppVersion }} is installed as {{ include "coord.fullname" . }}.
+
+Create the first agent token (shown once; store it, never paste it into prompts):
+
+  kubectl exec -n {{ .Release.Namespace }} deploy/{{ include "coord.fullname" . }} -- coord token create --label <name>
+
+{{- if not .Values.adminSecret.existingSecret }}
+
+Read the generated UI sign-in secret:
+
+  kubectl get secret -n {{ .Release.Namespace }} {{ include "coord.fullname" . }} -o jsonpath='{.data.{{ .Values.adminSecret.key }}}' | base64 -d
+{{- end }}
+
+{{- if .Values.ingress.enabled }}
+{{ range .Values.ingress.hosts }}
+Reach coord at http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}/
+{{- end }}
+{{- else }}
+
+Reach coord locally:
+
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "coord.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+{{- end }}

@@ -1,0 +1,97 @@
+# coord runs as a single replica in the MVP; the schema rejects anything else.
+replicaCount: 1
+
+image:
+  repository: ghcr.io/reyemtech/coord
+  # Defaults to the chart appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+database:
+  # sqlite: a PVC mounted at /data, DATABASE_URL=sqlite:///data/coord.db, Recreate strategy.
+  # postgres: the URL is read from an existing Secret; no PVC, RollingUpdate with maxSurge 0.
+  mode: sqlite
+  # postgres mode only: the Secret holding the connection URL and the key inside it.
+  existingSecret: ""
+  urlKey: DATABASE_URL
+
+persistence:
+  # sqlite mode only.
+  size: 1Gi
+  # Leave empty for the cluster default storage class.
+  storageClass: ""
+
+adminSecret:
+  # Name of an existing Secret holding the UI sign-in secret. When empty the chart generates
+  # one (kept across upgrades) and stores it under `key` in a Secret named after the release.
+  existingSecret: ""
+  key: COORD_ADMIN_SECRET
+
+# Mark the UI session cookie Secure (COORD_COOKIE_SECURE). Leave null to enable it
+# automatically when ingress.tls is set; set true/false to force it.
+cookieSecure: null
+
+# Header set by an authenticating proxy (e.g. oauth2-proxy) that signs UI requests in without
+# the admin secret (COORD_TRUSTED_HEADER). Empty = off. Only safe behind a proxy that sets
+# the header and strips it from client requests.
+trustedHeader: ""
+
+service:
+  type: ClusterIP
+  port: 7420
+
+ingress:
+  enabled: false
+  className: ""
+  # coord streams events over SSE, so the proxy must not buffer responses and must keep idle
+  # connections open. Example for ingress-nginx:
+  #   annotations:
+  #     nginx.ingress.kubernetes.io/proxy-buffering: "off"
+  #     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+  #     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+  annotations: {}
+  hosts: []
+  #  - host: coord.example.com
+  #    paths:
+  #      - path: /
+  #        pathType: Prefix
+  tls: []
+  #  - secretName: coord-tls
+  #    hosts: [coord.example.com]
+
+extraEnv: []
+#  - name: COORD_RATE_LIMIT_PER_SEC
+#    value: "50"
+
+resources: {}
+
+# The server drains in-flight requests for up to 5 s on SIGTERM.
+terminationGracePeriodSeconds: 15
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  # Lets the nonroot user write the /data volume.
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+serviceAccount:
+  create: true
+  name: ""
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
