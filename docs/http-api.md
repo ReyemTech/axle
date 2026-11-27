@@ -1,0 +1,164 @@
+# HTTP API
+
+Axle's HTTP surface today is small: health probes, the MCP endpoint, and a `/v1` JSON API
+that exists for the bridge and the hooks. A documented public API covering every MCP tool
+and UI action is planned; see [the roadmap](../ROADMAP.md#2-public-http-api). Until then,
+treat `/v1` as internal: it may change between releases.
+
+| Path | Auth | Purpose |
+|---|---|---|
+| `GET /healthz` | none | Liveness |
+| `GET /readyz` | none | Readiness (the database answers) |
+| `POST /mcp` (and `GET`, `DELETE`) | bearer token | MCP over Streamable HTTP |
+| `POST /v1/register` | bearer token | Register a session |
+| `POST /v1/heartbeat` | bearer token | Presence and lease renewal |
+| `GET /v1/events` | bearer token | Server-sent events for one session |
+| `GET /v1/inbox/summary` | bearer token | Unread mail, for hooks |
+| `/ui/…` | UI sign-in | The [web UI](web-ui.md) (HTML, not an API) |
+
+## Authentication
+
+Every `/mcp` and `/v1` request needs `Authorization: Bearer <token>`, with a token from
+`axl token create`. The scheme name is case-insensitive.
+
+| Status | Body | When |
+|---|---|---|
+| 401 | `{"error":"unauthorized"}` | Missing, unknown or revoked token. |
+| 429 | `{"error":"rate_limited"}` plus `Retry-After: <seconds>` | The token is over `AXL_RATE_LIMIT_PER_SEC` / `AXL_RATE_LIMIT_BURST`. Opening an event stream counts as one request. |
+| 500 | `{"error":"internal error"}` | Details go to the server log only. |
+
+A session can only be used with the token that registered it. Another token gets 403
+`session <id> was registered with a different token`.
+
+## Health probes
+
+```sh
+curl -s http://127.0.0.1:7420/healthz   # ok
+curl -s http://127.0.0.1:7420/readyz    # ok, or 503 "store unavailable"
+```
+
+`/healthz` answers whenever the process is up. `/readyz` also runs a trivial database query.
+The Helm chart wires both into the pod's probes.
+
+## `/mcp`
+
+The same 17 [MCP tools](mcp-tools.md) the bridge serves, over the MCP Streamable HTTP
+transport. Requests are limited to 1 MB. Use this for MCP clients that can send headers and
+cannot spawn a local process.
+
+### Identity headers
+
+A direct client identifies itself with headers. None is required.
+
+| Header | Default | Meaning |
+|---|---|---|
+| `X-Axl-Harness` | `unknown` | The harness name, such as `claude-code`. |
+| `X-Axl-Host` | `unknown` | The machine name. |
+| `X-Axl-Project` | none | The home project key. |
+| `X-Axl-Session` | derived | A session id (a UUID; other text is hashed into one). |
+
+Without `X-Axl-Session`, the session is derived from the transport's `Mcp-Session-Id`, or,
+for a stateless client, from the token and the other headers, so the client keeps one
+session per agent and token. Direct clients get presence from their tool calls but no
+hooks.
+
+## `POST /v1/register`
+
+Creates (or confirms) the project, agent and session. The bridge calls it at start.
+
+```sh
+curl -s http://127.0.0.1:7420/v1/register \
+  -H "Authorization: Bearer $AXL_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"session_id":"0199a000-0000-7000-8000-000000000003","host":"ci","harness":"script","project_key":"github.com/acme/web-app"}'
+```
+
+```json
+{
+  "session_id": "0199a000-0000-7000-8000-000000000003",
+  "agent_id": "01a21e49-7eba-7076-ab7c-822e2a18a680",
+  "project": { "key": "github.com/acme/web-app", "display_name": "acme/web-app" }
+}
+```
+
+`project_key` is optional. Errors: 400 for a missing or invalid host, harness or key (for
+example `invalid host: only letters, digits and . _ : @ - are allowed`), 409
+`session <id> already belongs to another agent`, 403 for another token's session.
+
+## `POST /v1/heartbeat`
+
+Marks the session alive and renews its leases (see
+[leases](concepts.md#claims-leases-and-takeover)). The bridge calls it every 30 seconds.
+
+```sh
+curl -s http://127.0.0.1:7420/v1/heartbeat \
+  -H "Authorization: Bearer $AXL_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"session_id":"0199a000-0000-7000-8000-000000000003"}'
+```
+
+```json
+{ "unread": 0, "leases": [] }
+```
+
+`leases` lists the ids of tasks this session holds (`planning`, `claimed`, `blocked` or
+`review`). An unknown session is 404 `{"error":"unknown session"}`; the bridge then
+registers again.
+
+## `GET /v1/inbox/summary`
+
+The session's unacknowledged messages, oldest first, as short previews. Like `fetch_inbox`,
+it marks them delivered. The hooks use it.
+
+| Query | Notes |
+|---|---|
+| `session` | Required. |
+| `limit` | Default 20, at most 100. |
+| `min_importance` | `high` or `urgent`: only messages at least this important, filtered before the limit. |
+
+```sh
+curl -s -H "Authorization: Bearer $AXL_TOKEN" \
+  "http://127.0.0.1:7420/v1/inbox/summary?session=0199a000-0000-7000-8000-000000000001&limit=5"
+```
+
+```json
+[
+  {
+    "id": "01a21e49-2ab1-7782-b68a-4deae8e35420",
+    "from": "acme/web-app · build-02 · codex",
+    "subject": null,
+    "project": "github.com/acme/web-app",
+    "importance": "normal",
+    "preview": "Starting with the middleware; tests next."
+  }
+]
+```
+
+`preview` is the body on one line, at most 120 characters. These fields are not framed; the
+hooks frame them before showing them to the model.
+
+## `GET /v1/events`
+
+A [server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html)
+stream of the events relevant to one session: wake-up hints, not data to rely on.
+
+```sh
+curl -sN -H "Authorization: Bearer $AXL_TOKEN" \
+  "http://127.0.0.1:7420/v1/events?session=0199a000-0000-7000-8000-000000000003"
+```
+
+```text
+event: MessageCreated
+data: {"id":"01a21e49-812d-71b1-a958-8ed6820c5bc3","to":{"kind":"project","id":"01a21e49-0e07-7760-8a58-abb7c38fc3ef"},"project_id":"01a21e49-0e07-7760-8a58-abb7c38fc3ef"}
+```
+
+| Event | Data | Sent to the session when |
+|---|---|---|
+| `MessageCreated` | `id`, `to` (`kind` and `id`), `project_id` | The message is addressed to it: its session, its agent, its home project, or a task its agent owns or created. Never for its agent's own messages. |
+| `TaskChanged` | `id`, `project_id`, `status`, `kind` (the history event kind) | The task is in its home project, spans its home project, or its agent owns or created it. |
+| `Lagged` | the number of dropped events | The subscriber fell behind. Re-read the inbox and tasks. |
+
+The stream sends keep-alive comments and ends when the server shuts down. There is no
+replay or `Last-Event-ID` yet; after a reconnect, read the inbox. Everything durable is
+always available through the inbox and the tasks.
+
+Behind a proxy, turn off response buffering and allow long idle connections; see
+[Kubernetes](deploy/kubernetes.md#ingress).

@@ -1,7 +1,7 @@
 # Axle Helm chart
 
 Installs the Axle coordination server as a single replica, with SQLite on a PVC or an
-external Postgres. The top-level [README](../../../README.md#kubernetes-helm) covers install,
+external Postgres. The [Kubernetes guide](../../../docs/deploy/kubernetes.md) covers install,
 database modes and ingress; this page covers the `ui` block. Every value is commented in
 [values.yaml](values.yaml) and checked by [values.schema.json](values.schema.json).
 
