@@ -6,6 +6,7 @@ pub mod codex;
 pub mod fsutil;
 pub mod jsonc;
 pub mod manifest;
+pub mod opencode;
 pub mod paths;
 
 use std::ffi::OsStr;

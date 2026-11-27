@@ -1,0 +1,15 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "axle": {
+      "type": "local",
+      "command": ["/old/path/axl", "bridge", "--harness", "opencode"],
+      "enabled": true,
+      "environment": { "AXL_SERVER_URL": "http://100.64.0.10:7420", "EXTRA": "1" }
+    },
+    "other": {
+      "type": "local",
+      "command": ["other-mcp"]
+    }
+  }
+}
