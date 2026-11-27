@@ -1,0 +1,9 @@
+[package]
+name = "coord"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.10", features = ["derive"] }
+thiserror = "2.0.21"
+time = { version = "0.3.55", features = ["macros"] }
