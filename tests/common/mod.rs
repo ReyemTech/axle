@@ -120,6 +120,19 @@ mod pg {
     }
 
     impl TestSchema {
+        /// A pool of its own on this test's schema, for driving raw interleavings.
+        pub async fn pool(&self) -> sqlx::PgPool {
+            PgPoolOptions::new()
+                .max_connections(2)
+                .connect_with(
+                    self.admin
+                        .clone()
+                        .options([("search_path", self.name.as_str())]),
+                )
+                .await
+                .expect("connect raw test pool")
+        }
+
         pub async fn drop(self) {
             let pool = PgPoolOptions::new()
                 .max_connections(1)

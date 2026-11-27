@@ -774,3 +774,83 @@ store_matrix!(a_human_reply_archives_the_original, |store: Arc<
     assert!(env.store.human_attention(10).await.unwrap().is_empty());
     assert!(env.inbox_of(&lead).await.iter().any(|m| m.body == "on it"));
 });
+
+/// PostgreSQL, READ COMMITTED: an approval that queues behind a resubmission's row lock must
+/// see the resubmitted plan once the lock is released, not the plan its snapshot started with.
+#[cfg(feature = "pg-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn approval_queued_behind_a_resubmission_is_refused_on_postgres() {
+    let (store, schema) = common::pg_store().await;
+    let raw = schema.pool().await;
+    let outcome = common::catch_body(async move {
+        let env = Env::new(store);
+        let lead = env.session("mac").await;
+        let gated = env.gated(project_of(&lead)).await;
+        env.claimed(&lead, &gated).await;
+        let (_, a) = env
+            .svc
+            .propose_plan(&lead, gated.id, "plan A".into())
+            .await
+            .unwrap();
+
+        // The resubmission, held open: it has locked the task row and written plan B.
+        let mut resubmit = raw.begin().await.unwrap();
+        let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *resubmit)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET version = version + 1 WHERE id = $1")
+            .bind(gated.id.as_uuid())
+            .execute(&mut *resubmit)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (id, project_id, to_kind, task_id, body, created_at, kind)
+             VALUES ($1, $2, 'human', $3, 'plan B', now(), 'plan')",
+        )
+        .bind(MessageId::new().as_uuid())
+        .bind(gated.project_id.as_uuid())
+        .bind(gated.id.as_uuid())
+        .execute(&mut *resubmit)
+        .await
+        .unwrap();
+
+        // The human approves plan A, the one they saw; it queues on the row lock.
+        let svc = env.svc.clone();
+        let id = gated.id;
+        let approval = tokio::spawn(async move { svc.approve_plan(id, a.id).await });
+        let mut waited = 0;
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(blocker)
+            .fetch_one(&raw)
+            .await
+            .unwrap();
+            if blocked > 0 {
+                break;
+            }
+            waited += 1;
+            assert!(
+                waited < 500,
+                "the approval never queued behind the resubmission"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        resubmit.commit().await.unwrap();
+
+        assert!(matches!(
+            approval.await.unwrap(),
+            Err(TaskError::PlanChanged)
+        ));
+        let t = env.task(&gated).await;
+        assert_eq!(
+            (t.status, t.plan_state),
+            (TaskStatus::Planning, PlanState::Submitted)
+        );
+    })
+    .await;
+    schema.drop().await;
+    common::resume(outcome);
+}

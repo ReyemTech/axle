@@ -1090,6 +1090,31 @@ impl Store for PostgresStore {
             .as_ref()
             .map(|states| states.iter().map(|s| s.as_str()).collect());
         let mut tx = self.pool.begin().await?;
+        // A decision on a named plan: lock the row first, then read the newest plan in a
+        // statement of its own. Under READ COMMITTED a guard subquery inside the UPDATE would
+        // keep the snapshot taken before it queued on the row lock, so a resubmission that
+        // held the lock (and wrote a newer plan) would go unseen. The UPDATE then also
+        // requires the version read under the lock, a guard on the row itself.
+        let mut locked_version: Option<i64> = None;
+        if let Some(plan) = req.latest_plan {
+            let version: Option<i64> =
+                sqlx::query_scalar("SELECT version FROM tasks WHERE id = $1 FOR UPDATE")
+                    .bind(req.task.as_uuid())
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let latest: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM messages WHERE task_id = $1 AND kind = 'plan'
+                  ORDER BY seq DESC LIMIT 1",
+            )
+            .bind(req.task.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if version.is_none() || latest != Some(plan.as_uuid()) {
+                tx.commit().await?;
+                return Ok(None);
+            }
+            locked_version = version;
+        }
         let updated = sqlx::query(concat!(
             "UPDATE tasks
                 SET status = COALESCE($1::text, status),
@@ -1103,10 +1128,7 @@ impl Store for PostgresStore {
                 AND status = ANY($7::text[])
                 AND ($8::uuid IS NULL OR owner_session_id = $8)
                 AND ($10::text[] IS NULL OR plan_state = ANY($10::text[]))
-                AND ($11::uuid IS NULL
-                     OR $11 = (SELECT p.id FROM messages p
-                                WHERE p.task_id = tasks.id AND p.kind = 'plan'
-                                ORDER BY p.seq DESC LIMIT 1))
+                AND ($11::bigint IS NULL OR version = $11)
               RETURNING ",
             task_cols!()
         ))
@@ -1120,7 +1142,7 @@ impl Store for PostgresStore {
         .bind(req.owner.map(|s| s.as_uuid()))
         .bind(req.plan_to.map(|s| s.as_str()))
         .bind(&plan_from)
-        .bind(req.latest_plan.map(|m| m.as_uuid()))
+        .bind(locked_version)
         .fetch_optional(&mut *tx)
         .await?
         .as_ref()
