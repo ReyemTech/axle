@@ -433,14 +433,20 @@ mod tests {
         };
         let text = format!("{start:?}");
         assert!(!text.contains("secretdevicecode"), "{text}");
-        assert!(text.contains("<redacted>") && text.contains("ABCD-EFGH"), "{text}");
+        assert!(
+            text.contains("<redacted>") && text.contains("ABCD-EFGH"),
+            "{text}"
+        );
         let token = PollReply::Token {
             token: "axl_secrettoken".into(),
             host: "laptop".into(),
         };
         let text = format!("{token:?}");
         assert!(!text.contains("secrettoken"), "{text}");
-        assert!(text.contains("<redacted>") && text.contains("laptop"), "{text}");
+        assert!(
+            text.contains("<redacted>") && text.contains("laptop"),
+            "{text}"
+        );
         assert_eq!(format!("{:?}", PollReply::Pending), "Pending");
     }
 
