@@ -1,0 +1,9 @@
+model = "gpt-5"
+approval_policy = "on-request"
+
+[mcp_servers.docs]
+command = "docs-mcp"
+args = ["--stdio"]
+
+[features]
+web_search = true

@@ -38,8 +38,9 @@ enum Command {
         #[arg(long)]
         harness: String,
     },
-    /// Claude Code hook: reads the hook JSON on stdin, prints hook JSON on stdout. Always
-    /// exits 0 (fail-open); problems are one line on stderr.
+    /// Claude Code or Codex hook: reads the hook JSON on stdin, prints hook JSON on stdout.
+    /// Always exits 0 (fail-open); problems are one line on stderr. Codex's commands add
+    /// `--harness codex`.
     Hook {
         /// session-start | user-prompt-submit | post-tool-use | stop (anything else is ignored)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -106,7 +107,8 @@ async fn main() -> ExitCode {
             .nth(2)
             .and_then(|a| <axle::hook::Event as clap::ValueEnum>::from_str(&a, true).ok());
         if let Some(event) = event {
-            hook(event).await;
+            let rest: Vec<String> = std::env::args().skip(3).collect();
+            hook(event, axle::hook::Harness::from_args(&rest)).await;
         }
         std::process::exit(0);
     }
@@ -151,7 +153,7 @@ async fn main() -> ExitCode {
 }
 
 /// Never fails: every problem is at most one stderr line, and stdout stays empty.
-async fn hook(event: axle::hook::Event) {
+async fn hook(event: axle::hook::Event, harness: axle::hook::Harness) {
     use std::io::{Read, Write};
     let work = async move {
         let stdin = tokio::task::spawn_blocking(|| {
@@ -163,7 +165,7 @@ async fn hook(event: axle::hook::Event) {
         .unwrap_or_default();
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let token = std::env::var("AXL_TOKEN").ok();
-        axle::hook::run(event, &stdin, home.as_deref(), token.as_deref()).await
+        axle::hook::run(event, harness, &stdin, home.as_deref(), token.as_deref()).await
     };
     // Hard ceiling on total runtime, including a stdin that never closes.
     match tokio::time::timeout(std::time::Duration::from_secs(5), tokio::spawn(work)).await {

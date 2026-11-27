@@ -76,7 +76,7 @@ impl Paths {
     }
 }
 
-fn read(path: &Path) -> io::Result<Option<String>> {
+pub(super) fn read(path: &Path) -> io::Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(t) => Ok(Some(t)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -88,7 +88,7 @@ fn read(path: &Path) -> io::Result<Option<String>> {
 }
 
 /// An `axl` path as it appears in a shell command: bare when it is plain, else single-quoted.
-fn shell_word(path: &str) -> String {
+pub(super) fn shell_word(path: &str) -> String {
     let plain = !path.is_empty()
         && path
             .chars()
@@ -598,7 +598,17 @@ fn plan_config_toml(cx: &mut Ctx) -> Result<(), EditError> {
         return Ok(());
     };
     let file = cx.paths.config_toml.clone();
-    let before = read(&file)?;
+    if plan_server_url(&file, &url, &mut cx.plan)? {
+        cx.push(&file, EntryKind::Added, "server_url", None);
+    }
+    Ok(())
+}
+
+/// Plans writing `server_url = <url>` into the axl `config.toml` at `file` unless it already
+/// has one (then a note says which URL was kept). Returns true when the key is added.
+/// Shared by every harness editor that adopts an `AXL_SERVER_URL` entry.
+pub(super) fn plan_server_url(file: &Path, url: &str, plan: &mut Plan) -> Result<bool, EditError> {
+    let before = read(file)?;
     let snippet = format!("server_url = \"{url}\"\n");
     let mut doc: toml_edit::DocumentMut =
         before
@@ -606,27 +616,29 @@ fn plan_config_toml(cx: &mut Ctx) -> Result<(), EditError> {
             .unwrap_or("")
             .parse()
             .map_err(|e: toml_edit::TomlError| EditError::NeedsManual {
-                file: file.clone(),
+                file: file.to_path_buf(),
                 reason: format!("it is not valid TOML ({e}); axl will not rewrite it"),
                 snippet: snippet.clone(),
             })?;
     match doc.get("server_url").and_then(|v| v.as_str()) {
-        Some(existing) if existing != url => cx.plan.notes.push(format!(
-            "the old axle entry used AXL_SERVER_URL={url}; kept server_url = \"{existing}\" from {}",
-            file.display()
-        )),
-        Some(_) => {}
+        Some(existing) if existing != url => {
+            plan.notes.push(format!(
+                "the old axle entry used AXL_SERVER_URL={url}; kept server_url = \"{existing}\" from {}",
+                file.display()
+            ));
+            Ok(false)
+        }
+        Some(_) => Ok(false),
         None => {
             doc["server_url"] = toml_edit::value(url);
-            cx.push(&file, EntryKind::Added, "server_url", None);
-            cx.plan.edits.push(FileEdit {
-                path: file,
+            plan.edits.push(FileEdit {
+                path: file.to_path_buf(),
                 before,
                 after: Some(doc.to_string()),
             });
+            Ok(true)
         }
     }
-    Ok(())
 }
 
 /// Plans the removal of what install added: the plugin files and link, or the user-scope

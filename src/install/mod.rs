@@ -2,6 +2,7 @@
 //! write, planned edits with diffs and backups, marker blocks, and the manifest.
 
 pub mod claude_code;
+pub mod codex;
 pub mod fsutil;
 pub mod jsonc;
 pub mod manifest;

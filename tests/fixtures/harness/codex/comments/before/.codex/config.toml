@@ -1,0 +1,22 @@
+# hand-edited Codex config
+model = "gpt-5"   # keep this one
+
+# notify me
+notify = ["notify-send", "codex"]
+
+# --- servers ---
+[mcp_servers.docs]
+command = "docs-mcp"   # docs server
+args = ["--stdio"]
+
+
+[mcp_servers.axle]
+# the old hand-made entry
+command = "axl"
+args = ["bridge", "--harness", "codex"]
+
+[mcp_servers.axle.env]
+AXL_SERVER_URL = "http://100.64.0.10:7420"
+
+[features]
+web_search = true  # trailing comment
