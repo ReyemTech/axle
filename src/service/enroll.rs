@@ -1,5 +1,6 @@
-//! Host enrollment (onboarding spec §2): one-time codes that `axl enroll` exchanges for a
-//! token, and the device flow where a person approves a short user code in the UI.
+//! Host enrollment (onboarding spec §2): one-time codes that `axl login --code` and
+//! `axl install --code` exchange for a token, and the device flow where a person approves a
+//! short user code in the UI.
 //!
 //! Secrets (the one-time code, the device code, the user code) are stored only as SHA-256
 //! hashes; the plaintext leaves this service once, in the reply that creates it.
@@ -96,7 +97,7 @@ pub struct IssuedCode {
     pub expires_at: OffsetDateTime,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DeviceStart {
     /// `axld_` + 64 hex; the poller's secret.
     pub device_code: String,
@@ -106,13 +107,41 @@ pub struct DeviceStart {
     pub expires_in: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum PollReply {
     Pending,
     SlowDown,
     Denied,
     Expired,
     Token { token: String, host: String },
+}
+
+// Hand-written so a stray `{:?}` (a log line, an unwrap) cannot print a secret.
+impl std::fmt::Debug for DeviceStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceStart")
+            .field("device_code", &"<redacted>")
+            .field("user_code", &self.user_code)
+            .field("interval", &self.interval)
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for PollReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => f.write_str("Pending"),
+            Self::SlowDown => f.write_str("SlowDown"),
+            Self::Denied => f.write_str("Denied"),
+            Self::Expired => f.write_str("Expired"),
+            Self::Token { host, .. } => f
+                .debug_struct("Token")
+                .field("token", &"<redacted>")
+                .field("host", host)
+                .finish(),
+        }
+    }
 }
 
 pub struct EnrollService {
@@ -392,6 +421,27 @@ mod tests {
             clock,
             bus,
         }
+    }
+
+    #[test]
+    fn debug_output_hides_secrets() {
+        let start = DeviceStart {
+            device_code: "axld_secretdevicecode".into(),
+            user_code: "ABCD-EFGH".into(),
+            interval: 7,
+            expires_in: 600,
+        };
+        let text = format!("{start:?}");
+        assert!(!text.contains("secretdevicecode"), "{text}");
+        assert!(text.contains("<redacted>") && text.contains("ABCD-EFGH"), "{text}");
+        let token = PollReply::Token {
+            token: "axl_secrettoken".into(),
+            host: "laptop".into(),
+        };
+        let text = format!("{token:?}");
+        assert!(!text.contains("secrettoken"), "{text}");
+        assert!(text.contains("<redacted>") && text.contains("laptop"), "{text}");
+        assert_eq!(format!("{:?}", PollReply::Pending), "Pending");
     }
 
     #[test]

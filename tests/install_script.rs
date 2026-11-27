@@ -176,6 +176,18 @@ struct Run {
 /// Runs the script piped into `sh` (as `curl | sh` does) with `id`, `uname` and a stub `axl`
 /// first on PATH, in a session with no controlling terminal.
 fn run_script(server_url: &str, uid: &str, os: &str, allow_root: bool, args: &[&str]) -> Run {
+    run_script_failing(server_url, uid, os, allow_root, args, "")
+}
+
+/// As `run_script`, with the stub `axl` exiting 1 on the subcommand named by `fail`.
+fn run_script_failing(
+    server_url: &str,
+    uid: &str,
+    os: &str,
+    allow_root: bool,
+    args: &[&str],
+    fail: &str,
+) -> Run {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
@@ -198,7 +210,9 @@ fn run_script(server_url: &str, uid: &str, os: &str, allow_root: bool, args: &[&
         "axl",
         "if [ \"$1\" = --version ]; then echo 'axl 99.0.0'; exit 0; fi\n\
          cat >/dev/null\n\
-         echo \"$1\" >>\"$HOME/axl.log\"",
+         echo \"$1\" >>\"$HOME/axl.log\"\n\
+         [ \"$1\" = \"$AXL_STUB_FAIL\" ] && exit 1\n\
+         exit 0",
     );
     let home = dir.path().join("home");
     std::fs::create_dir(&home).unwrap();
@@ -214,6 +228,7 @@ fn run_script(server_url: &str, uid: &str, os: &str, allow_root: bool, args: &[&
         .env_clear()
         .env("PATH", format!("{}:/usr/bin:/bin", shims.display()))
         .env("HOME", &home)
+        .env("AXL_STUB_FAIL", fail)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -305,4 +320,32 @@ fn plain_http_warns_unless_the_host_is_exactly_loopback() {
         assert!(r.ok, "{url}: {}", r.stderr);
         assert_eq!(r.axl_log, "install\nstatus\n", "{url}");
     }
+}
+
+#[test]
+fn advisory_status_problems_do_not_fail_a_good_install() {
+    let r = run_script_failing(
+        "https://axle.example.com",
+        "1000",
+        "Linux",
+        false,
+        &["CODE-1"],
+        "status",
+    );
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.axl_log, "install\nstatus\n", "{}", r.stderr);
+}
+
+#[test]
+fn a_failed_install_still_fails_the_script() {
+    let r = run_script_failing(
+        "https://axle.example.com",
+        "1000",
+        "Linux",
+        false,
+        &["CODE-1"],
+        "install",
+    );
+    assert!(!r.ok, "{}", r.stderr);
+    assert_eq!(r.axl_log, "install\n", "status ran after a failed install");
 }

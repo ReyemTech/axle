@@ -34,8 +34,9 @@ const EVENTS: [(&str, &str); 3] = [
 
 const BRIDGE_ARGS: [&str; 3] = ["bridge", "--harness", "codex"];
 const MCP_KEY: &str = "mcp_servers.axle";
-/// A hook must finish within this many seconds (`axl hook` has its own 5 s ceiling).
-const HOOK_TIMEOUT_SECS: i64 = 5;
+/// Codex kills a hook after this many seconds; `axl hook` gives up after 5 s on its own, so
+/// it always finishes first.
+const HOOK_TIMEOUT_SECS: i64 = 10;
 
 struct Paths {
     config: PathBuf,

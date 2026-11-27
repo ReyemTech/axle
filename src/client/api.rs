@@ -87,7 +87,7 @@ impl Api {
     }
 
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response, ClientError> {
-        req.send().await.map_err(|e| {
+        let res = req.send().await.map_err(|e| {
             // Without the URL: reqwest errors embed it, and this keeps one stable message.
             let why = if e.is_timeout() {
                 "timed out"
@@ -97,7 +97,23 @@ impl Api {
                 "request failed"
             };
             ClientError::Http(format!("{why} talking to {}", self.base))
-        })
+        })?;
+        if res.status().is_redirection() {
+            // Redirects are off (a token must not follow one), so say where it points.
+            let to = res
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("another address");
+            // A scheme or host move keeps the path; the user wants the base URL.
+            let path = res.url().path();
+            let to = to.strip_suffix(path).unwrap_or(to);
+            return Err(ClientError::Http(format!(
+                "{} redirects to {to}; use that URL instead",
+                self.base
+            )));
+        }
+        Ok(res)
     }
 
     pub async fn readyz(&self) -> Result<(), ClientError> {

@@ -415,3 +415,29 @@ async fn malformed_config_fails_before_redeeming_the_code() {
         .unwrap();
     assert!(dir.token_path().exists());
 }
+
+#[tokio::test]
+async fn redirecting_server_gets_a_clear_error() {
+    use axum::http::{StatusCode, header};
+    use axum::routing::get;
+    let app = axum::Router::new().route(
+        "/readyz",
+        get(|| async {
+            (
+                StatusCode::PERMANENT_REDIRECT,
+                [(header::LOCATION, "https://axle.example.com/readyz")],
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let err = Api::new(&base).readyz().await.unwrap_err().to_string();
+    assert!(
+        err.contains(&format!(
+            "{base} redirects to https://axle.example.com; use that URL instead"
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("HTTP 308"), "{err}");
+}

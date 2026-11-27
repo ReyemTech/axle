@@ -103,7 +103,7 @@ main() {
   else
     axl install --server '{{ server_url }}'
   fi
-  axl status
+  axl status || true
 }
 
 main "$@"

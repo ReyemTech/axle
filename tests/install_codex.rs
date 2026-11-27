@@ -288,7 +288,7 @@ fn hooks_block_written() {
             h["command"].as_str().unwrap(),
             format!("{AXL} hook {arg} --harness codex")
         );
-        assert_eq!(h["timeout"].as_integer(), Some(5));
+        assert_eq!(h["timeout"].as_integer(), Some(10));
     }
     assert_eq!(v["hooks"].as_table().unwrap().len(), 3, "no other events");
     assert!(
