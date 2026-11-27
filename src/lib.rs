@@ -5,6 +5,7 @@ pub mod cli;
 pub mod client;
 pub mod clock;
 pub mod config;
+pub mod daemon;
 pub mod domain;
 pub mod events;
 pub mod hook;

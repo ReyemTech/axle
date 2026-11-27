@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.reyemtech.axle</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{AXL}}</string>
+    <string>serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>DATABASE_URL</key>
+    <string>sqlite://{{HOME}}/.axl/axl.db</string>
+    <key>AXL_BIND</key>
+    <string>127.0.0.1:7420</string>
+    <key>AXL_UI_AUTH</key>
+    <string>auto</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{{HOME}}/.axl/logs/axl.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{HOME}}/.axl/logs/axl.log</string>
+</dict>
+</plist>

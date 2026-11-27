@@ -68,6 +68,11 @@ enum Command {
         #[arg(long)]
         revoke: bool,
     },
+    /// Run the server in the background: a launchd agent (macOS) or systemd user unit (Linux)
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
     /// Run database migrations (needs DATABASE_URL)
     Migrate,
     /// Manage projects
@@ -77,6 +82,28 @@ enum Command {
         #[command(subcommand)]
         command: TokenCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Install the service and start it (also at login)
+    Install {
+        /// Port to listen on (default 7420, or the one saved by an earlier install)
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Stop and remove the service; the database is kept
+    Uninstall {
+        /// Also delete ~/.axl/axl.db
+        #[arg(long)]
+        purge: bool,
+    },
+    Start,
+    Stop,
+    Restart,
+    Status,
+    /// Print the end of ~/.axl/logs/axl.log
+    Logs,
 }
 
 #[derive(Subcommand)]
@@ -139,6 +166,7 @@ async fn main() -> ExitCode {
             .await
         }
         Command::Logout { revoke } => logout(revoke).await,
+        Command::Service { command } => service(command),
         Command::Migrate => migrate().await,
         Command::Token { command } => token(command).await,
         Command::Project => Err("not implemented".into()),
@@ -249,6 +277,29 @@ async fn login(args: axle::cli::LoginArgs) -> CliResult {
 async fn logout(revoke: bool) -> CliResult {
     axle::cli::logout(&home_dir()?, revoke, &mut std::io::stdout()).await?;
     Ok(())
+}
+
+fn service(command: ServiceCommand) -> CliResult {
+    use axle::cli::ServiceAction;
+    let action = match command {
+        ServiceCommand::Install { port } => ServiceAction::Install { port },
+        ServiceCommand::Uninstall { purge } => ServiceAction::Uninstall { purge },
+        ServiceCommand::Start => ServiceAction::Start,
+        ServiceCommand::Stop => ServiceAction::Stop,
+        ServiceCommand::Restart => ServiceAction::Restart,
+        ServiceCommand::Status => ServiceAction::Status,
+        ServiceCommand::Logs => ServiceAction::Logs,
+    };
+    let exe = std::env::current_exe()?;
+    let axl = axle::install::axl_path(&exe, std::env::var_os("PATH").as_deref());
+    axle::cli::service(
+        &home_dir()?,
+        &axl,
+        std::env::consts::OS,
+        Box::new(axle::daemon::SystemRunner),
+        action,
+        &mut std::io::stdout(),
+    )
 }
 
 async fn migrate() -> CliResult {
