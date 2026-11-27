@@ -1,0 +1,12 @@
+# release-plz opens a release PR (version bump + CHANGELOG) on every push to main, and tags
+# `vX.Y.Z` when that PR is merged. The tag starts the existing pipeline: release.yml (dist:
+# binaries, GitHub Release, Homebrew), then crates.yml (crates.io) and docker.yml (images).
+# release-plz itself never publishes and never creates the GitHub Release.
+[workspace]
+git_only = true              # versions come from git tags, not from crates.io
+git_release_enable = false   # dist creates the GitHub Release
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+changelog_update = true
+semver_check = false
+release_always = false       # only tag when a release-plz PR is merged

@@ -1,3 +1,5 @@
+> Note: the project was renamed from coord to Axle (CLI `axl`) on 2026-11-27.
+
 # Agent Coordination Server — Design
 
 Date: 2026-11-27
@@ -13,7 +15,7 @@ non-exclusive claims and no task conversations).
 
 Why a new service rather than extending either:
 
-- **One system for everything.** One MCP setup for all of Mario's projects on any harness.
+- **One system for everything.** One MCP setup for all of the owner's projects on any harness.
 - **Exclusive ownership.** Concord Cloud currently shows the same task key
   (`concord-routing-check-20261127`) held by two agents at once. Exactly one owner is
   the core guarantee here.
@@ -21,7 +23,7 @@ Why a new service rather than extending either:
   registration token it had to repeat on every call; compaction dropped it and the
   agent lost its identity. Concord's `agent_id` argument has the same weakness. Here,
   no credential or identity ever lives in the model's context.
-- **Cross-project work.** IaC + Nimbus, Laravel + Sail must be able to share one task.
+- **Cross-project work.** platform-infra + web-app, api + dev-env must be able to share one task.
   Today that is done by ad-hoc messaging and asking agents to "call start_work with
   the other repo's workspace id".
 
@@ -62,7 +64,7 @@ Why a new service rather than extending either:
 - Two agents believing they own the same task.
 - History deleted or rewritten when a lease expires or a task is reassigned.
 - Projects shown by opaque keys (Agent Mail shows
-  `/agent-mail-projects/github/reyemtech/iac-15a994551a41`).
+  `/projects/github/acme/platform-infra`).
 
 ## 3. Constraints
 
@@ -73,7 +75,7 @@ Why a new service rather than extending either:
   the global instructions: token injection, no unrelated changes in `pulumi up`).
 - MVP clients are local CLI harnesses (Claude Code, Codex, OpenCode) through the bridge,
   plus any HTTP MCP client that can set headers. The server stays private (tailnet/VPN).
-- **claude.ai connectors come later** (Mario's decision). They need OAuth 2.1 (discovery,
+- **claude.ai connectors come later** (owner decision). They need OAuth 2.1 (discovery,
   dynamic client registration, PKCE) and internet exposure. Keep auth behind one
   `Authenticator` boundary so an OAuth path can be added without touching tools or storage.
 - Message bodies are untrusted peer data everywhere they are shown to a model.
@@ -84,7 +86,7 @@ Why a new service rather than extending either:
 |---|---|---|
 | **A. New Rust server, pluggable SQLite/Postgres** | `axum` + `rmcp` (Streamable HTTP), `sqlx`, server-rendered UI | **Chosen** |
 | B. Rust server, SQLite only | One file on a volume | Rejected as *the only* option: single replica, spot-node loss risks data. Kept as the local mode of A |
-| C. Extend Agent Mail | Build on the existing service | Rejected by Mario; inherits token-in-context identity model |
+| C. Extend Agent Mail | Build on the existing service | Rejected by the owner; inherits token-in-context identity model |
 
 Cross-project ownership was considered three ways: (A) one owner, others assist;
 (B) one owner slot per project; (C) linked parent/child tasks. **Chosen: a mix of B and
@@ -128,7 +130,7 @@ One crate, one binary with subcommands:
 Resolved by the bridge from the session's working directory, in order:
 
 1. `COORD_PROJECT` env var, if set.
-2. A `.coordination` file found walking up from cwd (`project = "reyemtech/iac"`,
+2. A `.coordination` file found walking up from cwd (`project = "acme/platform-infra"`,
    optional `display_name`).
 3. Git `origin` normalised to `host/owner/repo` (SSH, HTTPS, case, `.git` suffix all
    collapse to one key).
@@ -141,8 +143,8 @@ Projects are created on first contact. Each has a human `display_name` (defaults
 
 ### Agents and sessions
 
-- **Agent** = stable identity `(project, host, harness)`, e.g. `reyemtech/iac · mac · claude-code`.
-  Durable inbox lives here, so messages to "the IaC Claude on my Mac" survive restarts.
+- **Agent** = stable identity `(project, host, harness)`, e.g. `acme/platform-infra · mac · claude-code`.
+  Durable inbox lives here, so messages to "the platform-infra Claude on my Mac" survive restarts.
 - **Session** = one live harness process instance of an agent. Has presence, owns leases.
 
 The bridge generates a session UUID at spawn. Because the bridge process lives as long as
@@ -167,7 +169,7 @@ one call an agent makes after compaction or a reconnect to know where it stands.
 
 ## 7. Authentication and security
 
-- **Single owner (Mario).** Every host/harness gets its own bearer token
+- **Single owner.** Every host/harness gets its own bearer token
   (`coord token create --label mac-claude`). Tokens are stored hashed; revocable
   individually; last-used time shown in the UI.
 - Bridge reads the token from `COORD_TOKEN` or `~/.coord/token` (mode 0600). Remote HTTP
@@ -343,10 +345,10 @@ Server-rendered (askama + htmx), live via SSE. Light and dark. Keyboard navigati
 
   ```
   ┌ Rotate DB creds across stack ──── Claimed: claude@mac ┐
-  │ ███████░░░ 3/5   IaC ▪▪  Nimbus ▪▪▪                   │
-  │  ✓ IaC: update Pulumi secret       codex@cac-1        │
-  │  ● Nimbus: roll CNPG users         claude@mbp         │
-  │  ○ Nimbus: update ExternalSecret   (open)             │
+  │ ███████░░░ 3/5   platform-infra ▪▪  web-app ▪▪▪                   │
+  │  ✓ platform-infra: update Pulumi secret       codex@build-01        │
+  │  ● web-app: roll CNPG users         claude@laptop-01         │
+  │  ○ web-app: update ExternalSecret   (open)             │
   └───────────────────────────────────────────────────────┘
   ```
 
@@ -354,9 +356,9 @@ Server-rendered (askama + htmx), live via SSE. Light and dark. Keyboard navigati
   children, evidence.
 - **Inbox**: unified across projects, split view, receipts, search.
 - **Projects / Agents**: display names (editable), tokens and last use.
-- **Human actions, in the MVP** (Mario's decision): create a task, post into a thread or
+- **Human actions, in the MVP** (owner decision): create a task, post into a thread or
   to an agent as `human`, force-release a lease, cancel a task. `human` is a first-class
-  sender and recipient: agents can address messages to Mario's inbox (`to: human`).
+  sender and recipient: agents can address messages to the owner's inbox (`to: human`).
 
 ## 13. Phasing
 
@@ -364,7 +366,7 @@ Server-rendered (askama + htmx), live via SSE. Light and dark. Keyboard navigati
    tasks + children + leases, messages, web UI (overview, board, task page, inbox),
    Claude Code hook-based busy delivery, local mode, multi-arch container image, Helm
    chart (SQLite or external Postgres, one replica), and CI publishing image and chart
-   to GHCR (Mario's decision: packaging is in the MVP).
+   to GHCR (owner decision: packaging is in the MVP).
 2. **Wake**: Claude Code idle monitor, Codex adapter, OpenCode adapter,
    `coord adapters install|status|doctor`.
 3. **Cluster + migration**: Pulumi stack installing the Helm chart with Postgres, then retire Agent Mail hooks

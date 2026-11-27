@@ -1,0 +1,26 @@
+<dl class="counters">
+  <div class="counter" data-counter="hosts"><dt class="label">Hosts online</dt><dd class="value">{{ counters.hosts }}</dd></div>
+  <div class="counter" data-counter="sessions"><dt class="label">Sessions live</dt><dd class="value">{{ counters.sessions }}</dd></div>
+  <div class="counter" data-counter="open"><dt class="label">Open tasks</dt><dd class="value">{{ counters.open }}</dd></div>
+  <div class="counter" data-counter="unread"><dt class="label">Unread for you</dt><dd class="value">{{ counters.unread }}</dd></div>
+  <div class="counter{% if counters.urgent > 0 %} alert{% endif %}" data-counter="urgent"><dt class="label">{% if counters.urgent > 0 %}<span class="aspect" data-aspect="urgent" aria-hidden="true"></span>{% endif %}Urgent</dt><dd class="value">{{ counters.urgent }}</dd></div>
+</dl>
+<div class="section-head">
+  <h2 class="section-title">Agents</h2>
+  <span class="muted">seen in the last 24 hours</span>
+</div>
+{% if agents.is_empty() %}
+<p class="empty">No agent has been seen in the last 24 hours. Agents appear here once they connect with a token.</p>
+{% else %}
+<ul class="agents">
+{% for a in agents %}
+  <li class="agent{% if a.live %} is-live{% endif %}" id="agent-{{ a.id }}" data-nav tabindex="-1">
+    <span class="agent-presence"><span class="aspect" data-aspect="{% if a.live %}live{% else %}stale{% endif %}" aria-hidden="true"></span>{% if a.live %}live{% else %}stale{% endif %}</span>
+    <span class="agent-id"><span class="harness">{{ a.harness }}</span><span class="at">@</span><span class="host">{{ a.host }}</span></span>
+    <span class="agent-project">{% if let Some(p) = a.project %}<span class="project" data-line="{{ p.line }}" title="{{ p.key }}">{{ p.name }}</span>{% else %}<span class="muted">no project</span>{% endif %}</span>
+    <span class="agent-task">{% if let Some(t) = a.current_task %}<span class="visually-hidden">Working on </span>{{ t }}{% else %}<span class="muted">No task</span>{% endif %}</span>
+    <span class="agent-seen"><time datetime="{{ a.last_seen_at }}" title="{{ a.last_seen_at }}">{{ a.last_seen }}</time></span>
+  </li>
+{% endfor %}
+</ul>
+{% endif %}

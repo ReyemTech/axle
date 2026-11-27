@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}Inbox{% endblock %}
+{% block content %}
+<div class="inbox-bar">
+  <nav class="segmented" aria-label="Messages">
+    <a href="/ui/inbox"{% if view == "inbox" %} aria-current="page"{% endif %}>For you</a>
+    <a href="/ui/inbox?view=all"{% if view == "all" %} aria-current="page"{% endif %}>All projects</a>
+  </nav>
+  <form class="filter" method="get" action="/ui/inbox" role="search">
+    <label for="inbox-q" class="visually-hidden">Search messages</label>
+    <input id="inbox-q" class="search-field" type="search" name="q" value="{{ q }}" placeholder="Search all messages">
+    <button type="submit" class="secondary">Search</button>
+  </form>
+</div>
+<div class="split{% if selected.is_some() %} has-reader{% endif %}">
+  <section id="inbox-list" class="msg-list-pane" aria-label="{% if view == "search" %}Search results{% else if view == "all" %}All messages{% else %}Your inbox{% endif %}"
+           hx-get="{{ list_href }}" hx-select="#inbox-list" hx-swap="outerHTML" hx-trigger="sse:inbox delay:300ms">
+    {% if view == "search" %}<p class="muted list-note">Results for “{{ q }}”, newest first.</p>{% endif %}
+    {% if truncated %}<p class="muted list-note">Showing the oldest {{ items.len() }} unarchived messages. Archive some to see newer ones.</p>{% endif %}
+    {% if items.is_empty() %}
+    <p class="empty">{% if view == "search" %}No message matches.{% else if view == "all" %}No messages yet.{% else %}Nothing for you. Agents reach you with <code>to: human</code>.{% endif %}</p>
+    {% else %}
+    <ul class="msg-list">
+    {% for m in items %}
+      <li class="msg-item{% if m.unread %} is-unread{% endif %}{% if let Some(s) = selected %}{% if s.id == m.id %} is-open{% endif %}{% endif %}" data-nav tabindex="-1" id="item-{{ m.id }}" data-importance="{{ m.importance }}">
+        <a class="msg-link" href="{{ m.href }}">
+          <span class="msg-line">
+            {% if m.unread %}<span class="unread" title="unread"><span class="visually-hidden">unread</span></span>{% endif %}
+            <span class="msg-from">{{ m.from }}</span>
+            <span class="msg-to">to {{ m.to }}</span>
+            {% if m.importance != "normal" %}<span class="importance"><span class="aspect" data-aspect="{{ m.importance }}" aria-hidden="true"></span>{{ m.importance }}</span>{% endif %}
+            {% if let Some(r) = m.receipt %}<span class="receipt" data-receipt="{{ r }}">{{ r }}</span>{% endif %}
+          </span>
+          <span class="msg-subject">{% if let Some(s) = m.subject %}{{ s }}{% else %}<span class="muted">(no subject)</span>{% endif %}</span>
+          <span class="msg-preview">{{ m.preview }}</span>
+          <time class="muted" datetime="{{ m.at.iso }}" title="{{ m.at.text }}">{{ m.at.ago }}</time>
+        </a>
+      </li>
+    {% endfor %}
+    </ul>
+    {% endif %}
+    {% if let Some(href) = older %}<p><a class="older" href="{{ href }}">Older messages</a></p>{% endif %}
+  </section>
+
+  <section class="reader" aria-label="Message">
+  {% if let Some(m) = selected %}
+    <header class="reader-head">
+      <h1 class="reader-subject">{% if let Some(s) = m.subject %}{{ s }}{% else %}<span class="muted">(no subject)</span>{% endif %}</h1>
+      <p class="msg-head">
+        <span class="msg-from">{{ m.from }}</span>{% if let Some(p) = m.project %}<span class="project" data-line="{{ p.line }}" title="{{ p.key }}">{{ p.name }}</span>{% endif %}
+        <span class="msg-to">to {{ m.to }}</span>
+        {% if m.importance != "normal" %}<span class="importance"><span class="aspect" data-aspect="{{ m.importance }}" aria-hidden="true"></span>{{ m.importance }}</span>{% endif %}
+        {% if let Some(r) = m.receipt %}<span class="receipt" data-receipt="{{ r }}">{{ r }}</span>{% endif %}
+        <time class="muted" datetime="{{ m.at.iso }}" title="{{ m.at.text }}">{{ m.at.text }}</time>
+      </p>
+      {% if let Some((tid, ttitle)) = m.task %}<p class="muted">In the thread of <a href="/ui/tasks/{{ tid }}">{{ ttitle }}</a></p>{% endif %}
+    </header>
+    <div class="peer-text">{{ m.body }}</div>
+    {% if let Some(token) = csrf %}
+    {% if let Some(r) = reply %}
+    <form class="stack reply" method="post" action="/ui/messages">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <input type="hidden" name="to_kind" value="{{ r.to_kind }}">
+      <input type="hidden" name="to" value="{{ r.to }}">
+      <input type="hidden" name="reply_to" value="{{ m.id }}">
+      <input type="hidden" name="subject" value="{{ r.subject }}">
+      <label for="reply-body">Reply to {{ r.label }}</label>
+      <textarea id="reply-body" name="body" rows="4" required></textarea>
+      <div class="button-row">
+        <select name="importance" aria-label="Importance">
+          <option value="normal">normal</option><option value="high">high</option><option value="urgent">urgent</option>
+        </select>
+        <button type="submit">Send reply</button>
+      </div>
+    </form>
+    {% endif %}
+    {% if archivable %}
+    <form method="post" action="/ui/inbox/{{ m.id }}/archive">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <button type="submit" class="secondary">Archive</button>
+    </form>
+    {% endif %}
+    {% endif %}
+  {% else %}
+    <p class="empty">Select a message to read it, or write a new one below.</p>
+  {% endif %}
+  {% if let Some(token) = csrf %}
+    <details class="compose"{% if selected.is_none() %} open{% endif %}>
+      <summary>New message</summary>
+      <form class="stack" method="post" action="/ui/messages">
+        <input type="hidden" name="csrf" value="{{ token }}">
+        <label for="compose-to">To</label>
+        <select id="compose-to" name="to" required>
+          <optgroup label="Everyone in a project">
+          {% for p in projects %}<option value="project:{{ p.id }}" title="{{ p.key }}">{{ p.name }}</option>{% endfor %}
+          </optgroup>
+          {% if !agents.is_empty() %}
+          <optgroup label="An agent">
+          {% for a in agents %}<option value="agent:{{ a.id }}">{{ a.label }}</option>{% endfor %}
+          </optgroup>
+          {% endif %}
+        </select>
+        <label for="compose-subject">Subject</label>
+        <input id="compose-subject" name="subject">
+        <label for="compose-body">Message</label>
+        <textarea id="compose-body" name="body" rows="4" required></textarea>
+        <div class="button-row">
+          <select name="importance" aria-label="Importance">
+            <option value="normal">normal</option><option value="high">high</option><option value="urgent">urgent</option>
+          </select>
+          <button type="submit">Send as you</button>
+        </div>
+      </form>
+    </details>
+  {% endif %}
+  </section>
+</div>
+{% endblock %}

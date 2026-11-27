@@ -1,0 +1,199 @@
+{% extends "base.html" %}
+{% block title %}{{ task.title }}{% endblock %}
+{% block content %}
+<div class="task-page">
+<section id="task-live" class="task-live" data-keep-drafts
+         hx-get="{{ refresh }}" hx-select="#task-live" hx-select-oob="#task-actions" hx-swap="outerHTML"
+         data-drafts-also="#task-actions"
+         hx-trigger="sse:detail-{{ task.id }} delay:300ms, every 60s, axl:refresh">
+  <header class="task-head" data-status="{{ task.status }}" data-line="{{ task.project.line }}">
+    {% if let Some((pid, ptitle)) = task.parent %}<p class="crumb"><a href="/ui/tasks/{{ pid }}"><span class="crumb-label">Subtask of</span> {{ ptitle }}</a></p>{% endif %}
+    <h1 class="task-title">{{ task.title }}</h1>
+    <div class="task-meta">
+      <span class="status" data-aspect="{{ task.aspect }}"><span class="aspect" data-aspect="{{ task.aspect }}" aria-hidden="true"></span>{{ task.label }}</span>
+      <span class="project" data-line="{{ task.project.line }}" title="{{ task.project.key }}">{{ task.project.name }}</span>
+      {% if !task.also.is_empty() %}<span class="also"><span class="muted">also</span> {% for p in task.also %}<span class="project" data-line="{{ p.line }}" title="{{ p.key }}">{{ p.name }}</span>{% endfor %}</span>{% endif %}
+      {% if task.requires_plan %}<span class="plan-flag">plan first: {{ task.plan_words }}</span>{% endif %}
+      {% if let Some(o) = task.owner %}<span class="owner">{{ o }}</span>{% endif %}
+      <span class="muted">created by {{ task.created_by }} <time datetime="{{ task.created_at.iso }}" title="{{ task.created_at.text }}">{{ task.created_at.ago }}</time></span>
+    </div>
+  </header>
+
+  {% if task.requires_plan || plan.is_some() %}
+  <section id="plan" class="panel plan{% if task.can_decide %} is-waiting{% endif %}" aria-label="Plan">
+    <h2 class="panel-title">{% if task.can_decide %}<span class="aspect" data-aspect="plan-submitted" aria-hidden="true"></span>Plan awaiting your approval{% else %}Plan <span class="muted">{{ task.plan_words }}</span>{% endif %}</h2>
+    {% if plan_changed %}<p class="error" role="alert">The plan changed while you were reading it — review the new version below. Nothing was decided.</p>{% endif %}
+    {% if let Some(p) = plan %}
+    <p class="muted">Latest plan from <span class="owner">{{ p.from }}</span>, <time datetime="{{ p.at.iso }}" title="{{ p.at.text }}">{{ p.at.ago }}</time>. Agent-written text, shown as written; earlier plans stay in the thread.</p>
+    <div class="peer-text plan-body">{{ p.body }}</div>
+    {% else %}
+    <p class="empty">{% if task.status == "planning" %}The agent is writing the plan. It will appear here for you to approve.{% else %}No plan yet. The agent that claims this task writes one first.{% endif %}</p>
+    {% endif %}
+    {% if task.can_decide %}{% if let Some(token) = csrf %}{% if let Some(p) = plan %}
+    <div class="plan-actions">
+      <form method="post" action="/ui/tasks/{{ task.id }}/plan/approve">
+        <input type="hidden" name="csrf" value="{{ token }}">
+        <input type="hidden" name="plan" value="{{ p.id }}">
+        <button type="submit">Approve plan</button>
+      </form>
+      <form class="stack plan-changes" method="post" action="/ui/tasks/{{ task.id }}/plan/changes">
+        <input type="hidden" name="csrf" value="{{ token }}">
+        <input type="hidden" name="plan" value="{{ p.id }}">
+        <label for="plan-note">Or ask for changes</label>
+        <textarea id="plan-note" name="note" rows="3" required placeholder="What should change in the plan"></textarea>
+        <button type="submit" class="secondary">Request changes</button>
+      </form>
+    </div>
+    {% endif %}{% endif %}{% endif %}
+  </section>
+  {% endif %}
+
+  <section class="panel lease" aria-label="Lease">
+    <h2 class="panel-title">Lease</h2>
+    {% if let Some(l) = task.lease_bar %}
+    <div class="lease-meter lease-wide" data-line="{{ task.project.line }}" data-lease-left="{{ l.left }}" data-lease-ttl="{{ l.ttl }}" data-lease-state="{% if l.left <= 0 %}expired{% else if l.left * 5 < l.ttl %}low{% else %}ok{% endif %}">
+      <span class="lease-text">lease <span class="lease-left">{{ l.text }}</span></span>
+      <span class="track" aria-hidden="true"><span class="occupancy"></span></span>
+    </div>
+    {% endif %}
+    <p>{{ task.lease }}</p>
+    {% if let Some(e) = task.eligibility %}<p class="muted">Only for {{ e }}.</p>{% endif %}
+  </section>
+
+  {% if let Some(ev) = evidence %}
+  <section class="panel evidence" aria-label="Evidence">
+    <h2 class="panel-title">Evidence</h2>
+    {% if !ev.summary.is_empty() %}<p class="peer-text">{{ ev.summary }}</p>{% endif %}
+    {% if !ev.changed_files.is_empty() %}<h3>Changed files</h3><ul class="mono-list">{% for f in ev.changed_files %}<li>{{ f }}</li>{% endfor %}</ul>{% endif %}
+    {% if !ev.tests.is_empty() %}<h3>Tests</h3><ul class="mono-list">{% for t in ev.tests %}<li>{{ t }}</li>{% endfor %}</ul>{% endif %}
+    {% if !ev.links.is_empty() %}<h3>Links</h3><ul class="mono-list">{% for l in ev.links %}<li>{{ l }}</li>{% endfor %}</ul>{% endif %}
+  </section>
+  {% endif %}
+
+  <section class="panel" aria-label="Subtasks">
+    <h2 class="panel-title">Subtasks <span class="count">{{ children.len() }}</span></h2>
+    {% if children.is_empty() %}<p class="empty">No subtasks yet.</p>{% else %}
+    <ul class="child-list">
+    {% for c in children %}
+      <li class="child" data-status="{{ c.status }}">
+        <span class="station" data-status="{{ c.status }}" title="{{ c.status }}" aria-hidden="true"></span>
+        <a class="child-title" href="/ui/tasks/{{ c.id }}"><span class="project" data-line="{{ c.project.line }}" title="{{ c.project.key }}">{{ c.project.name }}</span> {{ c.title }}</a>
+        <span class="child-owner"><span class="child-state">{{ c.status }}</span>{% if let Some(o) = c.owner %} · {{ o }}{% endif %}</span>
+      </li>
+    {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+
+  <section class="panel" aria-label="Thread">
+    <h2 class="panel-title">Thread{% if thread_paged %} <span class="muted">(earlier)</span>{% endif %}</h2>
+    {% if let Some(href) = earlier %}<p><a class="earlier" href="{{ href }}">Earlier messages</a></p>{% endif %}
+    {% if thread_paged %}<p><a href="/ui/tasks/{{ task.id }}">Latest messages</a></p>{% endif %}
+    <ol class="thread">
+    {% for m in thread %}
+      <li class="msg" id="msg-{{ m.id }}" data-importance="{{ m.importance }}">
+        <div class="msg-head">
+          <span class="msg-from">{{ m.from }}</span>{% if let Some(p) = m.project %}<span class="project" data-line="{{ p.line }}" title="{{ p.key }}">{{ p.name }}</span>{% endif %}
+          {% if m.importance != "normal" %}<span class="importance"><span class="aspect" data-aspect="{{ m.importance }}" aria-hidden="true"></span>{{ m.importance }}</span>{% endif %}
+          {% if m.kind != "message" %}<span class="msg-kind" data-kind="{{ m.kind }}">{% if m.kind == "plan" %}plan{% else %}note from axle{% endif %}</span><span class="msg-to">to {{ m.to }}</span>{% endif %}
+          <time class="muted" datetime="{{ m.at.iso }}" title="{{ m.at.text }}">{{ m.at.ago }}</time>
+        </div>
+        {% if let Some(s) = m.subject %}<p class="msg-subject">{{ s }}</p>{% endif %}
+        <div class="peer-text">{{ m.body }}</div>
+      </li>
+    {% endfor %}
+    </ol>
+  </section>
+
+  <section class="panel" aria-label="History">
+    <h2 class="panel-title">History{% if paged %} <span class="muted">(older)</span>{% endif %}</h2>
+    {% if paged %}<p><a href="/ui/tasks/{{ task.id }}">Newest events</a></p>{% endif %}
+    <ol class="events">
+    {% for e in events %}
+      <li class="event">
+        <span class="event-kind">{{ e.kind }}</span>
+        <span class="event-actor">{{ e.actor }}</span>
+        <time class="muted" datetime="{{ e.at.iso }}" title="{{ e.at.text }}">{{ e.at.ago }}</time>
+        {% if let Some(c) = e.child %}<span class="event-child">{{ c }}</span>{% endif %}
+        {% if let Some(n) = e.note %}<span class="event-note peer-text">{{ n }}</span>{% endif %}
+      </li>
+    {% endfor %}
+    </ol>
+    {% if let Some(href) = older %}<p><a class="older" href="{{ href }}">Older events</a></p>{% endif %}
+  </section>
+</section>
+
+<aside id="task-actions" class="task-actions" aria-label="Actions">
+  {% if let Some(token) = csrf %}
+  <section class="panel">
+    <h2 class="panel-title">Post to the thread</h2>
+    <form class="stack" method="post" action="/ui/tasks/{{ task.id }}/post">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <label for="post-body">Message</label>
+      <textarea id="post-body" name="body" rows="4" required></textarea>
+      <label for="post-importance">Importance</label>
+      <select id="post-importance" name="importance">
+        <option value="normal">normal</option><option value="high">high</option><option value="urgent">urgent</option>
+      </select>
+      <button type="submit">Post as you</button>
+    </form>
+  </section>
+  {% if task.can_release || task.can_cancel %}
+  <section class="panel">
+    <h2 class="panel-title">Take over</h2>
+    <div class="button-row">
+    {% if task.can_release %}
+    <form method="post" action="/ui/tasks/{{ task.id }}/force-release" data-confirm="Take this task away from {% if let Some(o) = task.owner %}{{ o }}{% else %}its owner{% endif %} and reopen it?">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <button type="submit" class="secondary">Force release</button>
+    </form>
+    {% endif %}
+    {% if task.can_cancel %}
+    <form method="post" action="/ui/tasks/{{ task.id }}/cancel" data-confirm="Cancel this task?">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <button type="submit" class="danger">Cancel task</button>
+    </form>
+    {% endif %}
+    </div>
+  </section>
+  {% endif %}
+  {% if task.can_add_project %}
+  <section class="panel">
+    <h2 class="panel-title">Projects</h2>
+    <p><span class="muted">Lead</span> <span class="project" data-line="{{ task.project.line }}" title="{{ task.project.key }}">{{ task.project.name }}</span></p>
+    {% if !task.also.is_empty() %}<p><span class="muted">Also</span> {% for p in task.also %}<span class="project" data-line="{{ p.line }}" title="{{ p.key }}">{{ p.name }}</span> {% endfor %}</p>{% endif %}
+    {% if !addable.is_empty() %}
+    <form class="stack" method="post" action="/ui/tasks/{{ task.id }}/projects">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <label for="add-project">Add a project</label>
+      <select id="add-project" name="project">
+        {% for p in addable %}<option value="{{ p.id }}" title="{{ p.key }}">{{ p.name }}</option>{% endfor %}
+      </select>
+      <button type="submit" class="secondary">+ Add project</button>
+    </form>
+    <p class="hint">Projects are never removed, so subtasks already made stay valid.</p>
+    {% endif %}
+  </section>
+  {% endif %}
+  {% if task.can_cancel && task.status != "planning" %}
+  <section class="panel">
+    <h2 class="panel-title">Add a subtask</h2>
+    <form class="stack" method="post" action="/ui/tasks">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <input type="hidden" name="parent" value="{{ task.id }}">
+      <label for="child-project">Project</label>
+      <select id="child-project" name="project">
+        {% for p in child_projects %}<option value="{{ p.id }}" title="{{ p.key }}"{% if p.selected %} selected{% endif %}>{{ p.name }}</option>{% endfor %}
+      </select>
+      <label for="child-title">Title</label>
+      <input id="child-title" name="title" required>
+      <label for="child-body">Details</label>
+      <textarea id="child-body" name="body" rows="3"></textarea>
+      <button type="submit">Create subtask</button>
+    </form>
+  </section>
+  {% endif %}
+  {% endif %}
+</aside>
+</div>
+{% endblock %}

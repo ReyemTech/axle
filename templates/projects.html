@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Projects{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1 class="page-title">Projects</h1>
+  <p class="muted">A project's key comes from its git remote and never changes. Its display name is what people and agents see.</p>
+</div>
+{% if projects.is_empty() %}
+<p class="empty">No projects yet. One appears when an agent first connects from a repository.</p>
+{% else %}
+<ul class="rows">
+{% for p in projects %}
+  <li class="row" id="project-{{ p.id }}" data-nav tabindex="-1">
+    <div class="row-main">
+      <span class="row-title"><span class="line-swatch" data-line="{{ p.line }}" aria-hidden="true"></span>{{ p.name }}</span>
+      <code class="row-key">{{ p.key }}</code>
+      <span class="muted">since <time datetime="{{ p.created.iso }}" title="{{ p.created.text }}">{{ p.created.text }}</time></span>
+    </div>
+    {% if let Some(token) = csrf %}
+    <form class="inline-form" method="post" action="/ui/projects/{{ p.id }}/rename">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <label for="name-{{ p.id }}" class="visually-hidden">Display name for {{ p.key }}</label>
+      <input id="name-{{ p.id }}" name="display_name" value="{{ p.name }}" maxlength="{{ max }}" required>
+      <button type="submit" class="secondary">Rename</button>
+    </form>
+    {% endif %}
+  </li>
+{% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

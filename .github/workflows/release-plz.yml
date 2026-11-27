@@ -1,0 +1,59 @@
+name: Release PR
+
+# Pushes to main open or update the release PR. Merging that PR creates the vX.Y.Z tag,
+# which starts release.yml, crates.yml and docker.yml. See docs/releasing.md.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release-plz:
+    if: github.repository_owner == 'ReyemTech'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check setup
+        id: gate
+        env:
+          HAS_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN != '' }}
+        run: |
+          # A tag pushed with the default GITHUB_TOKEN would not start release.yml.
+          if [ "$HAS_TOKEN" != "true" ]; then
+            echo "::error::Secret RELEASE_PLZ_TOKEN is not set. See docs/releasing.md."
+            exit 1
+          fi
+          # The first version (v0.1.0) is tagged by hand; release-plz takes over after it.
+          if [ -z "$(git tag -l 'v*')" ]; then
+            echo "::notice::No v* tag yet. Tag the first release by hand (docs/releasing.md)."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.gate.outputs.ready == 'true'
+      - name: Tag a merged release PR
+        if: steps.gate.outputs.ready == 'true'
+        uses: release-plz/action@v0.5.148
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - name: Open or update the release PR
+        if: steps.gate.outputs.ready == 'true'
+        uses: release-plz/action@v0.5.148
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}

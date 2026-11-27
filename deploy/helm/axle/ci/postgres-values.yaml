@@ -1,0 +1,9 @@
+database:
+  mode: postgres
+  existingSecret: axle-db
+  urlKey: DATABASE_URL
+ui:
+  auth:
+    mode: secret
+    secret:
+      existingSecret: axle-admin

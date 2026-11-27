@@ -1,0 +1,364 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-27T16:36:27.562239+00:00",
+  "title": "Design System: axle",
+  "extensions": {
+    "colorMeta": {
+      "ink": {
+        "role": "primary",
+        "displayName": "Track Ink",
+        "canonical": "#1e2124",
+        "dark": "#e6e4dd",
+        "tonalRamp": [
+          "#0e1011",
+          "#1e2124",
+          "#2b2f33",
+          "#42474c",
+          "#5a5e63",
+          "#9e998c",
+          "#c9c5ba",
+          "#edebe4"
+        ]
+      },
+      "sig-red": {
+        "role": "secondary",
+        "displayName": "Occupied Red",
+        "canonical": "#d7263d",
+        "dark": "#e8475a",
+        "tonalRamp": [
+          "#4a0d16",
+          "#7c1220",
+          "#b11a2e",
+          "#d7263d",
+          "#e8475a",
+          "#f08a96",
+          "#f6dcdc",
+          "#fdf2f3"
+        ]
+      },
+      "sig-green": {
+        "role": "secondary",
+        "displayName": "Clear Green",
+        "canonical": "#258a52",
+        "dark": "#3bb273",
+        "tonalRamp": [
+          "#0d3a22",
+          "#1b6e40",
+          "#258a52",
+          "#3bb273",
+          "#4cc487",
+          "#8fdcb4",
+          "#cbefdc",
+          "#eefaf3"
+        ]
+      },
+      "sig-amber": {
+        "role": "secondary",
+        "displayName": "Caution Amber",
+        "canonical": "#b07800",
+        "dark": "#f0a202",
+        "tonalRamp": [
+          "#3d2a00",
+          "#835400",
+          "#b07800",
+          "#d99100",
+          "#f0a202",
+          "#f5c25a",
+          "#f3e6c8",
+          "#fbf5e6"
+        ]
+      },
+      "line-1": {
+        "role": "tertiary",
+        "displayName": "Line Blue",
+        "canonical": "#2d63c8",
+        "dark": "#6e9bf0",
+        "tonalRamp": [
+          "#10264e",
+          "#1d4290",
+          "#2d63c8",
+          "#4f7fdc",
+          "#6e9bf0",
+          "#9db9f5",
+          "#c8d6f2",
+          "#eef3fc"
+        ]
+      },
+      "line-2": {
+        "role": "tertiary",
+        "displayName": "Line Violet",
+        "canonical": "#7b4cc2",
+        "dark": "#a884e8"
+      },
+      "line-3": {
+        "role": "tertiary",
+        "displayName": "Line Teal",
+        "canonical": "#0b7b7b",
+        "dark": "#3dbdb8"
+      },
+      "line-4": {
+        "role": "tertiary",
+        "displayName": "Line Ochre",
+        "canonical": "#9a5b22",
+        "dark": "#d08b4e"
+      },
+      "line-5": {
+        "role": "tertiary",
+        "displayName": "Line Magenta",
+        "canonical": "#b23c88",
+        "dark": "#e07ab9"
+      },
+      "line-6": {
+        "role": "tertiary",
+        "displayName": "Line Slate",
+        "canonical": "#4e6478",
+        "dark": "#8fa3b6"
+      },
+      "ground": {
+        "role": "neutral",
+        "displayName": "Warm Paper",
+        "canonical": "#edebe4",
+        "dark": "#16181a",
+        "tonalRamp": [
+          "#16181a",
+          "#24282c",
+          "#33373c",
+          "#50565c",
+          "#9e998c",
+          "#c9c5ba",
+          "#e2dfd6",
+          "#f7f6f2"
+        ]
+      },
+      "card": {
+        "role": "neutral",
+        "displayName": "Card Stock",
+        "canonical": "#fbfaf7",
+        "dark": "#272b2f"
+      },
+      "band": {
+        "role": "neutral",
+        "displayName": "Column Band",
+        "canonical": "#e2dfd6",
+        "dark": "#1d2023"
+      }
+    },
+    "typographyMeta": {
+      "page-title": {
+        "displayName": "Page title",
+        "purpose": "Task page headline (22px)."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Inbox reader subject."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Card titles and message subjects."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Default text, tabular numerals."
+      },
+      "meta": {
+        "displayName": "Meta",
+        "purpose": "Card meta, owners, events, previews."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Uppercase column and section titles only."
+      },
+      "mono": {
+        "displayName": "Mono",
+        "purpose": "Agent ids, lease time left, keys."
+      },
+      "page-title-list": {
+        "displayName": "Page title, list",
+        "purpose": "List page headings (20px)."
+      },
+      "emphasis": {
+        "displayName": "Emphasis",
+        "purpose": "Wordmark and counter values (15px/700)."
+      }
+    },
+    "shadows": [],
+    "motion": [
+      {
+        "name": "press",
+        "value": "translateY(1px) on button :active",
+        "purpose": "Only motion; disabled under prefers-reduced-motion."
+      },
+      {
+        "name": "lease-tick",
+        "value": "JS updates --lease between renders",
+        "purpose": "Occupancy bar shrinks as the lease runs down."
+      },
+      {
+        "name": "mask-fade",
+        "value": "mask-image: linear-gradient(90deg, #000 calc(100% - 32px), transparent)",
+        "purpose": "Phone project-filter scroll fade; #000 is an alpha-mask stop, not a colour."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "wide",
+        "value": "1100px"
+      },
+      {
+        "name": "stack",
+        "value": "820px"
+      },
+      {
+        "name": "phone",
+        "value": "520px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Task Card",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "Bordered card on a column band with state glyph plus word, project line swatch, owner and lease meter.",
+      "html": "<article class=\"ds-card\"><h3 class=\"ds-card-title\"><a href=\"#\">Rotate staging credentials</a></h3><div class=\"ds-meta\"><span class=\"ds-state\"><span class=\"ds-aspect\"></span>claimed</span><span class=\"ds-project\">iac</span></div><div class=\"ds-owner\">Held by <span class=\"ds-mono\">iac/mac/claude</span> <span class=\"ds-live\">live</span></div><div class=\"ds-lease\"><span class=\"ds-lease-text\">lease 12m</span><span class=\"ds-track\"><span class=\"ds-occ\"></span></span></div></article>",
+      "css": ".ds-card{display:grid;gap:5px;padding:10px 12px;background:var(--card);border:1px solid var(--card-border);border-radius:6px;font:14px/1.45 var(--font);color:var(--text)}.ds-card:hover{border-color:var(--rule-strong)}.ds-card-title{margin:0;font-size:14px;font-weight:600;line-height:1.35}.ds-card-title a{color:var(--text);text-decoration:underline;text-decoration-thickness:1px;text-decoration-color:var(--rule-strong);text-underline-offset:3px}.ds-card:hover .ds-card-title a{text-decoration-color:currentColor}.ds-meta{display:flex;gap:12px;align-items:center;font-size:12.5px;color:var(--muted)}.ds-state{display:inline-flex;gap:5px;align-items:center;font-weight:600;color:var(--text)}.ds-aspect{width:10px;height:10px;border-radius:50%;border:1.5px solid var(--sig-red);background:linear-gradient(90deg,var(--sig-red) 50%,transparent 50%)}.ds-project::before{content:'';display:inline-block;width:10px;height:3px;margin-right:5px;background:var(--line-1);vertical-align:middle}.ds-owner{font-size:12.5px;color:var(--muted)}.ds-mono{font:12px var(--mono);color:var(--text)}.ds-live{font-size:12px;font-weight:600;color:var(--ok)}.ds-lease{display:flex;gap:10px;align-items:center}.ds-lease-text{font-size:12px;color:var(--muted)}.ds-track{position:relative;flex:1;height:2px;background:var(--line-1)}.ds-occ{position:absolute;left:0;top:-3px;height:8px;width:70%;background:var(--sig-red)}"
+    },
+    {
+      "name": "Blocked Card",
+      "kind": "card",
+      "refersTo": "card-blocked",
+      "description": "Soft red wash with square glyph and the word blocked.",
+      "html": "<article class=\"ds-card ds-blocked\"><h3 class=\"ds-card-title\">Waiting on DNS change</h3><div class=\"ds-meta\"><span class=\"ds-state\"><span class=\"ds-sq\"></span>blocked</span></div></article>",
+      "css": ".ds-card{display:grid;gap:5px;padding:10px 12px;background:var(--card);border:1px solid var(--card-border);border-radius:6px;font:14px/1.45 var(--font);color:var(--text)}.ds-blocked{background:var(--danger-soft);border-color:var(--danger-border)}.ds-card-title{margin:0;font-size:14px;font-weight:600}.ds-meta{font-size:12.5px}.ds-state{display:inline-flex;gap:5px;align-items:center;font-weight:600;color:var(--danger)}.ds-sq{width:10px;height:10px;border-radius:1px;background:var(--sig-red);border:1.5px solid var(--sig-red)}"
+    },
+    {
+      "name": "Column Head",
+      "kind": "custom",
+      "refersTo": "column-head",
+      "description": "Band header with aspect glyph, uppercase label and count; count grows when blocked holds work. Head rules join across the board via 8px gutter extensions with a 2px by 10px joint.",
+      "html": "<div class=\"ds-col\" style=\"margin-right:8px\"><header class=\"ds-head\"><span class=\"ds-sq\"></span><h2>Blocked</h2><span class=\"ds-count\">2</span></header></div>",
+      "css": ".ds-col{background:var(--band);border-radius:6px;font:14px var(--font);color:var(--text)}.ds-head{display:flex;align-items:center;gap:8px;height:40px;padding:0 12px;border-bottom:2px solid var(--text)}.ds-head h2{margin:0;font-size:12.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em}.ds-sq{width:14px;height:14px;border-radius:1px;background:var(--sig-red)}.ds-count{margin-left:auto;font-size:18px;font-weight:700;color:var(--danger)}.ds-col{position:relative}.ds-head{position:relative}.ds-head::after{content:'';position:absolute;right:-8px;bottom:-2px;width:8px;height:2px;background:var(--text)}.ds-head::before{content:'';position:absolute;right:-5px;bottom:-6px;width:2px;height:10px;background:var(--text)}"
+    },
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Ink-filled verb button.",
+      "html": "<button class=\"ds-btn\">Post as you</button>",
+      "css": ".ds-btn{height:30px;padding:0 12px;font:600 13px var(--font);border:1px solid var(--text);border-radius:4px;background:var(--text);color:var(--bg);cursor:pointer}.ds-btn:hover{background:var(--muted);border-color:var(--muted)}.ds-btn:active{transform:translateY(1px)}.ds-btn:focus-visible{outline:2px solid var(--focus);outline-offset:2px}"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Bordered card-fill button for non-destructive interventions.",
+      "html": "<button class=\"ds-btn-2\">Force release</button>",
+      "css": ".ds-btn-2{height:30px;padding:0 12px;font:600 13px var(--font);border:1px solid var(--rule-strong);border-radius:4px;background:var(--card);color:var(--text);cursor:pointer}.ds-btn-2:hover{background:var(--surface-2);border-color:var(--text)}.ds-btn-2:focus-visible{outline:2px solid var(--focus);outline-offset:2px}"
+    },
+    {
+      "name": "Danger Button",
+      "kind": "button",
+      "refersTo": "button-danger",
+      "description": "Soft red destructive button.",
+      "html": "<button class=\"ds-btn-d\">Cancel task</button>",
+      "css": ".ds-btn-d{height:30px;padding:0 12px;font:600 13px var(--font);border:1px solid var(--danger);border-radius:4px;background:var(--danger-soft);color:var(--danger);cursor:pointer}.ds-btn-d:hover{background:var(--danger);color:var(--card)}.ds-btn-d:focus-visible{outline:2px solid var(--focus);outline-offset:2px}"
+    },
+    {
+      "name": "Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "30px field with label above.",
+      "html": "<label class=\"ds-l\" for=\"ds-i\">Title</label><input id=\"ds-i\" class=\"ds-in\" placeholder=\"Task title\">",
+      "css": ".ds-l{display:block;margin-bottom:4px;color:var(--muted);font:600 12px var(--font)}.ds-in{height:30px;padding:5px 9px;border:1px solid var(--rule-strong);border-radius:3px;background:var(--surface);color:var(--text);font:14px var(--font)}.ds-in:hover{border-color:var(--text)}.ds-in:focus-visible{outline:2px solid var(--focus);border-color:var(--focus)}"
+    },
+    {
+      "name": "Top Bar",
+      "kind": "nav",
+      "refersTo": "topbar",
+      "description": "Dark bar with mark, tabs and live pulse.",
+      "html": "<div class=\"ds-bar\"><span class=\"ds-brand\"><span class=\"ds-mark\"></span>axle</span><nav class=\"ds-tabs\"><a class=\"ds-on\">Board</a><a>Inbox</a><a>Projects</a></nav></div>",
+      "css": ".ds-bar{display:flex;align-items:center;gap:20px;padding:0 16px;min-height:44px;background:var(--bar);color:var(--bar-text);font:14px var(--font)}.ds-brand{display:inline-flex;align-items:center;gap:8px;font-weight:700;font-size:15px}.ds-mark{position:relative;width:22px;height:2px;background:currentColor}.ds-mark::after{content:'';position:absolute;left:7px;top:-3px;width:8px;height:8px;background:var(--sig-red)}.ds-tabs{display:flex;align-self:stretch}.ds-tabs a{display:flex;align-items:center;padding:0 10px;color:var(--bar-muted);border-bottom:2px solid transparent}.ds-tabs a.ds-on{color:var(--bar-text);font-weight:600;border-bottom-color:var(--bar-text)}"
+    },
+    {
+      "name": "Key Button",
+      "kind": "button",
+      "refersTo": "button-key",
+      "description": "Secondary-style summary that opens the glyph key popover.",
+      "html": "<button class=\"ds-key\">Key</button>",
+      "css": ".ds-key{height:30px;padding:0 12px;font:600 13px var(--font);border:1px solid var(--rule-strong);border-radius:4px;background:var(--card);color:var(--text);cursor:pointer}.ds-key:hover{background:var(--surface-2);border-color:var(--text)}.ds-key:focus-visible{outline:2px solid var(--focus);outline-offset:2px}"
+    }
+  ],
+  "narrative": {
+    "northStar": "Block Signalling",
+    "overview": "axle reads like a railway signal box: projects are lines, tasks are blocks, a lease is the occupancy of a block, and a few signal aspects say what state each block is in. The first build was pure hairlines and read as too minimal; the shipped system adds column bands, bordered cards, labelled buttons and a text label beside every glyph, while keeping density.",
+    "keyCharacteristics": [
+      "Neutral warm-paper ground and graphite ink; saturated colour only for state and project lines.",
+      "Three signal hues, each with a text-safe twin.",
+      "Flat: no shadows; tonal depth plus 1px borders.",
+      "Tabular numerals; monospace for agent ids and leases.",
+      "System font stack only.",
+      "Light and dark themes via prefers-color-scheme."
+    ],
+    "rules": [
+      {
+        "name": "The Signal Is State Rule",
+        "body": "Red, green and amber appear only to report state; never decoration or branding.",
+        "section": "colors"
+      },
+      {
+        "name": "The Line Is Identity Rule",
+        "body": "Project line colours mark which project something belongs to, never state, never card fills.",
+        "section": "colors"
+      },
+      {
+        "name": "The Never Glyph Or Colour Alone Rule",
+        "body": "Every state glyph or hue is paired with a visible text label next to it.",
+        "section": "colors"
+      },
+      {
+        "name": "The Mono Means Machine Rule",
+        "body": "Monospace is for agent-produced identifiers; prose stays in the sans.",
+        "section": "typography"
+      },
+      {
+        "name": "The Tabular Rule",
+        "body": "Numerals are tabular so live counts and lease times do not jitter.",
+        "section": "typography"
+      },
+      {
+        "name": "The Flat Always Rule",
+        "body": "No box-shadow; separation comes from tone and 1px borders.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Selected Is An Outline Rule",
+        "body": "Keyboard selection and focus are a 2px outline, never a fill.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Shape Carries State Rule",
+        "body": "Ring open, half claimed, square blocked, ringed centre review, solid done or live, slash cancelled; do not reuse for other meaning.",
+        "section": "shapes"
+      }
+    ],
+    "dos": [
+      "Do pair every signal glyph or state hue with a text label right beside it.",
+      "Do keep red, green and amber for state, and use the text-safe twins for type.",
+      "Do colour a project's track rule or swatch with its line colour, consistently across surfaces.",
+      "Do surface tasks as bordered cards on column bands, 6px radius, no shadows.",
+      "Do label every button with a verb; ink for primary, bordered for secondary, soft red for destructive.",
+      "Do use tabular numerals and mono for agent ids and lease times.",
+      "Do make the blocked and review columns louder only when they hold work.",
+      "Do define colours as tokens on :root with a dark prefers-color-scheme override; add new roles to both."
+    ],
+    "donts": [
+      "Don't convey state by glyph or colour alone; a lone dot is a bug.",
+      "Don't use box-shadow, gradient glows or a decorative accent hue.",
+      "Don't use project line colours to mean status, or signal colours to mean project.",
+      "Don't add icon-only buttons or external fonts, scripts, styles or images.",
+      "Don't nest cards inside cards.",
+      "Don't add chrome, extra clicks or padding that reduces how much state fits on screen.",
+      "Don't dress it as a terminal or a generic SaaS dashboard."
+    ]
+  }
+}
