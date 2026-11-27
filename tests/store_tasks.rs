@@ -613,3 +613,136 @@ store_matrix!(cancel_force_release_and_children, |store: Arc<
         .unwrap();
     assert_eq!(open.len(), 2);
 });
+
+store_matrix!(per_task_lease_ttl, |store: Arc<dyn Store>| async move {
+    let env = Env::new(store);
+    let a = env.session("mac", "claude-code").await;
+    let b = env.session("linux", "claude-code").await;
+    let new = |ttl: Option<Duration>| NewTask {
+        project_id: project_of(&a),
+        title: "long migration".into(),
+        lease_ttl: ttl,
+        ..NewTask::default()
+    };
+    assert!(matches!(
+        env.svc
+            .create(Caller::Agent(&a), new(Some(Duration::milliseconds(500))))
+            .await,
+        Err(TaskError::InvalidLeaseTtl)
+    ));
+    let long = env
+        .svc
+        .create(Caller::Agent(&a), new(Some(Duration::hours(1))))
+        .await
+        .unwrap();
+    assert_eq!(long.lease_ttl, Some(Duration::hours(1)));
+    assert_eq!(
+        env.store
+            .get_task(long.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .lease_ttl,
+        Some(Duration::hours(1)),
+        "persisted"
+    );
+
+    // claim uses the task's TTL
+    let t = claimed(env.svc.claim(&a, long.id).await.unwrap());
+    assert_eq!(t.lease_expires_at, Some(T0 + Duration::hours(1)));
+    env.set_time(Duration::minutes(30));
+    assert!(matches!(
+        env.svc.claim(&b, long.id).await.unwrap(),
+        ClaimOutcome::AlreadyOwned { .. }
+    ));
+
+    // explicit renew and heartbeat renewal use it too
+    let t = env.svc.renew(&a, long.id).await.unwrap();
+    assert_eq!(
+        t.lease_expires_at,
+        Some(T0 + Duration::minutes(30) + Duration::hours(1))
+    );
+    env.set_time(Duration::minutes(40));
+    assert_eq!(env.svc.renew_by_heartbeat(a.session.id).await.unwrap(), 1);
+    assert_eq!(
+        env.store
+            .get_task(long.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .lease_expires_at,
+        Some(T0 + Duration::minutes(40) + Duration::hours(1))
+    );
+
+    // claim_next uses it; a task without its own TTL gets the server's 15 min
+    let short = env
+        .svc
+        .create(Caller::Agent(&a), new(Some(Duration::minutes(5))))
+        .await
+        .unwrap();
+    let t = env
+        .svc
+        .claim_next(&b, project_of(&b))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(t.id, short.id);
+    assert_eq!(
+        t.lease_expires_at,
+        Some(T0 + Duration::minutes(40) + Duration::minutes(5))
+    );
+    let plain = env.svc.create(Caller::Agent(&a), new(None)).await.unwrap();
+    assert_eq!(plain.lease_ttl, None);
+    let t = claimed(env.svc.claim(&b, plain.id).await.unwrap());
+    assert_eq!(
+        t.lease_expires_at,
+        Some(T0 + Duration::minutes(40) + Duration::minutes(15))
+    );
+});
+
+store_matrix!(claim_next_takes_over_expired_claims, |store: Arc<
+    dyn Store,
+>| async move {
+    let env = Env::new(store);
+    let a = env.session("mac", "claude-code").await;
+    let b = env.session("linux", "claude-code").await;
+    let abandoned = env.task(&a, Eligibility::default()).await;
+    let project = project_of(&a);
+
+    // a takes the task, then crashes (no renewals).
+    let t = env.svc.claim_next(&a, project).await.unwrap().unwrap();
+    assert_eq!(t.id, abandoned.id);
+
+    env.set_time(Duration::minutes(15));
+    assert_eq!(
+        env.svc.claim_next(&b, project).await.unwrap(),
+        None,
+        "still owned at exactly the expiry instant"
+    );
+
+    // A newer open task exists too; the older abandoned one is handed out first.
+    let newer = env.task(&a, Eligibility::default()).await;
+    env.set_time(Duration::minutes(15) + Duration::seconds(1));
+    let t = env.svc.claim_next(&b, project).await.unwrap().unwrap();
+    assert_eq!(t.id, abandoned.id);
+    assert_eq!(t.owner_session_id, Some(b.session.id));
+    assert_eq!(t.lease_epoch, 2);
+
+    let last = env.svc.get(abandoned.id).await.unwrap().events;
+    let last = last.last().unwrap();
+    assert_eq!(last.kind, TaskEventKind::LeaseExpiredTakeover);
+    let payload = last.payload.as_ref().unwrap();
+    assert_eq!(payload["previous_agent_id"], a.agent.id.to_string());
+    assert_eq!(payload["previous_session_id"], a.session.id.to_string());
+
+    assert!(matches!(
+        env.svc.renew(&a, abandoned.id).await,
+        Err(TaskError::LeaseLost)
+    ));
+    let t = env.svc.claim_next(&b, project).await.unwrap().unwrap();
+    assert_eq!(t.id, newer.id);
+    assert_eq!(
+        kinds(&env, &newer).await,
+        vec![TaskEventKind::Created, TaskEventKind::Claimed]
+    );
+});

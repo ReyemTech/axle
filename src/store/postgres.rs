@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgConnection, PgPool, Row};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use super::{
@@ -85,6 +85,9 @@ fn task_from(row: &PgRow) -> StoreResult<Task> {
         owner_agent_id: opt_id(row, "owner_agent_id")?,
         lease_expires_at: row.try_get("lease_expires_at")?,
         lease_epoch: row.try_get("lease_epoch")?,
+        lease_ttl: row
+            .try_get::<Option<i64>, _>("lease_ttl_secs")?
+            .map(Duration::seconds),
         eligibility: Eligibility {
             harness: row.try_get("eligible_harness")?,
             host: row.try_get("eligible_host")?,
@@ -148,8 +151,8 @@ async fn insert_event(
 macro_rules! task_cols {
     () => {
         "id, project_id, parent_id, title, body, status, owner_session_id, owner_agent_id,
-         lease_expires_at, lease_epoch, eligible_harness, eligible_host, created_by_agent_id,
-         created_by_session_id, created_at, updated_at, version"
+         lease_expires_at, lease_epoch, lease_ttl_secs, eligible_harness, eligible_host,
+         created_by_agent_id, created_by_session_id, created_at, updated_at, version"
     };
 }
 
@@ -164,6 +167,75 @@ macro_rules! eligible {
                                                           AND tp.project_id = $4::uuid)),
                   false)"
     };
+}
+
+/// The guarded claim inside an open transaction. Locks the row first so `previous` is
+/// exactly what the guarded update replaces (and the per-task TTL is read under the lock).
+async fn claim_locked(
+    conn: &mut PgConnection,
+    task: TaskId,
+    req: &ClaimRequest,
+) -> StoreResult<ClaimAttempt> {
+    let c = &req.claimant;
+    let Some(row) = sqlx::query(concat!(
+        "SELECT ",
+        task_cols!(),
+        ", ",
+        eligible!(),
+        " AS eligible FROM tasks WHERE id = $1 FOR UPDATE OF tasks"
+    ))
+    .bind(task.as_uuid())
+    .bind(&c.harness)
+    .bind(&c.host)
+    .bind(c.project.map(|p| p.as_uuid()))
+    .fetch_optional(&mut *conn)
+    .await?
+    else {
+        return Ok(ClaimAttempt {
+            previous: None,
+            eligible: false,
+            claimed: None,
+        });
+    };
+    let previous = task_from(&row)?;
+    let eligible: bool = row.try_get("eligible")?;
+
+    let claimed = sqlx::query(concat!(
+        "UPDATE tasks
+            SET owner_session_id = $5, owner_agent_id = $6,
+                status = 'claimed', lease_expires_at = $7,
+                lease_epoch = lease_epoch + 1, version = version + 1, updated_at = $8
+          WHERE id = $1
+            AND (status = 'open'
+                 OR (status = 'claimed' AND lease_expires_at < $8)
+                 OR (status IN ('claimed', 'blocked', 'review') AND owner_agent_id = $6))
+            AND ",
+        eligible!(),
+        " RETURNING ",
+        task_cols!()
+    ))
+    .bind(task.as_uuid())
+    .bind(&c.harness)
+    .bind(&c.host)
+    .bind(c.project.map(|p| p.as_uuid()))
+    .bind(c.session.as_uuid())
+    .bind(c.agent.as_uuid())
+    .bind(req.lease_until(&previous))
+    .bind(req.now)
+    .fetch_optional(&mut *conn)
+    .await?
+    .as_ref()
+    .map(task_from)
+    .transpose()?;
+
+    if claimed.is_some() {
+        insert_event(conn, &claim_event(&previous, req), Some(c.token)).await?;
+    }
+    Ok(ClaimAttempt {
+        previous: Some(previous),
+        eligible,
+        claimed,
+    })
 }
 
 /// Session columns (alias `s`) as a literal, so queries stay static SQL.
@@ -344,6 +416,7 @@ impl Store for PostgresStore {
             .map(|row| Ok((agent_from(row, "a_")?, session_from(row)?)))
             .collect()
     }
+
     async fn insert_task(
         &self,
         task: &Task,
@@ -356,11 +429,11 @@ impl Store for PostgresStore {
         sqlx::query(
             "INSERT INTO tasks
                  (id, project_id, parent_id, title, body, status, owner_session_id,
-                  owner_agent_id, lease_expires_at, lease_epoch, eligible_harness, eligible_host,
-                  created_by_agent_id, created_by_session_id, token_id, created_at, updated_at,
-                  version)
+                  owner_agent_id, lease_expires_at, lease_epoch, lease_ttl_secs,
+                  eligible_harness, eligible_host, created_by_agent_id, created_by_session_id,
+                  token_id, created_at, updated_at, version)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                     $17, $18)",
+                     $17, $18, $19)",
         )
         .bind(task.id.as_uuid())
         .bind(task.project_id.as_uuid())
@@ -372,6 +445,7 @@ impl Store for PostgresStore {
         .bind(task.owner_agent_id.map(|a| a.as_uuid()))
         .bind(task.lease_expires_at)
         .bind(task.lease_epoch)
+        .bind(task.lease_ttl.map(|d| d.whole_seconds()))
         .bind(&task.eligibility.harness)
         .bind(&task.eligibility.host)
         .bind(by_agent.map(|a| a.as_uuid()))
@@ -450,69 +524,10 @@ impl Store for PostgresStore {
     }
 
     async fn claim_task(&self, task: TaskId, req: &ClaimRequest) -> StoreResult<ClaimAttempt> {
-        let c = &req.claimant;
         let mut tx = self.pool.begin().await?;
-        // Lock the row first so `previous` is exactly what the guarded update replaces.
-        let Some(row) = sqlx::query(concat!(
-            "SELECT ",
-            task_cols!(),
-            ", ",
-            eligible!(),
-            " AS eligible FROM tasks WHERE id = $1 FOR UPDATE OF tasks"
-        ))
-        .bind(task.as_uuid())
-        .bind(&c.harness)
-        .bind(&c.host)
-        .bind(c.project.map(|p| p.as_uuid()))
-        .fetch_optional(&mut *tx)
-        .await?
-        else {
-            return Ok(ClaimAttempt {
-                previous: None,
-                eligible: false,
-                claimed: None,
-            });
-        };
-        let previous = task_from(&row)?;
-        let eligible: bool = row.try_get("eligible")?;
-
-        let claimed = sqlx::query(concat!(
-            "UPDATE tasks
-                SET owner_session_id = $5, owner_agent_id = $6,
-                    status = 'claimed', lease_expires_at = $7,
-                    lease_epoch = lease_epoch + 1, version = version + 1, updated_at = $8
-              WHERE id = $1
-                AND (status = 'open'
-                     OR (status = 'claimed' AND lease_expires_at < $8)
-                     OR (status IN ('claimed', 'blocked', 'review') AND owner_agent_id = $6))
-                AND ",
-            eligible!(),
-            " RETURNING ",
-            task_cols!()
-        ))
-        .bind(task.as_uuid())
-        .bind(&c.harness)
-        .bind(&c.host)
-        .bind(c.project.map(|p| p.as_uuid()))
-        .bind(c.session.as_uuid())
-        .bind(c.agent.as_uuid())
-        .bind(req.lease_until)
-        .bind(req.now)
-        .fetch_optional(&mut *tx)
-        .await?
-        .as_ref()
-        .map(task_from)
-        .transpose()?;
-
-        if claimed.is_some() {
-            insert_event(&mut tx, &claim_event(&previous, req), Some(c.token)).await?;
-        }
+        let attempt = claim_locked(&mut tx, task, req).await?;
         tx.commit().await?;
-        Ok(ClaimAttempt {
-            previous: Some(previous),
-            eligible,
-            claimed,
-        })
+        Ok(attempt)
     }
 
     async fn claim_next_task(
@@ -522,58 +537,32 @@ impl Store for PostgresStore {
     ) -> StoreResult<Option<Task>> {
         let c = &req.claimant;
         let mut tx = self.pool.begin().await?;
-        let Some(row) = sqlx::query(concat!(
-            "WITH pick AS (
-                 SELECT id FROM tasks
-                  WHERE project_id = $1 AND status = 'open' AND ",
+        // Same reclaimable set as the claim guard minus same-agent takeover: open work and
+        // abandoned (expired) claims. Rows another claimer has locked are skipped, and
+        // `claim_locked` then applies the full guard to the row we locked.
+        let picked: Option<Uuid> = sqlx::query_scalar(concat!(
+            "SELECT id FROM tasks
+              WHERE project_id = $1
+                AND (status = 'open' OR (status = 'claimed' AND lease_expires_at < $5))
+                AND ",
             eligible!(),
-            "     ORDER BY created_at, id
-                  LIMIT 1
-                  FOR UPDATE SKIP LOCKED
-             )
-             UPDATE tasks
-                SET owner_session_id = $5, owner_agent_id = $6,
-                    status = 'claimed', lease_expires_at = $7,
-                    lease_epoch = lease_epoch + 1, version = version + 1, updated_at = $8
-               FROM pick
-              WHERE tasks.id = pick.id AND tasks.status = 'open'
-              RETURNING tasks.id"
+            " ORDER BY created_at, id
+              LIMIT 1
+              FOR UPDATE SKIP LOCKED"
         ))
         .bind(project.as_uuid())
         .bind(&c.harness)
         .bind(&c.host)
         .bind(c.project.map(|p| p.as_uuid()))
-        .bind(c.session.as_uuid())
-        .bind(c.agent.as_uuid())
-        .bind(req.lease_until)
         .bind(req.now)
         .fetch_optional(&mut *tx)
-        .await?
-        else {
-            tx.commit().await?;
-            return Ok(None);
+        .await?;
+        let claimed = match picked {
+            Some(id) => claim_locked(&mut tx, id.into(), req).await?.claimed,
+            None => None,
         };
-        let id: Uuid = row.try_get("id")?;
-        let claimed = task_from(
-            &sqlx::query(concat!(
-                "SELECT ",
-                task_cols!(),
-                " FROM tasks WHERE id = $1"
-            ))
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?,
-        )?;
-        // The picked row was `open`, so the event is a plain claim.
-        let previous = Task {
-            status: crate::domain::TaskStatus::Open,
-            owner_session_id: None,
-            owner_agent_id: None,
-            ..claimed.clone()
-        };
-        insert_event(&mut tx, &claim_event(&previous, req), Some(c.token)).await?;
         tx.commit().await?;
-        Ok(Some(claimed))
+        Ok(claimed)
     }
 
     async fn transition_task(&self, req: &TransitionRequest) -> StoreResult<Option<Task>> {
@@ -634,15 +623,17 @@ impl Store for PostgresStore {
         &self,
         session: SessionId,
         now: OffsetDateTime,
-        until: OffsetDateTime,
+        default_ttl: Duration,
     ) -> StoreResult<u64> {
         let done = sqlx::query(
-            "UPDATE tasks SET lease_expires_at = $1
-             WHERE owner_session_id = $2 AND status = 'claimed' AND lease_expires_at >= $3",
+            "UPDATE tasks
+                SET lease_expires_at = $1
+                    + make_interval(secs => COALESCE(lease_ttl_secs, $3)::double precision)
+              WHERE owner_session_id = $2 AND status = 'claimed' AND lease_expires_at >= $1",
         )
-        .bind(until)
-        .bind(session.as_uuid())
         .bind(now)
+        .bind(session.as_uuid())
+        .bind(default_ttl.whole_seconds())
         .execute(&self.pool)
         .await?;
         Ok(done.rows_affected())

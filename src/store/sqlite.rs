@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqliteConnection, SqlitePool};
-use time::OffsetDateTime;
+use time::{Duration as TimeDuration, OffsetDateTime};
 
 use super::{
     ClaimAttempt, ClaimRequest, LeaseUpdate, Store, StoreError, StoreResult, TaskFilter,
@@ -137,6 +137,9 @@ fn task_from(row: &SqliteRow) -> StoreResult<Task> {
         owner_agent_id: opt_uuid(row, "owner_agent_id")?,
         lease_expires_at: lease.map(ts::dec).transpose()?,
         lease_epoch: row.try_get("lease_epoch")?,
+        lease_ttl: row
+            .try_get::<Option<i64>, _>("lease_ttl_secs")?
+            .map(TimeDuration::seconds),
         eligibility: Eligibility {
             harness: row.try_get("eligible_harness")?,
             host: row.try_get("eligible_host")?,
@@ -200,8 +203,8 @@ async fn insert_event(
 macro_rules! task_cols {
     () => {
         "id, project_id, parent_id, title, body, status, owner_session_id, owner_agent_id,
-         lease_expires_at, lease_epoch, eligible_harness, eligible_host, created_by_agent_id,
-         created_by_session_id, created_at, updated_at, version"
+         lease_expires_at, lease_epoch, lease_ttl_secs, eligible_harness, eligible_host,
+         created_by_agent_id, created_by_session_id, created_at, updated_at, version"
     };
 }
 
@@ -269,7 +272,7 @@ async fn claim_locked(
     ))
     .bind(c.session.to_string())
     .bind(&agent)
-    .bind(ts::enc(req.lease_until))
+    .bind(ts::enc(req.lease_until(&previous)))
     .bind(&now)
     .bind(&id)
     .bind(&now)
@@ -478,6 +481,7 @@ impl Store for SqliteStore {
             .map(|row| Ok((agent_from(row, "a_")?, session_from(row)?)))
             .collect()
     }
+
     async fn insert_task(
         &self,
         task: &Task,
@@ -490,10 +494,10 @@ impl Store for SqliteStore {
         sqlx::query(
             "INSERT INTO tasks
                  (id, project_id, parent_id, title, body, status, owner_session_id,
-                  owner_agent_id, lease_expires_at, lease_epoch, eligible_harness, eligible_host,
-                  created_by_agent_id, created_by_session_id, token_id, created_at, updated_at,
-                  version)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  owner_agent_id, lease_expires_at, lease_epoch, lease_ttl_secs,
+                  eligible_harness, eligible_host, created_by_agent_id, created_by_session_id,
+                  token_id, created_at, updated_at, version)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(task.id.to_string())
         .bind(task.project_id.to_string())
@@ -505,6 +509,7 @@ impl Store for SqliteStore {
         .bind(task.owner_agent_id.map(|a| a.to_string()))
         .bind(task.lease_expires_at.map(ts::enc))
         .bind(task.lease_epoch)
+        .bind(task.lease_ttl.map(|d| d.whole_seconds()))
         .bind(&task.eligibility.harness)
         .bind(&task.eligibility.host)
         .bind(by_agent.map(|a| a.to_string()))
@@ -598,12 +603,18 @@ impl Store for SqliteStore {
         // The write lock taken by BEGIN IMMEDIATE is SQLite's equivalent of SKIP LOCKED:
         // no other writer can pick the same row between this SELECT and the UPDATE.
         let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        // Same reclaimable set as the claim guard minus same-agent takeover: open work and
+        // abandoned (expired) claims. `claim_locked` then applies the full guard.
         let picked: Option<String> = sqlx::query_scalar(concat!(
-            "SELECT id FROM tasks WHERE project_id = ? AND status = 'open' AND ",
+            "SELECT id FROM tasks
+              WHERE project_id = ?
+                AND (status = 'open' OR (status = 'claimed' AND lease_expires_at < ?))
+                AND ",
             eligible!(),
             " ORDER BY created_at, id LIMIT 1"
         ))
         .bind(project.to_string())
+        .bind(ts::enc(req.now))
         .bind(&c.harness)
         .bind(&c.host)
         .bind(&home)
@@ -685,17 +696,28 @@ impl Store for SqliteStore {
         &self,
         session: SessionId,
         now: OffsetDateTime,
-        until: OffsetDateTime,
+        default_ttl: TimeDuration,
     ) -> StoreResult<u64> {
-        let done = sqlx::query(
-            "UPDATE tasks SET lease_expires_at = ?
+        // Timestamps are fixed-width text, so the per-task expiry is computed in Rust; the
+        // write transaction keeps the select and the updates consistent.
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let live: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT id, lease_ttl_secs FROM tasks
              WHERE owner_session_id = ? AND status = 'claimed' AND lease_expires_at >= ?",
         )
-        .bind(ts::enc(until))
         .bind(session.to_string())
         .bind(ts::enc(now))
-        .execute(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
-        Ok(done.rows_affected())
+        for (id, ttl) in &live {
+            let ttl = ttl.map_or(default_ttl, TimeDuration::seconds);
+            sqlx::query("UPDATE tasks SET lease_expires_at = ? WHERE id = ?")
+                .bind(ts::enc(now + ttl))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(live.len() as u64)
     }
 }

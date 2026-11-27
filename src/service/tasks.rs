@@ -51,6 +51,8 @@ pub struct NewTask {
     /// Additional participating projects (parent tasks spanning repos).
     pub extra_projects: Vec<ProjectId>,
     pub eligibility: Eligibility,
+    /// Lease length for this task (whole seconds, at least 1 s); `None` uses the server TTL.
+    pub lease_ttl: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -97,6 +99,8 @@ pub enum TaskError {
     NotFound,
     #[error("a reason is required to block a task")]
     ReasonRequired,
+    #[error("a task lease TTL must be at least one second")]
+    InvalidLeaseTtl,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -131,6 +135,11 @@ impl TaskService {
     }
 
     pub async fn create(&self, by: Caller<'_>, new: NewTask) -> Result<Task, TaskError> {
+        let lease_ttl = match new.lease_ttl {
+            Some(d) if d < Duration::SECOND => return Err(TaskError::InvalidLeaseTtl),
+            Some(d) => Some(Duration::seconds(d.whole_seconds())),
+            None => None,
+        };
         let now = self.clock.now();
         let task = Task {
             id: TaskId::new(),
@@ -143,6 +152,7 @@ impl TaskService {
             owner_agent_id: None,
             lease_expires_at: None,
             lease_epoch: 0,
+            lease_ttl,
             eligibility: new.eligibility,
             created_by: by.actor(),
             created_at: now,
@@ -196,9 +206,12 @@ impl TaskService {
             .await?)
     }
 
-    /// Explicitly extends the caller's lease on a `claimed` task to `now + ttl`.
+    /// Explicitly extends the caller's lease on a `claimed` task to `now + ttl` (the task's
+    /// own TTL, else the server's).
     pub async fn renew(&self, caller: &Resolved, id: TaskId) -> Result<Task, TaskError> {
-        let until = self.clock.now() + self.lease_ttl;
+        // A task's TTL never changes after creation, so reading it outside the write is safe.
+        let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+        let until = self.clock.now() + task.lease_ttl.unwrap_or(self.lease_ttl);
         self.owner_transition(
             caller,
             id,
@@ -351,7 +364,8 @@ impl TaskService {
         .await
     }
 
-    /// Heartbeat renewal: extends the session's live `claimed` leases to `now + ttl`, but
+    /// Heartbeat renewal: extends the session's live `claimed` leases to `now + ttl` (per
+    /// task TTL, else the server's), but
     /// only while the session made a tool call within `idle_renew_cap`. Returns how many
     /// leases were extended.
     pub async fn renew_by_heartbeat(&self, session: SessionId) -> Result<u64, TaskError> {
@@ -364,7 +378,7 @@ impl TaskService {
         }
         Ok(self
             .store
-            .extend_session_leases(session, now, now + self.lease_ttl)
+            .extend_session_leases(session, now, self.lease_ttl)
             .await?)
     }
 
@@ -403,7 +417,7 @@ impl TaskService {
                 host: caller.agent.host.clone(),
             },
             now,
-            lease_until: now + self.lease_ttl,
+            default_ttl: self.lease_ttl,
             event_id: Uuid::now_v7(),
         }
     }

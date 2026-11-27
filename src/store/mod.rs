@@ -9,7 +9,7 @@ pub mod sqlite;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 
 use crate::config::Backend;
 use crate::domain::{
@@ -105,8 +105,9 @@ pub trait Store: Send + Sync {
     /// The spec §8 guarded claim. In one transaction: locks and reads the task, runs the
     /// guarded `UPDATE … RETURNING`, and on success appends the event from `claim_event`.
     async fn claim_task(&self, task: TaskId, req: &ClaimRequest) -> StoreResult<ClaimAttempt>;
-    /// Claims the oldest open task in `project` the claimant is eligible for (Postgres:
-    /// `FOR UPDATE SKIP LOCKED`), appending a `claimed` event. `None` if there is none.
+    /// Claims the oldest task in `project` that is `open` or `claimed` with an expired
+    /// lease and that the claimant is eligible for (Postgres: `FOR UPDATE SKIP LOCKED`),
+    /// through the same guarded claim and event as `claim_task`. `None` if there is none.
     async fn claim_next_task(
         &self,
         project: ProjectId,
@@ -119,14 +120,14 @@ pub trait Store: Send + Sync {
     /// Whether `session` ever claimed `task` (distinguishes "lost the lease" from "never
     /// owned it").
     async fn session_held_task(&self, task: TaskId, session: SessionId) -> StoreResult<bool>;
-    /// Sets `lease_expires_at = until` on every `claimed` task owned by `session` whose lease
-    /// has not yet expired at `now` (heartbeat renewal never revives an expired lease).
-    /// Returns the number of leases extended.
+    /// Sets `lease_expires_at = now + ttl` (the task's own TTL, else `default_ttl`) on every
+    /// `claimed` task owned by `session` whose lease has not yet expired at `now` (heartbeat
+    /// renewal never revives an expired lease). Returns the number of leases extended.
     async fn extend_session_leases(
         &self,
         session: SessionId,
         now: OffsetDateTime,
-        until: OffsetDateTime,
+        default_ttl: Duration,
     ) -> StoreResult<u64>;
 }
 
@@ -146,7 +147,8 @@ pub struct Claimant {
 pub struct ClaimRequest {
     pub claimant: Claimant,
     pub now: OffsetDateTime,
-    pub lease_until: OffsetDateTime,
+    /// Lease length for tasks without their own TTL.
+    pub default_ttl: Duration,
     /// Id for the event appended on success.
     pub event_id: uuid::Uuid,
 }
@@ -190,6 +192,13 @@ pub struct TaskFilter {
     pub status: Option<TaskStatus>,
     pub owner: Option<AgentId>,
     pub parent: Option<TaskId>,
+}
+
+impl ClaimRequest {
+    /// When a claim of `task` (as read under the lock) expires.
+    pub fn lease_until(&self, task: &Task) -> OffsetDateTime {
+        self.now + task.lease_ttl.unwrap_or(self.default_ttl)
+    }
 }
 
 /// The event a successful claim appends, given the row as it was before the claim.

@@ -184,6 +184,8 @@ pub struct Task {
     pub lease_expires_at: Option<OffsetDateTime>,
     /// Incremented by every successful claim.
     pub lease_epoch: i64,
+    /// Per-task lease length (whole seconds); `None` uses the server-wide TTL.
+    pub lease_ttl: Option<time::Duration>,
     pub eligibility: Eligibility,
     pub created_by: Actor,
     pub created_at: OffsetDateTime,
