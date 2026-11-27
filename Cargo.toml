@@ -3,7 +3,26 @@ name = "axle-mcp"
 version = "0.1.0"
 edition = "2024"
 description = "Axle: self-hosted MCP server for agent messaging and task claiming with leases"
+license = "Elastic-2.0"
 repository = "https://github.com/ReyemTech/axle"
+homepage = "https://github.com/ReyemTech/axle#readme"
+readme = "README.md"
+keywords = ["mcp", "agents", "coordination", "tasks", "leases"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "/src/**",
+    "/migrations/**",
+    "/templates/**",
+    "/static/**",
+    "/build.rs",
+    "/README.md",
+    "/LICENSE",
+]
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/axle-mcp-{ target }.tar.xz"
+bin-dir = "axle-mcp-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tar.xz"
 
 [lib]
 name = "axle"
