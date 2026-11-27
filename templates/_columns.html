@@ -1,0 +1,9 @@
+{% for col in columns %}
+<section class="column" data-status="{{ col.status }}" aria-label="{{ col.label }}">
+  <header><h2>{{ col.label }}</h2><span class="count">{{ col.cards.len() }}</span></header>
+  <div class="cards">
+  {% for card in col.cards %}{% include "_card.html" %}{% endfor %}
+  {% if col.cards.is_empty() %}<p class="empty">Nothing here.</p>{% endif %}
+  </div>
+</section>
+{% endfor %}

@@ -208,8 +208,10 @@ pub trait Store: Send + Sync {
         ids: &[MessageId],
         now: OffsetDateTime,
     ) -> StoreResult<u64>;
-    /// How many messages `inbox` with no filter would return, without writing anything.
-    async fn unread_count(&self, to: Recipient) -> StoreResult<u64>;
+    /// How many messages `inbox` with no filter (`importance`: only that importance) would
+    /// return, without writing anything.
+    async fn unread_count(&self, to: Recipient, importance: Option<Importance>)
+    -> StoreResult<u64>;
     /// Full-text match of every word of `query` over subject + body, newest first.
     /// `query` must contain at least one non-blank word.
     async fn search_messages(

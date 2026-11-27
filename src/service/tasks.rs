@@ -95,7 +95,7 @@ pub struct Progress {
 }
 
 impl Progress {
-    fn of(children: &[Task]) -> Self {
+    pub fn of(children: &[Task]) -> Self {
         let mut progress = Progress {
             total: children.len() as u32,
             ..Progress::default()

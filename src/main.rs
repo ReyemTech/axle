@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use coord::clock::{Clock, SystemClock};
-use coord::config::{ServerConfig, backend_from_env};
+use coord::config::{ServerConfig, backend_from_env, trusted_header_name};
 use coord::domain::TokenId;
 use coord::http::AppState;
 use coord::service::auth::AuthService;
@@ -25,6 +25,11 @@ enum Command {
         /// Address to listen on; overrides COORD_BIND (default 127.0.0.1:7420)
         #[arg(long)]
         bind: Option<SocketAddr>,
+        /// Sign UI requests in by this header (set by an auth proxy such as oauth2-proxy)
+        /// instead of the admin secret; overrides COORD_TRUSTED_HEADER. Only safe when the
+        /// proxy strips the header from client requests.
+        #[arg(long, value_name = "NAME")]
+        trusted_header: Option<String>,
     },
     /// Stdio MCP bridge a harness spawns per session (reads COORD_TOKEN or ~/.coord/token,
     /// COORD_SERVER_URL, COORD_PROJECT)
@@ -68,7 +73,10 @@ async fn main() -> ExitCode {
             // shutdown after a signal. The bridge fails open, so this is always success.
             std::process::exit(0);
         }
-        Command::Serve { bind } => serve(bind).await,
+        Command::Serve {
+            bind,
+            trusted_header,
+        } => serve(bind, trusted_header).await,
         Command::Migrate => migrate().await,
         Command::Token { command } => token(command).await,
         Command::Project => Err("not implemented".into()),
@@ -82,10 +90,13 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn serve(bind: Option<SocketAddr>) -> CliResult {
+async fn serve(bind: Option<SocketAddr>, trusted_header: Option<String>) -> CliResult {
     let mut config = ServerConfig::from_env()?;
     if let Some(bind) = bind {
         config.bind = bind;
+    }
+    if let Some(raw) = trusted_header {
+        config.trusted_header = trusted_header_name(&raw)?;
     }
     let store = open_store(&config.backend).await?;
     let addr = config.bind;

@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Board{% endblock %}
+{% block content %}
+<div class="board-bar">
+  <form class="filter" method="get" action="/ui/board">
+    <label for="project">Project</label>
+    <select id="project" name="project" data-autosubmit>
+      <option value="">All projects</option>
+      {% for p in projects %}<option value="{{ p.id }}" title="{{ p.key }}"{% if p.selected %} selected{% endif %}>{{ p.name }}</option>{% endfor %}
+    </select>
+    <noscript><button type="submit">Filter</button></noscript>
+  </form>
+</div>
+<div id="columns" class="columns"
+     hx-get="/ui/board/columns{% if let Some(id) = filter %}?project={{ id }}{% endif %}"
+     hx-trigger="sse:board delay:300ms" hx-swap="innerHTML">
+{% include "_columns.html" %}
+</div>
+{% endblock %}

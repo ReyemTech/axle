@@ -1,0 +1,663 @@
+//! Page and fragment handlers and the view models they render (askama, auto-escaped: peer
+//! strings are never marked safe). Projects are labelled by display name; the key is only
+//! ever a `title` (hover) attribute.
+
+use std::collections::{HashMap, HashSet};
+
+use askama::Template;
+use axum::Extension;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::{Html, IntoResponse, Response};
+use serde::Deserialize;
+use time::format_description::well_known::Rfc3339;
+use time::{Duration, OffsetDateTime};
+
+use super::SessionCtx;
+use crate::domain::{Agent, AgentId, Importance, Project, ProjectId, Task, TaskId, TaskStatus};
+use crate::events::Event;
+use crate::http::AppState;
+use crate::service::tasks::Progress;
+use crate::store::{Store, StoreError, StoreResult, TaskFilter};
+
+/// The board's Done column shows tasks finished within this window.
+pub const DONE_WINDOW: Duration = Duration::days(7);
+/// The overview shows agents seen within this window.
+pub const AGENT_WINDOW: Duration = Duration::hours(24);
+/// The deepest parent chain the live stream walks up to find a card.
+const MAX_DEPTH: usize = 16;
+
+const COLUMNS: [(TaskStatus, &str); 5] = [
+    (TaskStatus::Open, "Open"),
+    (TaskStatus::Claimed, "Claimed"),
+    (TaskStatus::Blocked, "Blocked"),
+    (TaskStatus::Review, "Review"),
+    (TaskStatus::Done, "Done"),
+];
+
+// ---------------------------------------------------------------- errors
+
+/// A failed UI request: 404 for unknown things, 500 (logged) for store errors.
+#[derive(Debug, thiserror::Error)]
+pub enum UiError {
+    #[error("not found: {0}")]
+    NotFound(&'static str),
+    #[error("{0}")]
+    Internal(String),
+}
+
+impl From<StoreError> for UiError {
+    fn from(e: StoreError) -> Self {
+        UiError::Internal(e.to_string())
+    }
+}
+
+impl From<askama::Error> for UiError {
+    fn from(e: askama::Error) -> Self {
+        UiError::Internal(format!("template: {e}"))
+    }
+}
+
+impl IntoResponse for UiError {
+    fn into_response(self) -> Response {
+        match self {
+            UiError::NotFound(what) => error_page(StatusCode::NOT_FOUND, what),
+            UiError::Internal(e) => {
+                eprintln!("coord: ui error: {e}");
+                error_page(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong.")
+            }
+        }
+    }
+}
+
+type UiResult<T> = Result<T, UiError>;
+
+#[derive(Template)]
+#[template(path = "error.html")]
+struct ErrorPage<'a> {
+    message: &'a str,
+}
+
+/// A minimal page for errors (`message` is escaped like everything else).
+pub fn error_page(status: StatusCode, message: &str) -> Response {
+    match (ErrorPage { message }).render() {
+        Ok(html) => (status, Html(html)).into_response(),
+        Err(_) => status.into_response(),
+    }
+}
+
+fn html(t: &impl Template) -> UiResult<Response> {
+    Ok(Html(t.render()?).into_response())
+}
+
+// ---------------------------------------------------------------- login
+
+#[derive(Template)]
+#[template(path = "login.html")]
+struct LoginPage<'a> {
+    csrf: Option<String>,
+    nav: &'static str,
+    error: Option<&'a str>,
+}
+
+pub fn login_page(status: StatusCode, error: Option<&str>) -> Response {
+    let page = LoginPage {
+        csrf: None,
+        nav: "",
+        error,
+    };
+    match page.render() {
+        Ok(html) => (status, Html(html)).into_response(),
+        Err(e) => UiError::from(e).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------- labels
+
+/// A project as the UI shows it: display name, with the key on hover.
+pub struct ProjectLabel {
+    pub name: String,
+    pub key: String,
+}
+
+/// Caches project and agent lookups for one render.
+struct Labels<'a> {
+    store: &'a dyn Store,
+    projects: HashMap<ProjectId, Project>,
+    agents: HashMap<AgentId, Option<Agent>>,
+}
+
+impl<'a> Labels<'a> {
+    async fn load(store: &'a dyn Store) -> StoreResult<Self> {
+        let projects = store
+            .list_projects()
+            .await?
+            .into_iter()
+            .map(|p| (p.id, p))
+            .collect();
+        Ok(Self {
+            store,
+            projects,
+            agents: HashMap::new(),
+        })
+    }
+
+    fn project(&self, id: ProjectId) -> ProjectLabel {
+        match self.projects.get(&id) {
+            Some(p) => ProjectLabel {
+                name: p.display_name.clone(),
+                key: p.key.clone(),
+            },
+            None => ProjectLabel {
+                name: "unknown project".into(),
+                key: id.to_string(),
+            },
+        }
+    }
+
+    async fn agent(&mut self, id: AgentId) -> StoreResult<Option<&Agent>> {
+        if !self.agents.contains_key(&id) {
+            let agent = self.store.get_agent(id).await?;
+            self.agents.insert(id, agent);
+        }
+        Ok(self.agents[&id].as_ref())
+    }
+
+    /// `harness@host`, like `claude-code@mac`.
+    async fn agent_label(&mut self, id: AgentId) -> StoreResult<String> {
+        Ok(match self.agent(id).await? {
+            Some(a) => format!("{}@{}", a.harness, a.host),
+            None => "unknown agent".into(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------- cards
+
+pub struct CardView {
+    pub id: String,
+    pub title: String,
+    pub status: &'static str,
+    pub project: ProjectLabel,
+    /// The agent holding the task (or that finished it).
+    pub owner: Option<String>,
+    pub progress: Option<ProgressView>,
+}
+
+pub struct ProgressView {
+    pub done: u32,
+    pub total: u32,
+    pub owners: Vec<OwnerGroup>,
+}
+
+/// The agents holding a parent's unfinished children in one project.
+pub struct OwnerGroup {
+    pub project: ProjectLabel,
+    pub agents: Vec<String>,
+}
+
+async fn card(labels: &mut Labels<'_>, task: &Task) -> StoreResult<CardView> {
+    let children = labels
+        .store
+        .list_tasks(&TaskFilter {
+            parent: Some(task.id),
+            ..TaskFilter::default()
+        })
+        .await?;
+    let progress = if children.is_empty() {
+        None
+    } else {
+        let p = Progress::of(&children);
+        let mut owners = Vec::with_capacity(p.owners_by_project.len());
+        for (project, agents) in &p.owners_by_project {
+            let mut names = Vec::with_capacity(agents.len());
+            for a in agents {
+                names.push(labels.agent_label(*a).await?);
+            }
+            owners.push(OwnerGroup {
+                project: labels.project(*project),
+                agents: names,
+            });
+        }
+        Some(ProgressView {
+            done: p.done,
+            total: p.total,
+            owners,
+        })
+    };
+    let owner = match task.owner_agent_id {
+        Some(a) => Some(labels.agent_label(a).await?),
+        None => None,
+    };
+    Ok(CardView {
+        id: task.id.to_string(),
+        title: task.title.clone(),
+        status: task.status.as_str(),
+        project: labels.project(task.project_id),
+        owner,
+        progress,
+    })
+}
+
+#[derive(Template)]
+#[template(path = "_card.html")]
+struct CardFragment {
+    card: CardView,
+}
+
+// ---------------------------------------------------------------- board
+
+pub struct ColumnView {
+    pub status: &'static str,
+    pub label: &'static str,
+    pub cards: Vec<CardView>,
+}
+
+pub struct ProjectOption {
+    pub id: String,
+    pub name: String,
+    pub key: String,
+    pub selected: bool,
+}
+
+#[derive(Template)]
+#[template(path = "board.html")]
+struct BoardPage {
+    csrf: Option<String>,
+    nav: &'static str,
+    projects: Vec<ProjectOption>,
+    /// The filtered project's id (for the columns re-fetch URL).
+    filter: Option<String>,
+    columns: Vec<ColumnView>,
+}
+
+#[derive(Template)]
+#[template(path = "_columns.html")]
+struct ColumnsFragment {
+    columns: Vec<ColumnView>,
+}
+
+#[derive(Deserialize)]
+pub struct BoardQuery {
+    /// A project key or id.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+/// The project named by `?project=` (its id or its key); `None` when absent or blank.
+async fn board_filter(store: &dyn Store, q: &BoardQuery) -> UiResult<Option<Project>> {
+    let Some(raw) = q
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    let found = match raw.parse::<ProjectId>() {
+        Ok(id) => store.get_project(id).await?,
+        Err(_) => store.get_project_by_key(raw).await?,
+    };
+    found.map(Some).ok_or(UiError::NotFound("No such project."))
+}
+
+/// Top-level tasks per column; Done holds tasks finished within `DONE_WINDOW`, newest first.
+async fn columns(
+    state: &AppState,
+    labels: &mut Labels<'_>,
+    project: Option<ProjectId>,
+) -> StoreResult<Vec<ColumnView>> {
+    let since = state.clock.now() - DONE_WINDOW;
+    let mut out = Vec::with_capacity(COLUMNS.len());
+    for (status, label) in COLUMNS {
+        let mut tasks: Vec<Task> = state
+            .store
+            .list_tasks(&TaskFilter {
+                project,
+                status: Some(status),
+                ..TaskFilter::default()
+            })
+            .await?
+            .into_iter()
+            .filter(|t| t.parent_id.is_none())
+            .collect();
+        if status == TaskStatus::Done {
+            tasks.retain(|t| t.updated_at >= since);
+            tasks.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
+        }
+        let mut cards = Vec::with_capacity(tasks.len());
+        for t in &tasks {
+            cards.push(card(labels, t).await?);
+        }
+        out.push(ColumnView {
+            status: status.as_str(),
+            label,
+            cards,
+        });
+    }
+    Ok(out)
+}
+
+pub async fn board(
+    State(state): State<AppState>,
+    Extension(session): Extension<SessionCtx>,
+    Query(q): Query<BoardQuery>,
+) -> UiResult<Response> {
+    let filter = board_filter(&*state.store, &q).await?;
+    let mut labels = Labels::load(&*state.store).await?;
+    let columns = columns(&state, &mut labels, filter.as_ref().map(|p| p.id)).await?;
+    let mut projects: Vec<ProjectOption> = labels
+        .projects
+        .values()
+        .map(|p| ProjectOption {
+            id: p.id.to_string(),
+            name: p.display_name.clone(),
+            key: p.key.clone(),
+            selected: filter.as_ref().is_some_and(|f| f.id == p.id),
+        })
+        .collect();
+    projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.key.cmp(&b.key)));
+    html(&BoardPage {
+        csrf: Some(session.csrf),
+        nav: "board",
+        projects,
+        filter: filter.map(|p| p.id.to_string()),
+        columns,
+    })
+}
+
+pub async fn board_columns(
+    State(state): State<AppState>,
+    Query(q): Query<BoardQuery>,
+) -> UiResult<Response> {
+    let filter = board_filter(&*state.store, &q).await?;
+    let mut labels = Labels::load(&*state.store).await?;
+    let columns = columns(&state, &mut labels, filter.map(|p| p.id)).await?;
+    html(&ColumnsFragment { columns })
+}
+
+// ---------------------------------------------------------------- children
+
+pub struct ChildView {
+    pub status: &'static str,
+    pub icon: &'static str,
+    pub project: ProjectLabel,
+    pub title: String,
+    pub owner: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "_children.html")]
+struct ChildrenFragment {
+    children: Vec<ChildView>,
+}
+
+fn status_icon(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Open => "○",
+        TaskStatus::Claimed => "●",
+        TaskStatus::Blocked => "■",
+        TaskStatus::Review => "◆",
+        TaskStatus::Done => "✓",
+        TaskStatus::Cancelled => "✕",
+    }
+}
+
+pub async fn children(State(state): State<AppState>, Path(id): Path<String>) -> UiResult<Response> {
+    let id: TaskId = id.parse().map_err(|_| UiError::NotFound("No such task."))?;
+    if state.store.get_task(id).await?.is_none() {
+        return Err(UiError::NotFound("No such task."));
+    }
+    let tasks = state
+        .store
+        .list_tasks(&TaskFilter {
+            parent: Some(id),
+            ..TaskFilter::default()
+        })
+        .await?;
+    let mut labels = Labels::load(&*state.store).await?;
+    let mut children = Vec::with_capacity(tasks.len());
+    for t in tasks {
+        let owner = match t.owner_agent_id {
+            Some(a) => Some(labels.agent_label(a).await?),
+            None => None,
+        };
+        children.push(ChildView {
+            status: t.status.as_str(),
+            icon: status_icon(t.status),
+            project: labels.project(t.project_id),
+            title: t.title,
+            owner,
+        });
+    }
+    html(&ChildrenFragment { children })
+}
+
+// ---------------------------------------------------------------- overview
+
+pub struct Counters {
+    pub hosts: usize,
+    pub sessions: usize,
+    pub open: usize,
+    pub unread: u32,
+    pub urgent: u32,
+}
+
+pub struct AgentCard {
+    pub id: String,
+    pub project: Option<ProjectLabel>,
+    pub host: String,
+    pub harness: String,
+    pub current_task: Option<String>,
+    pub live: bool,
+    pub last_seen: String,
+    pub last_seen_at: String,
+}
+
+#[derive(Template)]
+#[template(path = "overview.html")]
+struct OverviewPage {
+    csrf: Option<String>,
+    nav: &'static str,
+    counters: Counters,
+    agents: Vec<AgentCard>,
+}
+
+#[derive(Template)]
+#[template(path = "_overview_panel.html")]
+struct OverviewPanel {
+    counters: Counters,
+    agents: Vec<AgentCard>,
+}
+
+/// "12s ago", "5m ago", "3h ago", "2d ago".
+fn ago(now: OffsetDateTime, t: OffsetDateTime) -> String {
+    let secs = (now - t).whole_seconds().max(0);
+    match secs {
+        s if s < 60 => format!("{s}s ago"),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
+    }
+}
+
+async fn overview_data(state: &AppState) -> UiResult<(Counters, Vec<AgentCard>)> {
+    let now = state.clock.now();
+    let live_since = now - state.config.presence_stale;
+    let sessions = state.store.list_sessions(None).await?;
+    let live: Vec<_> = sessions
+        .iter()
+        .filter(|(_, s)| s.last_heartbeat_at >= live_since)
+        .collect();
+    let hosts: HashSet<&str> = live.iter().map(|(a, _)| a.host.as_str()).collect();
+    let open = state
+        .store
+        .list_tasks(&TaskFilter {
+            status: Some(TaskStatus::Open),
+            ..TaskFilter::default()
+        })
+        .await?
+        .len();
+    let unread = state
+        .messages
+        .human_unread_count(None)
+        .await
+        .map_err(|e| UiError::Internal(e.to_string()))?;
+    let urgent = state
+        .messages
+        .human_unread_count(Some(Importance::Urgent))
+        .await
+        .map_err(|e| UiError::Internal(e.to_string()))?;
+    let counters = Counters {
+        hosts: hosts.len(),
+        sessions: live.len(),
+        open,
+        unread,
+        urgent,
+    };
+
+    // One card per agent: its most recently seen session, if seen within the window.
+    let mut latest: HashMap<AgentId, (&Agent, OffsetDateTime)> = HashMap::new();
+    for (agent, session) in &sessions {
+        let seen = session.last_heartbeat_at;
+        let entry = latest.entry(agent.id).or_insert((agent, seen));
+        if seen > entry.1 {
+            entry.1 = seen;
+        }
+    }
+    let mut recent: Vec<_> = latest
+        .into_values()
+        .filter(|(_, seen)| *seen >= now - AGENT_WINDOW)
+        .collect();
+    recent.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.harness.cmp(&b.0.harness))
+            .then_with(|| a.0.host.cmp(&b.0.host))
+    });
+    let labels = Labels::load(&*state.store).await?;
+    let mut agents = Vec::with_capacity(recent.len());
+    for (agent, seen) in recent {
+        let current_task = state
+            .store
+            .list_tasks(&TaskFilter {
+                owner: Some(agent.id),
+                ..TaskFilter::default()
+            })
+            .await?
+            .into_iter()
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    TaskStatus::Claimed | TaskStatus::Blocked | TaskStatus::Review
+                )
+            })
+            .max_by_key(|t| t.updated_at)
+            .map(|t| t.title);
+        agents.push(AgentCard {
+            id: agent.id.to_string(),
+            project: agent.project_id.map(|p| labels.project(p)),
+            host: agent.host.clone(),
+            harness: agent.harness.clone(),
+            current_task,
+            live: seen >= live_since,
+            last_seen: ago(now, seen),
+            last_seen_at: seen.format(&Rfc3339).unwrap_or_default(),
+        });
+    }
+    Ok((counters, agents))
+}
+
+pub async fn overview(
+    State(state): State<AppState>,
+    Extension(session): Extension<SessionCtx>,
+) -> UiResult<Response> {
+    let (counters, agents) = overview_data(&state).await?;
+    html(&OverviewPage {
+        csrf: Some(session.csrf),
+        nav: "overview",
+        counters,
+        agents,
+    })
+}
+
+pub async fn overview_panel(State(state): State<AppState>) -> UiResult<Response> {
+    let (counters, agents) = overview_data(&state).await?;
+    html(&OverviewPanel { counters, agents })
+}
+
+// ---------------------------------------------------------------- live frames
+
+/// Data for frames that only trigger a re-fetch. Browsers drop SSE events whose data is
+/// empty, so it must not be.
+const PING: &str = "1";
+
+/// `(event name, data)` pairs for the UI stream; see `super::live`.
+pub type Frames = Vec<(String, String)>;
+
+/// What every page should re-fetch after missed events.
+pub fn refresh_frames() -> Frames {
+    vec![
+        ("board".into(), PING.into()),
+        ("overview".into(), PING.into()),
+    ]
+}
+
+/// The frames one bus event produces. A lookup failure degrades to a full refresh.
+pub async fn live_frames(state: &AppState, event: &Event) -> Frames {
+    match task_frames(state, event).await {
+        Ok(frames) => frames,
+        Err(e) => {
+            eprintln!("coord: ui live update failed: {e}");
+            refresh_frames()
+        }
+    }
+}
+
+async fn task_frames(state: &AppState, event: &Event) -> UiResult<Frames> {
+    let Event::TaskChanged { id, kind, .. } = *event else {
+        return Ok(vec![("overview".into(), PING.into())]);
+    };
+    // The card on the board is the task's top-level ancestor.
+    let mut root = state
+        .store
+        .get_task(id)
+        .await?
+        .ok_or(UiError::NotFound("task"))?;
+    for _ in 0..MAX_DEPTH {
+        let Some(parent) = root.parent_id else { break };
+        root = state
+            .store
+            .get_task(parent)
+            .await?
+            .ok_or(UiError::NotFound("task"))?;
+    }
+    let mut frames = Vec::with_capacity(3);
+    if root.id == id && kind != crate::domain::TaskEventKind::Edited {
+        frames.push(("board".into(), PING.into()));
+    }
+    let mut labels = Labels::load(&*state.store).await?;
+    let card = card(&mut labels, &root).await?;
+    // SSE data must be one line per `data:` field; HTML does not care about the newlines.
+    let html = CardFragment { card }.render()?.replace(['\r', '\n'], " ");
+    frames.push((format!("task-{}", root.id), html));
+    frames.push(("overview".into(), PING.into()));
+    Ok(frames)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ago;
+    use time::Duration;
+    use time::macros::datetime;
+
+    #[test]
+    fn ago_picks_the_largest_unit() {
+        let now = datetime!(2026-11-27 9:00 UTC);
+        assert_eq!(ago(now, now), "0s ago");
+        assert_eq!(ago(now, now - Duration::seconds(59)), "59s ago");
+        assert_eq!(ago(now, now - Duration::minutes(5)), "5m ago");
+        assert_eq!(ago(now, now - Duration::hours(3)), "3h ago");
+        assert_eq!(ago(now, now - Duration::days(2)), "2d ago");
+        assert_eq!(ago(now, now + Duration::seconds(5)), "0s ago");
+    }
+}

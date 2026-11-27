@@ -323,6 +323,79 @@ store_matrix!(human_inbox, |store: Arc<dyn Store>| async move {
     );
 });
 
+store_matrix!(
+    unread_counts_by_importance,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let x = env.session(IAC, "mac").await;
+        let y = env.session(IAC, "cac-1").await;
+        for (to, importance) in [
+            (Address::Human, Importance::Normal),
+            (Address::Human, Importance::Urgent),
+            (Address::Human, Importance::Urgent),
+            (Address::Agent(y.agent.id), Importance::Urgent),
+            (Address::Project(project_of(&y)), Importance::Urgent),
+        ] {
+            env.msgs
+                .send(
+                    &actor(&x),
+                    NewMessage {
+                        importance,
+                        ..msg(to, "ping")
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(env.msgs.human_unread_count(None).await.unwrap(), 3);
+        let urgent = Some(Importance::Urgent);
+        assert_eq!(env.msgs.human_unread_count(urgent).await.unwrap(), 2);
+        assert_eq!(
+            env.msgs
+                .human_unread_count(Some(Importance::High))
+                .await
+                .unwrap(),
+            0
+        );
+        // The filter covers agent rows and not-yet-materialised project mail too.
+        assert_eq!(
+            env.store
+                .unread_count(
+                    coord::store::Recipient::Agent {
+                        agent: y.agent.id,
+                        session: y.session.id
+                    },
+                    urgent
+                )
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            env.store
+                .unread_count(
+                    coord::store::Recipient::Agent {
+                        agent: y.agent.id,
+                        session: y.session.id
+                    },
+                    Some(Importance::Normal)
+                )
+                .await
+                .unwrap(),
+            0
+        );
+        // Writes nothing: the human inbox still returns all three.
+        assert_eq!(
+            env.msgs
+                .human_inbox(InboxFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+);
+
 store_matrix!(task_thread_delivery, |store: Arc<dyn Store>| async move {
     let env = Env::new(store);
     let creator = env.session(IAC, "mac").await;

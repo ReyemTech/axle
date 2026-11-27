@@ -1,0 +1,23 @@
+<article class="card" id="task-{{ card.id }}" data-status="{{ card.status }}" data-nav tabindex="-1"
+         sse-swap="task-{{ card.id }}" hx-swap="outerHTML">
+  <div class="card-head">
+    <h3 class="card-title">{{ card.title }}</h3>
+    {% if let Some(owner) = card.owner %}<span class="owner">{{ owner }}</span>{% endif %}
+  </div>
+  <div class="card-meta"><span class="project" title="{{ card.project.key }}">{{ card.project.name }}</span> <span class="status">{{ card.status }}</span></div>
+  {% if let Some(p) = card.progress %}
+  <div class="progress">
+    <progress value="{{ p.done }}" max="{{ p.total }}" aria-label="children done">{{ p.done }}/{{ p.total }}</progress>
+    <span class="ratio">{{ p.done }}/{{ p.total }}</span>
+  </div>
+  {% if !p.owners.is_empty() %}
+  <ul class="owners">
+    {% for g in p.owners %}<li><span class="project" title="{{ g.project.key }}">{{ g.project.name }}</span> {% for a in g.agents %}<span class="agent-chip">{{ a }}</span>{% endfor %}</li>{% endfor %}
+  </ul>
+  {% endif %}
+  <details class="children">
+    <summary data-expand>{{ p.total }} subtask{% if p.total != 1 %}s{% endif %}</summary>
+    <div hx-get="/ui/tasks/{{ card.id }}/children" hx-trigger="toggle from:closest details" hx-swap="innerHTML">Loading…</div>
+  </details>
+  {% endif %}
+</article>

@@ -15,8 +15,8 @@ use super::{
     claim_event, closes_child, edit_payload, send_time_recipient,
 };
 use crate::domain::{
-    Actor, Address, Agent, AgentId, Eligibility, InboxItem, Message, MessageId, Project, ProjectId,
-    Session, SessionId, Task, TaskEvent, TaskId, TokenId, TokenInfo,
+    Actor, Address, Agent, AgentId, Eligibility, Importance, InboxItem, Message, MessageId,
+    Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskId, TokenId, TokenInfo,
 };
 
 /// Write transactions take the write lock up front, so a read-then-update inside one is
@@ -1248,19 +1248,24 @@ impl Store for SqliteStore {
         .await
     }
 
-    async fn unread_count(&self, to: Recipient) -> StoreResult<u64> {
+    async fn unread_count(
+        &self,
+        to: Recipient,
+        importance: Option<Importance>,
+    ) -> StoreResult<u64> {
         let (agent, session) = recipient_binds(to);
         let n: i64 = sqlx::query_scalar(concat!(
             "SELECT (SELECT COUNT(*) FROM message_recipients r
                      JOIN messages m ON m.id = r.message_id
                      WHERE r.acked_at IS NULL AND ",
             inbox_rows!(),
-            ") + (SELECT COUNT(*) FROM messages m WHERE ",
+            " AND (?3 IS NULL OR m.importance = ?3)) + (SELECT COUNT(*) FROM messages m WHERE ",
             pending_messages!(),
-            ")"
+            " AND (?3 IS NULL OR m.importance = ?3))"
         ))
         .bind(&agent)
         .bind(&session)
+        .bind(importance.map(|i| i.as_str()))
         .fetch_one(&self.pool)
         .await?;
         Ok(n as u64)

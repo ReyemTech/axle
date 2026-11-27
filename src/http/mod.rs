@@ -1,4 +1,5 @@
-//! The axum server: shared state, bearer-token auth, health probes and the `/v1` API.
+//! The axum server: shared state, bearer-token auth, health probes, the `/v1` API, the MCP
+//! endpoint and the web UI.
 
 pub mod rate_limit;
 pub mod v1;
@@ -25,6 +26,7 @@ use crate::service::auth::AuthService;
 use crate::service::messages::MessageService;
 use crate::service::tasks::TaskService;
 use crate::store::Store;
+use crate::ui::UiState;
 
 /// Everything a request handler needs; cheap to clone.
 #[derive(Clone)]
@@ -39,6 +41,8 @@ pub struct AppState {
     /// Fired when the server starts shutting down; long-lived responses (SSE) end on it.
     pub shutdown: Shutdown,
     pub rate_limit: Arc<RateLimiter>,
+    /// Web UI sessions and login limits.
+    pub ui: Arc<UiState>,
 }
 
 /// A one-way "the server is stopping" flag that any number of tasks can wait on.
@@ -80,7 +84,8 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let shutdown = state.shutdown.clone();
     let trigger = shutdown.clone();
-    let server = axum::serve(listener, router(state))
+    let app = router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let server = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             signal.await;
             trigger.trigger();
@@ -120,6 +125,7 @@ impl AppState {
                 config.rate_limit_per_sec,
                 config.rate_limit_burst,
             )),
+            ui: Arc::new(UiState::new()),
             config: Arc::new(config),
             store,
             clock,
@@ -131,8 +137,9 @@ impl AppState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthToken(pub TokenId);
 
-/// The full server: unauthenticated probes plus the token-protected `/v1` API and MCP
-/// endpoint (`/mcp`, Streamable HTTP). Must be called inside a Tokio runtime.
+/// The full server: unauthenticated probes, the token-protected `/v1` API and MCP endpoint
+/// (`/mcp`, Streamable HTTP), and the cookie-session web UI under `/ui`. Must be called
+/// inside a Tokio runtime.
 pub fn router(state: AppState) -> Router {
     let mcp = Router::new()
         .nest_service("/mcp", crate::mcp::service(state.clone()))
@@ -144,6 +151,7 @@ pub fn router(state: AppState) -> Router {
             "/v1",
             v1::routes().route_layer(middleware::from_fn_with_state(state.clone(), require_token)),
         )
+        .merge(crate::ui::routes(state.clone()))
         .merge(mcp)
         .with_state(state)
 }

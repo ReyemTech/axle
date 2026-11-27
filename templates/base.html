@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false}'>
+{% if let Some(token) = csrf %}<meta name="csrf-token" content="{{ token }}">{% endif %}
+<title>{% block title %}coord{% endblock %} · coord</title>
+<link rel="stylesheet" href="/ui/static/app.css">
+<script src="/ui/static/htmx.min.js" defer></script>
+<script src="/ui/static/htmx-ext-sse.js" defer></script>
+<script src="/ui/static/app.js" defer></script>
+</head>
+<body>
+{% if let Some(token) = csrf %}
+<header class="topbar">
+  <a class="brand" href="/ui/">coord</a>
+  <nav class="tabs" aria-label="Sections">
+    <a href="/ui/"{% if nav == "overview" %} aria-current="page"{% endif %}>Overview</a>
+    <a href="/ui/board"{% if nav == "board" %} aria-current="page"{% endif %}>Board</a>
+  </nav>
+  <input id="search" class="search" type="search" placeholder="Search  /" aria-label="Search (press /)" autocomplete="off">
+  <form class="logout" method="post" action="/ui/logout">
+    <input type="hidden" name="csrf" value="{{ token }}">
+    <button type="submit" class="link">Log out</button>
+  </form>
+</header>
+<main class="page" hx-ext="sse" sse-connect="/ui/live">
+{% block content %}{% endblock %}
+</main>
+<footer class="keys" aria-hidden="true"><kbd>j</kbd>/<kbd>k</kbd> move · <kbd>Enter</kbd> expand · <kbd>/</kbd> search</footer>
+{% else %}
+<main class="page narrow">
+{% block bare %}{% endblock %}
+</main>
+{% endif %}
+</body>
+</html>

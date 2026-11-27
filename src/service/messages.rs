@@ -155,7 +155,19 @@ impl MessageService {
     /// Unacked items in the session's inbox (what `inbox` with no filter would return), for
     /// `whoami`, heartbeats and hooks. Writes nothing.
     pub async fn unread_count(&self, caller: &Resolved) -> Result<u32, MessageError> {
-        let n = self.store.unread_count(recipient(caller)).await?;
+        let n = self.store.unread_count(recipient(caller), None).await?;
+        Ok(u32::try_from(n).unwrap_or(u32::MAX))
+    }
+
+    /// Unacked items in the human inbox (`importance`: only that importance). Writes nothing.
+    pub async fn human_unread_count(
+        &self,
+        importance: Option<Importance>,
+    ) -> Result<u32, MessageError> {
+        let n = self
+            .store
+            .unread_count(Recipient::Human, importance)
+            .await?;
         Ok(u32::try_from(n).unwrap_or(u32::MAX))
     }
 

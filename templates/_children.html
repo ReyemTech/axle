@@ -1,0 +1,11 @@
+{% if children.is_empty() %}<p class="empty">No subtasks.</p>{% else %}
+<ul class="child-list">
+{% for c in children %}
+  <li class="child" data-status="{{ c.status }}">
+    <span class="icon" title="{{ c.status }}" aria-label="{{ c.status }}">{{ c.icon }}</span>
+    <span class="child-title"><span class="project" title="{{ c.project.key }}">{{ c.project.name }}</span>: {{ c.title }}</span>
+    <span class="child-owner">{% if let Some(o) = c.owner %}{{ o }}{% else %}(open){% endif %}</span>
+  </li>
+{% endfor %}
+</ul>
+{% endif %}

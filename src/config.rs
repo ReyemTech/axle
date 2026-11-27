@@ -14,6 +14,22 @@ pub enum ConfigError {
     BadNumber(&'static str, String),
     #[error("invalid COORD_BIND address: {0}")]
     BadBind(String),
+    #[error("{0} must be true or false, got {1:?}")]
+    BadBool(&'static str, String),
+    #[error("invalid trusted header name: {0:?}")]
+    BadHeader(String),
+}
+
+/// A trusted-header-mode header name: blank means off; otherwise it must be a valid HTTP
+/// header name.
+pub fn trusted_header_name(raw: &str) -> Result<Option<String>, ConfigError> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    axum::http::HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| ConfigError::BadHeader(name.to_string()))?;
+    Ok(Some(name.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +61,13 @@ pub struct ServerConfig {
     pub rate_limit_per_sec: u32,
     /// Per-token burst size (`COORD_RATE_LIMIT_BURST`, default 100).
     pub rate_limit_burst: u32,
+    /// Mark the UI session cookie `Secure` (`COORD_COOKIE_SECURE`, default false). Set it
+    /// whenever the UI is reached over https, e.g. behind a TLS ingress.
+    pub cookie_secure: bool,
+    /// Trusted-header mode (`COORD_TRUSTED_HEADER` or `serve --trusted-header`): a UI
+    /// request carrying this header is signed in without the admin secret. Only safe
+    /// behind a proxy (e.g. oauth2-proxy) that sets it and strips it from client requests.
+    pub trusted_header: Option<String>,
 }
 
 const DEFAULT_BIND: &str = "127.0.0.1:7420";
@@ -72,6 +95,22 @@ fn positive(
         Some(raw) => match raw.trim().parse::<u32>() {
             Ok(n) if n > 0 => Ok(n),
             _ => Err(ConfigError::BadNumber(name, raw)),
+        },
+    }
+}
+
+/// An optional boolean variable (`true`/`false`/`1`/`0`, any case), `default` when unset.
+fn boolean(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: bool,
+) -> Result<bool, ConfigError> {
+    match get(name) {
+        None => Ok(default),
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" => Ok(true),
+            "false" | "0" => Ok(false),
+            _ => Err(ConfigError::BadBool(name, raw)),
         },
     }
 }
@@ -108,6 +147,11 @@ impl ServerConfig {
             idle_renew_cap: Duration::hours(2),
             rate_limit_per_sec: positive(&get, "COORD_RATE_LIMIT_PER_SEC", 20)?,
             rate_limit_burst: positive(&get, "COORD_RATE_LIMIT_BURST", 100)?,
+            cookie_secure: boolean(&get, "COORD_COOKIE_SECURE", false)?,
+            trusted_header: match get("COORD_TRUSTED_HEADER") {
+                Some(raw) => trusted_header_name(&raw)?,
+                None => None,
+            },
         })
     }
 }
@@ -150,6 +194,44 @@ mod tests {
         assert_eq!(c.bind.to_string(), "127.0.0.1:7420");
         assert_eq!(c.rate_limit_per_sec, 20);
         assert_eq!(c.rate_limit_burst, 100);
+        assert!(!c.cookie_secure);
+        assert_eq!(c.trusted_header, None);
+    }
+
+    #[test]
+    fn cookie_secure_and_trusted_header() {
+        let base = [
+            ("DATABASE_URL", "sqlite://./coord.db"),
+            ("COORD_ADMIN_SECRET", "s3cret"),
+        ];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let vars: Vec<(&str, &str)> = base.iter().chain(extra).copied().collect();
+            ServerConfig::from_lookup(lookup(&vars))
+        };
+        let c = with(&[
+            ("COORD_COOKIE_SECURE", "TRUE"),
+            ("COORD_TRUSTED_HEADER", " X-Forwarded-User "),
+        ])
+        .unwrap();
+        assert!(c.cookie_secure);
+        assert_eq!(c.trusted_header.as_deref(), Some("X-Forwarded-User"));
+        assert!(!with(&[("COORD_COOKIE_SECURE", "0")]).unwrap().cookie_secure);
+        assert_eq!(
+            with(&[("COORD_TRUSTED_HEADER", "  ")])
+                .unwrap()
+                .trusted_header,
+            None
+        );
+        let e = with(&[("COORD_TRUSTED_HEADER", "x user")]).unwrap_err();
+        assert!(
+            matches!(e, ConfigError::BadHeader(ref h) if h == "x user"),
+            "{e}"
+        );
+        let e = with(&[("COORD_COOKIE_SECURE", "yes")]).unwrap_err();
+        assert!(
+            matches!(e, ConfigError::BadBool("COORD_COOKIE_SECURE", _)),
+            "{e}"
+        );
     }
 
     #[test]
