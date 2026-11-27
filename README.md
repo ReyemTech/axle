@@ -4,6 +4,34 @@
 share tasks, claims and messages through an MCP server, and people watch and steer them in
 a small web UI. One binary: server, stdio MCP bridge for harnesses, and Claude Code hooks.
 
+## Install
+
+No compiler needed. Pick one:
+
+```sh
+# Shell installer (macOS and Linux, x86_64 and arm64)
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/ReyemTech/axle/releases/latest/download/axle-mcp-installer.sh | sh
+
+# Homebrew
+brew install reyemtech/tap/axle
+
+# Prebuilt binary via cargo-binstall
+cargo binstall axle-mcp
+
+# From source (crates.io)
+cargo install axle-mcp --locked
+```
+
+All of these install the `axl` binary. Release archives ship `.sha256` checksums.
+
+Docker (multi-arch, amd64 and arm64):
+
+```sh
+docker pull ghcr.io/reyemtech/axle:latest
+# Amazon ECR, when the maintainers have enabled the mirror (see docs/releasing.md):
+docker pull <registry>/axle:latest
+```
+
 ## Quickstart (local, SQLite)
 
 ```sh
@@ -146,3 +174,8 @@ Keep Axle private: bind it to localhost or run it on a tailnet or private networ
 TLS if it leaves the host. Only enable `AXL_TRUSTED_HEADER` behind a proxy that sets the
 header and strips it from client requests. claude.ai connectors and OAuth are not supported
 yet; clients authenticate with bearer tokens only.
+
+## License
+
+Axle is source-available under the [Elastic License 2.0](LICENSE): free to use, modify and
+self-host. You may not provide Axle to third parties as a hosted or managed service.
