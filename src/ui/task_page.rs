@@ -11,7 +11,7 @@ use time::format_description::well_known::Rfc3339;
 
 use super::SessionCtx;
 use super::views::{
-    Labels, ProjectLabel, ProjectOption, UiError, UiResult, ago, html, status_icon,
+    Labels, LeaseView, ProjectLabel, ProjectOption, UiError, UiResult, ago, html, lease_view,
 };
 use crate::domain::{Message, MessageId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus};
 use crate::http::AppState;
@@ -131,7 +131,6 @@ pub struct Evidence {
 pub struct ChildLink {
     pub id: String,
     pub status: &'static str,
-    pub icon: &'static str,
     pub project: ProjectLabel,
     pub title: String,
     pub owner: Option<String>,
@@ -148,6 +147,8 @@ pub struct TaskView {
     pub owner: Option<String>,
     /// The lease, in words.
     pub lease: String,
+    /// The running lease of a claimed task, drawn as a bar.
+    pub lease_bar: Option<LeaseView>,
     pub eligibility: Option<String>,
     pub can_release: bool,
     pub can_cancel: bool,
@@ -279,6 +280,7 @@ pub async fn task_page(
         created_at: Stamp::new(now, task.created_at),
         parent,
         lease: lease_text(now, &task, owner.as_deref()),
+        lease_bar: lease_view(now, state.config.lease_ttl, &task),
         owner,
         eligibility,
         can_release: matches!(
@@ -354,7 +356,6 @@ pub async fn task_page(
         children.push(ChildLink {
             id: c.id.to_string(),
             status: c.status.as_str(),
-            icon: status_icon(c.status),
             project: labels.project(c.project_id),
             title: c.title,
             owner,
@@ -372,6 +373,7 @@ pub async fn task_page(
                 id: p.to_string(),
                 name: label.name,
                 key: label.key,
+                line: label.line,
                 selected: p == task.project_id,
             }
         })

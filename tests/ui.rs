@@ -443,6 +443,16 @@ async fn board_columns_and_progress() {
         select_texts(&page, ".column[data-status=claimed] .card .badge-blocked"),
         ["1 blocked"]
     );
+    // The parent's children are stations on its line, in order, each naming its state.
+    assert_eq!(
+        select_texts(&page, ".card .stations .station"),
+        ["done", "blocked", "open"]
+    );
+    // The top bar's pulse counts the blocked child.
+    let pulse = app.get("/ui/pulse", Some(&cookie)).await;
+    assert_eq!(pulse.status, StatusCode::OK);
+    assert!(!pulse.body.contains("<html"));
+    assert_eq!(select_texts(&pulse, ".pulse-item"), ["2 live", "1 blocked"]);
 
     let missing = app
         .get(
@@ -451,6 +461,58 @@ async fn board_columns_and_progress() {
         )
         .await;
     assert_eq!(missing.status, StatusCode::NOT_FOUND);
+}
+
+/// The `data-lease-*` attributes and text of the first lease meter on a page.
+fn lease_meter(page: &Page) -> (i64, i64, String, String) {
+    let html = page.html();
+    let sel = Selector::parse(".lease-meter").unwrap();
+    let el = html.select(&sel).next().expect("a lease meter");
+    let attr = |name: &str| el.value().attr(name).unwrap().to_string();
+    (
+        attr("data-lease-left").parse().unwrap(),
+        attr("data-lease-ttl").parse().unwrap(),
+        attr("data-lease-state"),
+        el.text().collect::<String>().trim().to_string(),
+    )
+}
+
+#[tokio::test]
+async fn claimed_card_draws_its_lease() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let task = app.task(&iac, "Hold me", None).await;
+    let open = app.get("/ui/board", Some(&cookie)).await;
+    assert!(
+        select_texts(&open, ".lease-meter").is_empty(),
+        "no lease while open"
+    );
+
+    app.claim(&iac, task.id).await;
+    let page = app.get("/ui/board", Some(&cookie)).await;
+    assert_eq!(
+        lease_meter(&page),
+        (900, 900, "ok".into(), "15m left".into())
+    );
+    let detail = app
+        .get(&format!("/ui/tasks/{}", task.id), Some(&cookie))
+        .await;
+    assert_eq!(lease_meter(&detail).0, 900);
+
+    // Under a fifth of the lease left reads as caution; past expiry, as expired.
+    app.clock.advance(time::Duration::minutes(13));
+    let page = app.get("/ui/board", Some(&cookie)).await;
+    assert_eq!(
+        lease_meter(&page),
+        (120, 900, "low".into(), "2m left".into())
+    );
+    app.clock.advance(time::Duration::minutes(5));
+    let page = app.get("/ui/board", Some(&cookie)).await;
+    assert_eq!(
+        lease_meter(&page),
+        (0, 900, "expired".into(), "lease expired".into())
+    );
 }
 
 #[tokio::test]

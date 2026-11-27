@@ -7,7 +7,7 @@ use axum::response::Response;
 
 use super::SessionCtx;
 use super::task_page::Stamp;
-use super::views::{UiError, UiResult, html};
+use super::views::{UiError, UiResult, html, line_colours};
 use crate::domain::DISPLAY_NAME_MAX;
 use crate::http::AppState;
 
@@ -15,6 +15,8 @@ pub struct ProjectRow {
     pub id: String,
     pub name: String,
     pub key: String,
+    /// The project's line colour (see `views::line_colours`).
+    pub line: u8,
     pub created: Stamp,
 }
 
@@ -32,13 +34,13 @@ pub async fn projects(
     Extension(session): Extension<SessionCtx>,
 ) -> UiResult<Response> {
     let now = state.clock.now();
-    let mut projects: Vec<ProjectRow> = state
-        .store
-        .list_projects()
-        .await?
+    let all = state.store.list_projects().await?;
+    let lines = line_colours(&all);
+    let mut projects: Vec<ProjectRow> = all
         .into_iter()
         .map(|p| ProjectRow {
             id: p.id.to_string(),
+            line: lines.get(&p.id).copied().unwrap_or(0),
             name: p.display_name,
             key: p.key,
             created: Stamp::new(now, p.created_at),

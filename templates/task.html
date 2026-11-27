@@ -5,18 +5,25 @@
 <section id="task-live" class="task-live"
          hx-get="/ui/tasks/{{ task.id }}" hx-select="#task-live" hx-swap="outerHTML"
          hx-trigger="sse:detail-{{ task.id }} delay:300ms">
-  <header class="task-head" data-status="{{ task.status }}">
-    {% if let Some((pid, ptitle)) = task.parent %}<p class="crumb"><a href="/ui/tasks/{{ pid }}">↑ {{ ptitle }}</a></p>{% endif %}
+  <header class="task-head" data-status="{{ task.status }}" data-line="{{ task.project.line }}">
+    {% if let Some((pid, ptitle)) = task.parent %}<p class="crumb"><a href="/ui/tasks/{{ pid }}"><span class="crumb-label">Subtask of</span> {{ ptitle }}</a></p>{% endif %}
     <h1 class="task-title">{{ task.title }}</h1>
     <div class="task-meta">
-      <span class="status">{{ task.status }}</span>
-      <span class="project" title="{{ task.project.key }}">{{ task.project.name }}</span>
+      <span class="status"><span class="aspect" data-aspect="{{ task.status }}" aria-hidden="true"></span>{{ task.status }}</span>
+      <span class="project" data-line="{{ task.project.line }}" title="{{ task.project.key }}">{{ task.project.name }}</span>
+      {% if let Some(o) = task.owner %}<span class="owner">{{ o }}</span>{% endif %}
       <span class="muted">created by {{ task.created_by }} <time datetime="{{ task.created_at.iso }}" title="{{ task.created_at.text }}">{{ task.created_at.ago }}</time></span>
     </div>
   </header>
 
   <section class="panel lease" aria-label="Lease">
     <h2 class="panel-title">Lease</h2>
+    {% if let Some(l) = task.lease_bar %}
+    <div class="lease-meter lease-wide" data-line="{{ task.project.line }}" data-lease-left="{{ l.left }}" data-lease-ttl="{{ l.ttl }}" data-lease-state="{% if l.left <= 0 %}expired{% else if l.left * 5 < l.ttl %}low{% else %}ok{% endif %}">
+      <span class="track" aria-hidden="true"><span class="occupancy"></span></span>
+      <span class="lease-left">{{ l.text }}</span>
+    </div>
+    {% endif %}
     <p>{{ task.lease }}</p>
     {% if let Some(e) = task.eligibility %}<p class="muted">Only for {{ e }}.</p>{% endif %}
   </section>
@@ -33,12 +40,12 @@
 
   <section class="panel" aria-label="Subtasks">
     <h2 class="panel-title">Subtasks <span class="count">{{ children.len() }}</span></h2>
-    {% if children.is_empty() %}<p class="empty">No subtasks.</p>{% else %}
+    {% if children.is_empty() %}<p class="empty">No subtasks yet.</p>{% else %}
     <ul class="child-list">
     {% for c in children %}
       <li class="child" data-status="{{ c.status }}">
-        <span class="icon" title="{{ c.status }}" aria-label="{{ c.status }}">{{ c.icon }}</span>
-        <a class="child-title" href="/ui/tasks/{{ c.id }}"><span class="project" title="{{ c.project.key }}">{{ c.project.name }}</span>: {{ c.title }}</a>
+        <span class="station" data-status="{{ c.status }}" title="{{ c.status }}" aria-label="{{ c.status }}"></span>
+        <a class="child-title" href="/ui/tasks/{{ c.id }}"><span class="project" data-line="{{ c.project.line }}" title="{{ c.project.key }}">{{ c.project.name }}</span> {{ c.title }}</a>
         <span class="child-owner">{% if let Some(o) = c.owner %}{{ o }}{% else %}(open){% endif %}</span>
       </li>
     {% endfor %}
@@ -54,8 +61,8 @@
     {% for m in thread %}
       <li class="msg" id="msg-{{ m.id }}" data-importance="{{ m.importance }}">
         <div class="msg-head">
-          <span class="msg-from">{{ m.from }}{% if let Some(p) = m.project %} <span class="muted">in</span> <span class="project" title="{{ p.key }}">{{ p.name }}</span>{% endif %}</span>
-          {% if m.importance != "normal" %}<span class="importance">{{ m.importance }}</span>{% endif %}
+          <span class="msg-from">{{ m.from }}</span>{% if let Some(p) = m.project %}<span class="project" data-line="{{ p.line }}" title="{{ p.key }}">{{ p.name }}</span>{% endif %}
+          {% if m.importance != "normal" %}<span class="importance"><span class="aspect" data-aspect="{{ m.importance }}" aria-hidden="true"></span>{{ m.importance }}</span>{% endif %}
           <time class="muted" datetime="{{ m.at.iso }}" title="{{ m.at.text }}">{{ m.at.ago }}</time>
         </div>
         {% if let Some(s) = m.subject %}<p class="msg-subject">{{ s }}</p>{% endif %}

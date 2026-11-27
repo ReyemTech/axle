@@ -144,6 +144,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
     let signed_in = Router::new()
         .route("/ui/", get(views::overview))
         .route("/ui/overview/panel", get(views::overview_panel))
+        .route("/ui/pulse", get(views::pulse))
         .route("/ui/board", get(views::board))
         .route("/ui/board/columns", get(views::board_columns))
         .route("/ui/tasks", post(actions::create_task))

@@ -128,12 +128,32 @@ pub fn login_page(status: StatusCode, error: Option<&str>) -> Response {
 pub struct ProjectLabel {
     pub name: String,
     pub key: String,
+    /// The project's line colour, `1..=LINES` (`0`: unknown project).
+    pub line: u8,
+}
+
+/// How many distinct project line colours the stylesheet defines.
+pub const LINES: usize = 6;
+
+/// Each project's line colour: projects in key order take the colours in turn, so a
+/// project keeps its colour across renders until projects are added before it.
+pub(super) fn line_colours<'p>(
+    projects: impl IntoIterator<Item = &'p Project>,
+) -> HashMap<ProjectId, u8> {
+    let mut keyed: Vec<&Project> = projects.into_iter().collect();
+    keyed.sort_by(|a, b| a.key.cmp(&b.key));
+    keyed
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| (p.id, (i % LINES) as u8 + 1))
+        .collect()
 }
 
 /// Caches project and agent lookups for one render.
 pub(super) struct Labels<'a> {
     pub(super) store: &'a dyn Store,
     pub(super) projects: HashMap<ProjectId, Project>,
+    lines: HashMap<ProjectId, u8>,
     agents: HashMap<AgentId, Option<Agent>>,
     /// Task titles, fetched once per render.
     task_titles: HashMap<TaskId, Option<String>>,
@@ -141,7 +161,7 @@ pub(super) struct Labels<'a> {
 
 impl<'a> Labels<'a> {
     pub(super) async fn load(store: &'a dyn Store) -> StoreResult<Self> {
-        let projects = store
+        let projects: HashMap<ProjectId, Project> = store
             .list_projects()
             .await?
             .into_iter()
@@ -149,6 +169,7 @@ impl<'a> Labels<'a> {
             .collect();
         Ok(Self {
             store,
+            lines: line_colours(projects.values()),
             projects,
             agents: HashMap::new(),
             task_titles: HashMap::new(),
@@ -169,10 +190,12 @@ impl<'a> Labels<'a> {
             Some(p) => ProjectLabel {
                 name: p.display_name.clone(),
                 key: p.key.clone(),
+                line: self.lines.get(&id).copied().unwrap_or(0),
             },
             None => ProjectLabel {
                 name: "unknown project".into(),
                 key: id.to_string(),
+                line: 0,
             },
         }
     }
@@ -231,12 +254,53 @@ pub struct CardView {
     pub project: ProjectLabel,
     /// The agent holding the task (or that finished it).
     pub owner: Option<String>,
+    /// The running lease of a claimed task.
+    pub lease: Option<LeaseView>,
     pub progress: Option<ProgressView>,
+}
+
+/// A running lease: seconds left out of its full length, and the same in words.
+/// The page counts `left` down between renders.
+pub struct LeaseView {
+    pub left: i64,
+    pub ttl: i64,
+    pub text: String,
+}
+
+/// "lease expired", "42s left", "12m left", "1h 5m left".
+pub(super) fn lease_left_text(left: i64) -> String {
+    match left {
+        s if s <= 0 => "lease expired".into(),
+        s if s < 60 => format!("{s}s left"),
+        s if s < 3600 => format!("{}m left", s / 60),
+        s => format!("{}h {}m left", s / 3600, s % 3600 / 60),
+    }
+}
+
+/// The lease of a `claimed` task (`None` for any other status, or without an expiry).
+pub(super) fn lease_view(
+    now: OffsetDateTime,
+    default_ttl: Duration,
+    task: &Task,
+) -> Option<LeaseView> {
+    if task.status != TaskStatus::Claimed {
+        return None;
+    }
+    let until = task.lease_expires_at?;
+    let ttl = task.lease_ttl.unwrap_or(default_ttl).whole_seconds().max(1);
+    let left = (until - now).whole_seconds().clamp(0, ttl);
+    Some(LeaseView {
+        left,
+        ttl,
+        text: lease_left_text(left),
+    })
 }
 
 pub struct ProgressView {
     pub done: u32,
     pub total: u32,
+    /// Each child's status, in order: the parent's line of stations.
+    pub stations: Vec<&'static str>,
     /// Children that are `blocked`, shown as a badge so they are seen without expanding.
     pub blocked: u32,
     pub owners: Vec<OwnerGroup>,
@@ -248,7 +312,12 @@ pub struct OwnerGroup {
     pub agents: Vec<String>,
 }
 
-async fn card(labels: &mut Labels<'_>, task: &Task) -> StoreResult<CardView> {
+async fn card(
+    labels: &mut Labels<'_>,
+    now: OffsetDateTime,
+    default_ttl: Duration,
+    task: &Task,
+) -> StoreResult<CardView> {
     let children = labels
         .store
         .list_tasks(&TaskFilter {
@@ -274,6 +343,7 @@ async fn card(labels: &mut Labels<'_>, task: &Task) -> StoreResult<CardView> {
         Some(ProgressView {
             done: p.done,
             total: p.total,
+            stations: children.iter().map(|c| c.status.as_str()).collect(),
             blocked: p.blocked,
             owners,
         })
@@ -288,6 +358,7 @@ async fn card(labels: &mut Labels<'_>, task: &Task) -> StoreResult<CardView> {
         status: task.status.as_str(),
         project: labels.project(task.project_id),
         owner,
+        lease: lease_view(now, default_ttl, task),
         progress,
     })
 }
@@ -311,6 +382,7 @@ pub struct ProjectOption {
     pub id: String,
     pub name: String,
     pub key: String,
+    pub line: u8,
     pub selected: bool,
 }
 
@@ -350,6 +422,7 @@ pub(super) fn project_options(
             id: p.id.to_string(),
             name: p.display_name.clone(),
             key: p.key.clone(),
+            line: labels.lines.get(&p.id).copied().unwrap_or(0),
             selected: selected == Some(p.id),
         })
         .collect();
@@ -380,7 +453,8 @@ async fn columns(
     labels: &mut Labels<'_>,
     project: Option<ProjectId>,
 ) -> StoreResult<Vec<ColumnView>> {
-    let since = state.clock.now() - DONE_WINDOW;
+    let now = state.clock.now();
+    let since = now - DONE_WINDOW;
     let mut out = Vec::with_capacity(COLUMNS.len());
     for (status, label) in COLUMNS {
         let mut tasks: Vec<Task> = state
@@ -400,7 +474,7 @@ async fn columns(
         }
         let mut cards = Vec::with_capacity(tasks.len());
         for t in &tasks {
-            cards.push(card(labels, t).await?);
+            cards.push(card(labels, now, state.config.lease_ttl, t).await?);
         }
         out.push(ColumnView {
             status: status.as_str(),
@@ -443,7 +517,6 @@ pub async fn board_columns(
 
 pub struct ChildView {
     pub status: &'static str,
-    pub icon: &'static str,
     pub project: ProjectLabel,
     pub title: String,
     pub owner: Option<String>,
@@ -453,17 +526,6 @@ pub struct ChildView {
 #[template(path = "_children.html")]
 struct ChildrenFragment {
     children: Vec<ChildView>,
-}
-
-pub(super) fn status_icon(status: TaskStatus) -> &'static str {
-    match status {
-        TaskStatus::Open => "○",
-        TaskStatus::Claimed => "●",
-        TaskStatus::Blocked => "■",
-        TaskStatus::Review => "◆",
-        TaskStatus::Done => "✓",
-        TaskStatus::Cancelled => "✕",
-    }
 }
 
 pub async fn children(State(state): State<AppState>, Path(id): Path<String>) -> UiResult<Response> {
@@ -487,7 +549,6 @@ pub async fn children(State(state): State<AppState>, Path(id): Path<String>) -> 
         };
         children.push(ChildView {
             status: t.status.as_str(),
-            icon: status_icon(t.status),
             project: labels.project(t.project_id),
             title: t.title,
             owner,
@@ -648,6 +709,40 @@ pub async fn overview_panel(State(state): State<AppState>) -> UiResult<Response>
     html(&OverviewPanel { counters, agents })
 }
 
+// ---------------------------------------------------------------- pulse
+
+/// The top bar's live state: agents with a live session, and blocked tasks.
+#[derive(Template)]
+#[template(path = "_pulse.html")]
+struct PulseFragment {
+    live: usize,
+    blocked: usize,
+}
+
+pub async fn pulse(State(state): State<AppState>) -> UiResult<Response> {
+    let live_since = state.clock.now() - state.config.presence_stale;
+    let live: HashSet<AgentId> = state
+        .store
+        .list_sessions(None)
+        .await?
+        .iter()
+        .filter(|(_, s)| s.last_heartbeat_at >= live_since)
+        .map(|(a, _)| a.id)
+        .collect();
+    let blocked = state
+        .store
+        .list_tasks(&TaskFilter {
+            status: Some(TaskStatus::Blocked),
+            ..TaskFilter::default()
+        })
+        .await?
+        .len();
+    html(&PulseFragment {
+        live: live.len(),
+        blocked,
+    })
+}
+
 // ---------------------------------------------------------------- live frames
 
 /// Data for frames that only trigger a re-fetch. Browsers drop SSE events whose data is
@@ -711,7 +806,13 @@ async fn task_frames(state: &AppState, event: &Event) -> UiResult<Frames> {
         frames.push(("board".into(), PING.into()));
     }
     let mut labels = Labels::load(&*state.store).await?;
-    let card = card(&mut labels, &root).await?;
+    let card = card(
+        &mut labels,
+        state.clock.now(),
+        state.config.lease_ttl,
+        &root,
+    )
+    .await?;
     // SSE data must be one line per `data:` field; HTML does not care about the newlines.
     let html = CardFragment { card }.render()?.replace(['\r', '\n'], " ");
     frames.push((format!("task-{}", root.id), html));

@@ -25,10 +25,10 @@
       <li class="msg-item{% if m.unread %} is-unread{% endif %}{% if let Some(s) = selected %}{% if s.id == m.id %} is-open{% endif %}{% endif %}" data-nav tabindex="-1" id="item-{{ m.id }}" data-importance="{{ m.importance }}">
         <a class="msg-link" href="{{ m.href }}">
           <span class="msg-line">
-            {% if m.unread %}<span class="unread dot live" title="unread"></span>{% endif %}
+            {% if m.unread %}<span class="unread" title="unread"><span class="visually-hidden">unread</span></span>{% endif %}
             <span class="msg-from">{{ m.from }}</span>
-            <span class="muted">→ {{ m.to }}</span>
-            {% if m.importance != "normal" %}<span class="importance">{{ m.importance }}</span>{% endif %}
+            <span class="msg-to">to {{ m.to }}</span>
+            {% if m.importance != "normal" %}<span class="importance"><span class="aspect" data-aspect="{{ m.importance }}" aria-hidden="true"></span>{{ m.importance }}</span>{% endif %}
             {% if let Some(r) = m.receipt %}<span class="receipt" data-receipt="{{ r }}">{{ r }}</span>{% endif %}
           </span>
           <span class="msg-subject">{% if let Some(s) = m.subject %}{{ s }}{% else %}<span class="muted">(no subject)</span>{% endif %}</span>
@@ -47,9 +47,9 @@
     <header class="reader-head">
       <h1 class="reader-subject">{% if let Some(s) = m.subject %}{{ s }}{% else %}<span class="muted">(no subject)</span>{% endif %}</h1>
       <p class="msg-head">
-        <span class="msg-from">{{ m.from }}{% if let Some(p) = m.project %} <span class="muted">in</span> <span class="project" title="{{ p.key }}">{{ p.name }}</span>{% endif %}</span>
-        <span class="muted">→ {{ m.to }}</span>
-        {% if m.importance != "normal" %}<span class="importance">{{ m.importance }}</span>{% endif %}
+        <span class="msg-from">{{ m.from }}</span>{% if let Some(p) = m.project %}<span class="project" data-line="{{ p.line }}" title="{{ p.key }}">{{ p.name }}</span>{% endif %}
+        <span class="msg-to">to {{ m.to }}</span>
+        {% if m.importance != "normal" %}<span class="importance"><span class="aspect" data-aspect="{{ m.importance }}" aria-hidden="true"></span>{{ m.importance }}</span>{% endif %}
         {% if let Some(r) = m.receipt %}<span class="receipt" data-receipt="{{ r }}">{{ r }}</span>{% endif %}
         <time class="muted" datetime="{{ m.at.iso }}" title="{{ m.at.text }}">{{ m.at.text }}</time>
       </p>
@@ -82,7 +82,7 @@
     {% endif %}
     {% endif %}
   {% else %}
-    <p class="empty">Select a message to read it.</p>
+    <p class="empty">Select a message to read it, or write a new one below.</p>
   {% endif %}
   {% if let Some(token) = csrf %}
     <details class="compose"{% if selected.is_none() %} open{% endif %}>

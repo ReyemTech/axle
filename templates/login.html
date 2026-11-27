@@ -2,11 +2,11 @@
 {% block title %}Log in{% endblock %}
 {% block bare %}
 <section class="login">
-  <h1>coord</h1>
-  <form method="post" action="/ui/login">
+  <h1 class="brand brand-lg"><span class="brand-mark" aria-hidden="true"></span>coord</h1>
+  <form class="stack" method="post" action="/ui/login">
     <label for="secret">Admin secret</label>
     <input id="secret" name="secret" type="password" autocomplete="current-password" required autofocus>
-    {% if let Some(message) = error %}<p class="error" role="alert">{{ message }}</p>{% endif %}
+    {% if let Some(message) = error %}<p class="error" role="alert"><span class="aspect" data-aspect="blocked" aria-hidden="true"></span>{{ message }}</p>{% endif %}
     <button type="submit">Log in</button>
   </form>
 </section>

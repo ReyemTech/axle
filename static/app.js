@@ -1,5 +1,5 @@
 // coord web UI: CSRF header for htmx requests, j/k selection, "/" search, filter autosubmit,
-// confirmations on destructive forms.
+// confirmations on destructive forms, and lease bars that count down between renders.
 (function () {
   "use strict";
 
@@ -103,10 +103,43 @@
     });
   }
 
+  // A lease element carries the seconds left when it was rendered (`data-lease-left`) out of
+  // the lease's length (`data-lease-ttl`). Counting from when this page first saw the element
+  // keeps it independent of the browser's clock. `--lease` (0..1) sizes the occupancy bar.
+  var seenAt = new WeakMap();
+
+  function leaseText(left) {
+    var s = Math.ceil(left);
+    if (s <= 0) return "lease expired";
+    if (s < 60) return s + "s left";
+    if (s < 3600) return Math.floor(s / 60) + "m left";
+    return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m left";
+  }
+
+  function tickLeases() {
+    var now = performance.now();
+    document.querySelectorAll("[data-lease-left]").forEach(function (el) {
+      if (!seenAt.has(el)) seenAt.set(el, now);
+      var ttl = Number(el.getAttribute("data-lease-ttl")) || 1;
+      var left = Number(el.getAttribute("data-lease-left")) - (now - seenAt.get(el)) / 1000;
+      left = Math.max(0, Math.min(ttl, left));
+      el.style.setProperty("--lease", (left / ttl).toFixed(4));
+      var state = left <= 0 ? "expired" : left * 5 < ttl ? "low" : "ok";
+      if (el.getAttribute("data-lease-state") !== state) el.setAttribute("data-lease-state", state);
+      var label = el.querySelector(".lease-left");
+      var text = leaseText(left);
+      if (label && label.textContent !== text) label.textContent = text;
+    });
+  }
+  tickLeases();
+  setInterval(tickLeases, 1000);
+  document.addEventListener("htmx:load", tickLeases);
+
   // Live swaps replace elements: keep the filter, the selection and open subtask lists.
   function afterSwap() {
     applySearch();
     restoreOpen();
+    tickLeases();
     if (selectedId) {
       var el = document.getElementById(selectedId);
       if (el) el.classList.add("selected");

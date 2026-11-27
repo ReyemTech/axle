@@ -1,24 +1,34 @@
-<article class="card" id="task-{{ card.id }}" data-status="{{ card.status }}" data-nav tabindex="-1"
+<article class="card" id="task-{{ card.id }}" data-status="{{ card.status }}" data-line="{{ card.project.line }}" data-nav tabindex="-1"
          sse-swap="task-{{ card.id }}" hx-swap="outerHTML">
   <div class="card-head">
+    <span class="aspect" data-aspect="{{ card.status }}" aria-hidden="true"></span>
     <h3 class="card-title"><a class="card-link" href="/ui/tasks/{{ card.id }}">{{ card.title }}</a></h3>
-    {% if let Some(owner) = card.owner %}<span class="owner">{{ owner }}</span>{% endif %}
   </div>
-  <div class="card-meta"><span class="project" title="{{ card.project.key }}">{{ card.project.name }}</span> <span class="status">{{ card.status }}</span></div>
+  <div class="card-meta"><span class="project" data-line="{{ card.project.line }}" title="{{ card.project.key }}">{{ card.project.name }}</span>{% if let Some(owner) = card.owner %}<span class="owner">{{ owner }}</span>{% endif %}<span class="status visually-hidden">{{ card.status }}</span></div>
+  {% if let Some(l) = card.lease %}
+  <div class="lease-meter" data-lease-left="{{ l.left }}" data-lease-ttl="{{ l.ttl }}" data-lease-state="{% if l.left <= 0 %}expired{% else if l.left * 5 < l.ttl %}low{% else %}ok{% endif %}">
+    <span class="track" aria-hidden="true"><span class="occupancy"></span></span>
+    <span class="lease-left">{{ l.text }}</span>
+  </div>
+  {% else %}
+  <span class="track" aria-hidden="true"></span>
+  {% endif %}
   {% if let Some(p) = card.progress %}
   <div class="progress">
-    <progress value="{{ p.done }}" max="{{ p.total }}" aria-label="children done">{{ p.done }}/{{ p.total }}</progress>
+    <ol class="stations" aria-label="{{ p.done }} of {{ p.total }} subtasks done">
+      {% for s in p.stations %}<li class="station" data-status="{{ s }}" title="{{ s }}"><span class="visually-hidden">{{ s }}</span></li>{% endfor %}
+    </ol>
     <span class="ratio">{{ p.done }}/{{ p.total }}</span>
-    {% if p.blocked > 0 %}<span class="badge-blocked">{{ p.blocked }} blocked</span>{% endif %}
+    {% if p.blocked > 0 %}<span class="badge-blocked"><span class="aspect" data-aspect="blocked" aria-hidden="true"></span>{{ p.blocked }} blocked</span>{% endif %}
   </div>
   {% if !p.owners.is_empty() %}
   <ul class="owners">
-    {% for g in p.owners %}<li><span class="project" title="{{ g.project.key }}">{{ g.project.name }}</span> {% for a in g.agents %}<span class="agent-chip">{{ a }}</span>{% endfor %}</li>{% endfor %}
+    {% for g in p.owners %}<li><span class="project" data-line="{{ g.project.line }}" title="{{ g.project.key }}">{{ g.project.name }}</span> {% for a in g.agents %}<span class="agent-chip">{{ a }}</span>{% endfor %}</li>{% endfor %}
   </ul>
   {% endif %}
   <details class="children">
     <summary data-expand>{{ p.total }} subtask{% if p.total != 1 %}s{% endif %}</summary>
-    <div hx-get="/ui/tasks/{{ card.id }}/children" hx-trigger="toggle from:closest details" hx-swap="innerHTML">Loading…</div>
+    <div hx-get="/ui/tasks/{{ card.id }}/children" hx-trigger="toggle from:closest details" hx-swap="innerHTML"><p class="loading">Loading subtasks…</p></div>
   </details>
   {% endif %}
 </article>

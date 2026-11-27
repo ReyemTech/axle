@@ -7,10 +7,13 @@
 <title>Error · coord</title>
 <link rel="stylesheet" href="/ui/static/app.css">
 </head>
-<body>
+<body class="bare">
 <main class="page narrow">
-  <p class="error" role="alert">{{ message }}</p>
-  <p><a href="/ui/">Back to the overview</a></p>
+  <section class="login">
+    <p class="brand brand-lg"><span class="brand-mark" aria-hidden="true"></span>coord</p>
+    <p class="error" role="alert"><span class="aspect" data-aspect="blocked" aria-hidden="true"></span>{{ message }}</p>
+    <p><a href="/ui/">Back to the overview</a></p>
+  </section>
 </main>
 </body>
 </html>

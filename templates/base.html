@@ -12,10 +12,10 @@
 <script src="/ui/static/htmx-ext-sse.js" defer></script>
 <script src="/ui/static/app.js" defer></script>
 </head>
-<body>
 {% if let Some(token) = csrf %}
+<body hx-ext="sse" sse-connect="/ui/live">
 <header class="topbar">
-  <a class="brand" href="/ui/">coord</a>
+  <a class="brand" href="/ui/"><span class="brand-mark" aria-hidden="true"></span>coord</a>
   <nav class="tabs" aria-label="Sections">
     <a href="/ui/"{% if nav == "overview" %} aria-current="page"{% endif %}>Overview</a>
     <a href="/ui/board"{% if nav == "board" %} aria-current="page"{% endif %}>Board</a>
@@ -23,20 +23,25 @@
     <a href="/ui/projects"{% if nav == "projects" %} aria-current="page"{% endif %}>Projects</a>
     <a href="/ui/tokens"{% if nav == "tokens" %} aria-current="page"{% endif %}>Tokens</a>
   </nav>
-  <input id="search" class="search" type="search" placeholder="Search  /" aria-label="Search (press /)" autocomplete="off">
+  <input id="search" class="search" type="search" placeholder="Filter this page  /" aria-label="Filter this page (press /)" autocomplete="off">
+  <div id="pulse" class="pulse" hx-get="/ui/pulse" hx-trigger="load, sse:overview delay:300ms, every 30s" hx-swap="innerHTML" aria-live="polite">
+    <span class="pulse-item"><span class="aspect" data-aspect="none" aria-hidden="true"></span><span class="num">–</span> live</span>
+  </div>
   <form class="logout" method="post" action="/ui/logout">
     <input type="hidden" name="csrf" value="{{ token }}">
     <button type="submit" class="link">Log out</button>
   </form>
 </header>
-<main class="page" hx-ext="sse" sse-connect="/ui/live">
+<main class="page">
 {% block content %}{% endblock %}
 </main>
-<footer class="keys" aria-hidden="true"><kbd>j</kbd>/<kbd>k</kbd> move · <kbd>Enter</kbd> expand · <kbd>/</kbd> search</footer>
+<footer class="keys" aria-hidden="true"><kbd>j</kbd> <kbd>k</kbd> move <span class="sep"></span> <kbd>Enter</kbd> expand <span class="sep"></span> <kbd>/</kbd> filter</footer>
+</body>
 {% else %}
+<body class="bare">
 <main class="page narrow">
 {% block bare %}{% endblock %}
 </main>
-{% endif %}
 </body>
+{% endif %}
 </html>

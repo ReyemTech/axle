@@ -2,17 +2,13 @@
 {% block title %}Board{% endblock %}
 {% block content %}
 <div class="board-bar">
-  <form class="filter" method="get" action="/ui/board">
-    <label for="project">Project</label>
-    <select id="project" name="project" data-autosubmit>
-      <option value="">All projects</option>
-      {% for p in projects %}<option value="{{ p.id }}" title="{{ p.key }}"{% if p.selected %} selected{% endif %}>{{ p.name }}</option>{% endfor %}
-    </select>
-    <noscript><button type="submit">Filter</button></noscript>
-  </form>
+  <nav class="lines" aria-label="Projects">
+    <a href="/ui/board"{% if filter.is_none() %} aria-current="page"{% endif %}><span class="line-swatch" data-line="all" aria-hidden="true"></span>All projects</a>
+    {% for p in projects %}<a href="/ui/board?project={{ p.id }}" title="{{ p.key }}"{% if p.selected %} aria-current="page"{% endif %}><span class="line-swatch" data-line="{{ p.line }}" aria-hidden="true"></span>{{ p.name }}</a>{% endfor %}
+  </nav>
   {% if let Some(token) = csrf %}{% if !projects.is_empty() %}
   <details class="new-task">
-    <summary>New task</summary>
+    <summary class="button-like">New task</summary>
     <form class="stack" method="post" action="/ui/tasks">
       <input type="hidden" name="csrf" value="{{ token }}">
       <label for="new-project">Project</label>

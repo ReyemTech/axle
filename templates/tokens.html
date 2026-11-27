@@ -1,17 +1,19 @@
 {% extends "base.html" %}
 {% block title %}Tokens{% endblock %}
 {% block content %}
-<h1 class="page-title">Tokens</h1>
-<p class="muted">One bearer token per host and harness. Create them with <code>coord token create --label &lt;name&gt;</code>; the secret is shown only then.</p>
+<div class="page-head">
+  <h1 class="page-title">Tokens</h1>
+  <p class="muted">One bearer token per host and harness. Create them with <code>coord token create --label &lt;name&gt;</code>; the secret is shown only then.</p>
+</div>
 {% if tokens.is_empty() %}
-<p class="empty">No tokens yet.</p>
+<p class="empty">No tokens yet. Create one with <code>coord token create --label &lt;name&gt;</code> on the server.</p>
 {% else %}
 <ul class="rows">
 {% for t in tokens %}
   <li class="row{% if t.revoked.is_some() %} is-revoked{% endif %}" id="token-{{ t.id }}" data-nav tabindex="-1">
     <div class="row-main">
       <span class="row-title">{{ t.label }}</span>
-      <span class="token-state">{% if let Some(r) = t.revoked %}revoked <time datetime="{{ r.iso }}" title="{{ r.text }}">{{ r.ago }}</time>{% else %}active{% endif %}</span>
+      <span class="token-state">{% if let Some(r) = t.revoked %}<span class="aspect" data-aspect="cancelled" aria-hidden="true"></span>revoked <time datetime="{{ r.iso }}" title="{{ r.text }}">{{ r.ago }}</time>{% else %}<span class="aspect" data-aspect="live" aria-hidden="true"></span>active{% endif %}</span>
       <span class="muted">last used {% if let Some(u) = t.last_used %}<time datetime="{{ u.iso }}" title="{{ u.text }}">{{ u.ago }}</time>{% else %}never{% endif %}</span>
       <span class="muted">created <time datetime="{{ t.created.iso }}" title="{{ t.created.text }}">{{ t.created.text }}</time></span>
     </div>
