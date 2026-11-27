@@ -1,0 +1,615 @@
+#[macro_use]
+mod common;
+
+use std::sync::Arc;
+
+use coord::clock::{Clock, TestClock};
+use coord::domain::{
+    Actor, Eligibility, ProjectId, SessionId, Task, TaskEventKind, TaskStatus, TokenId,
+};
+use coord::service::identity::{IdentityInput, IdentityService, Resolved};
+use coord::service::tasks::{Caller, ClaimOutcome, Completion, NewTask, TaskError, TaskService};
+use coord::store::{Store, TaskFilter};
+use time::macros::datetime;
+use time::{Duration, OffsetDateTime};
+
+const T0: OffsetDateTime = datetime!(2026-11-27 9:00 UTC);
+const PROJECT: &str = "github.com/reyemtech/coord";
+
+struct Env {
+    store: Arc<dyn Store>,
+    clock: Arc<TestClock>,
+    svc: Arc<TaskService>,
+}
+
+impl Env {
+    fn new(store: Arc<dyn Store>) -> Self {
+        let clock = Arc::new(TestClock::new(T0));
+        let svc = Arc::new(TaskService::new(
+            store.clone(),
+            clock.clone(),
+            Duration::minutes(15),
+            Duration::hours(2),
+        ));
+        Self { store, clock, svc }
+    }
+
+    /// A new session of the agent `(PROJECT, host, harness)`.
+    async fn session(&self, host: &str, harness: &str) -> Resolved {
+        self.session_in(Some(PROJECT), host, harness).await
+    }
+
+    async fn session_in(&self, project: Option<&str>, host: &str, harness: &str) -> Resolved {
+        IdentityService::resolve(
+            &*self.store,
+            &*self.clock,
+            IdentityInput {
+                project_key: project.map(str::to_string),
+                host: host.into(),
+                harness: harness.into(),
+                session: SessionId::new(),
+                token: TokenId::new(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn task(&self, by: &Resolved, eligibility: Eligibility) -> Task {
+        self.svc
+            .create(
+                Caller::Agent(by),
+                NewTask {
+                    project_id: project_of(by),
+                    title: "fix the flaky test".into(),
+                    eligibility,
+                    ..NewTask::default()
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    fn set_time(&self, offset: Duration) {
+        let delta = T0 + offset - self.clock.now();
+        self.clock.advance(delta);
+    }
+}
+
+fn project_of(r: &Resolved) -> ProjectId {
+    r.project.as_ref().expect("has a project").id
+}
+
+fn claimed(outcome: ClaimOutcome) -> Task {
+    match outcome {
+        ClaimOutcome::Claimed(t) => t,
+        other => panic!("expected Claimed, got {other:?}"),
+    }
+}
+
+async fn kinds(env: &Env, task: &Task) -> Vec<TaskEventKind> {
+    env.svc
+        .get(task.id)
+        .await
+        .unwrap()
+        .events
+        .iter()
+        .map(|e| e.kind)
+        .collect()
+}
+
+store_matrix!(concurrent_claims_have_one_winner, |store: Arc<
+    dyn Store,
+>| async move {
+    let env = Env::new(store);
+    let creator = env.session("creator", "claude-code").await;
+    let task = env.task(&creator, Eligibility::default()).await;
+
+    let mut agents = Vec::new();
+    for i in 0..20 {
+        agents.push(env.session(&format!("host-{i}"), "claude-code").await);
+    }
+    let handles: Vec<_> = agents
+        .iter()
+        .cloned()
+        .map(|r| {
+            let svc = env.svc.clone();
+            tokio::spawn(async move { svc.claim(&r, task.id).await.unwrap() })
+        })
+        .collect();
+    let mut outcomes = Vec::new();
+    for h in handles {
+        outcomes.push(h.await.unwrap());
+    }
+
+    let winners: Vec<&Task> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            ClaimOutcome::Claimed(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(winners.len(), 1, "exactly one winner: {outcomes:?}");
+    let winner = winners[0].owner_agent_id.unwrap();
+    let lost = outcomes
+        .iter()
+        .filter(|o| {
+            matches!(o, ClaimOutcome::AlreadyOwned { by, until }
+                    if *by == winner && *until == Some(T0 + Duration::minutes(15)))
+        })
+        .count();
+    assert_eq!(lost, 19, "{outcomes:?}");
+
+    let stored = env.store.get_task(task.id).await.unwrap().unwrap();
+    assert_eq!(stored.owner_agent_id, Some(winner));
+    assert_eq!(stored.lease_epoch, 1);
+    assert_eq!(
+        kinds(&env, &task).await,
+        vec![TaskEventKind::Created, TaskEventKind::Claimed]
+    );
+});
+
+store_matrix!(lease_boundary, |store: Arc<dyn Store>| async move {
+    let env = Env::new(store);
+    let a = env.session("mac", "claude-code").await;
+    let b = env.session("linux", "claude-code").await;
+    let task = env.task(&a, Eligibility::default()).await;
+
+    let held = claimed(env.svc.claim(&a, task.id).await.unwrap());
+    assert_eq!(held.lease_expires_at, Some(T0 + Duration::minutes(15)));
+
+    env.set_time(Duration::minutes(15));
+    assert_eq!(
+        env.svc.claim(&b, task.id).await.unwrap(),
+        ClaimOutcome::AlreadyOwned {
+            by: a.agent.id,
+            until: Some(T0 + Duration::minutes(15)),
+        },
+        "a lease is still owned at exactly its expiry instant"
+    );
+
+    env.set_time(Duration::minutes(15) + Duration::seconds(1));
+    let taken = claimed(env.svc.claim(&b, task.id).await.unwrap());
+    assert_eq!(taken.owner_session_id, Some(b.session.id));
+    assert_eq!(taken.lease_epoch, 2);
+
+    let events = env.svc.get(task.id).await.unwrap().events;
+    let last = events.last().unwrap();
+    assert_eq!(last.kind, TaskEventKind::LeaseExpiredTakeover);
+    assert_eq!(last.actor, Actor::Agent(b.agent.id, b.session.id));
+    let payload = last.payload.as_ref().unwrap();
+    assert_eq!(payload["previous_agent_id"], a.agent.id.to_string());
+    assert_eq!(payload["previous_session_id"], a.session.id.to_string());
+    assert!(
+        last.note
+            .as_deref()
+            .unwrap()
+            .contains(&a.agent.id.to_string())
+    );
+
+    assert!(matches!(
+        env.svc.renew(&a, task.id).await,
+        Err(TaskError::LeaseLost)
+    ));
+});
+
+store_matrix!(
+    same_agent_takeover_immediate,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let a = env.session("mac", "claude-code").await;
+        let other = env.session("linux", "claude-code").await;
+        let task = env.task(&a, Eligibility::default()).await;
+        claimed(env.svc.claim(&a, task.id).await.unwrap());
+
+        env.set_time(Duration::minutes(1));
+        assert!(matches!(
+            env.svc.claim(&other, task.id).await.unwrap(),
+            ClaimOutcome::AlreadyOwned { .. }
+        ));
+
+        let a2 = env.session("mac", "claude-code").await;
+        assert_eq!(a2.agent.id, a.agent.id);
+        assert_ne!(a2.session.id, a.session.id);
+        let taken = claimed(env.svc.claim(&a2, task.id).await.unwrap());
+        assert_eq!(taken.owner_session_id, Some(a2.session.id));
+        assert_eq!(taken.lease_expires_at, Some(T0 + Duration::minutes(16)));
+
+        assert!(matches!(
+            env.svc.renew(&a, task.id).await,
+            Err(TaskError::LeaseLost)
+        ));
+        assert!(matches!(
+            env.svc.release(&a, task.id, None).await,
+            Err(TaskError::LeaseLost)
+        ));
+        env.svc.renew(&a2, task.id).await.unwrap();
+    }
+);
+
+store_matrix!(
+    same_agent_two_sessions_race,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let a1 = env.session("mac", "claude-code").await;
+        let task = env.task(&a1, Eligibility::default()).await;
+        claimed(env.svc.claim(&a1, task.id).await.unwrap());
+
+        let a2 = env.session("mac", "claude-code").await;
+        let a3 = env.session("mac", "claude-code").await;
+        let spawn_claim = |r: Resolved| {
+            let svc = env.svc.clone();
+            tokio::spawn(async move { svc.claim(&r, task.id).await.unwrap() })
+        };
+        let (h2, h3) = (spawn_claim(a2.clone()), spawn_claim(a3.clone()));
+        let (t2, t3) = (claimed(h2.await.unwrap()), claimed(h3.await.unwrap()));
+
+        // Both claims succeed (same-agent takeover), but they are serialised: each got its
+        // own epoch and the later one owns the task.
+        let mut epochs = [t2.lease_epoch, t3.lease_epoch];
+        epochs.sort();
+        assert_eq!(epochs, [2, 3]);
+        let (owner, loser) = if t3.lease_epoch > t2.lease_epoch {
+            (&a3, &a2)
+        } else {
+            (&a2, &a3)
+        };
+        let stored = env.store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(stored.owner_session_id, Some(owner.session.id));
+        assert_eq!(stored.lease_epoch, 3);
+
+        assert!(matches!(
+            env.svc.renew(loser, task.id).await,
+            Err(TaskError::LeaseLost)
+        ));
+        env.svc.renew(owner, task.id).await.unwrap();
+    }
+);
+
+store_matrix!(
+    blocked_and_review_never_expire,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let a = env.session("mac", "claude-code").await;
+        let b = env.session("linux", "claude-code").await;
+        let blocked = env.task(&a, Eligibility::default()).await;
+        let review = env.task(&a, Eligibility::default()).await;
+        claimed(env.svc.claim(&a, blocked.id).await.unwrap());
+        claimed(env.svc.claim(&a, review.id).await.unwrap());
+
+        assert!(matches!(
+            env.svc.block(&a, blocked.id, "  ").await,
+            Err(TaskError::ReasonRequired)
+        ));
+        let t = env
+            .svc
+            .block(&a, blocked.id, "waiting on CI")
+            .await
+            .unwrap();
+        assert_eq!(t.status, TaskStatus::Blocked);
+        assert_eq!(t.lease_expires_at, None);
+        env.svc
+            .to_review(&a, review.id, Some("ready".into()))
+            .await
+            .unwrap();
+
+        env.set_time(Duration::hours(5));
+        for task in [&blocked, &review] {
+            assert_eq!(
+                env.svc.claim(&b, task.id).await.unwrap(),
+                ClaimOutcome::AlreadyOwned {
+                    by: a.agent.id,
+                    until: None
+                }
+            );
+        }
+
+        let block_event = env.svc.get(blocked.id).await.unwrap().events;
+        assert_eq!(block_event.last().unwrap().kind, TaskEventKind::Blocked);
+        assert_eq!(
+            block_event.last().unwrap().note.as_deref(),
+            Some("waiting on CI")
+        );
+
+        // The owner resumes a blocked task by claiming it again.
+        let resumed = claimed(env.svc.claim(&a, blocked.id).await.unwrap());
+        assert_eq!(resumed.status, TaskStatus::Claimed);
+        assert_eq!(
+            resumed.lease_expires_at,
+            Some(T0 + Duration::hours(5) + Duration::minutes(15))
+        );
+    }
+);
+
+store_matrix!(
+    heartbeat_renews_until_idle_cap,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let a = env.session("mac", "claude-code").await; // last tool call at t0
+        let task = env.task(&a, Eligibility::default()).await;
+        claimed(env.svc.claim(&a, task.id).await.unwrap());
+
+        // Heartbeats every 10 minutes keep the lease alive up to t0+1h50m.
+        for i in 1..=11 {
+            env.set_time(Duration::minutes(10 * i));
+            assert_eq!(env.svc.renew_by_heartbeat(a.session.id).await.unwrap(), 1);
+        }
+        let lease = |t: Task| t.lease_expires_at.unwrap();
+        let until = T0 + Duration::minutes(110) + Duration::minutes(15);
+        assert_eq!(
+            lease(env.store.get_task(task.id).await.unwrap().unwrap()),
+            until
+        );
+
+        // Past the 2h idle cap the heartbeat no longer renews.
+        env.set_time(Duration::hours(2) + Duration::minutes(1));
+        assert_eq!(env.svc.renew_by_heartbeat(a.session.id).await.unwrap(), 0);
+        assert_eq!(
+            lease(env.store.get_task(task.id).await.unwrap().unwrap()),
+            until
+        );
+
+        // A tool call makes the session active again.
+        env.store
+            .touch_tool_call(a.session.id, env.clock.now())
+            .await
+            .unwrap();
+        assert_eq!(env.svc.renew_by_heartbeat(a.session.id).await.unwrap(), 1);
+        assert_eq!(
+            lease(env.store.get_task(task.id).await.unwrap().unwrap()),
+            T0 + Duration::hours(2) + Duration::minutes(16)
+        );
+
+        // Heartbeats never revive an expired lease.
+        env.set_time(Duration::hours(3));
+        env.store
+            .touch_tool_call(a.session.id, env.clock.now())
+            .await
+            .unwrap();
+        assert_eq!(env.svc.renew_by_heartbeat(a.session.id).await.unwrap(), 0);
+    }
+);
+
+store_matrix!(eligibility_filters, |store: Arc<dyn Store>| async move {
+    let env = Env::new(store);
+    let claude = env.session("mac", "claude-code").await;
+    let codex = env.session("mac", "codex").await;
+    let homeless = env.session_in(None, "mac", "codex").await;
+    let elsewhere = env
+        .session_in(Some("github.com/x/other"), "mac", "codex")
+        .await;
+    let task = env
+        .task(
+            &claude,
+            Eligibility {
+                harness: Some("codex".into()),
+                host: None,
+            },
+        )
+        .await;
+
+    assert_eq!(
+        env.svc.claim(&claude, task.id).await.unwrap(),
+        ClaimOutcome::NotEligible
+    );
+    assert_eq!(
+        env.svc
+            .claim_next(&claude, project_of(&claude))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        env.svc.claim(&homeless, task.id).await.unwrap(),
+        ClaimOutcome::NotEligible,
+        "no home project → not eligible for project-scoped claims"
+    );
+    assert_eq!(
+        env.svc.claim(&elsewhere, task.id).await.unwrap(),
+        ClaimOutcome::NotEligible,
+        "agents of other projects are not eligible"
+    );
+    let next = env
+        .svc
+        .claim_next(&codex, project_of(&codex))
+        .await
+        .unwrap()
+        .expect("codex is eligible");
+    assert_eq!(next.id, task.id);
+    assert_eq!(next.owner_agent_id, Some(codex.agent.id));
+    assert_eq!(
+        env.svc
+            .claim(&codex, coord::domain::TaskId::new())
+            .await
+            .unwrap(),
+        ClaimOutcome::NotFound
+    );
+});
+
+store_matrix!(invalid_transition, |store: Arc<dyn Store>| async move {
+    let env = Env::new(store);
+    let a = env.session("mac", "claude-code").await;
+    let b = env.session("linux", "claude-code").await;
+    let task = env.task(&a, Eligibility::default()).await;
+
+    let err = env
+        .svc
+        .complete(&a, task.id, Completion::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            TaskError::InvalidTransition {
+                from: TaskStatus::Open,
+                to: TaskStatus::Done
+            }
+        ),
+        "{err:?}"
+    );
+
+    claimed(env.svc.claim(&a, task.id).await.unwrap());
+    assert!(matches!(
+        env.svc.release(&b, task.id, None).await,
+        Err(TaskError::NotOwner)
+    ));
+    assert!(matches!(
+        env.svc.renew(&a, coord::domain::TaskId::new()).await,
+        Err(TaskError::NotFound)
+    ));
+    env.svc
+        .complete(&a, task.id, Completion::default())
+        .await
+        .unwrap();
+    assert!(matches!(
+        env.svc.claim(&b, task.id).await.unwrap(),
+        ClaimOutcome::Closed(TaskStatus::Done)
+    ));
+});
+
+store_matrix!(history_kept, |store: Arc<dyn Store>| async move {
+    let env = Env::new(store);
+    let a = env.session("mac", "claude-code").await;
+    let b = env.session("linux", "codex").await;
+    let task = env.task(&a, Eligibility::default()).await;
+
+    claimed(env.svc.claim(&a, task.id).await.unwrap());
+    env.clock.advance(Duration::minutes(1));
+    let released = env
+        .svc
+        .release(&a, task.id, Some("handing off".into()))
+        .await
+        .unwrap();
+    assert_eq!(released.status, TaskStatus::Open);
+    assert_eq!(released.owner_session_id, None);
+    assert_eq!(released.lease_expires_at, None);
+    env.clock.advance(Duration::minutes(1));
+    claimed(env.svc.claim(&b, task.id).await.unwrap());
+    env.clock.advance(Duration::minutes(1));
+    let done = env
+        .svc
+        .complete(
+            &b,
+            task.id,
+            Completion {
+                summary: "fixed".into(),
+                changed_files: vec!["src/lib.rs".into()],
+                tests: vec!["cargo test".into()],
+                links: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(done.status, TaskStatus::Done);
+    assert_eq!(done.owner_agent_id, Some(b.agent.id));
+
+    let detail = env.svc.get(task.id).await.unwrap();
+    let kinds: Vec<_> = detail.events.iter().map(|e| e.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            TaskEventKind::Created,
+            TaskEventKind::Claimed,
+            TaskEventKind::Released,
+            TaskEventKind::Claimed,
+            TaskEventKind::Done,
+        ]
+    );
+    assert_eq!(detail.events[2].note.as_deref(), Some("handing off"));
+    let report = detail.events[4].payload.as_ref().unwrap();
+    assert_eq!(report["summary"], "fixed");
+    assert_eq!(report["changed_files"][0], "src/lib.rs");
+    assert_eq!(detail.task, done);
+});
+
+store_matrix!(claim_next_concurrent_takes_distinct_tasks, |store: Arc<
+    dyn Store,
+>| async move {
+    let env = Env::new(store);
+    let creator = env.session("creator", "claude-code").await;
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        ids.push(env.task(&creator, Eligibility::default()).await.id);
+        env.clock.advance(Duration::seconds(1));
+    }
+    let project = project_of(&creator);
+
+    let mut handles = Vec::new();
+    for i in 0..6 {
+        let r = env.session(&format!("host-{i}"), "claude-code").await;
+        let svc = env.svc.clone();
+        handles.push(tokio::spawn(async move {
+            svc.claim_next(&r, project).await.unwrap()
+        }));
+    }
+    let mut got: Vec<_> = Vec::new();
+    for h in handles {
+        if let Some(t) = h.await.unwrap() {
+            got.push(t.id);
+        }
+    }
+    got.sort();
+    ids.sort();
+    assert_eq!(got, ids, "each open task claimed exactly once");
+});
+
+store_matrix!(cancel_force_release_and_children, |store: Arc<
+    dyn Store,
+>| async move {
+    let env = Env::new(store);
+    let a = env.session("mac", "claude-code").await;
+    let b = env.session("linux", "claude-code").await;
+    let parent = env.task(&a, Eligibility::default()).await;
+    let child = env
+        .svc
+        .create(
+            Caller::Human,
+            NewTask {
+                project_id: project_of(&a),
+                parent_id: Some(parent.id),
+                title: "child".into(),
+                ..NewTask::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(child.created_by, Actor::Human);
+    let detail = env.svc.get(parent.id).await.unwrap();
+    assert_eq!(detail.children, vec![child.clone()]);
+
+    // Only the human or the creating agent may cancel.
+    assert!(matches!(
+        env.svc.cancel(Caller::Agent(&b), parent.id).await,
+        Err(TaskError::NotOwner)
+    ));
+    claimed(env.svc.claim(&b, child.id).await.unwrap());
+    let reopened = env.svc.force_release(child.id).await.unwrap();
+    assert_eq!(reopened.status, TaskStatus::Open);
+    assert_eq!(reopened.owner_agent_id, None);
+    assert_eq!(
+        kinds(&env, &child).await.last(),
+        Some(&TaskEventKind::ForceReleased)
+    );
+
+    let cancelled = env.svc.cancel(Caller::Agent(&a), parent.id).await.unwrap();
+    assert_eq!(cancelled.status, TaskStatus::Cancelled);
+    env.svc.cancel(Caller::Human, child.id).await.unwrap();
+    assert!(matches!(
+        env.svc.cancel(Caller::Human, child.id).await,
+        Err(TaskError::InvalidTransition {
+            from: TaskStatus::Cancelled,
+            to: TaskStatus::Cancelled
+        })
+    ));
+
+    let open = env
+        .svc
+        .list(TaskFilter {
+            project: Some(project_of(&a)),
+            status: Some(TaskStatus::Cancelled),
+            ..TaskFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(open.len(), 2);
+});

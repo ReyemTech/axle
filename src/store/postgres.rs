@@ -2,12 +2,18 @@
 
 use async_trait::async_trait;
 use sqlx::postgres::{PgPoolOptions, PgRow};
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::{Store, StoreError, StoreResult};
-use crate::domain::{Agent, AgentId, Project, ProjectId, Session, SessionId, TokenId};
+use super::{
+    ClaimAttempt, ClaimRequest, LeaseUpdate, Store, StoreError, StoreResult, TaskFilter,
+    TransitionRequest, claim_event,
+};
+use crate::domain::{
+    Actor, Agent, AgentId, Eligibility, Project, ProjectId, Session, SessionId, Task, TaskEvent,
+    TaskId, TokenId,
+};
 
 pub struct PostgresStore {
     pool: PgPool,
@@ -57,6 +63,107 @@ fn session_from(row: &PgRow) -> StoreResult<Session> {
         last_heartbeat_at: row.try_get("last_heartbeat_at")?,
         last_tool_call_at: row.try_get("last_tool_call_at")?,
     })
+}
+
+fn opt_id<T: From<Uuid>>(row: &PgRow, col: &str) -> StoreResult<Option<T>> {
+    Ok(row.try_get::<Option<Uuid>, _>(col)?.map(Into::into))
+}
+
+fn parse_text<T: std::str::FromStr<Err = String>>(s: &str) -> StoreResult<T> {
+    s.parse().map_err(StoreError::Corrupt)
+}
+
+fn task_from(row: &PgRow) -> StoreResult<Task> {
+    Ok(Task {
+        id: row.try_get::<Uuid, _>("id")?.into(),
+        project_id: row.try_get::<Uuid, _>("project_id")?.into(),
+        parent_id: opt_id(row, "parent_id")?,
+        title: row.try_get("title")?,
+        body: row.try_get("body")?,
+        status: parse_text(row.try_get("status")?)?,
+        owner_session_id: opt_id(row, "owner_session_id")?,
+        owner_agent_id: opt_id(row, "owner_agent_id")?,
+        lease_expires_at: row.try_get("lease_expires_at")?,
+        lease_epoch: row.try_get("lease_epoch")?,
+        eligibility: Eligibility {
+            harness: row.try_get("eligible_harness")?,
+            host: row.try_get("eligible_host")?,
+        },
+        created_by: Actor::from_ids(
+            opt_id(row, "created_by_agent_id")?,
+            opt_id(row, "created_by_session_id")?,
+        ),
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        version: row.try_get("version")?,
+    })
+}
+
+fn event_from(row: &PgRow) -> StoreResult<TaskEvent> {
+    let payload: Option<&str> = row.try_get("payload")?;
+    Ok(TaskEvent {
+        id: row.try_get("id")?,
+        task_id: row.try_get::<Uuid, _>("task_id")?.into(),
+        at: row.try_get("created_at")?,
+        actor: Actor::from_ids(
+            opt_id(row, "actor_agent_id")?,
+            opt_id(row, "actor_session_id")?,
+        ),
+        kind: parse_text(row.try_get("kind")?)?,
+        note: row.try_get("note")?,
+        payload: payload
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| StoreError::Corrupt(format!("event payload: {e}")))?,
+    })
+}
+
+async fn insert_event(
+    conn: &mut PgConnection,
+    event: &TaskEvent,
+    token: Option<TokenId>,
+) -> StoreResult<()> {
+    let (agent, session) = event.actor.ids();
+    sqlx::query(
+        "INSERT INTO task_events
+             (id, task_id, kind, actor_agent_id, actor_session_id, token_id, note, payload,
+              created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)",
+    )
+    .bind(event.id)
+    .bind(event.task_id.as_uuid())
+    .bind(event.kind.as_str())
+    .bind(agent.map(|a| a.as_uuid()))
+    .bind(session.map(|s| s.as_uuid()))
+    .bind(token.map(|t| t.as_uuid()))
+    .bind(&event.note)
+    .bind(event.payload.as_ref().map(|p| p.to_string()))
+    .bind(event.at)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Task columns as a literal, so queries stay static SQL.
+macro_rules! task_cols {
+    () => {
+        "id, project_id, parent_id, title, body, status, owner_session_id, owner_agent_id,
+         lease_expires_at, lease_epoch, eligible_harness, eligible_host, created_by_agent_id,
+         created_by_session_id, created_at, updated_at, version"
+    };
+}
+
+/// Whether the claimant may claim the `tasks` row in scope. Uses `$2` harness, `$3` host,
+/// `$4` home project.
+macro_rules! eligible {
+    () => {
+        "COALESCE((eligible_harness IS NULL OR eligible_harness = $2::text)
+                  AND (eligible_host IS NULL OR eligible_host = $3::text)
+                  AND (project_id = $4::uuid OR EXISTS (SELECT 1 FROM task_projects tp
+                                                        WHERE tp.task_id = tasks.id
+                                                          AND tp.project_id = $4::uuid)),
+                  false)"
+    };
 }
 
 /// Session columns (alias `s`) as a literal, so queries stay static SQL.
@@ -236,5 +343,308 @@ impl Store for PostgresStore {
             .iter()
             .map(|row| Ok((agent_from(row, "a_")?, session_from(row)?)))
             .collect()
+    }
+    async fn insert_task(
+        &self,
+        task: &Task,
+        extra_projects: &[ProjectId],
+        token: Option<TokenId>,
+        event: &TaskEvent,
+    ) -> StoreResult<()> {
+        let (by_agent, by_session) = task.created_by.ids();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO tasks
+                 (id, project_id, parent_id, title, body, status, owner_session_id,
+                  owner_agent_id, lease_expires_at, lease_epoch, eligible_harness, eligible_host,
+                  created_by_agent_id, created_by_session_id, token_id, created_at, updated_at,
+                  version)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                     $17, $18)",
+        )
+        .bind(task.id.as_uuid())
+        .bind(task.project_id.as_uuid())
+        .bind(task.parent_id.map(|p| p.as_uuid()))
+        .bind(&task.title)
+        .bind(&task.body)
+        .bind(task.status.as_str())
+        .bind(task.owner_session_id.map(|s| s.as_uuid()))
+        .bind(task.owner_agent_id.map(|a| a.as_uuid()))
+        .bind(task.lease_expires_at)
+        .bind(task.lease_epoch)
+        .bind(&task.eligibility.harness)
+        .bind(&task.eligibility.host)
+        .bind(by_agent.map(|a| a.as_uuid()))
+        .bind(by_session.map(|s| s.as_uuid()))
+        .bind(token.map(|t| t.as_uuid()))
+        .bind(task.created_at)
+        .bind(task.updated_at)
+        .bind(task.version)
+        .execute(&mut *tx)
+        .await?;
+        for project in extra_projects {
+            sqlx::query(
+                "INSERT INTO task_projects (task_id, project_id) VALUES ($1, $2)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(task.id.as_uuid())
+            .bind(project.as_uuid())
+            .execute(&mut *tx)
+            .await?;
+        }
+        insert_event(&mut tx, event, token).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn get_task(&self, id: TaskId) -> StoreResult<Option<Task>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            task_cols!(),
+            " FROM tasks WHERE id = $1"
+        ))
+        .bind(id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(task_from)
+        .transpose()
+    }
+
+    async fn list_tasks(&self, filter: &TaskFilter) -> StoreResult<Vec<Task>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            task_cols!(),
+            " FROM tasks
+             WHERE ($1::uuid IS NULL OR project_id = $1
+                    OR EXISTS (SELECT 1 FROM task_projects tp
+                               WHERE tp.task_id = tasks.id AND tp.project_id = $1))
+               AND ($2::text IS NULL OR status = $2)
+               AND ($3::uuid IS NULL OR owner_agent_id = $3)
+               AND ($4::uuid IS NULL OR parent_id = $4)
+             ORDER BY created_at, id"
+        ))
+        .bind(filter.project.map(|p| p.as_uuid()))
+        .bind(filter.status.map(|s| s.as_str()))
+        .bind(filter.owner.map(|a| a.as_uuid()))
+        .bind(filter.parent.map(|p| p.as_uuid()))
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(task_from)
+        .collect()
+    }
+
+    async fn task_events(&self, id: TaskId) -> StoreResult<Vec<TaskEvent>> {
+        sqlx::query(
+            "SELECT id, task_id, kind, actor_agent_id, actor_session_id, note,
+                    payload::text AS payload, created_at
+             FROM task_events WHERE task_id = $1 ORDER BY created_at, id",
+        )
+        .bind(id.as_uuid())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(event_from)
+        .collect()
+    }
+
+    async fn claim_task(&self, task: TaskId, req: &ClaimRequest) -> StoreResult<ClaimAttempt> {
+        let c = &req.claimant;
+        let mut tx = self.pool.begin().await?;
+        // Lock the row first so `previous` is exactly what the guarded update replaces.
+        let Some(row) = sqlx::query(concat!(
+            "SELECT ",
+            task_cols!(),
+            ", ",
+            eligible!(),
+            " AS eligible FROM tasks WHERE id = $1 FOR UPDATE OF tasks"
+        ))
+        .bind(task.as_uuid())
+        .bind(&c.harness)
+        .bind(&c.host)
+        .bind(c.project.map(|p| p.as_uuid()))
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            return Ok(ClaimAttempt {
+                previous: None,
+                eligible: false,
+                claimed: None,
+            });
+        };
+        let previous = task_from(&row)?;
+        let eligible: bool = row.try_get("eligible")?;
+
+        let claimed = sqlx::query(concat!(
+            "UPDATE tasks
+                SET owner_session_id = $5, owner_agent_id = $6,
+                    status = 'claimed', lease_expires_at = $7,
+                    lease_epoch = lease_epoch + 1, version = version + 1, updated_at = $8
+              WHERE id = $1
+                AND (status = 'open'
+                     OR (status = 'claimed' AND lease_expires_at < $8)
+                     OR (status IN ('claimed', 'blocked', 'review') AND owner_agent_id = $6))
+                AND ",
+            eligible!(),
+            " RETURNING ",
+            task_cols!()
+        ))
+        .bind(task.as_uuid())
+        .bind(&c.harness)
+        .bind(&c.host)
+        .bind(c.project.map(|p| p.as_uuid()))
+        .bind(c.session.as_uuid())
+        .bind(c.agent.as_uuid())
+        .bind(req.lease_until)
+        .bind(req.now)
+        .fetch_optional(&mut *tx)
+        .await?
+        .as_ref()
+        .map(task_from)
+        .transpose()?;
+
+        if claimed.is_some() {
+            insert_event(&mut tx, &claim_event(&previous, req), Some(c.token)).await?;
+        }
+        tx.commit().await?;
+        Ok(ClaimAttempt {
+            previous: Some(previous),
+            eligible,
+            claimed,
+        })
+    }
+
+    async fn claim_next_task(
+        &self,
+        project: ProjectId,
+        req: &ClaimRequest,
+    ) -> StoreResult<Option<Task>> {
+        let c = &req.claimant;
+        let mut tx = self.pool.begin().await?;
+        let Some(row) = sqlx::query(concat!(
+            "WITH pick AS (
+                 SELECT id FROM tasks
+                  WHERE project_id = $1 AND status = 'open' AND ",
+            eligible!(),
+            "     ORDER BY created_at, id
+                  LIMIT 1
+                  FOR UPDATE SKIP LOCKED
+             )
+             UPDATE tasks
+                SET owner_session_id = $5, owner_agent_id = $6,
+                    status = 'claimed', lease_expires_at = $7,
+                    lease_epoch = lease_epoch + 1, version = version + 1, updated_at = $8
+               FROM pick
+              WHERE tasks.id = pick.id AND tasks.status = 'open'
+              RETURNING tasks.id"
+        ))
+        .bind(project.as_uuid())
+        .bind(&c.harness)
+        .bind(&c.host)
+        .bind(c.project.map(|p| p.as_uuid()))
+        .bind(c.session.as_uuid())
+        .bind(c.agent.as_uuid())
+        .bind(req.lease_until)
+        .bind(req.now)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let id: Uuid = row.try_get("id")?;
+        let claimed = task_from(
+            &sqlx::query(concat!(
+                "SELECT ",
+                task_cols!(),
+                " FROM tasks WHERE id = $1"
+            ))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?,
+        )?;
+        // The picked row was `open`, so the event is a plain claim.
+        let previous = Task {
+            status: crate::domain::TaskStatus::Open,
+            owner_session_id: None,
+            owner_agent_id: None,
+            ..claimed.clone()
+        };
+        insert_event(&mut tx, &claim_event(&previous, req), Some(c.token)).await?;
+        tx.commit().await?;
+        Ok(Some(claimed))
+    }
+
+    async fn transition_task(&self, req: &TransitionRequest) -> StoreResult<Option<Task>> {
+        let from: Vec<&str> = req.from.iter().map(|s| s.as_str()).collect();
+        let (keep_lease, lease) = match req.lease {
+            LeaseUpdate::Keep => (true, None),
+            LeaseUpdate::Clear => (false, None),
+            LeaseUpdate::Set(t) => (false, Some(t)),
+        };
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(concat!(
+            "UPDATE tasks
+                SET status = COALESCE($1::text, status),
+                    lease_expires_at = CASE WHEN $2 THEN lease_expires_at
+                                            ELSE $3::timestamptz END,
+                    owner_session_id = CASE WHEN $4 THEN NULL ELSE owner_session_id END,
+                    owner_agent_id = CASE WHEN $4 THEN NULL ELSE owner_agent_id END,
+                    version = version + 1, updated_at = $5
+              WHERE id = $6
+                AND status = ANY($7::text[])
+                AND ($8::uuid IS NULL OR owner_session_id = $8)
+              RETURNING ",
+            task_cols!()
+        ))
+        .bind(req.to.map(|s| s.as_str()))
+        .bind(keep_lease)
+        .bind(lease)
+        .bind(req.clear_owner)
+        .bind(req.now)
+        .bind(req.task.as_uuid())
+        .bind(&from)
+        .bind(req.owner.map(|s| s.as_uuid()))
+        .fetch_optional(&mut *tx)
+        .await?
+        .as_ref()
+        .map(task_from)
+        .transpose()?;
+        if updated.is_some() {
+            insert_event(&mut tx, &req.event, req.token).await?;
+        }
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    async fn session_held_task(&self, task: TaskId, session: SessionId) -> StoreResult<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM task_events
+                            WHERE task_id = $1 AND actor_session_id = $2
+                              AND kind IN ('claimed', 'lease_expired_takeover'))",
+        )
+        .bind(task.as_uuid())
+        .bind(session.as_uuid())
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    async fn extend_session_leases(
+        &self,
+        session: SessionId,
+        now: OffsetDateTime,
+        until: OffsetDateTime,
+    ) -> StoreResult<u64> {
+        let done = sqlx::query(
+            "UPDATE tasks SET lease_expires_at = $1
+             WHERE owner_session_id = $2 AND status = 'claimed' AND lease_expires_at >= $3",
+        )
+        .bind(until)
+        .bind(session.as_uuid())
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected())
     }
 }

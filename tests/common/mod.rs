@@ -2,15 +2,22 @@
 //!
 //! `store_matrix!(name, |store: Arc<dyn Store>| async move { ... })` expands to a module
 //! `name` with one `#[tokio::test]` per backend:
-//! - `name::sqlite` — fresh in-memory SQLite (`sqlite::memory:`), always run;
+//! - `name::sqlite` — a fresh SQLite file in the temp dir (WAL, pooled connections, so
+//!   concurrent tests race for real), always run; the files are removed even on panic;
 //! - `name::postgres` — only with `--features pg-tests`; uses `COORD_TEST_PG_URL` and a
-//!   freshly created schema per test (dropped afterwards), so tests run in parallel.
+//!   freshly created schema per test, dropped afterwards even when the body panics, so
+//!   tests run in parallel.
+//!
+//! Bodies run on a multi-threaded runtime inside a spawned task (so they must be `Send`).
 #![allow(dead_code)]
 
+use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use coord::store::Store;
 use coord::store::sqlite::SqliteStore;
+use tokio::task::JoinError;
 
 macro_rules! store_matrix {
     ($name:ident, $body:expr) => {
@@ -18,29 +25,63 @@ macro_rules! store_matrix {
             #[allow(unused_imports)]
             use super::*;
 
-            #[tokio::test]
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
             async fn sqlite() {
-                let store = crate::common::sqlite_store().await;
-                ($body)(store).await;
+                let (store, _file) = crate::common::sqlite_store().await;
+                crate::common::run_body(($body)(store)).await;
             }
 
             #[cfg(feature = "pg-tests")]
-            #[tokio::test]
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
             async fn postgres() {
                 let (store, schema) = crate::common::pg_store().await;
-                ($body)(store).await;
+                let outcome = crate::common::catch_body(($body)(store)).await;
                 schema.drop().await;
+                crate::common::resume(outcome);
             }
         }
     };
 }
 
-pub async fn sqlite_store() -> Arc<dyn Store> {
-    Arc::new(
-        SqliteStore::connect("sqlite::memory:")
-            .await
-            .expect("open in-memory sqlite store"),
-    )
+/// Runs a test body in its own task so a panic is caught rather than unwinding past cleanup.
+pub async fn catch_body<F>(body: F) -> Result<(), JoinError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(body).await
+}
+
+/// Re-raises a panic captured by `catch_body` (after cleanup has run).
+pub fn resume(outcome: Result<(), JoinError>) {
+    if let Err(e) = outcome {
+        std::panic::resume_unwind(e.into_panic());
+    }
+}
+
+pub async fn run_body<F>(body: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    resume(catch_body(body).await);
+}
+
+/// A temp SQLite database file (plus `-wal` / `-shm`), deleted on drop.
+pub struct TempDb(PathBuf);
+
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
+        }
+    }
+}
+
+pub async fn sqlite_store() -> (Arc<dyn Store>, TempDb) {
+    let path = std::env::temp_dir().join(format!("coord-test-{}.db", uuid::Uuid::now_v7()));
+    let store = SqliteStore::connect(&format!("sqlite://{}", path.display()))
+        .await
+        .expect("open temp-file sqlite store");
+    (Arc::new(store), TempDb(path))
 }
 
 #[cfg(feature = "pg-tests")]
@@ -56,7 +97,8 @@ mod pg {
     use sqlx::AssertSqlSafe;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-    /// A per-test Postgres schema; `drop` removes it once the test body succeeded.
+    /// A per-test Postgres schema; `drop` removes it (the macro calls it whether or not the
+    /// test body panicked).
     pub struct TestSchema {
         admin: PgConnectOptions,
         name: String,
@@ -99,7 +141,7 @@ mod pg {
 
         let scoped = admin.clone().options([("search_path", name.as_str())]);
         let pool = PgPoolOptions::new()
-            .max_connections(4)
+            .max_connections(8)
             .connect_with(scoped)
             .await
             .expect("connect with test search_path");
