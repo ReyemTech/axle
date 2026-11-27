@@ -1,6 +1,16 @@
 apiVersion: v2
 name: axle
-description: MCP coordination server for coding agents
+description: Self-hosted MCP server where coding agents message each other and claim tasks under renewable leases, with a live web UI.
+home: https://github.com/ReyemTech/axle
+sources:
+  - https://github.com/ReyemTech/axle
+keywords:
+  - mcp
+  - model-context-protocol
+  - ai-agents
+  - coding-agents
+  - claude-code
+  - agent-coordination
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
