@@ -1,5 +1,5 @@
-<section id="needs-you" class="needs-you" aria-label="Needs you"{% if needs.is_empty() %} hidden{% endif %}
-         hx-get="/ui/needs-you?back={{ back }}" hx-trigger="sse:overview delay:300ms, every 30s" hx-swap="outerHTML">
+<section id="needs-you" class="needs-you" aria-label="Needs you"{% if needs.is_empty() %} hidden{% endif %} data-keep-drafts
+         hx-get="/ui/needs-you?back={{ back }}" hx-trigger="sse:overview delay:300ms, every 30s, axl:refresh" hx-swap="outerHTML">
 {% if !needs.is_empty() %}
   <header class="needs-head">
     <span class="aspect" data-aspect="plan-submitted" aria-hidden="true"></span>

@@ -315,6 +315,10 @@ pub struct InboxQuery {
     /// Page size (default 20, at most 100).
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Only messages at least this important (`high` or `urgent`), filtered before the page
+    /// limit so they are never hidden behind older ordinary mail.
+    #[serde(default)]
+    pub min_importance: Option<Importance>,
 }
 
 #[derive(Debug, Serialize)]
@@ -345,6 +349,7 @@ async fn inbox_summary(
             &r,
             InboxFilter {
                 limit: Some(limit),
+                min_importance: q.min_importance,
                 ..InboxFilter::default()
             },
         )

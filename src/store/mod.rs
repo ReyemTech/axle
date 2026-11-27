@@ -331,6 +331,9 @@ pub struct InboxFilter {
     pub task: Option<TaskId>,
     /// Only messages of exactly this importance.
     pub importance: Option<Importance>,
+    /// Only messages of at least this importance (applied before `limit`, so mail that
+    /// matters is never hidden behind a page of ordinary mail).
+    pub min_importance: Option<Importance>,
     /// `None`: no limit.
     pub limit: Option<u32>,
 }

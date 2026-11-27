@@ -477,3 +477,52 @@ store_matrix!(
         );
     }
 );
+
+store_matrix!(urgent_behind_a_full_page_still_wakes, |store: Arc<
+    dyn Store,
+>| async move {
+    let home = TempDir::new();
+    let l = live(store, &home.0).await;
+    // More ordinary unread mail than the server's page holds, then urgent and high.
+    for i in 0..105 {
+        l.send(&format!("n{i}"), "x", Importance::Normal).await;
+    }
+    l.send("buried-urgent", "x", Importance::Urgent).await;
+    l.send("buried-high", "x", Importance::High).await;
+    let (h, t) = (home.0.clone(), l.token.clone());
+    let o = tokio::task::spawn_blocking(move || hook(&h, "stop", "{}", Some(&t)))
+        .await
+        .unwrap();
+    assert_eq!((o.code, o.stderr.as_str()), (0, ""));
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(v["decision"], "block");
+    assert!(
+        v["reason"].as_str().unwrap().contains("buried-urgent"),
+        "{v}"
+    );
+    let (h, t) = (home.0.clone(), l.token.clone());
+    let o = tokio::task::spawn_blocking(move || hook(&h, "post-tool-use", "{}", Some(&t)))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    let ctx = v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(ctx.contains("buried-high"), "{ctx}");
+
+    // The summary filters by importance in the query, before the page limit.
+    let only: Value = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/inbox/summary?session={}&min_importance=high&limit=1",
+            l.server, l.session
+        ))
+        .bearer_auth(&l.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(only.as_array().unwrap().len(), 1);
+    assert_eq!(only[0]["subject"], "buried-urgent");
+});

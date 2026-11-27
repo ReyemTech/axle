@@ -2444,3 +2444,41 @@ async fn replying_or_dismissing_clears_a_reply_card() {
         .unwrap();
     assert!(!receipt[0].replied);
 }
+
+#[tokio::test]
+async fn live_refreshes_keep_drafts_and_leases_fresh() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let task = submitted_plan(&app, &iac, "Gated work").await;
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    // Leases renewed by heartbeat publish nothing, so lease and presence views re-render on
+    // a timer as well as on events.
+    assert_eq!(
+        select_texts(&board, "#columns[hx-trigger*='every 60s']").len(),
+        1
+    );
+    assert_eq!(
+        select_texts(
+            &board,
+            "#needs-you[data-keep-drafts][hx-trigger*='axl:refresh']"
+        )
+        .len(),
+        1
+    );
+    let page = app
+        .get(&format!("/ui/tasks/{}", task.id), Some(&cookie))
+        .await;
+    assert_eq!(
+        select_texts(
+            &page,
+            "#task-live[data-keep-drafts][hx-trigger*='every 60s'][hx-trigger*='axl:refresh']"
+        )
+        .len(),
+        1,
+        "the plan form inside the live section keeps its draft"
+    );
+    let js = include_str!("../static/app.js");
+    assert!(js.contains("[data-keep-drafts]") || js.contains("keepDrafts"));
+    assert!(js.contains("hasDraft") && js.contains("axl:refresh"));
+}

@@ -340,6 +340,17 @@ text_enum!(Importance {
     Urgent => "urgent",
 });
 
+impl Importance {
+    /// 0 normal, 1 high, 2 urgent (the order SQL filters compare).
+    pub fn rank(&self) -> i64 {
+        match self {
+            Importance::Normal => 0,
+            Importance::High => 1,
+            Importance::Urgent => 2,
+        }
+    }
+}
+
 /// Where a message goes (spec §9). The project is part of the address, not an access
 /// barrier: any agent may address any project or agent.
 ///

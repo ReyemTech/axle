@@ -243,13 +243,30 @@ fn token(home: &Path, env_token: Option<&str>) -> Result<String, String> {
     }
 }
 
+/// The session's unread mail, oldest first: the server's first page, plus any high or
+/// urgent message beyond it (asked for separately, filtered on the server before the page
+/// limit), so important mail is never hidden behind a full page of ordinary mail. Messages
+/// missing from the first page are newer than all of it, so appending keeps the order.
 async fn fetch(info: &SessionInfo, token: &str) -> Result<Vec<Item>, String> {
     let client = reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .build()
         .map_err(|e| format!("http client: {e}"))?;
+    let mut items = fetch_page(&client, info, token, "").await?;
+    let important = fetch_page(&client, info, token, "&min_importance=high").await?;
+    let have: HashSet<String> = items.iter().map(|i| i.id.clone()).collect();
+    items.extend(important.into_iter().filter(|i| !have.contains(&i.id)));
+    Ok(items)
+}
+
+async fn fetch_page(
+    client: &reqwest::Client,
+    info: &SessionInfo,
+    token: &str,
+    filter: &str,
+) -> Result<Vec<Item>, String> {
     let url = format!(
-        "{}/v1/inbox/summary?session={}&limit={SUMMARY_LIMIT}",
+        "{}/v1/inbox/summary?session={}&limit={SUMMARY_LIMIT}{filter}",
         info.server_url.trim_end_matches('/'),
         info.session_id
     );

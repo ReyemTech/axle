@@ -1291,6 +1291,9 @@ impl Store for PostgresStore {
             "     AND ($3::uuid IS NULL OR m.project_id = $3)
                   AND ($4::uuid IS NULL OR m.task_id = $4)
                   AND ($5::text IS NULL OR m.importance = $5)
+                  AND ($8::bigint IS NULL
+                       OR (CASE m.importance WHEN 'urgent' THEN 2 WHEN 'high' THEN 1 ELSE 0 END)
+                          >= $8)
                   ORDER BY m.seq LIMIT $6
              ),
              stamped AS (
@@ -1313,6 +1316,7 @@ impl Store for PostgresStore {
         .bind(filter.importance.map(|i| i.as_str()))
         .bind(filter.limit.map(i64::from))
         .bind(now)
+        .bind(filter.min_importance.map(|i| i.rank()))
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;

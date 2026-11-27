@@ -52,7 +52,7 @@
 </div>
 <div id="columns" class="columns"
      hx-get="/ui/board/columns{% if let Some(id) = filter %}?project={{ id }}{% endif %}"
-     hx-trigger="sse:board delay:300ms" hx-swap="innerHTML">
+     hx-trigger="sse:board delay:300ms, every 60s" hx-swap="innerHTML">
 {% include "_columns.html" %}
 </div>
 {% endblock %}

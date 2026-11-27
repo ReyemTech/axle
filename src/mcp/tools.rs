@@ -699,6 +699,7 @@ impl AxleMcp {
             },
             task: p.task.as_deref().map(|t| parse_id("task", t)).transpose()?,
             importance: p.importance.map(Into::into),
+            min_importance: None,
             limit: Some(page(p.limit)),
         };
         let items = self.state.messages.inbox(me, filter).await?;

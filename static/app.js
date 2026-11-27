@@ -145,13 +145,37 @@
       if (el) el.classList.add("selected");
     }
   }
-  // A live refresh of "Needs you" must not wipe a change request being written.
+  // A live refresh of a region marked data-keep-drafts (Needs you, the task page's live
+  // section with its plan form) must not wipe something being written: while it has focus,
+  // an open disclosure or a typed but unsent field, the refresh waits, and runs once the
+  // draft is gone (sent, cleared or abandoned with focus elsewhere).
+  function hasDraft(region) {
+    if (region.contains(document.activeElement) && document.activeElement !== region) {
+      return true;
+    }
+    if (region.querySelector("details[open]")) return true;
+    return Array.prototype.some.call(
+      region.querySelectorAll("textarea, input[type=text], input:not([type])"),
+      function (f) { return f.value.trim() !== ""; }
+    );
+  }
   document.addEventListener("htmx:beforeRequest", function (e) {
-    var strip = document.getElementById("needs-you");
-    if (!strip || e.detail.elt !== strip) return;
-    if (strip.querySelector("details[open]") || strip.contains(document.activeElement)) {
+    var region = e.detail.elt;
+    if (!region || !region.matches || !region.matches("[data-keep-drafts]")) return;
+    if (hasDraft(region)) {
+      region.dataset.stale = "1";
       e.preventDefault();
     }
+  });
+  function catchUp() {
+    document.querySelectorAll("[data-keep-drafts][data-stale]").forEach(function (region) {
+      if (hasDraft(region)) return;
+      delete region.dataset.stale;
+      htmx.trigger(region, "axl:refresh");
+    });
+  }
+  ["focusout", "input", "toggle"].forEach(function (name) {
+    document.addEventListener(name, function () { setTimeout(catchUp, 0); }, true);
   });
 
   // New task: the lead project cannot also be an extra project.

@@ -1392,6 +1392,9 @@ impl Store for SqliteStore {
             " AND (?3 IS NULL OR m.project_id = ?3)
               AND (?4 IS NULL OR m.task_id = ?4)
               AND (?5 IS NULL OR m.importance = ?5)
+              AND (?7 IS NULL
+                   OR (CASE m.importance WHEN 'urgent' THEN 2 WHEN 'high' THEN 1 ELSE 0 END)
+                      >= ?7)
              ORDER BY m.seq LIMIT ?6"
         ))
         .bind(&agent)
@@ -1400,6 +1403,7 @@ impl Store for SqliteStore {
         .bind(filter.task.map(|t| t.to_string()))
         .bind(filter.importance.map(|i| i.as_str()))
         .bind(filter.limit.map_or(-1, i64::from))
+        .bind(filter.min_importance.map(|i| i.rank()))
         .fetch_all(&mut *tx)
         .await?;
         let mut items = Vec::with_capacity(rows.len());
