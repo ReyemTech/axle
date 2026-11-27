@@ -276,7 +276,7 @@ Flat. There are no shadows anywhere. Depth is tonal: ground, then the band (a da
 Quiet geometry. Cards, panels, columns, lists and the reader use a 6px radius; buttons and the segmented control 4px; form fields and the error bar 3px. State glyphs are 10px circles, except blocked and urgent which become a 1px-radius square, so shape carries state without colour. Track rules and line swatches are straight bars (2px track, 4px swatch, 8px lease occupancy bar). Dividers are 1px rules; nothing is rounded beyond 6px except the circular glyphs. The 1px `hairline` radius is used only on the blocked square glyph. The one literal `#000` in the stylesheet is the opaque stop of the phone project-filter fade mask (`mask-image`); it is an alpha mask, not a colour.
 
 ### Named Rules
-**The Shape Carries State Rule.** Ring is open, half-filled is claimed, square is blocked, ringed centre is review, solid is done or live, diagonal slash is cancelled. Do not reuse these shapes for non-state meaning.
+**The Shape Carries State Rule.** Ring is open, half-filled is claimed, square is blocked, ringed centre is review, solid is done or live, diagonal slash is cancelled, a dashed red ring is planning (block reserved, work not started) and a dashed amber ring with a centre is a plan awaiting the human. Do not reuse these shapes for non-state meaning.
 
 ## Components
 
@@ -294,6 +294,12 @@ Quiet geometry. Cards, panels, columns, lists and the reader use a 6px radius; b
 - **Content order:** title link (600, persistent 1px Rule Strong underline offset 3px that turns to ink on card or link hover), optional "Subtask of ..." line, state + project row, owner row ("Held by" or "Done by" + mono agent id + live/stale), lease meter, subtask progress.
 - **State:** a blocked card is soft red with a red border. Hover darkens the border and the title underline.
 - **Selection:** j/k moves a 2px outline between `[data-nav]` cards.
+
+### Needs you
+An amber band (Warn Soft fill, Caution Amber 1px border, 6px radius) at the top of the board and the overview, rendered only when something waits on the human. Its head mirrors a column head (glyph, uppercase label, count in warn at 18px bold) over a 2px amber rule. Inside, a responsive grid of attention cards (card fill, 2px amber border, red border and soft red fill for urgent mail), each led by the verb in uppercase warn text beside its glyph ("Approve plan", "Review", "Reply"), then the title link, project, agent and "waiting 12m", a clipped preview, and the action (Approve plan as primary, Request changes as an inline disclosure, or a labelled link). Live refreshes skip the band while a change request is open or focused. The top bar's "N need you" equals the card count and links to it.
+
+### Plan panel
+On the task page, above the lease: the latest plan as peer text in a card-filled box. While it awaits the human the panel takes the Needs-you treatment (warn soft fill, 2px amber border, warn title with the plan-awaiting glyph) and carries Approve plan plus a Request changes form with a required note.
 
 ### Columns
 - **Band:** tinted wash, 6px radius, min-height 160px. Header is 40px with a 2px ink bottom rule, the column's aspect glyph, an uppercase label and a count at the right. The 2px head rules join into one continuous line across the board: each non-last head extends 8px into the gutter with a 2px by 10px vertical joint, so gutters read as junctions between blocks.
