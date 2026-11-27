@@ -7,9 +7,9 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use super::{
-    ClaimAttempt, ClaimRequest, InboxFilter, LeaseUpdate, Recipient, Store, StoreError,
-    StoreResult, TaskFilter, TransitionRequest, child_event, children_complete_event, claim_event,
-    closes_child, send_time_recipient,
+    ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate, Recipient, Store,
+    StoreError, StoreResult, TaskFilter, TransitionRequest, child_event, children_complete_event,
+    claim_event, closes_child, edit_payload, send_time_recipient,
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, Eligibility, InboxItem, Message, MessageId, Project, ProjectId,
@@ -847,12 +847,17 @@ impl Store for PostgresStore {
                AND ($2::text IS NULL OR status = $2)
                AND ($3::uuid IS NULL OR owner_agent_id = $3)
                AND ($4::uuid IS NULL OR parent_id = $4)
-             ORDER BY created_at, id"
+               AND ($5::uuid IS NULL
+                    OR (created_at, id) > (SELECT created_at, id FROM tasks WHERE id = $5))
+             ORDER BY created_at, id
+             LIMIT $6"
         ))
         .bind(filter.project.map(|p| p.as_uuid()))
         .bind(filter.status.map(|s| s.as_str()))
         .bind(filter.owner.map(|a| a.as_uuid()))
         .bind(filter.parent.map(|p| p.as_uuid()))
+        .bind(filter.after.map(|t| t.as_uuid()))
+        .bind(filter.limit.map(i64::from))
         .fetch_all(&self.pool)
         .await?
         .iter()
@@ -958,34 +963,42 @@ impl Store for PostgresStore {
         Ok(updated)
     }
 
-    async fn edit_task(
-        &self,
-        id: TaskId,
-        title: Option<&str>,
-        body: Option<&str>,
-        token: Option<TokenId>,
-        event: &TaskEvent,
-    ) -> StoreResult<Option<Task>> {
+    async fn edit_task(&self, req: &EditRequest<'_>) -> StoreResult<Option<Task>> {
         let mut tx = self.pool.begin().await?;
+        let previous: Option<(String, String)> =
+            sqlx::query_as("SELECT title, body FROM tasks WHERE id = $1 FOR UPDATE")
+                .bind(req.task.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((title, body)) = previous else {
+            return Ok(None);
+        };
         let updated = sqlx::query(concat!(
             "UPDATE tasks
                 SET title = COALESCE($1::text, title), body = COALESCE($2::text, body),
                     version = version + 1, updated_at = $3
               WHERE id = $4
+                AND status NOT IN ('done', 'cancelled')
+                AND (created_by_agent_id = $5
+                     OR (owner_session_id = $6 AND status IN ('claimed', 'blocked', 'review')))
               RETURNING ",
             task_cols!()
         ))
-        .bind(title)
-        .bind(body)
-        .bind(event.at)
-        .bind(id.as_uuid())
+        .bind(req.title)
+        .bind(req.body)
+        .bind(req.event.at)
+        .bind(req.task.as_uuid())
+        .bind(req.agent.as_uuid())
+        .bind(req.session.as_uuid())
         .fetch_optional(&mut *tx)
         .await?
         .as_ref()
         .map(task_from)
         .transpose()?;
         if updated.is_some() {
-            insert_event(&mut tx, event, token).await?;
+            let mut event = req.event.clone();
+            event.payload = Some(edit_payload(req, title, body));
+            insert_event(&mut tx, &event, req.token).await?;
         }
         tx.commit().await?;
         Ok(updated)

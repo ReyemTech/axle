@@ -16,17 +16,19 @@ use serde_json::{Value, json};
 
 use super::{CoordMcp, Labels, ToolError, project_view, render, timestamp};
 use crate::domain::{
-    Address, Agent, Eligibility, Importance, MessageId, Project, ProjectId, SessionId, TaskId,
-    TaskStatus,
+    Address, Agent, Eligibility, Importance, MessageId, Project, ProjectId, Session, SessionId,
+    TaskId, TaskStatus,
 };
 use crate::service::identity::Resolved;
-use crate::service::messages::{InboxFilter, NewMessage};
+use crate::service::messages::{InboxFilter, NewMessage, check_body};
 use crate::service::tasks::{Caller, ClaimOutcome, Completion, NewTask};
 use crate::store::TaskFilter;
 
 /// Page size for inbox and search results when none is asked for, and the most allowed.
 const PAGE: u32 = 20;
 const PAGE_MAX: u32 = 100;
+/// Sessions shown per agent in `agent_list` (most recent first).
+const SESSIONS_PER_AGENT: usize = 10;
 
 /// Every tool description starts with this, so agents never invent ids for themselves.
 macro_rules! described {
@@ -51,9 +53,22 @@ macro_rules! me {
 // ---------------------------------------------------------------- parameters
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ProjectFilterParams {
-    /// Project key (e.g. `github.com/reyemtech/iac`) or display name.
+pub struct ProjectListParams {
+    /// Page size (default 20, at most 100).
+    pub limit: Option<u32>,
+    /// Page cursor: the `next` value of the previous page.
+    pub after: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AgentListParams {
+    /// Only agents whose home project this is (key, e.g. `github.com/reyemtech/iac`, or
+    /// display name).
     pub project: Option<String>,
+    /// Page size (default 20, at most 100).
+    pub limit: Option<u32>,
+    /// Page cursor: the `next` value of the previous page.
+    pub after: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
@@ -185,6 +200,10 @@ pub struct TaskListParams {
     pub owner: Option<String>,
     /// Parent task id: list its children.
     pub parent: Option<String>,
+    /// Page size (default 20, at most 100).
+    pub limit: Option<u32>,
+    /// Page cursor: the `next` value of the previous page.
+    pub after: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -261,21 +280,27 @@ impl CoordMcp {
     }
 
     #[tool(description = described!(
-        "All projects with display names, live agent counts and open task counts."
+        "Projects with display names, live agent counts and open task counts, by key; \
+         paged (`limit`, `after` = the previous page's `next`)."
     ))]
-    async fn project_list(&self, Extension(parts): Extension<Parts>) -> CallToolResult {
+    async fn project_list(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<ProjectListParams>,
+    ) -> CallToolResult {
         let _me = me!(self, parts);
-        render(self.project_list_impl().await)
+        render(self.project_list_impl(p).await)
     }
 
     #[tool(description = described!(
         "Agents and their sessions, with presence and the tasks each session holds; \
-         optionally only agents whose home project is `project`."
+         optionally only agents whose home project is `project`. Ordered by agent label; \
+         paged (`limit`, `after` = the previous page's `next`)."
     ))]
     async fn agent_list(
         &self,
         Extension(parts): Extension<Parts>,
-        Parameters(p): Parameters<ProjectFilterParams>,
+        Parameters(p): Parameters<AgentListParams>,
     ) -> CallToolResult {
         let _me = me!(self, parts);
         render(self.agent_list_impl(p).await)
@@ -345,7 +370,10 @@ impl CoordMcp {
         render(self.task_create_impl(&me, p).await)
     }
 
-    #[tool(description = described!("List tasks, filtered by project, status, owner and parent."))]
+    #[tool(description = described!(
+        "List tasks, oldest first, filtered by project, status, owner and parent; paged \
+         (`limit`, `after` = the previous page's `next`)."
+    ))]
     async fn task_list(
         &self,
         Extension(parts): Extension<Parts>,
@@ -464,7 +492,7 @@ impl CoordMcp {
         }) {
             leases.push(json!({
                 "id": t.id,
-                "title": t.title,
+                "title": labels.task_title(t).await?,
                 "status": t.status,
                 "project": labels.project(t.project_id).await?,
                 "lease_expires_at": t.lease_expires_at.map(timestamp),
@@ -481,14 +509,29 @@ impl CoordMcp {
         }))
     }
 
-    async fn project_list_impl(&self) -> ToolResult {
+    async fn project_list_impl(&self, p: ProjectListParams) -> ToolResult {
         let now = self.state.clock.now();
+        let limit = page(p.limit) as usize;
+        // Ordered by key.
+        let mut projects: Vec<Project> = self
+            .state
+            .store
+            .list_projects()
+            .await?
+            .into_iter()
+            .filter(|proj| {
+                p.after
+                    .as_deref()
+                    .is_none_or(|after| proj.key.as_str() > after)
+            })
+            .collect();
+        let next = more(&mut projects, limit).map(|last| last.key.clone());
         let mut out = vec![];
-        for p in self.state.store.list_projects().await? {
+        for proj in &projects {
             let live: HashSet<_> = self
                 .state
                 .store
-                .list_sessions(Some(p.id))
+                .list_sessions(Some(proj.id))
                 .await?
                 .into_iter()
                 .filter(|(_, s)| now - s.last_heartbeat_at <= self.state.config.presence_stale)
@@ -498,39 +541,50 @@ impl CoordMcp {
                 .state
                 .tasks
                 .list(TaskFilter {
-                    project: Some(p.id),
+                    project: Some(proj.id),
                     status: Some(TaskStatus::Open),
                     ..TaskFilter::default()
                 })
                 .await?
                 .len();
             out.push(json!({
-                "key": p.key,
-                "display_name": p.display_name,
+                "key": proj.key,
+                "display_name": proj.display_name,
                 "live_agents": live.len(),
                 "open_tasks": open,
             }));
         }
-        Ok(json!({ "projects": out }))
+        Ok(json!({ "projects": out, "next": next }))
     }
 
-    async fn agent_list_impl(&self, p: ProjectFilterParams) -> ToolResult {
+    async fn agent_list_impl(&self, p: AgentListParams) -> ToolResult {
         let project = match &p.project {
             Some(name) => Some(self.project(name).await?.id),
             None => None,
         };
         let now = self.state.clock.now();
+        let limit = page(p.limit) as usize;
         let mut labels = self.labels();
-        // Sessions come oldest first; keep agents in first-seen order.
-        let mut agents: Vec<(Agent, Vec<crate::domain::Session>)> = vec![];
+        // Sessions come oldest first; group them by agent.
+        let mut agents: Vec<(String, Agent, Vec<Session>)> = vec![];
         for (agent, session) in self.state.store.list_sessions(project).await? {
-            match agents.iter_mut().find(|(a, _)| a.id == agent.id) {
-                Some((_, sessions)) => sessions.push(session),
-                None => agents.push((agent, vec![session])),
+            match agents.iter_mut().find(|(_, a, _)| a.id == agent.id) {
+                Some((_, _, sessions)) => sessions.push(session),
+                None => {
+                    let label = labels.agent(agent.id).await?;
+                    agents.push((label, agent, vec![session]));
+                }
             }
         }
+        agents.sort_by(|a, b| a.0.cmp(&b.0));
+        agents.retain(|(label, _, _)| {
+            p.after
+                .as_deref()
+                .is_none_or(|after| label.as_str() > after)
+        });
+        let next = more(&mut agents, limit).map(|(label, _, _)| label.clone());
         let mut out = vec![];
-        for (agent, sessions) in agents {
+        for (label, agent, sessions) in agents {
             let held = self
                 .state
                 .tasks
@@ -539,19 +593,24 @@ impl CoordMcp {
                     ..TaskFilter::default()
                 })
                 .await?;
+            let session_count = sessions.len();
             let mut session_views = vec![];
-            for s in sessions {
-                let tasks: Vec<Value> = held
-                    .iter()
-                    .filter(|t| {
-                        t.owner_session_id == Some(s.id)
-                            && matches!(
-                                t.status,
-                                TaskStatus::Claimed | TaskStatus::Blocked | TaskStatus::Review
-                            )
-                    })
-                    .map(|t| json!({ "id": t.id, "title": t.title, "status": t.status }))
-                    .collect();
+            // The most recent sessions only: old ones accumulate and are rarely interesting.
+            for s in sessions.iter().rev().take(SESSIONS_PER_AGENT) {
+                let mut tasks = vec![];
+                for t in held.iter().filter(|t| {
+                    t.owner_session_id == Some(s.id)
+                        && matches!(
+                            t.status,
+                            TaskStatus::Claimed | TaskStatus::Blocked | TaskStatus::Review
+                        )
+                }) {
+                    tasks.push(json!({
+                        "id": t.id,
+                        "title": labels.task_title(t).await?,
+                        "status": t.status,
+                    }));
+                }
                 session_views.push(json!({
                     "session": s.id,
                     "live": now - s.last_heartbeat_at <= self.state.config.presence_stale,
@@ -560,17 +619,18 @@ impl CoordMcp {
                 }));
             }
             out.push(json!({
-                "agent": labels.agent(agent.id).await?,
+                "agent": label,
                 "project": match agent.project_id {
                     Some(p) => Some(labels.project(p).await?),
                     None => None,
                 },
                 "host": agent.host,
                 "harness": agent.harness,
+                "session_count": session_count,
                 "sessions": session_views,
             }));
         }
-        Ok(json!({ "agents": out }))
+        Ok(json!({ "agents": out, "next": next }))
     }
 
     async fn send_message_impl(&self, me: &Resolved, p: SendMessageParams) -> ToolResult {
@@ -710,6 +770,7 @@ impl CoordMcp {
     }
 
     async fn task_list_impl(&self, p: TaskListParams) -> ToolResult {
+        let limit = page(p.limit);
         let filter = TaskFilter {
             project: match &p.project {
                 Some(name) => Some(self.project(name).await?.id),
@@ -725,14 +786,22 @@ impl CoordMcp {
                 .as_deref()
                 .map(|id| parse_id("parent task", id))
                 .transpose()?,
+            after: p
+                .after
+                .as_deref()
+                .map(|id| parse_id("cursor task", id))
+                .transpose()?,
+            // One extra row says whether there is another page.
+            limit: Some(limit + 1),
         };
-        let tasks = self.state.tasks.list(filter).await?;
+        let mut tasks = self.state.tasks.list(filter).await?;
+        let next = more(&mut tasks, limit as usize).map(|last| last.id);
         let mut labels = self.labels();
         let mut out = Vec::with_capacity(tasks.len());
         for t in &tasks {
             out.push(labels.task_summary(t).await?);
         }
-        Ok(json!({ "tasks": out }))
+        Ok(json!({ "tasks": out, "next": next }))
     }
 
     async fn task_get_impl(&self, p: TaskIdParams) -> ToolResult {
@@ -838,6 +907,9 @@ impl CoordMcp {
         Ok(json!({ "id": message.id, "task": id }))
     }
 
+    /// Everything that can be refused without writing is checked first; the status change
+    /// (owner-guarded) runs before the edit, so a refused update writes nothing. After a
+    /// successful status change the caller holds the task, so the edit's guard passes.
     async fn task_update_impl(&self, me: &Resolved, p: TaskUpdateParams) -> ToolResult {
         let id: TaskId = parse_id("task", &p.id)?;
         if p.status.is_none() && p.title.is_none() && p.body.is_none() {
@@ -845,27 +917,35 @@ impl CoordMcp {
                 "nothing to update: pass `status`, `title` and/or `body`",
             ));
         }
+        if p.reason.is_some() && p.status.is_none() {
+            return Err(ToolError::invalid(
+                "`reason` goes with `status`; pass `status: blocked` or `status: review`",
+            ));
+        }
         if p.title.as_deref().is_some_and(|t| t.trim().is_empty()) {
             return Err(ToolError::invalid("a task needs a title"));
         }
-        let mut task = None;
+        if let Some(body) = &p.body {
+            check_body(body).map_err(ToolError::from)?;
+        }
+        let reason = non_blank(p.reason);
+        if matches!(p.status, Some(UpdateStatusParam::Blocked)) && reason.is_none() {
+            return Err(ToolError::invalid("a reason is required to block a task"));
+        }
+        let mut task = match p.status {
+            Some(UpdateStatusParam::Blocked) => Some(
+                self.state
+                    .tasks
+                    .block(me, id, reason.as_deref().unwrap_or_default())
+                    .await?,
+            ),
+            Some(UpdateStatusParam::Review) => {
+                Some(self.state.tasks.to_review(me, id, reason).await?)
+            }
+            None => None,
+        };
         if p.title.is_some() || p.body.is_some() {
             task = Some(self.state.tasks.edit(me, id, p.title, p.body).await?);
-        }
-        match p.status {
-            Some(UpdateStatusParam::Blocked) => {
-                let reason = p.reason.unwrap_or_default();
-                task = Some(self.state.tasks.block(me, id, &reason).await?);
-            }
-            Some(UpdateStatusParam::Review) => {
-                task = Some(
-                    self.state
-                        .tasks
-                        .to_review(me, id, non_blank(p.reason))
-                        .await?,
-                );
-            }
-            None => {}
         }
         let task = task.expect("at least one update ran");
         self.labels().task_summary(&task).await
@@ -997,6 +1077,16 @@ fn parse_id<T: FromStr>(what: &str, s: &str) -> Result<T, ToolError> {
     s.trim()
         .parse()
         .map_err(|_| ToolError::invalid(format!("{what} id {s:?} is not a valid id")))
+}
+
+/// Truncates `items` to `limit` and, if that dropped any, returns the last kept item (the
+/// next page's cursor).
+fn more<T>(items: &mut Vec<T>, limit: usize) -> Option<&T> {
+    if items.len() <= limit {
+        return None;
+    }
+    items.truncate(limit);
+    items.last()
 }
 
 fn page(limit: Option<u32>) -> u32 {

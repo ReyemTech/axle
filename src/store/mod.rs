@@ -157,16 +157,13 @@ pub trait Store: Send + Sync {
     /// `owner` is set) `owner_session_id = owner`. Appends `event` in the same transaction.
     /// `None` when the guard did not match (callers re-read to explain why).
     async fn transition_task(&self, req: &TransitionRequest) -> StoreResult<Option<Task>>;
-    /// Sets the title and/or body (`None` keeps each), bumps `version` / `updated_at` and
-    /// appends `event`, in one transaction. `None` if the task does not exist.
-    async fn edit_task(
-        &self,
-        id: TaskId,
-        title: Option<&str>,
-        body: Option<&str>,
-        token: Option<TokenId>,
-        event: &TaskEvent,
-    ) -> StoreResult<Option<Task>>;
+    /// A guarded edit, in one transaction: applies only if the task is not `done` /
+    /// `cancelled` and `req.agent` created it or `req.session` holds it (`claimed`, `blocked`
+    /// or `review`). Sets the title and/or body (`None` keeps each), bumps `version` /
+    /// `updated_at`, and appends `req.event` with its payload set to the replaced values
+    /// (`previous_title` / `previous_body`, read under the lock). `None` when the guard did not
+    /// match (callers re-read to explain why).
+    async fn edit_task(&self, req: &EditRequest<'_>) -> StoreResult<Option<Task>>;
     /// Whether `session` ever claimed `task` (distinguishes "lost the lease" from "never
     /// owned it").
     async fn session_held_task(&self, task: TaskId, session: SessionId) -> StoreResult<bool>;
@@ -328,6 +325,35 @@ pub struct TaskFilter {
     pub status: Option<TaskStatus>,
     pub owner: Option<AgentId>,
     pub parent: Option<TaskId>,
+    /// Page cursor: only tasks after this one in `(created_at, id)` order.
+    pub after: Option<TaskId>,
+    /// `None`: no limit.
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EditRequest<'a> {
+    pub task: TaskId,
+    pub title: Option<&'a str>,
+    pub body: Option<&'a str>,
+    /// The editor: allowed as the task's creator, or as the session holding it.
+    pub agent: AgentId,
+    pub session: SessionId,
+    pub token: Option<TokenId>,
+    /// Appended on success (`at` is also the new `updated_at`); its payload is filled in.
+    pub event: TaskEvent,
+}
+
+/// `previous_title` / `previous_body` for the fields an edit replaces.
+pub fn edit_payload(req: &EditRequest<'_>, title: String, body: String) -> serde_json::Value {
+    let mut previous = serde_json::Map::new();
+    if req.title.is_some() {
+        previous.insert("previous_title".into(), title.into());
+    }
+    if req.body.is_some() {
+        previous.insert("previous_body".into(), body.into());
+    }
+    previous.into()
 }
 
 impl ClaimRequest {

@@ -10,9 +10,9 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 use time::{Duration as TimeDuration, OffsetDateTime};
 
 use super::{
-    ClaimAttempt, ClaimRequest, InboxFilter, LeaseUpdate, Recipient, Store, StoreError,
-    StoreResult, TaskFilter, TransitionRequest, child_event, children_complete_event, claim_event,
-    closes_child, send_time_recipient,
+    ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate, Recipient, Store,
+    StoreError, StoreResult, TaskFilter, TransitionRequest, child_event, children_complete_event,
+    claim_event, closes_child, edit_payload, send_time_recipient,
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, Eligibility, InboxItem, Message, MessageId, Project, ProjectId,
@@ -922,12 +922,17 @@ impl Store for SqliteStore {
                AND (?2 IS NULL OR status = ?2)
                AND (?3 IS NULL OR owner_agent_id = ?3)
                AND (?4 IS NULL OR parent_id = ?4)
-             ORDER BY created_at, id"
+               AND (?5 IS NULL
+                    OR (created_at, id) > (SELECT created_at, id FROM tasks WHERE id = ?5))
+             ORDER BY created_at, id
+             LIMIT ?6"
         ))
         .bind(project)
         .bind(status)
         .bind(owner)
         .bind(parent)
+        .bind(filter.after.map(|t| t.to_string()))
+        .bind(filter.limit.map_or(-1, i64::from))
         .fetch_all(&self.pool)
         .await?
         .iter()
@@ -1042,34 +1047,42 @@ impl Store for SqliteStore {
         Ok(updated)
     }
 
-    async fn edit_task(
-        &self,
-        id: TaskId,
-        title: Option<&str>,
-        body: Option<&str>,
-        token: Option<TokenId>,
-        event: &TaskEvent,
-    ) -> StoreResult<Option<Task>> {
+    async fn edit_task(&self, req: &EditRequest<'_>) -> StoreResult<Option<Task>> {
         let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let previous: Option<(String, String)> =
+            sqlx::query_as("SELECT title, body FROM tasks WHERE id = ?")
+                .bind(req.task.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((title, body)) = previous else {
+            return Ok(None);
+        };
         let updated = sqlx::query(concat!(
             "UPDATE tasks
-                SET title = COALESCE(?, title), body = COALESCE(?, body),
-                    version = version + 1, updated_at = ?
-              WHERE id = ?
+                SET title = COALESCE(?1, title), body = COALESCE(?2, body),
+                    version = version + 1, updated_at = ?3
+              WHERE id = ?4
+                AND status NOT IN ('done', 'cancelled')
+                AND (created_by_agent_id = ?5
+                     OR (owner_session_id = ?6 AND status IN ('claimed', 'blocked', 'review')))
               RETURNING ",
             task_cols!()
         ))
-        .bind(title)
-        .bind(body)
-        .bind(ts::enc(event.at))
-        .bind(id.to_string())
+        .bind(req.title)
+        .bind(req.body)
+        .bind(ts::enc(req.event.at))
+        .bind(req.task.to_string())
+        .bind(req.agent.to_string())
+        .bind(req.session.to_string())
         .fetch_optional(&mut *tx)
         .await?
         .as_ref()
         .map(task_from)
         .transpose()?;
         if updated.is_some() {
-            insert_event(&mut tx, event, token).await?;
+            let mut event = req.event.clone();
+            event.payload = Some(edit_payload(req, title, body));
+            insert_event(&mut tx, &event, req.token).await?;
         }
         tx.commit().await?;
         Ok(updated)

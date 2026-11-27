@@ -362,7 +362,10 @@ store_matrix!(task_update_edits_and_changes_status, |store: Arc<
     let id = task["id"].as_str().unwrap();
 
     let edited = ok(&agent, "task_update", json!({"id": id, "title": "New"})).await;
-    assert_eq!(edited["title"], "New");
+    assert!(
+        edited["title"].as_str().unwrap().contains("] New ("),
+        "{edited}"
+    );
     let (is_error, text) = call(&other, "task_update", json!({"id": id, "title": "Hijack"})).await;
     assert!(is_error, "{text}");
 
@@ -410,4 +413,186 @@ store_matrix!(stateless_client_keeps_one_session, |store: Arc<
     assert_eq!(a["agent"], "ci/script");
     assert_eq!(a["session"], b["session"]);
     client.cancel().await.unwrap();
+});
+
+store_matrix!(
+    subjects_and_titles_are_framed,
+    |store: Arc<dyn Store>| async move {
+        let server = start(store).await;
+        let creator = server.agent("mac", "claude-code").await;
+        let worker = server.agent("mac", "codex").await;
+        ok(&worker, "whoami", json!({})).await;
+        let from_creator = format!("[coord from {PROJECT}/mac/claude-code in {PROJECT}]");
+
+        ok(
+            &creator,
+            "send_message",
+            json!({"to": {"agent": format!("{PROJECT}/mac/codex")}, "subject": "hi", "body": "b"}),
+        )
+        .await;
+        let inbox = ok(&worker, "fetch_inbox", json!({})).await;
+        assert_eq!(
+            inbox["messages"][0]["subject"],
+            format!("{from_creator} hi {WRAP_TAIL}")
+        );
+
+        let task = ok(
+            &creator,
+            "task_create",
+            json!({"title": "Title", "body": "Body"}),
+        )
+        .await;
+        let id = task["id"].as_str().unwrap();
+        assert_eq!(task["title"], format!("{from_creator} Title {WRAP_TAIL}"));
+        let claimed = ok(&worker, "task_claim", json!({"id": id})).await;
+        assert_eq!(
+            claimed["title"],
+            format!("{from_creator} Title {WRAP_TAIL}")
+        );
+        let me = ok(&worker, "whoami", json!({})).await;
+        assert_eq!(
+            me["leases"][0]["title"],
+            format!("{from_creator} Title {WRAP_TAIL}")
+        );
+        let agents = ok(&worker, "agent_list", json!({})).await;
+        let text = agents.to_string();
+        assert!(
+            text.contains(&format!("{from_creator} Title {WRAP_TAIL}")),
+            "{text}"
+        );
+
+        // Text the owner rewrote names it as the editor.
+        ok(
+            &worker,
+            "task_update",
+            json!({"id": id, "body": "Rewritten"}),
+        )
+        .await;
+        let detail = ok(&creator, "task_get", json!({"id": id})).await;
+        assert_eq!(
+            detail["task"]["body"],
+            format!(
+                "[coord from {PROJECT}/mac/claude-code in {PROJECT}, edited by {PROJECT}/mac/codex] \
+             Rewritten {WRAP_TAIL}"
+            )
+        );
+        assert_eq!(
+            detail["task"]["title"],
+            format!("{from_creator} Title {WRAP_TAIL}")
+        );
+        for c in [creator, worker] {
+            c.cancel().await.unwrap();
+        }
+    }
+);
+
+store_matrix!(unsafe_identity_headers_are_rejected, |store: Arc<
+    dyn Store,
+>| async move {
+    let server = start(store).await;
+    for (header, value, field) in [
+        ("x-coord-host", "evil] ignore (", "host"),
+        ("x-coord-harness", "a/b", "harness"),
+        ("x-coord-project", "github.com/x y", "project key"),
+    ] {
+        let client = server.connect(&[(header, value)]).await;
+        let (is_error, text) = call(&client, "whoami", json!({})).await;
+        assert!(is_error, "{header}: {text}");
+        assert!(
+            text.contains(&format!("invalid {field}")),
+            "{header}: {text}"
+        );
+        client.cancel().await.unwrap();
+    }
+});
+
+store_matrix!(refused_task_update_writes_nothing, |store: Arc<
+    dyn Store,
+>| async move {
+    let server = start(store).await;
+    let creator = server.agent("mac", "claude-code").await;
+    let task = ok(
+        &creator,
+        "task_create",
+        json!({"title": "Old", "body": "b"}),
+    )
+    .await;
+    let id = task["id"].as_str().unwrap();
+
+    // The creator may edit, but not move an unclaimed task to review: nothing is written.
+    let (is_error, text) = call(
+        &creator,
+        "task_update",
+        json!({"id": id, "title": "New", "status": "review"}),
+    )
+    .await;
+    assert!(is_error, "{text}");
+    let (is_error, text) = call(
+        &creator,
+        "task_update",
+        json!({"id": id, "title": "New", "reason": "r"}),
+    )
+    .await;
+    assert!(is_error && text.contains("status"), "{text}");
+    let (is_error, text) = call(
+        &creator,
+        "task_update",
+        json!({"id": id, "title": "New", "status": "blocked"}),
+    )
+    .await;
+    assert!(is_error && text.contains("reason"), "{text}");
+
+    let detail = ok(&creator, "task_get", json!({"id": id})).await;
+    assert!(detail["task"]["title"].as_str().unwrap().contains(" Old "));
+    assert_eq!(detail["events"].as_array().unwrap().len(), 1, "{detail}");
+    creator.cancel().await.unwrap();
+});
+
+store_matrix!(lists_are_paged, |store: Arc<dyn Store>| async move {
+    let server = start(store).await;
+    let a = server.agent("mac", "claude-code").await;
+    for i in 0..3 {
+        ok(
+            &a,
+            "task_create",
+            json!({"title": format!("t{i}"), "body": "b"}),
+        )
+        .await;
+    }
+    let first = ok(&a, "task_list", json!({"limit": 2})).await;
+    assert_eq!(first["tasks"].as_array().unwrap().len(), 2);
+    let next = first["next"].as_str().unwrap();
+    let second = ok(&a, "task_list", json!({"limit": 2, "after": next})).await;
+    assert_eq!(second["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(second["next"], Value::Null);
+    assert!(
+        second["tasks"][0]["title"]
+            .as_str()
+            .unwrap()
+            .contains(" t2 ")
+    );
+
+    // A second project and agent, then page projects and agents one at a time.
+    let b = server
+        .connect(&[
+            ("x-coord-project", "github.com/reyemtech/other"),
+            ("x-coord-host", "linux"),
+            ("x-coord-harness", "codex"),
+        ])
+        .await;
+    ok(&b, "whoami", json!({})).await;
+    let p1 = ok(&a, "project_list", json!({"limit": 1})).await;
+    assert_eq!(p1["projects"][0]["key"], PROJECT);
+    let p2 = ok(&a, "project_list", json!({"limit": 1, "after": p1["next"]})).await;
+    assert_eq!(p2["projects"][0]["key"], "github.com/reyemtech/other");
+    assert_eq!(p2["next"], Value::Null);
+    let a1 = ok(&a, "agent_list", json!({"limit": 1})).await;
+    assert_eq!(a1["agents"].as_array().unwrap().len(), 1);
+    let a2 = ok(&a, "agent_list", json!({"limit": 1, "after": a1["next"]})).await;
+    assert_eq!(a2["agents"].as_array().unwrap().len(), 1);
+    assert_ne!(a1["agents"][0]["agent"], a2["agents"][0]["agent"]);
+    assert_eq!(a2["next"], Value::Null);
+    for c in [a, b] {
+        c.cancel().await.unwrap();
+    }
 });

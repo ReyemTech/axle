@@ -93,7 +93,9 @@ async fn register(
 
 fn identity_error(e: IdentityError) -> ApiError {
     match e {
-        IdentityError::Missing(_) => ApiError::new(StatusCode::BAD_REQUEST, e.to_string()),
+        IdentityError::Missing(_) | IdentityError::Invalid { .. } => {
+            ApiError::new(StatusCode::BAD_REQUEST, e.to_string())
+        }
         IdentityError::SessionAgentMismatch { .. } => {
             ApiError::new(StatusCode::CONFLICT, e.to_string())
         }

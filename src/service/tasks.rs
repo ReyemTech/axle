@@ -18,8 +18,8 @@ use crate::events::{Event, EventBus};
 use crate::service::identity::Resolved;
 use crate::service::messages::{MessageError, check_body};
 use crate::store::{
-    ClaimRequest, Claimant, LeaseUpdate, Store, StoreError, TaskFilter, TransitionRequest,
-    claim_event,
+    ClaimRequest, Claimant, EditRequest, LeaseUpdate, Store, StoreError, TaskFilter,
+    TransitionRequest, claim_event,
 };
 
 /// Who is calling a task operation that agents and the human may both perform.
@@ -150,6 +150,8 @@ pub enum TaskError {
     InvalidTransition { from: TaskStatus, to: TaskStatus },
     #[error("task not found")]
     NotFound,
+    #[error("the task is {0}")]
+    Closed(TaskStatus),
     #[error("a reason is required to block a task")]
     ReasonRequired,
     #[error("a task lease TTL must be at least one second")]
@@ -472,8 +474,9 @@ impl TaskService {
     }
 
     /// Changes the title and/or body (`None` keeps each). Allowed for the creating agent and
-    /// the agent that currently owns the task. The previous values are kept in the `edited`
-    /// event, so history stays append-only.
+    /// for the session holding the task (`claimed`, `blocked` or `review`); never on a `done`
+    /// or `cancelled` task. The check is part of the write. The replaced values are kept in
+    /// the `edited` event, so history stays append-only.
     pub async fn edit(
         &self,
         caller: &Resolved,
@@ -484,36 +487,30 @@ impl TaskService {
         if let Some(body) = &body {
             check_body(body)?;
         }
+        let req = EditRequest {
+            task: id,
+            title: title.as_deref(),
+            body: body.as_deref(),
+            agent: caller.agent.id,
+            session: caller.session.id,
+            token: Some(caller.session.token_id),
+            event: self.event(id, actor_of(caller), TaskEventKind::Edited, None, None),
+        };
+        if let Some(task) = self.store.edit_task(&req).await? {
+            self.changed(&task, TaskEventKind::Edited).await;
+            return Ok(task);
+        }
         let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
-        let agent = caller.agent.id;
-        let created = matches!(task.created_by, Actor::Agent(a, _) if a == agent);
-        if !created && task.owner_agent_id != Some(agent) {
-            return Err(TaskError::NotOwner);
+        if matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled) {
+            return Err(TaskError::Closed(task.status));
         }
-        let mut previous = serde_json::Map::new();
-        if title.is_some() {
-            previous.insert("previous_title".into(), task.title.into());
-        }
-        if body.is_some() {
-            previous.insert("previous_body".into(), task.body.into());
-        }
-        let event = self.event(
-            id,
-            actor_of(caller),
-            TaskEventKind::Edited,
-            None,
-            Some(previous.into()),
-        );
-        self.store
-            .edit_task(
-                id,
-                title.as_deref(),
-                body.as_deref(),
-                Some(caller.session.token_id),
-                &event,
-            )
-            .await?
-            .ok_or(TaskError::NotFound)
+        Err(
+            if self.store.session_held_task(id, caller.session.id).await? {
+                TaskError::LeaseLost
+            } else {
+                TaskError::NotOwner
+            },
+        )
     }
 
     /// Cancels a not-yet-closed task. Allowed for the human and for the creating agent.

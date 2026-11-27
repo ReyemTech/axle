@@ -1045,3 +1045,118 @@ store_matrix!(
         );
     }
 );
+
+store_matrix!(edit_is_guarded_attributed_and_published, |store: Arc<
+    dyn Store,
+>| async move {
+    let env = Env::new(store.clone());
+    let bus = coord::events::EventBus::new(store.clone(), env.clock.clone());
+    let svc = TaskService::new(
+        store.clone(),
+        env.clock.clone(),
+        Duration::minutes(15),
+        Duration::hours(2),
+    )
+    .with_events(bus.clone());
+    let mut rx = bus.subscribe();
+    let creator = env.session("creator", "claude-code").await;
+    let task = env.task(&creator, Eligibility::default()).await;
+
+    // The creator may edit; the replaced value is kept and a TaskChanged is published.
+    let edited = svc
+        .edit(&creator, task.id, Some("renamed".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(edited.title, "renamed");
+    assert_eq!(edited.body, task.body);
+    assert_eq!(edited.version, task.version + 1);
+    let last = svc.get(task.id).await.unwrap().events.pop().unwrap();
+    assert_eq!(last.kind, TaskEventKind::Edited);
+    assert_eq!(
+        last.payload,
+        Some(serde_json::json!({"previous_title": "fix the flaky test"}))
+    );
+    match rx.recv().await.unwrap() {
+        coord::events::Event::TaskChanged { id, kind, .. } => {
+            assert_eq!((id, kind), (task.id, TaskEventKind::Edited));
+        }
+        other => panic!("expected TaskChanged, got {other:?}"),
+    }
+
+    // Another agent may not, until its session holds the task.
+    let worker = env.session("worker", "codex").await;
+    assert!(matches!(
+        svc.edit(&worker, task.id, None, Some("x".into())).await,
+        Err(TaskError::NotOwner)
+    ));
+    claimed(svc.claim(&worker, task.id).await.unwrap());
+    svc.edit(&worker, task.id, None, Some("worker body".into()))
+        .await
+        .unwrap();
+
+    // A second session of the owning agent does not hold the lease, so it may not edit...
+    let worker_again = env.session("worker", "codex").await;
+    assert!(matches!(
+        svc.edit(&worker_again, task.id, None, Some("y".into()))
+            .await,
+        Err(TaskError::NotOwner)
+    ));
+    // ...and once it takes the task over, the first session has lost it.
+    claimed(svc.claim(&worker_again, task.id).await.unwrap());
+    assert!(matches!(
+        svc.edit(&worker, task.id, None, Some("z".into())).await,
+        Err(TaskError::LeaseLost)
+    ));
+
+    // Closed tasks are never edited, not even by their creator.
+    svc.complete(
+        &worker_again,
+        task.id,
+        Completion {
+            summary: "done".into(),
+            ..Completion::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        svc.edit(&creator, task.id, Some("late".into()), None).await,
+        Err(TaskError::Closed(TaskStatus::Done))
+    ));
+    let after = store.get_task(task.id).await.unwrap().unwrap();
+    assert_eq!(
+        (after.title.as_str(), after.body.as_str()),
+        ("renamed", "worker body")
+    );
+});
+
+store_matrix!(
+    task_list_pages_by_cursor,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store.clone());
+        let creator = env.session("creator", "claude-code").await;
+        let mut ids = vec![];
+        for _ in 0..3 {
+            ids.push(env.task(&creator, Eligibility::default()).await.id);
+        }
+        let page = |after: Option<TaskId>| {
+            let store = store.clone();
+            async move {
+                store
+                    .list_tasks(&TaskFilter {
+                        after,
+                        limit: Some(2),
+                        ..TaskFilter::default()
+                    })
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|t| t.id)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(page(None).await, ids[..2]);
+        assert_eq!(page(Some(ids[1])).await, ids[2..]);
+        assert_eq!(page(Some(ids[2])).await, Vec::<TaskId>::new());
+    }
+);

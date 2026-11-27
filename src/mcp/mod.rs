@@ -27,7 +27,8 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::domain::{
-    Actor, Address, AgentId, Message, Project, ProjectId, SessionId, Task, TokenId,
+    Actor, Address, AgentId, Message, Project, ProjectId, SessionId, Task, TaskEventKind, TaskId,
+    TokenId,
 };
 use crate::http::{AppState, AuthToken};
 use crate::service::identity::{IdentityError, IdentityInput, IdentityService, Resolved};
@@ -243,6 +244,14 @@ pub struct Labels<'a> {
     store: &'a dyn Store,
     agents: HashMap<AgentId, String>,
     projects: HashMap<ProjectId, String>,
+    editors: HashMap<TaskId, Editors>,
+}
+
+/// Who last replaced a task's title and body, if anyone did.
+#[derive(Debug, Clone, Copy, Default)]
+struct Editors {
+    title: Option<Actor>,
+    body: Option<Actor>,
 }
 
 impl<'a> Labels<'a> {
@@ -251,6 +260,7 @@ impl<'a> Labels<'a> {
             store,
             agents: HashMap::new(),
             projects: HashMap::new(),
+            editors: HashMap::new(),
         }
     }
 
@@ -305,14 +315,57 @@ impl<'a> Labels<'a> {
         project: Option<ProjectId>,
         text: &str,
     ) -> Result<String, ToolError> {
-        let from = self.actor(from).await?;
+        self.wrap_edited(from, None, project, text).await
+    }
+
+    /// `wrap`, naming the actor who last rewrote `text` when that is not its author.
+    async fn wrap_edited(
+        &mut self,
+        from: Actor,
+        editor: Option<Actor>,
+        project: Option<ProjectId>,
+        text: &str,
+    ) -> Result<String, ToolError> {
+        let from_label = self.actor(from).await?;
         let project = match project {
             Some(p) => self.project(p).await?,
             None => "no project".to_string(),
         };
+        let edited = match editor {
+            Some(e) if !same_author(e, from) => format!(", edited by {}", self.actor(e).await?),
+            _ => String::new(),
+        };
         Ok(format!(
-            "[coord from {from} in {project}] {text} {WRAP_TAIL}"
+            "[coord from {from_label} in {project}{edited}] {text} {WRAP_TAIL}"
         ))
+    }
+
+    async fn editors(&mut self, t: &Task) -> Result<Editors, ToolError> {
+        if let Some(e) = self.editors.get(&t.id) {
+            return Ok(*e);
+        }
+        let mut editors = Editors::default();
+        for e in self.store.task_events(t.id).await? {
+            if e.kind != TaskEventKind::Edited {
+                continue;
+            }
+            let replaced = |field: &str| e.payload.as_ref().is_some_and(|p| p.get(field).is_some());
+            if replaced("previous_title") {
+                editors.title = Some(e.actor);
+            }
+            if replaced("previous_body") {
+                editors.body = Some(e.actor);
+            }
+        }
+        self.editors.insert(t.id, editors);
+        Ok(editors)
+    }
+
+    /// The task's title, framed as peer data from its author (and last editor).
+    pub async fn task_title(&mut self, t: &Task) -> Result<String, ToolError> {
+        let editor = self.editors(t).await?.title;
+        self.wrap_edited(t.created_by, editor, Some(t.project_id), &t.title)
+            .await
     }
 
     pub async fn address(&mut self, to: Address) -> Result<String, ToolError> {
@@ -330,7 +383,10 @@ impl<'a> Labels<'a> {
             "id": m.id,
             "from": self.actor(m.from).await?,
             "to": self.address(m.to).await?,
-            "subject": m.subject,
+            "subject": match &m.subject {
+                Some(subject) => Some(self.wrap(m.from, m.project_id, subject).await?),
+                None => None,
+            },
             "importance": m.importance,
             "task": m.task_id,
             "reply_to": m.reply_to,
@@ -347,7 +403,7 @@ impl<'a> Labels<'a> {
         };
         Ok(json!({
             "id": t.id,
-            "title": t.title,
+            "title": self.task_title(t).await?,
             "status": t.status,
             "project": self.project(t.project_id).await?,
             "parent": t.parent_id,
@@ -367,11 +423,21 @@ impl<'a> Labels<'a> {
     /// A task with its (wrapped) body.
     pub async fn task(&mut self, t: &Task) -> Result<Value, ToolError> {
         let mut v = self.task_summary(t).await?;
+        let editor = self.editors(t).await?.body;
         v["body"] = self
-            .wrap(t.created_by, Some(t.project_id), &t.body)
+            .wrap_edited(t.created_by, editor, Some(t.project_id), &t.body)
             .await?
             .into();
         Ok(v)
+    }
+}
+
+/// Whether two actors are the same author (agents compare by agent, not session).
+fn same_author(a: Actor, b: Actor) -> bool {
+    match (a, b) {
+        (Actor::Human, Actor::Human) => true,
+        (Actor::Agent(x, _), Actor::Agent(y, _)) => x == y,
+        _ => false,
     }
 }
 

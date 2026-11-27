@@ -596,3 +596,21 @@ async fn shutdown_ends_sse_streams_and_returns() {
         .expect("connection closed")
         .unwrap();
 }
+
+#[tokio::test]
+async fn register_rejects_unsafe_identity_labels() {
+    let app = app().await;
+    let token = app.token().await;
+    let (status, body) = app
+        .post(
+            &token,
+            "/v1/register",
+            json!({"session_id": SessionId::new(), "host": "mac] (x", "harness": "codex"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("invalid host"),
+        "{body}"
+    );
+}

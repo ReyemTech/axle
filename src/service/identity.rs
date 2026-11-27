@@ -26,6 +26,13 @@ pub struct Resolved {
 pub enum IdentityError {
     #[error("missing {0}")]
     Missing(&'static str),
+    /// A host, harness or project key outside the allowed charset or length. These values
+    /// become labels inside peer-data frames, so they must not be able to forge one.
+    #[error("invalid {field}: {reason}")]
+    Invalid {
+        field: &'static str,
+        reason: &'static str,
+    },
     #[error("session {session} already belongs to another agent")]
     SessionAgentMismatch { session: SessionId },
     /// A session is bound to the token that created it.
@@ -53,6 +60,8 @@ impl IdentityService {
         if harness.is_empty() {
             return Err(IdentityError::Missing("harness"));
         }
+        check_label("host", host, NAME_MAX, false)?;
+        check_label("harness", harness, NAME_MAX, false)?;
         let now = clock.now();
 
         let key = input
@@ -60,6 +69,9 @@ impl IdentityService {
             .as_deref()
             .map(str::trim)
             .filter(|k| !k.is_empty());
+        if let Some(key) = key {
+            check_label("project key", key, PROJECT_KEY_MAX, true)?;
+        }
         let project = match key {
             Some(key) => Some(
                 store
@@ -118,6 +130,41 @@ impl IdentityService {
     }
 }
 
+/// Longest accepted host or harness, in bytes.
+pub const NAME_MAX: usize = 64;
+/// Longest accepted project key, in bytes.
+pub const PROJECT_KEY_MAX: usize = 200;
+
+/// Accepts only `[A-Za-z0-9._:@-]` (plus `/` when `slash`), at most `max` bytes. Hosts and
+/// harnesses may not contain `/`, which separates the parts of an agent label.
+pub fn check_label(
+    field: &'static str,
+    value: &str,
+    max: usize,
+    slash: bool,
+) -> Result<(), IdentityError> {
+    if value.len() > max {
+        return Err(IdentityError::Invalid {
+            field,
+            reason: "too long",
+        });
+    }
+    let ok = value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b".:_@-".contains(&b) || (slash && b == b'/'));
+    if !ok {
+        return Err(IdentityError::Invalid {
+            field,
+            reason: if slash {
+                "only letters, digits and . _ : @ - / are allowed"
+            } else {
+                "only letters, digits and . _ : @ - are allowed"
+            },
+        });
+    }
+    Ok(())
+}
+
 /// The last two path segments of a project key: `github.com/reyemtech/iac` → `reyemtech/iac`.
 pub fn default_display_name(key: &str) -> String {
     let segments: Vec<&str> = key.split('/').filter(|s| !s.is_empty()).collect();
@@ -130,7 +177,23 @@ pub fn default_display_name(key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::default_display_name;
+    use super::{IdentityError, NAME_MAX, check_label, default_display_name};
+
+    #[test]
+    fn labels_are_restricted_to_a_safe_charset() {
+        assert!(check_label("host", "mac-mini.local", NAME_MAX, false).is_ok());
+        assert!(check_label("project key", "github.com/a/b", 200, true).is_ok());
+        for bad in ["a b", "x]y", "a/b", "(info)", "é", "a\nb"] {
+            assert!(
+                matches!(
+                    check_label("host", bad, NAME_MAX, false),
+                    Err(IdentityError::Invalid { field: "host", .. })
+                ),
+                "{bad:?}"
+            );
+        }
+        assert!(check_label("host", &"a".repeat(NAME_MAX + 1), NAME_MAX, false).is_err());
+    }
 
     #[test]
     fn display_name_is_last_two_segments() {
