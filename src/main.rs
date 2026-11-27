@@ -38,6 +38,12 @@ enum Command {
         #[arg(long)]
         harness: String,
     },
+    /// Claude Code hook: reads the hook JSON on stdin, prints hook JSON on stdout. Always
+    /// exits 0 (fail-open); problems are one line on stderr.
+    Hook {
+        #[arg(value_enum)]
+        event: coord::hook::Event,
+    },
     /// Run database migrations (needs DATABASE_URL)
     Migrate,
     /// Manage projects
@@ -73,6 +79,10 @@ async fn main() -> ExitCode {
             // shutdown after a signal. The bridge fails open, so this is always success.
             std::process::exit(0);
         }
+        Command::Hook { event } => {
+            hook(event).await;
+            std::process::exit(0);
+        }
         Command::Serve {
             bind,
             trusted_header,
@@ -87,6 +97,31 @@ async fn main() -> ExitCode {
             eprintln!("coord: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Never fails: every problem is at most one stderr line, and stdout stays empty.
+async fn hook(event: coord::hook::Event) {
+    use std::io::Read;
+    let work = async move {
+        let stdin = tokio::task::spawn_blocking(|| {
+            let mut buf = String::new();
+            let _ = std::io::stdin().take(1 << 20).read_to_string(&mut buf);
+            buf
+        })
+        .await
+        .unwrap_or_default();
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let token = std::env::var("COORD_TOKEN").ok();
+        coord::hook::run(event, &stdin, home.as_deref(), token.as_deref()).await
+    };
+    // Hard ceiling on total runtime, including a stdin that never closes.
+    match tokio::time::timeout(std::time::Duration::from_secs(5), tokio::spawn(work)).await {
+        Ok(Ok(Ok(Some(out)))) => println!("{out}"),
+        Ok(Ok(Ok(None))) => {}
+        Ok(Ok(Err(e))) => eprintln!("coord hook: {e}"),
+        Ok(Err(_)) => eprintln!("coord hook: internal error"),
+        Err(_) => eprintln!("coord hook: timed out"),
     }
 }
 
