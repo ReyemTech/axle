@@ -40,40 +40,67 @@ version_ge() {
   return 0
 }
 
-AXL=
-if command -v axl >/dev/null 2>&1; then
-  have=$(axl --version 2>/dev/null | awk '{ print $NF }') || have=
-  if [ -n "$have" ] && version_ge "$have" "$VERSION"; then
-    AXL=$(command -v axl)
-  fi
-fi
-
-if [ -z "$AXL" ]; then
-  echo "Installing axl $VERSION..."
-  curl -fsSL "https://github.com/ReyemTech/axle/releases/download/v{{ version }}/axle-mcp-installer.sh" | sh
-  AXL="${CARGO_HOME:-$HOME/.cargo}/bin/axl"
-  [ -x "$AXL" ] || die "the installer did not produce $AXL"
-fi
-
-case "$SERVER_URL" in
-  http://127.0.0.1* | http://localhost* | 'http://[::1]'*) ;;
-  http://*)
-    echo "Warning: $SERVER_URL is plain http; your token will cross the network unencrypted." >&2
-    printf 'Continue? [y/N] ' >&2
-    answer=
-    read -r answer </dev/tty || die "cannot ask for confirmation without a terminal; use an https server URL"
-    [ "$answer" = "y" ] || die "cancelled"
-    ;;
-esac
-
-# From here on `axl` is the binary resolved above, whether or not it is on PATH.
-axl() {
-  "$AXL" "$@"
+# Succeeds when the host of URL $1 is exactly localhost, 127.0.0.1 or [::1].
+is_loopback_host() {
+  host=${1#*://}
+  host=${host%%/*}
+  host=${host##*@}
+  case "$host" in
+    '['*) host="${host%%]*}]" ;;
+    *) host=${host%%:*} ;;
+  esac
+  case "$host" in
+    localhost | 127.0.0.1 | '[::1]') return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
-if [ -n "${1:-}" ]; then
-  axl install --server '{{ server_url }}' --code "$1"
-else
-  axl install --server '{{ server_url }}'
-fi
-axl status
+# Everything runs inside main so sh has read the whole script before the first command.
+main() {
+  AXL=
+  found=$(command -v axl 2>/dev/null) || found=
+  if [ -n "$found" ]; then
+    have=$("$found" --version 2>/dev/null | awk '{ print $NF }') || have=
+    if [ -n "$have" ] && version_ge "$have" "$VERSION"; then
+      AXL=$found
+    fi
+  fi
+
+  if [ -z "$AXL" ]; then
+    echo "Installing axl $VERSION..."
+    curl -fsSL "https://github.com/ReyemTech/axle/releases/download/v{{ version }}/axle-mcp-installer.sh" | sh
+    AXL="${CARGO_HOME:-$HOME/.cargo}/bin/axl"
+    [ -x "$AXL" ] || die "the installer did not produce $AXL"
+  fi
+
+  # From here on `axl` is the binary resolved above, run with the terminal as stdin when there is
+  # one, else with none, so it can never read the rest of this script when piped into sh.
+  axl() {
+    if { : </dev/tty; } 2>/dev/null; then
+      "$AXL" "$@" </dev/tty
+    else
+      "$AXL" "$@" </dev/null
+    fi
+  }
+
+  case "$SERVER_URL" in
+    http://*)
+      if ! is_loopback_host "$SERVER_URL"; then
+        echo "Warning: $SERVER_URL is plain http; your token will cross the network unencrypted." >&2
+        printf 'Continue? [y/N] ' >&2
+        answer=
+        read -r answer </dev/tty || die "cannot ask for confirmation without a terminal; use an https server URL"
+        [ "$answer" = "y" ] || die "cancelled"
+      fi
+      ;;
+  esac
+
+  if [ -n "${1:-}" ]; then
+    axl install --server '{{ server_url }}' --code "$1"
+  else
+    axl install --server '{{ server_url }}'
+  fi
+  axl status
+}
+
+main "$@"

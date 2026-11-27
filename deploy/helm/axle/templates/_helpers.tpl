@@ -94,8 +94,13 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- define "axle.publicUrl" -}}
 {{- if .Values.publicUrl -}}
 {{- .Values.publicUrl -}}
-{{- else if and .Values.ingress.enabled .Values.ingress.hosts -}}
-{{- $host := (first .Values.ingress.hosts).host -}}
+{{- else if .Values.ingress.enabled -}}
+{{- $host := "" -}}
+{{- range .Values.ingress.hosts -}}
+{{- if and (not $host) .host -}}{{- $host = .host -}}{{- end -}}
+{{- end -}}
+{{- if $host -}}
 {{- if .Values.ingress.tls }}https{{ else }}http{{ end }}://{{ $host }}
+{{- end -}}
 {{- end -}}
 {{- end }}

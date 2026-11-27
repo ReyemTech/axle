@@ -114,6 +114,10 @@ expect "$(env_val AXL_PUBLIC_URL --set publicUrl=https://x.test)" https://x.test
 expect "$(env_val AXL_PUBLIC_URL --set publicUrl=https://x.test --set ingress.enabled=true \
   --set 'ingress.hosts[0].host=axle.example.com')" https://x.test "explicit publicUrl wins over ingress"
 expect "$(has_env AXL_PUBLIC_URL --set ingress.enabled=true)" 0 "no AXL_PUBLIC_URL for an ingress without hosts"
+expect "$(env_val AXL_PUBLIC_URL --set ingress.enabled=true --set 'ingress.hosts[0].paths[0].path=/' \
+  --set 'ingress.hosts[1].host=second.example.com')" http://second.example.com "AXL_PUBLIC_URL skips a hostless ingress entry"
+expect "$(has_env AXL_PUBLIC_URL --set ingress.enabled=true --set 'ingress.hosts[0].paths[0].path=/')" 0 \
+  "no AXL_PUBLIC_URL when no ingress entry has a host"
 
 # invalid UI settings are rejected (schema or template)
 rejects() { local why="$1"; shift; if helm template t "$CHART" -f "$S" "$@" >/dev/null 2>&1; then fail "$why was accepted"; fi; }
