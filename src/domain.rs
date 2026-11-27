@@ -223,6 +223,8 @@ pub enum TaskEventKind {
     ChildDone,
     ChildCancelled,
     ChildrenComplete,
+    /// The title and/or body was changed (the previous values are in the payload).
+    Edited,
 }
 
 text_enum!(TaskEventKind {
@@ -241,6 +243,7 @@ text_enum!(TaskEventKind {
     ChildDone => "child_done",
     ChildCancelled => "child_cancelled",
     ChildrenComplete => "children_complete",
+    Edited => "edited",
 });
 
 /// One append-only entry in a task's history.

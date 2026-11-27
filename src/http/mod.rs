@@ -131,8 +131,12 @@ impl AppState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthToken(pub TokenId);
 
-/// The full server: unauthenticated probes plus the token-protected `/v1` API.
+/// The full server: unauthenticated probes plus the token-protected `/v1` API and MCP
+/// endpoint (`/mcp`, Streamable HTTP). Must be called inside a Tokio runtime.
 pub fn router(state: AppState) -> Router {
+    let mcp = Router::new()
+        .nest_service("/mcp", crate::mcp::service(state.clone()))
+        .layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -140,6 +144,7 @@ pub fn router(state: AppState) -> Router {
             "/v1",
             v1::routes().route_layer(middleware::from_fn_with_state(state.clone(), require_token)),
         )
+        .merge(mcp)
         .with_state(state)
 }
 

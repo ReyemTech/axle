@@ -958,6 +958,39 @@ impl Store for PostgresStore {
         Ok(updated)
     }
 
+    async fn edit_task(
+        &self,
+        id: TaskId,
+        title: Option<&str>,
+        body: Option<&str>,
+        token: Option<TokenId>,
+        event: &TaskEvent,
+    ) -> StoreResult<Option<Task>> {
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(concat!(
+            "UPDATE tasks
+                SET title = COALESCE($1::text, title), body = COALESCE($2::text, body),
+                    version = version + 1, updated_at = $3
+              WHERE id = $4
+              RETURNING ",
+            task_cols!()
+        ))
+        .bind(title)
+        .bind(body)
+        .bind(event.at)
+        .bind(id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .as_ref()
+        .map(task_from)
+        .transpose()?;
+        if updated.is_some() {
+            insert_event(&mut tx, event, token).await?;
+        }
+        tx.commit().await?;
+        Ok(updated)
+    }
+
     async fn session_held_task(&self, task: TaskId, session: SessionId) -> StoreResult<bool> {
         Ok(sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM task_events

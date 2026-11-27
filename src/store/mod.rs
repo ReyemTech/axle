@@ -157,6 +157,16 @@ pub trait Store: Send + Sync {
     /// `owner` is set) `owner_session_id = owner`. Appends `event` in the same transaction.
     /// `None` when the guard did not match (callers re-read to explain why).
     async fn transition_task(&self, req: &TransitionRequest) -> StoreResult<Option<Task>>;
+    /// Sets the title and/or body (`None` keeps each), bumps `version` / `updated_at` and
+    /// appends `event`, in one transaction. `None` if the task does not exist.
+    async fn edit_task(
+        &self,
+        id: TaskId,
+        title: Option<&str>,
+        body: Option<&str>,
+        token: Option<TokenId>,
+        event: &TaskEvent,
+    ) -> StoreResult<Option<Task>>;
     /// Whether `session` ever claimed `task` (distinguishes "lost the lease" from "never
     /// owned it").
     async fn session_held_task(&self, task: TaskId, session: SessionId) -> StoreResult<bool>;

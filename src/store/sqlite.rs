@@ -1042,6 +1042,39 @@ impl Store for SqliteStore {
         Ok(updated)
     }
 
+    async fn edit_task(
+        &self,
+        id: TaskId,
+        title: Option<&str>,
+        body: Option<&str>,
+        token: Option<TokenId>,
+        event: &TaskEvent,
+    ) -> StoreResult<Option<Task>> {
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let updated = sqlx::query(concat!(
+            "UPDATE tasks
+                SET title = COALESCE(?, title), body = COALESCE(?, body),
+                    version = version + 1, updated_at = ?
+              WHERE id = ?
+              RETURNING ",
+            task_cols!()
+        ))
+        .bind(title)
+        .bind(body)
+        .bind(ts::enc(event.at))
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?
+        .as_ref()
+        .map(task_from)
+        .transpose()?;
+        if updated.is_some() {
+            insert_event(&mut tx, event, token).await?;
+        }
+        tx.commit().await?;
+        Ok(updated)
+    }
+
     async fn session_held_task(&self, task: TaskId, session: SessionId) -> StoreResult<bool> {
         Ok(sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM task_events

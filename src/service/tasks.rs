@@ -471,6 +471,51 @@ impl TaskService {
         .await
     }
 
+    /// Changes the title and/or body (`None` keeps each). Allowed for the creating agent and
+    /// the agent that currently owns the task. The previous values are kept in the `edited`
+    /// event, so history stays append-only.
+    pub async fn edit(
+        &self,
+        caller: &Resolved,
+        id: TaskId,
+        title: Option<String>,
+        body: Option<String>,
+    ) -> Result<Task, TaskError> {
+        if let Some(body) = &body {
+            check_body(body)?;
+        }
+        let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+        let agent = caller.agent.id;
+        let created = matches!(task.created_by, Actor::Agent(a, _) if a == agent);
+        if !created && task.owner_agent_id != Some(agent) {
+            return Err(TaskError::NotOwner);
+        }
+        let mut previous = serde_json::Map::new();
+        if title.is_some() {
+            previous.insert("previous_title".into(), task.title.into());
+        }
+        if body.is_some() {
+            previous.insert("previous_body".into(), task.body.into());
+        }
+        let event = self.event(
+            id,
+            actor_of(caller),
+            TaskEventKind::Edited,
+            None,
+            Some(previous.into()),
+        );
+        self.store
+            .edit_task(
+                id,
+                title.as_deref(),
+                body.as_deref(),
+                Some(caller.session.token_id),
+                &event,
+            )
+            .await?
+            .ok_or(TaskError::NotFound)
+    }
+
     /// Cancels a not-yet-closed task. Allowed for the human and for the creating agent.
     pub async fn cancel(&self, by: Caller<'_>, id: TaskId) -> Result<Task, TaskError> {
         let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
