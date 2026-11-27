@@ -9,6 +9,7 @@ pub mod domain;
 pub mod events;
 pub mod hook;
 pub mod http;
+pub mod install;
 pub mod mcp;
 pub mod service;
 pub mod store;
