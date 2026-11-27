@@ -21,10 +21,11 @@
       {% if let Some(pv) = n.preview %}<p class="need-preview peer-text">{{ pv }}</p>{% endif %}
       {% if let Some(token) = csrf %}
       <div class="need-actions">
-      {% if let Some(tid) = n.task_id %}
+      {% if let Some(tid) = n.task_id %}{% if let Some(pid) = n.plan_id %}
         <form method="post" action="/ui/tasks/{{ tid }}/plan/approve">
           <input type="hidden" name="csrf" value="{{ token }}">
           <input type="hidden" name="back" value="{{ back }}">
+          <input type="hidden" name="plan" value="{{ pid }}">
           <button type="submit">Approve plan</button>
         </form>
         <details class="need-changes">
@@ -32,12 +33,15 @@
           <form class="stack" method="post" action="/ui/tasks/{{ tid }}/plan/changes">
             <input type="hidden" name="csrf" value="{{ token }}">
             <input type="hidden" name="back" value="{{ back }}">
+            <input type="hidden" name="plan" value="{{ pid }}">
+          <input type="hidden" name="plan" value="{{ pid }}">
             <label for="changes-{{ tid }}">What should change</label>
             <textarea id="changes-{{ tid }}" name="note" rows="3" required></textarea>
             <button type="submit" class="secondary">Send to the agent</button>
           </form>
         </details>
         <a class="need-open" href="{{ n.href }}">Read the full plan</a>
+      {% endif %}
       {% else if n.need.key() == "review" %}
         <a class="button-like" href="{{ n.href }}">Review the work</a>
       {% else %}

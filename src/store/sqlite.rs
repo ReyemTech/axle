@@ -1191,6 +1191,10 @@ impl Store for SqliteStore {
                 AND instr(?, ',' || status || ',') > 0
                 AND (? IS NULL OR instr(?, ',' || plan_state || ',') > 0)
                 AND (? IS NULL OR owner_session_id = ?)
+                AND (? IS NULL
+                     OR ? = (SELECT p.id FROM messages p
+                              WHERE p.task_id = tasks.id AND p.kind = 'plan'
+                              ORDER BY p.seq DESC LIMIT 1))
               RETURNING ",
             task_cols!()
         ))
@@ -1207,6 +1211,8 @@ impl Store for SqliteStore {
         .bind(&plan_from)
         .bind(&owner)
         .bind(&owner)
+        .bind(req.latest_plan.map(|m| m.to_string()))
+        .bind(req.latest_plan.map(|m| m.to_string()))
         .fetch_optional(&mut *tx)
         .await?
         .as_ref()
@@ -1217,6 +1223,20 @@ impl Store for SqliteStore {
             return Ok(None);
         };
         let children_complete = record_event(&mut tx, &task, &req.event, req.token).await?;
+        if req.archive_plans {
+            sqlx::query(
+                "UPDATE message_recipients
+                    SET acked_at = ?1, delivered_at = COALESCE(delivered_at, ?1)
+                  WHERE recipient_agent_id IS NULL AND recipient_session_id IS NULL
+                    AND acked_at IS NULL
+                    AND message_id IN (SELECT id FROM messages
+                                        WHERE task_id = ?2 AND kind = 'plan')",
+            )
+            .bind(ts::enc(req.now))
+            .bind(req.task.to_string())
+            .execute(&mut *tx)
+            .await?;
+        }
         if let Some(message) = &req.message {
             insert_message(&mut tx, message, req.token).await?;
         }
@@ -1530,6 +1550,29 @@ impl Store for SqliteStore {
         ))
         .bind(project.map(|p| p.to_string()))
         .bind(before.map(|b| b.to_string()))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(message_from)
+        .collect()
+    }
+
+    async fn human_attention(&self, limit: u32) -> StoreResult<Vec<Message>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            message_cols!(),
+            " FROM messages m
+             WHERE m.importance IN ('high', 'urgent') AND m.kind <> 'plan'
+               AND (EXISTS (SELECT 1 FROM message_recipients r
+                            WHERE r.message_id = m.id AND r.recipient_agent_id IS NULL
+                              AND r.recipient_session_id IS NULL AND r.acked_at IS NULL)
+                    OR (",
+            pending_messages!(),
+            "))
+             ORDER BY m.seq LIMIT ?2"
+        ))
+        .bind(Option::<String>::None)
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await?

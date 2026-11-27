@@ -43,7 +43,8 @@ fn task_error(e: TaskError) -> UiError {
         | TaskError::LeaseLost
         | TaskError::PlanNotApproved(_)
         | TaskError::NotPlanning(_)
-        | TaskError::NoPlanToReview(_)) => UiError::Conflict(capitalise(&e.to_string())),
+        | TaskError::NoPlanToReview(_)
+        | TaskError::PlanChanged) => UiError::Conflict(capitalise(&e.to_string())),
         e @ (TaskError::ReasonRequired
         | TaskError::EmptyPlan
         | TaskError::NoteRequired
@@ -184,6 +185,9 @@ pub async fn create_task(
 pub struct DecisionForm {
     #[serde(default)]
     note: String,
+    /// The plan message the human read; the decision applies only while it is the latest.
+    #[serde(default)]
+    plan: String,
     /// The page to return to: the board or the overview (anything else: the task page).
     #[serde(default)]
     back: String,
@@ -198,15 +202,35 @@ fn back_to(back: &str, id: TaskId) -> String {
     }
 }
 
-/// The human approves the submitted plan; the task becomes `claimed`.
+fn plan_id(raw: &str) -> UiResult<MessageId> {
+    opt_id(raw, "plan")?.ok_or_else(|| UiError::Invalid("Which plan? Reload the page.".into()))
+}
+
+/// A decision on a plan that has since been replaced sends the human back to the task page,
+/// which says so and shows the new plan.
+fn decided(
+    result: Result<crate::domain::Task, TaskError>,
+    back: &str,
+    id: TaskId,
+) -> UiResult<Response> {
+    match result {
+        Ok(_) => Ok(see_other(&back_to(back, id))),
+        Err(TaskError::PlanChanged) => {
+            Ok(see_other(&format!("/ui/tasks/{id}?plan_changed=1#plan")))
+        }
+        Err(e) => Err(task_error(e)),
+    }
+}
+
+/// The human approves the submitted plan they read; the task becomes `claimed`.
 pub async fn approve_plan(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Form(form): Form<DecisionForm>,
 ) -> UiResult<Response> {
     let id = task_id(&id)?;
-    state.tasks.approve_plan(id).await.map_err(task_error)?;
-    Ok(see_other(&back_to(&form.back, id)))
+    let plan = plan_id(&form.plan)?;
+    decided(state.tasks.approve_plan(id, plan).await, &form.back, id)
 }
 
 /// The human asks for changes to the submitted plan (a note is required).
@@ -216,12 +240,12 @@ pub async fn request_plan_changes(
     Form(form): Form<DecisionForm>,
 ) -> UiResult<Response> {
     let id = task_id(&id)?;
-    state
-        .tasks
-        .request_plan_changes(id, &form.note)
-        .await
-        .map_err(task_error)?;
-    Ok(see_other(&back_to(&form.back, id)))
+    let plan = plan_id(&form.plan)?;
+    decided(
+        state.tasks.request_plan_changes(id, plan, &form.note).await,
+        &form.back,
+        id,
+    )
 }
 
 #[derive(Deserialize)]

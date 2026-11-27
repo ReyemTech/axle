@@ -1952,11 +1952,12 @@ async fn plan_is_approved_from_the_task_page() {
         .post_form(&format!("{path}/plan/approve"), Some(&cookie), "")
         .await;
     assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    let plan = input_value(&page, "#plan input[name=plan]");
     let refused = app
         .post_form(
             &format!("{path}/plan/changes"),
             Some(&cookie),
-            &form(&csrf, &[("note", " ")]),
+            &form(&csrf, &[("note", " "), ("plan", &plan)]),
         )
         .await;
     assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1965,7 +1966,7 @@ async fn plan_is_approved_from_the_task_page() {
         .post_form(
             &format!("{path}/plan/changes"),
             Some(&cookie),
-            &form(&csrf, &[("note", "Do Nimbus first")]),
+            &form(&csrf, &[("note", "Do Nimbus first"), ("plan", &plan)]),
         )
         .await;
     assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
@@ -1984,11 +1985,15 @@ async fn plan_is_approved_from_the_task_page() {
         .propose_plan(&iac, task.id, "Nimbus first, then IaC".into())
         .await
         .unwrap();
+    let plan = input_value(
+        &app.get(&path, Some(&cookie)).await,
+        "#plan input[name=plan]",
+    );
     let page = app
         .post_form(
             &format!("{path}/plan/approve"),
             Some(&cookie),
-            &form(&csrf, &[]),
+            &form(&csrf, &[("plan", &plan)]),
         )
         .await;
     assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
@@ -2000,7 +2005,7 @@ async fn plan_is_approved_from_the_task_page() {
         .post_form(
             &format!("{path}/plan/approve"),
             Some(&cookie),
-            &form(&csrf, &[]),
+            &form(&csrf, &[("plan", &plan)]),
         )
         .await;
     assert_eq!(page.status, StatusCode::CONFLICT);
@@ -2173,11 +2178,12 @@ async fn needs_you_cards_match_the_count() {
     let fragment = app.get("/ui/needs-you?back=/ui/board", Some(&cookie)).await;
     assert_eq!(select_texts(&fragment, ".need-card").len(), 3);
     let csrf = csrf_of(&board);
+    let plan_id = input_value(&board, ".need-card input[name=plan]");
     let page = app
         .post_form(
             &format!("/ui/tasks/{}/plan/approve", plan.id),
             Some(&cookie),
-            &form(&csrf, &[("back", "/ui/board")]),
+            &form(&csrf, &[("back", "/ui/board"), ("plan", &plan_id)]),
         )
         .await;
     assert_eq!(page.location.as_deref(), Some("/ui/board#needs-you"));
@@ -2185,4 +2191,114 @@ async fn needs_you_cards_match_the_count() {
     assert_eq!(select_texts(&fragment, ".need-card").len(), 2);
     let pulse = app.get("/ui/pulse", Some(&cookie)).await;
     assert_eq!(select_texts(&pulse, ".pulse-item")[2], "2 need you");
+}
+
+fn input_value(page: &Page, css: &str) -> String {
+    let sel = Selector::parse(css).unwrap();
+    page.html()
+        .select(&sel)
+        .next()
+        .unwrap_or_else(|| panic!("no {css}"))
+        .value()
+        .attr("value")
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_stale_plan_decision_shows_the_new_plan() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let task = submitted_plan(&app, &iac, "Gated work").await;
+    let path = format!("/ui/tasks/{}", task.id);
+    let page = app.get(&path, Some(&cookie)).await;
+    let csrf = csrf_of(&page);
+    let seen = input_value(&page, "#plan input[name=plan]");
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    assert_eq!(input_value(&board, ".need-card input[name=plan]"), seen);
+
+    // The agent replaces the plan while the human is reading the old one.
+    app.state
+        .tasks
+        .propose_plan(&iac, task.id, "A different plan".into())
+        .await
+        .unwrap();
+    for (action, extra) in [("approve", None), ("changes", Some("smaller"))] {
+        let mut fields = vec![("plan", seen.as_str()), ("back", "/ui/board")];
+        if let Some(note) = extra {
+            fields.push(("note", note));
+        }
+        let page = app
+            .post_form(
+                &format!("{path}/plan/{action}"),
+                Some(&cookie),
+                &form(&csrf, &fields),
+            )
+            .await;
+        assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+        assert_eq!(
+            page.location.as_deref(),
+            Some(format!("{path}?plan_changed=1#plan").as_str())
+        );
+    }
+    let t = app.state.store.get_task(task.id).await.unwrap().unwrap();
+    assert_eq!(t.plan_state, axle::domain::PlanState::Submitted);
+    let page = app
+        .get(&format!("{path}?plan_changed=1"), Some(&cookie))
+        .await;
+    assert!(
+        select_texts(&page, "#plan .error")[0].contains("The plan changed"),
+        "{}",
+        page.text()
+    );
+    assert_eq!(
+        select_texts(&page, "#plan .plan-body"),
+        ["A different plan"]
+    );
+    assert_ne!(input_value(&page, "#plan input[name=plan]"), seen);
+}
+
+#[tokio::test]
+async fn needs_you_shows_every_review_and_peeks_without_delivering() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let other = app.agent(IAC, "linux", "codex").await;
+    // A task an agent created, now in review: it waits on someone too.
+    let t = app.task(&iac, "Agent-made work", None).await;
+    app.claim(&other, t.id).await;
+    app.state.tasks.to_review(&other, t.id, None).await.unwrap();
+    let urgent = app
+        .state
+        .messages
+        .send(
+            &Actor::Agent(iac.agent.id, iac.session.id),
+            NewMessage {
+                to: Address::Human,
+                subject: Some("Prod is down".into()),
+                body: "details".into(),
+                importance: Importance::Urgent,
+                reply_to: None,
+            },
+        )
+        .await
+        .unwrap();
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    assert_eq!(
+        select_texts(&board, "#needs-you .card-title"),
+        ["Agent-made work", "Prod is down"]
+    );
+    app.get("/ui/pulse", Some(&cookie)).await;
+    app.get("/ui/needs-you", Some(&cookie)).await;
+    let receipt = app
+        .state
+        .store
+        .message_receipts(&[urgent.id])
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt[0].delivered, 0,
+        "showing the strip delivers nothing"
+    );
 }

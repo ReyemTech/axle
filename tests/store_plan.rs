@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use axle::clock::{Clock, TestClock};
 use axle::domain::{
-    Actor, Address, Eligibility, Importance, MessageKind, PlanState, ProjectId, SessionId, Task,
-    TaskEventKind, TaskStatus,
+    Actor, Address, Eligibility, Importance, MessageId, MessageKind, PlanState, ProjectId,
+    SessionId, Task, TaskEventKind, TaskStatus,
 };
 use axle::service::identity::{IdentityInput, IdentityService, Resolved};
 use axle::service::tasks::{Caller, ClaimOutcome, Completion, NewTask, TaskError, TaskService};
@@ -346,16 +346,17 @@ store_matrix!(
         let gated = env.gated(project_of(&lead)).await;
         env.claimed(&lead, &gated).await;
         assert!(matches!(
-            env.svc.approve_plan(gated.id).await,
+            env.svc.approve_plan(gated.id, MessageId::new()).await,
             Err(TaskError::NoPlanToReview(PlanState::Drafting))
         ));
-        env.svc
+        let (_, plan) = env
+            .svc
             .propose_plan(&lead, gated.id, "plan".into())
             .await
             .unwrap();
 
         env.clock.advance(Duration::minutes(30));
-        let t = env.svc.approve_plan(gated.id).await.unwrap();
+        let t = env.svc.approve_plan(gated.id, plan.id).await.unwrap();
         assert_eq!(t.status, TaskStatus::Claimed);
         assert_eq!(t.plan_state, PlanState::Approved);
         assert_eq!(
@@ -380,7 +381,7 @@ store_matrix!(
 
         // Approving twice is refused; the work can now finish.
         assert!(matches!(
-            env.svc.approve_plan(gated.id).await,
+            env.svc.approve_plan(gated.id, plan.id).await,
             Err(TaskError::InvalidTransition { .. })
         ));
         env.svc
@@ -405,18 +406,19 @@ store_matrix!(requesting_changes_keeps_planning, |store: Arc<
     let other = env.session("linux").await;
     let gated = env.gated(project_of(&lead)).await;
     env.claimed(&lead, &gated).await;
-    env.svc
+    let (_, plan) = env
+        .svc
         .propose_plan(&lead, gated.id, "plan".into())
         .await
         .unwrap();
     assert!(matches!(
-        env.svc.request_plan_changes(gated.id, " ").await,
+        env.svc.request_plan_changes(gated.id, plan.id, " ").await,
         Err(TaskError::NoteRequired)
     ));
 
     let t = env
         .svc
-        .request_plan_changes(gated.id, "split the nimbus part")
+        .request_plan_changes(gated.id, plan.id, "split the nimbus part")
         .await
         .unwrap();
     assert_eq!(t.status, TaskStatus::Planning);
@@ -590,3 +592,142 @@ store_matrix!(
         let _ = Eligibility::default();
     }
 );
+
+store_matrix!(
+    a_decision_names_the_plan_it_saw,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let lead = env.session("mac").await;
+        let gated = env.gated(project_of(&lead)).await;
+        env.claimed(&lead, &gated).await;
+        let (_, a) = env
+            .svc
+            .propose_plan(&lead, gated.id, "plan A".into())
+            .await
+            .unwrap();
+        let (_, b) = env
+            .svc
+            .propose_plan(&lead, gated.id, "plan B".into())
+            .await
+            .unwrap();
+
+        // Deciding on a plan that is no longer the latest is refused and changes nothing.
+        assert!(matches!(
+            env.svc.approve_plan(gated.id, a.id).await,
+            Err(TaskError::PlanChanged)
+        ));
+        assert!(matches!(
+            env.svc.request_plan_changes(gated.id, a.id, "nope").await,
+            Err(TaskError::PlanChanged)
+        ));
+        let t = env.task(&gated).await;
+        assert_eq!(
+            (t.status, t.plan_state),
+            (TaskStatus::Planning, PlanState::Submitted)
+        );
+
+        let t = env.svc.approve_plan(gated.id, b.id).await.unwrap();
+        assert_eq!(t.status, TaskStatus::Claimed);
+    }
+);
+
+store_matrix!(
+    superseded_and_decided_plans_leave_the_human_inbox,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let lead = env.session("mac").await;
+        let gated = env.gated(project_of(&lead)).await;
+        env.claimed(&lead, &gated).await;
+        let human = |env: &Env| {
+            let store = env.store.clone();
+            let now = env.clock.now();
+            async move {
+                store
+                    .inbox(Recipient::Human, &InboxFilter::default(), now)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|i| i.message.id)
+                    .collect::<Vec<_>>()
+            }
+        };
+        let (_, a) = env
+            .svc
+            .propose_plan(&lead, gated.id, "plan A".into())
+            .await
+            .unwrap();
+        assert_eq!(human(&env).await, vec![a.id]);
+        let (_, b) = env
+            .svc
+            .propose_plan(&lead, gated.id, "plan B".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            human(&env).await,
+            vec![b.id],
+            "the superseded plan is archived"
+        );
+        env.svc
+            .request_plan_changes(gated.id, b.id, "smaller")
+            .await
+            .unwrap();
+        assert!(human(&env).await.is_empty(), "the decided plan is archived");
+        let (_, c) = env
+            .svc
+            .propose_plan(&lead, gated.id, "plan C".into())
+            .await
+            .unwrap();
+        env.svc.approve_plan(gated.id, c.id).await.unwrap();
+        assert!(human(&env).await.is_empty());
+    }
+);
+
+store_matrix!(human_attention_is_a_read_only_peek, |store: Arc<
+    dyn Store,
+>| async move {
+    let env = Env::new(store);
+    let lead = env.session("mac").await;
+    let gated = env.gated(project_of(&lead)).await;
+    env.claimed(&lead, &gated).await;
+    let (_, plan) = env
+        .svc
+        .propose_plan(&lead, gated.id, "plan".into())
+        .await
+        .unwrap();
+    let messages =
+        axle::service::messages::MessageService::new(env.store.clone(), env.clock.clone());
+    let send = |to: Address, importance: Importance, body: &'static str| {
+        let messages = &messages;
+        let from = Actor::Agent(lead.agent.id, lead.session.id);
+        async move {
+            messages
+                .send(
+                    &from,
+                    axle::service::messages::NewMessage {
+                        to,
+                        subject: None,
+                        body: body.into(),
+                        importance,
+                        reply_to: None,
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let urgent = send(Address::Human, Importance::Urgent, "urgent").await;
+    send(Address::Human, Importance::Normal, "normal").await;
+    // A high post in the thread of a task the human created is due to the human too.
+    let thread = send(Address::Task(gated.id), Importance::High, "thread").await;
+
+    let peek = env.store.human_attention(100).await.unwrap();
+    let ids: Vec<_> = peek.iter().map(|m| m.id).collect();
+    assert_eq!(
+        ids,
+        vec![urgent.id, thread.id],
+        "plans and normal mail are left out"
+    );
+    assert!(!ids.contains(&plan.id));
+    let receipts = env.store.message_receipts(&[urgent.id]).await.unwrap();
+    assert_eq!(receipts[0].delivered, 0, "peeking delivers nothing");
+});

@@ -4,9 +4,9 @@
 //! A card is one of:
 //! - a plan awaiting approval (a `planning` task whose plan is `submitted`), with Approve and
 //!   Request changes inline;
-//! - a task the human created that is in `review`;
-//! - an unarchived human-addressed message of high or urgent importance (plans excluded: they
-//!   have their own card).
+//! - a task in `review` (awaiting the coordinator or the human), whoever created it;
+//! - an unarchived human-due message of high or urgent importance (plans excluded: they have
+//!   their own card), read with a peek that marks nothing delivered.
 
 use askama::Template;
 use axum::Extension;
@@ -17,9 +17,9 @@ use time::format_description::well_known::Rfc3339;
 
 use super::SessionCtx;
 use super::views::{Labels, ProjectLabel, UiResult, html};
-use crate::domain::{Actor, Importance, Message, MessageKind, PlanState, Task, TaskId, TaskStatus};
+use crate::domain::{Actor, Message, MessageKind, PlanState, Task, TaskId, TaskStatus};
 use crate::http::AppState;
-use crate::store::{InboxFilter, Recipient, StoreResult, TaskFilter};
+use crate::store::{StoreResult, TaskFilter};
 
 /// Most messages of each importance the strip looks at.
 const MESSAGE_LIMIT: u32 = 100;
@@ -69,8 +69,9 @@ pub struct NeedCard {
     /// How long it has waited, e.g. `12m`.
     pub waited: String,
     pub since: String,
-    /// For plan cards: the task to decide on.
+    /// For plan cards: the task to decide on and the plan shown (sent with the decision).
     pub task_id: Option<String>,
+    pub plan_id: Option<String>,
     pub importance: &'static str,
 }
 
@@ -127,6 +128,9 @@ pub(super) async fn needs_you(
     for t in planning {
         let plan = latest_plan(state, t.id).await?;
         let at = plan.as_ref().map_or(t.updated_at, |p| p.created_at);
+        if plan.is_none() {
+            continue;
+        }
         plans.push((t, plan, at));
     }
     plans.sort_by_key(|(_, _, at)| *at);
@@ -143,10 +147,11 @@ pub(super) async fn needs_you(
             project: Some(labels.project(t.project_id)),
             agent,
             task_title: None,
-            preview: plan.map(|p| clip(&p.body)),
+            preview: plan.as_ref().map(|p| clip(&p.body)),
             waited: waited(now, at),
             since: since(at),
             task_id: Some(t.id.to_string()),
+            plan_id: plan.map(|p| p.id.to_string()),
             importance: "high",
         });
     }
@@ -157,10 +162,7 @@ pub(super) async fn needs_you(
             status: Some(TaskStatus::Review),
             ..TaskFilter::default()
         })
-        .await?
-        .into_iter()
-        .filter(|t| t.created_by == Actor::Human)
-        .collect();
+        .await?;
     reviews.sort_by_key(|t| t.updated_at);
     for t in reviews {
         let agent = match t.owner_agent_id {
@@ -179,30 +181,13 @@ pub(super) async fn needs_you(
             waited: waited(now, t.updated_at),
             since: since(t.updated_at),
             task_id: None,
+            plan_id: None,
             importance: "high",
         });
     }
 
-    let mut messages = Vec::new();
-    for importance in [Importance::Urgent, Importance::High] {
-        messages.extend(
-            state
-                .store
-                .inbox(
-                    Recipient::Human,
-                    &InboxFilter {
-                        importance: Some(importance),
-                        limit: Some(MESSAGE_LIMIT),
-                        ..InboxFilter::default()
-                    },
-                    now,
-                )
-                .await?
-                .into_iter()
-                .map(|i| i.message)
-                .filter(|m| m.kind != MessageKind::Plan),
-        );
-    }
+    // A read-only peek: showing the strip must not mark anything delivered.
+    let mut messages = state.store.human_attention(MESSAGE_LIMIT).await?;
     messages.sort_by_key(|m| m.created_at);
     for m in messages {
         let agent = match m.from {
@@ -230,6 +215,7 @@ pub(super) async fn needs_you(
             waited: waited(now, m.created_at),
             since: since(m.created_at),
             task_id: None,
+            plan_id: None,
             importance: m.importance.as_str(),
         });
     }

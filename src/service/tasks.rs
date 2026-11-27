@@ -182,6 +182,9 @@ pub enum TaskError {
     NoPlanToReview(PlanState),
     #[error("a plan needs some text")]
     EmptyPlan,
+    /// The decision named a plan that has since been replaced.
+    #[error("the plan changed — review the new version")]
+    PlanChanged,
     #[error("a note is required to request changes")]
     NoteRequired,
     #[error("unknown project")]
@@ -514,6 +517,7 @@ impl TaskService {
                     lease: LeaseUpdate::Clear,
                     plan_to: Some(PlanState::Submitted),
                     message: Some(message.clone()),
+                    archive_plans: true,
                     ..Guarded::new(TaskEventKind::PlanSubmitted)
                 },
             )
@@ -528,9 +532,10 @@ impl TaskService {
         }
     }
 
-    /// The human approves the submitted plan: `planning → claimed` with a fresh lease, and a
-    /// system message tells the owner's session to go ahead.
-    pub async fn approve_plan(&self, id: TaskId) -> Result<Task, TaskError> {
+    /// The human approves the submitted plan `plan` (the one they read): `planning → claimed`
+    /// with a fresh lease, and a system message tells the owner's session to go ahead. Refused
+    /// with `PlanChanged` when a newer plan has been submitted since.
+    pub async fn approve_plan(&self, id: TaskId, plan: MessageId) -> Result<Task, TaskError> {
         let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
         let until = self.clock.now() + task.lease_ttl.unwrap_or(self.lease_ttl);
         let body = format!(
@@ -545,6 +550,7 @@ impl TaskService {
             LeaseUpdate::Set(until),
             TaskEventKind::PlanApproved,
             None,
+            plan,
             ("plan approved", body, MessageKind::System),
         )
         .await
@@ -553,7 +559,12 @@ impl TaskService {
     /// The human asks for changes (a note is required): the plan state becomes
     /// `changes_requested`, the task stays `planning` with a running lease again, and the note
     /// goes to the owner's session.
-    pub async fn request_plan_changes(&self, id: TaskId, note: &str) -> Result<Task, TaskError> {
+    pub async fn request_plan_changes(
+        &self,
+        id: TaskId,
+        plan: MessageId,
+        note: &str,
+    ) -> Result<Task, TaskError> {
         let note = note.trim();
         if note.is_empty() {
             return Err(TaskError::NoteRequired);
@@ -568,6 +579,7 @@ impl TaskService {
             LeaseUpdate::Set(until),
             TaskEventKind::PlanChangesRequested,
             Some(note.to_string()),
+            plan,
             (
                 "plan changes requested",
                 note.to_string(),
@@ -1095,6 +1107,8 @@ impl TaskService {
                 plan_from: g.plan_from.map(<[PlanState]>::to_vec),
                 plan_to: g.plan_to,
                 message: g.message.clone(),
+                latest_plan: None,
+                archive_plans: g.archive_plans,
             };
             if let Some(done) = self.store.transition_task(&req).await? {
                 if g.kind != TaskEventKind::Renewed {
@@ -1140,6 +1154,7 @@ impl TaskService {
         lease: LeaseUpdate,
         kind: TaskEventKind,
         note: Option<String>,
+        plan: MessageId,
         (subject, body, message_kind): (&str, String, MessageKind),
     ) -> Result<Task, TaskError> {
         let id = task.id;
@@ -1184,6 +1199,8 @@ impl TaskService {
                 plan_from: Some(vec![PlanState::Submitted]),
                 plan_to: Some(plan_to),
                 message: Some(message.clone()),
+                latest_plan: Some(plan),
+                archive_plans: true,
             };
             if let Some(done) = self.store.transition_task(&req).await? {
                 self.after_transition(&done, &req.event, None).await;
@@ -1191,8 +1208,26 @@ impl TaskService {
                 return Ok(done.task);
             }
             current = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+            if current.status == TaskStatus::Planning
+                && current.plan_state == PlanState::Submitted
+                && self.latest_plan(id).await? != Some(plan)
+            {
+                return Err(TaskError::PlanChanged);
+            }
         }
         Err(TaskError::NoPlanToReview(current.plan_state))
+    }
+
+    /// The id of a task's newest `plan` message.
+    async fn latest_plan(&self, id: TaskId) -> Result<Option<MessageId>, TaskError> {
+        Ok(self
+            .store
+            .task_thread(id)
+            .await?
+            .into_iter()
+            .rev()
+            .find(|m| m.kind == MessageKind::Plan)
+            .map(|m| m.id))
     }
 
     async fn message_created(&self, message: &Message) {
@@ -1231,6 +1266,8 @@ impl TaskService {
             plan_from: None,
             plan_to: (to == TaskStatus::Open).then_some(PlanState::None),
             message: None,
+            latest_plan: None,
+            archive_plans: false,
         };
         match self.store.transition_task(&req).await? {
             Some(done) => {
@@ -1281,6 +1318,7 @@ struct Guarded<'a> {
     plan_from: Option<&'a [PlanState]>,
     plan_to: Option<PlanState>,
     message: Option<Message>,
+    archive_plans: bool,
 }
 
 impl Guarded<'_> {
@@ -1297,6 +1335,7 @@ impl Guarded<'_> {
             plan_from: None,
             plan_to: None,
             message: None,
+            archive_plans: false,
         }
     }
 }

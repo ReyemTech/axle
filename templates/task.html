@@ -21,26 +21,29 @@
   {% if task.requires_plan || plan.is_some() %}
   <section id="plan" class="panel plan{% if task.can_decide %} is-waiting{% endif %}" aria-label="Plan">
     <h2 class="panel-title">{% if task.can_decide %}<span class="aspect" data-aspect="plan-submitted" aria-hidden="true"></span>Plan awaiting your approval{% else %}Plan <span class="muted">{{ task.plan_words }}</span>{% endif %}</h2>
+    {% if plan_changed %}<p class="error" role="alert">The plan changed while you were reading it — review the new version below. Nothing was decided.</p>{% endif %}
     {% if let Some(p) = plan %}
     <p class="muted">Latest plan from <span class="owner">{{ p.from }}</span>, <time datetime="{{ p.at.iso }}" title="{{ p.at.text }}">{{ p.at.ago }}</time>. Agent-written text, shown as written; earlier plans stay in the thread.</p>
     <div class="peer-text plan-body">{{ p.body }}</div>
     {% else %}
     <p class="empty">{% if task.status == "planning" %}The agent is writing the plan. It will appear here for you to approve.{% else %}No plan yet. The agent that claims this task writes one first.{% endif %}</p>
     {% endif %}
-    {% if task.can_decide %}{% if let Some(token) = csrf %}
+    {% if task.can_decide %}{% if let Some(token) = csrf %}{% if let Some(p) = plan %}
     <div class="plan-actions">
       <form method="post" action="/ui/tasks/{{ task.id }}/plan/approve">
         <input type="hidden" name="csrf" value="{{ token }}">
+        <input type="hidden" name="plan" value="{{ p.id }}">
         <button type="submit">Approve plan</button>
       </form>
       <form class="stack plan-changes" method="post" action="/ui/tasks/{{ task.id }}/plan/changes">
         <input type="hidden" name="csrf" value="{{ token }}">
+        <input type="hidden" name="plan" value="{{ p.id }}">
         <label for="plan-note">Or ask for changes</label>
         <textarea id="plan-note" name="note" rows="3" required placeholder="What should change in the plan"></textarea>
         <button type="submit" class="secondary">Request changes</button>
       </form>
     </div>
-    {% endif %}{% endif %}
+    {% endif %}{% endif %}{% endif %}
   </section>
   {% endif %}
 

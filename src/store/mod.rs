@@ -267,6 +267,10 @@ pub trait Store: Send + Sync {
     ) -> StoreResult<Vec<Message>>;
     /// Delivery receipts for `ids`, in the same order (an unknown id gets an empty receipt).
     async fn message_receipts(&self, ids: &[MessageId]) -> StoreResult<Vec<MessageReceipt>>;
+    /// What waits on the human's attention, oldest first, at most `limit`: unarchived
+    /// human-due messages (their own rows, and thread posts not yet materialised) of high or
+    /// urgent importance that are not plans. Read-only: nothing is marked delivered.
+    async fn human_attention(&self, limit: u32) -> StoreResult<Vec<Message>>;
 }
 
 /// How far a message has got, from its recipient rows (spec §9 receipts).
@@ -401,6 +405,11 @@ pub struct TransitionRequest {
     pub plan_to: Option<PlanState>,
     /// A message written with the transition (a submitted plan, an approval).
     pub message: Option<Message>,
+    /// Required latest plan: applies only while this is the task's newest `plan` message.
+    pub latest_plan: Option<MessageId>,
+    /// Archives (acks for the human) the task's existing plan messages, before `message` is
+    /// written: a superseded or decided plan no longer waits on anyone.
+    pub archive_plans: bool,
 }
 
 /// A request to append participating projects to a task (see `Store::add_task_projects`).

@@ -146,6 +146,8 @@ pub struct ChildLink {
 
 /// The latest plan of a task, for the plan panel.
 pub struct PlanView {
+    /// The plan message's id, sent back with a decision.
+    pub id: String,
     pub from: String,
     pub at: Stamp,
     pub body: String,
@@ -201,6 +203,8 @@ struct TaskPage {
     children: Vec<ChildLink>,
     evidence: Option<Evidence>,
     plan: Option<PlanView>,
+    /// A decision was refused because the plan changed.
+    plan_changed: bool,
     /// Projects that can still be added.
     addable: Vec<ProjectOption>,
     /// Projects a subtask may be created in.
@@ -215,6 +219,9 @@ pub struct TaskQuery {
     /// Thread cursor: show messages sent before this message id.
     #[serde(default)]
     pub thread_before: Option<String>,
+    /// Set when a decision named a plan that had been replaced.
+    #[serde(default)]
+    pub plan_changed: Option<String>,
 }
 
 fn lease_text(now: OffsetDateTime, task: &Task, owner: Option<&str>) -> String {
@@ -421,6 +428,7 @@ pub async fn task_page(
 
     let plan = match latest_plan(&state, id).await? {
         Some(m) => Some(PlanView {
+            id: m.id.to_string(),
             from: labels.actor_label(m.from).await?,
             at: Stamp::new(now, m.created_at),
             body: m.body,
@@ -464,6 +472,7 @@ pub async fn task_page(
         evidence,
         child_projects,
         plan,
+        plan_changed: q.plan_changed.is_some(),
         addable,
     })
 }
