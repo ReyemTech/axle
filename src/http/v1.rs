@@ -318,6 +318,8 @@ pub struct InboxSummaryItem {
     /// `human`, or the sending agent as `<project> · <host> · <harness>`.
     pub from: String,
     pub subject: Option<String>,
+    /// The message's project key (where it was sent), for the `in <project>` label.
+    pub project: Option<String>,
     pub importance: Importance,
     /// The body on one line, at most `PREVIEW_CHARS` characters.
     pub preview: String,
@@ -344,6 +346,7 @@ async fn inbox_summary(
         .await
         .map_err(ApiError::internal)?;
     let mut labels: HashMap<AgentId, String> = HashMap::new();
+    let mut projects: HashMap<ProjectId, Option<String>> = HashMap::new();
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         let m = item.message;
@@ -360,10 +363,27 @@ async fn inbox_summary(
                 }
             },
         };
+        let project = match m.project_id {
+            None => None,
+            Some(p) => match projects.get(&p) {
+                Some(k) => k.clone(),
+                None => {
+                    let k = state
+                        .store
+                        .get_project(p)
+                        .await
+                        .map_err(ApiError::internal)?
+                        .map(|p| p.key);
+                    projects.insert(p, k.clone());
+                    k
+                }
+            },
+        };
         out.push(InboxSummaryItem {
             id: m.id,
             from,
             subject: m.subject,
+            project,
             importance: m.importance,
             preview: preview(&m.body),
         });

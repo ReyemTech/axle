@@ -27,6 +27,8 @@ pub use crate::store::InboxFilter;
 
 /// Largest accepted message (and task) body, in bytes.
 pub const BODY_LIMIT: usize = 65_536;
+/// Longest accepted message subject (and task title), in characters.
+pub const SUBJECT_MAX: usize = 200;
 
 #[derive(Debug, Clone)]
 pub struct NewMessage {
@@ -41,11 +43,24 @@ pub struct NewMessage {
 pub enum MessageError {
     #[error("body exceeds {limit} bytes")]
     BodyTooLarge { limit: usize },
+    #[error("{field} is longer than {max} characters")]
+    TooLong { field: &'static str, max: usize },
     /// The sender, recipient or replied-to message does not exist.
     #[error("{0} not found")]
     NotFound(&'static str),
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+/// Rejects a subject or title over `SUBJECT_MAX` characters.
+pub fn check_subject(field: &'static str, text: &str) -> Result<(), MessageError> {
+    if text.chars().count() > SUBJECT_MAX {
+        return Err(MessageError::TooLong {
+            field,
+            max: SUBJECT_MAX,
+        });
+    }
+    Ok(())
 }
 
 /// Rejects bodies over `BODY_LIMIT` bytes.
@@ -79,6 +94,9 @@ impl MessageService {
 
     pub async fn send(&self, caller: &Actor, new: NewMessage) -> Result<Message, MessageError> {
         check_body(&new.body)?;
+        if let Some(subject) = &new.subject {
+            check_subject("subject", subject)?;
+        }
         let (sender_project, token) = self.sender(caller).await?;
         if let Some(reply_to) = new.reply_to
             && self.store.get_message(reply_to).await?.is_none()

@@ -26,6 +26,7 @@ fn message_error(e: MessageError) -> UiError {
         MessageError::BodyTooLarge { limit } => {
             UiError::Invalid(format!("The message is over {limit} bytes."))
         }
+        e @ MessageError::TooLong { .. } => UiError::Invalid(capitalise(&e.to_string())),
         MessageError::NotFound(what) => UiError::Invalid(format!("That {what} does not exist.")),
         MessageError::Store(e) => e.into(),
     }
@@ -43,7 +44,8 @@ fn task_error(e: TaskError) -> UiError {
         e @ (TaskError::ReasonRequired
         | TaskError::InvalidLeaseTtl
         | TaskError::ChildExtraProjects
-        | TaskError::ChildProjectMismatch) => UiError::Invalid(capitalise(&e.to_string())),
+        | TaskError::ChildProjectMismatch
+        | TaskError::InvalidField { .. }) => UiError::Invalid(capitalise(&e.to_string())),
     }
 }
 

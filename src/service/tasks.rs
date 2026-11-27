@@ -15,8 +15,8 @@ use crate::domain::{
     Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId,
 };
 use crate::events::{Event, EventBus};
-use crate::service::identity::Resolved;
-use crate::service::messages::{MessageError, check_body};
+use crate::service::identity::{IdentityError, NAME_MAX, Resolved, check_label};
+use crate::service::messages::{MessageError, SUBJECT_MAX, check_body, check_subject};
 use crate::store::{
     ClaimRequest, Claimant, EditRequest, LeaseUpdate, Store, StoreError, TaskFilter,
     TransitionRequest, claim_event,
@@ -156,6 +156,12 @@ pub enum TaskError {
     ReasonRequired,
     #[error("a task lease TTL must be at least one second")]
     InvalidLeaseTtl,
+    /// An eligibility harness or host outside the label charset or length.
+    #[error("invalid {field}: {reason}")]
+    InvalidField {
+        field: &'static str,
+        reason: &'static str,
+    },
     #[error("child tasks belong to one project")]
     ChildExtraProjects,
     #[error("a child task's project must be its parent's project or one the parent spans")]
@@ -226,10 +232,12 @@ impl TaskService {
             .await?
             .ok_or(MessageError::NotFound("message"))?;
         if new.title.trim().is_empty() {
-            new.title = message
+            let title = message
                 .subject
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| message.body.lines().next().unwrap_or_default().to_string());
+            // A derived title is cut to fit rather than refused.
+            new.title = title.chars().take(SUBJECT_MAX).collect();
         }
         if new.body.trim().is_empty() {
             new.body = message.body;
@@ -244,6 +252,8 @@ impl TaskService {
         reply_to: Option<MessageId>,
     ) -> Result<Task, TaskError> {
         check_body(&new.body)?;
+        check_subject("title", &new.title)?;
+        check_eligibility(&new.eligibility)?;
         let lease_ttl = match new.lease_ttl {
             Some(d) if d < Duration::SECOND => return Err(TaskError::InvalidLeaseTtl),
             Some(d) => Some(Duration::seconds(d.whole_seconds())),
@@ -486,6 +496,9 @@ impl TaskService {
     ) -> Result<Task, TaskError> {
         if let Some(body) = &body {
             check_body(body)?;
+        }
+        if let Some(title) = &title {
+            check_subject("title", title)?;
         }
         let req = EditRequest {
             task: id,
@@ -755,6 +768,24 @@ impl TaskService {
             }
         }
     }
+}
+
+/// Eligibility values are shown to models next to peer data, so they follow the same label
+/// rules as hosts and harnesses.
+fn check_eligibility(e: &Eligibility) -> Result<(), TaskError> {
+    let fields = [
+        ("eligibility harness", &e.harness),
+        ("eligibility host", &e.host),
+    ];
+    for (field, value) in fields {
+        if let Some(v) = value
+            && let Err(IdentityError::Invalid { field, reason }) =
+                check_label(field, v, NAME_MAX, false)
+        {
+            return Err(TaskError::InvalidField { field, reason });
+        }
+    }
+    Ok(())
 }
 
 fn actor_of(r: &Resolved) -> Actor {
