@@ -39,6 +39,8 @@
 }
 
 *, *::before, *::after { box-sizing: border-box; }
+/* Components set `display`; search hides items with the `hidden` attribute. */
+[hidden] { display: none !important; }
 html { -webkit-text-size-adjust: 100%; }
 body {
   margin: 0;
@@ -203,7 +205,6 @@ button.link:hover { color: var(--text); }
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-left: 3px solid var(--border);
   border-radius: var(--radius);
   padding: 10px 12px;
   display: grid;
@@ -211,10 +212,6 @@ button.link:hover { color: var(--text); }
   min-width: 0;
   overflow-wrap: anywhere;
 }
-.card[data-status="claimed"] { border-left-color: var(--accent); }
-.card[data-status="blocked"] { border-left-color: var(--danger); }
-.card[data-status="review"] { border-left-color: var(--warn); }
-.card[data-status="done"] { border-left-color: var(--ok); }
 [data-nav].selected { outline: 2px solid var(--focus); outline-offset: 1px; }
 .card-head { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; justify-content: space-between; }
 .card-title { font-size: 15px; }
@@ -228,7 +225,18 @@ button.link:hover { color: var(--text); }
 .card-meta { font-size: 13px; color: var(--muted); display: flex; gap: 8px; }
 .project { color: var(--text); }
 .card-meta .project { color: var(--muted); }
-.status { text-transform: capitalize; }
+.status {
+  text-transform: capitalize;
+  font-size: 12px;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+.card[data-status="claimed"] .status { color: var(--accent); border-color: var(--accent); }
+.card[data-status="blocked"] .status { color: var(--danger); border-color: var(--danger); }
+.card[data-status="review"] .status { color: var(--warn); border-color: var(--warn); }
+.card[data-status="done"] .status { color: var(--ok); border-color: var(--ok); }
+.card[data-status="blocked"] { border-color: var(--danger); background: var(--danger-soft); }
 .progress { display: flex; align-items: center; gap: 8px; }
 .progress progress {
   flex: 1;

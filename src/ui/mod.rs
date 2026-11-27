@@ -37,6 +37,8 @@ pub const COOKIE: &str = "coord_ui";
 pub const SESSION_TTL: Duration = Duration::hours(12);
 /// Login attempts allowed per client IP per minute.
 pub const LOGIN_PER_MINUTE: u32 = 10;
+/// How often an idle live stream re-checks that its session is still signed in.
+const LIVE_SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
 /// Largest form body a UI POST may send.
 const FORM_LIMIT: usize = 256 * 1024;
 
@@ -406,26 +408,41 @@ async fn asset(Path(file): Path<String>, headers: HeaderMap) -> Response {
 /// `task-<id>` with the re-rendered card of the affected top-level task (htmx `sse-swap`s it
 /// in place), `board` when a top-level task may have changed column (the board re-fetches
 /// its columns) and `overview` for anything (the overview re-fetches its panel). A lagging
-/// subscriber gets `board` and `overview`. The stream ends when the server shuts down.
+/// subscriber gets `board` and `overview`. The stream ends when the server shuts down, and
+/// when its session is logged out or expires (checked before every event and every
+/// `LIVE_SESSION_RECHECK`).
 async fn live(
     State(state): State<AppState>,
+    Extension(session): Extension<SessionCtx>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     // Subscribe before responding, so nothing published after this request is missed.
     let rx = state.bus.subscribe();
     let shutdown = state.shutdown.clone();
-    let stream = futures_util::stream::unfold((rx, state), move |(mut rx, state)| {
+    let mut recheck = tokio::time::interval(LIVE_SESSION_RECHECK);
+    recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let init = (rx, recheck, state, session.id);
+    let stream = futures_util::stream::unfold(init, move |(mut rx, mut recheck, state, id)| {
         let shutdown = shutdown.clone();
         async move {
-            let received = tokio::select! {
-                received = rx.recv() => received,
-                () = shutdown.wait() => return None,
-            };
-            let frames = match received {
-                Ok(event) => views::live_frames(&state, &event).await,
-                Err(RecvError::Lagged(_)) => views::refresh_frames(),
-                Err(RecvError::Closed) => return None,
-            };
-            Some((frames, (rx, state)))
+            loop {
+                let received = tokio::select! {
+                    received = rx.recv() => received,
+                    _ = recheck.tick() => {
+                        // Ends the stream once the session is gone.
+                        state.ui.get(&id, state.clock.now())?;
+                        continue;
+                    }
+                    () = shutdown.wait() => return None,
+                };
+                // Logged out or expired since the stream opened: send nothing more.
+                state.ui.get(&id, state.clock.now())?;
+                let frames = match received {
+                    Ok(event) => views::live_frames(&state, &event).await,
+                    Err(RecvError::Lagged(_)) => views::refresh_frames(),
+                    Err(RecvError::Closed) => return None,
+                };
+                return Some((frames, (rx, recheck, state, id)));
+            }
         }
     })
     .flat_map(|frames| {

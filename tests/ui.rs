@@ -811,3 +811,80 @@ async fn static_assets_are_embedded() {
     let missing = app.get("/ui/static/nope.js", None).await;
     assert_eq!(missing.status, StatusCode::NOT_FOUND);
 }
+
+/// Opens `/ui/live` with `cookie`; returns the body as text chunks.
+async fn open_live(app: &App, cookie: &str) -> impl futures_util::Stream<Item = String> + Unpin {
+    let res = app
+        .router
+        .clone()
+        .oneshot(
+            Request::get("/ui/live")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    res.into_body()
+        .into_data_stream()
+        .map(|c| String::from_utf8(c.unwrap().to_vec()).unwrap())
+}
+
+/// Everything the stream sends until it ends (fails if it does not end within `wait`).
+async fn drain_until_end(
+    stream: &mut (impl futures_util::Stream<Item = String> + Unpin),
+    wait: Duration,
+) -> String {
+    tokio::time::timeout(wait, async {
+        let mut all = String::new();
+        while let Some(chunk) = stream.next().await {
+            all.push_str(&chunk);
+        }
+        all
+    })
+    .await
+    .expect("the live stream ended")
+}
+
+#[tokio::test]
+async fn live_stream_ends_on_logout() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let csrf = csrf_of(&app.get("/ui/", Some(&cookie)).await);
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let mut stream = open_live(&app, &cookie).await;
+
+    let page = app
+        .post_form("/ui/logout", Some(&cookie), &format!("csrf={csrf}"))
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER);
+    app.task(&iac, "secret plans", None).await;
+    let sent = drain_until_end(&mut stream, Duration::from_secs(2)).await;
+    assert!(!sent.contains("event: task-"), "{sent}");
+    assert!(!sent.contains("secret plans"), "{sent}");
+}
+
+#[tokio::test]
+async fn live_stream_ends_when_the_session_expires() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let mut stream = open_live(&app, &cookie).await;
+    app.clock
+        .advance(time::Duration::hours(12) + time::Duration::seconds(1));
+    app.task(&iac, "after expiry", None).await;
+    let sent = drain_until_end(&mut stream, Duration::from_secs(2)).await;
+    assert!(!sent.contains("after expiry"), "{sent}");
+}
+
+#[test]
+fn stylesheet_hides_hidden_elements() {
+    // Search hides items with the `hidden` attribute; `display: grid` on cards and agent
+    // cards would otherwise override the browser's own `[hidden]` rule.
+    let css = include_str!("../static/app.css");
+    assert!(
+        css.contains("[hidden] { display: none !important; }"),
+        "app.css must force [hidden] to display: none"
+    );
+}
