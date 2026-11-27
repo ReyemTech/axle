@@ -436,7 +436,12 @@ async fn board_columns_and_progress() {
     assert_eq!(rows.len(), 3, "{rows:?}");
     assert!(rows[0].contains("update Pulumi secret") && rows[0].contains("codex@cac-1"));
     assert!(rows[1].contains("roll CNPG users") && rows[1].contains("claude-code@mac"));
-    assert!(rows[2].contains("(open)"), "{rows:?}");
+    assert!(rows[2].ends_with("open"), "{rows:?}");
+    assert_eq!(
+        select_texts(&children, ".child-owner")[2],
+        "open",
+        "an unclaimed subtask names its state once"
+    );
 
     // A blocked child shows on the parent card without expanding it.
     app.state.tasks.block(&iac, b.id, "waiting").await.unwrap();

@@ -429,22 +429,13 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
 .lines a[aria-current="page"] { color: var(--text); font-weight: 600; background: var(--card); border-color: var(--card-border); }
 .lines a[aria-current="page"] .line-swatch { height: 6px; }
 .key { margin-left: auto; position: relative; }
-.key > summary {
-  cursor: pointer;
-  height: 32px;
-  display: inline-flex;
-  align-items: center;
-  padding: 0 10px;
-  color: var(--muted);
-  font-size: 13px;
-  border-radius: var(--radius);
-}
-.key > summary:hover { color: var(--text); background: var(--band); }
-.key[open] > summary { color: var(--text); }
+.key > summary { list-style: none; }
+.key > summary::-webkit-details-marker { display: none; }
+.key[open] > summary { background: var(--band); border-color: var(--text); }
 .key-list {
   position: absolute;
   right: 0;
-  top: calc(100% + 4px);
+  top: calc(100% + 6px);
   z-index: 5;
   width: min(420px, calc(100vw - 24px));
   display: grid;
@@ -452,7 +443,7 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
   margin: 0;
   padding: 12px 14px;
   background: var(--card);
-  border: 1px solid var(--card-border);
+  border: 1px solid var(--rule-strong);
   border-radius: 6px;
   font-size: 12.5px;
 }
@@ -506,6 +497,25 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
   padding: 0 12px;
   border-bottom: 2px solid var(--text);
 }
+/* The heads join into one line across the board, with a joint at each column. */
+.column:not(:last-child) > header::after {
+  content: "";
+  position: absolute;
+  right: -8px;
+  bottom: -2px;
+  width: 8px;
+  height: 2px;
+  background: var(--text);
+}
+.column:not(:last-child) > header::before {
+  content: "";
+  position: absolute;
+  right: -5px;
+  bottom: -6px;
+  width: 2px;
+  height: 10px;
+  background: var(--text);
+}
 .column h2 { font-size: 12.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
 .column .count { margin-left: auto; font-size: 13px; font-weight: 600; color: var(--muted); }
 /* Waiting work reads from across the desk; an empty column stays quiet. */
@@ -528,12 +538,17 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
   border-radius: 6px;
 }
 .card:hover { border-color: var(--rule-strong); }
-.card:hover .card-link { text-decoration: underline; }
 .card[data-status="blocked"] { background: var(--danger-soft); border-color: var(--danger-border); }
 [data-nav].selected, [data-nav]:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
 .card-title { font-size: 14px; font-weight: 600; line-height: 1.35; min-width: 0; text-wrap: pretty; overflow-wrap: break-word; hyphens: manual; }
-.card-link { color: var(--text); text-decoration: none; text-decoration-thickness: 1px; }
-.card-link:hover { text-decoration-thickness: 2px; }
+.card-link {
+  color: var(--text);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-decoration-color: var(--rule-strong);
+  text-underline-offset: 3px;
+}
+.card-link:hover, .card:hover .card-link { text-decoration-color: currentColor; }
 .card-parent { font-size: 12.5px; color: var(--muted); overflow-wrap: break-word; }
 .card-parent a { color: var(--text); }
 .card-meta { display: flex; flex-wrap: wrap; gap: 2px 12px; align-items: center; font-size: 12.5px; color: var(--muted); }

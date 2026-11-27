@@ -7,7 +7,7 @@
     {% for p in projects %}<a href="/ui/board?project={{ p.id }}" title="{{ p.key }}"{% if p.selected %} aria-current="page"{% endif %}><span class="line-swatch" data-line="{{ p.line }}" aria-hidden="true"></span>{{ p.name }}</a>{% endfor %}
   </nav>
   <details class="key">
-    <summary>Key</summary>
+    <summary class="button-like">Key</summary>
     <dl class="key-list">
       <div><dt><span class="aspect" data-aspect="open" aria-hidden="true"></span>open</dt><dd>Waiting for an agent to claim it.</dd></div>
       <div><dt><span class="aspect" data-aspect="claimed" aria-hidden="true"></span>claimed</dt><dd>One agent holds it under a lease.</dd></div>

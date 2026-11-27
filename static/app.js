@@ -155,6 +155,19 @@
     if (question && !window.confirm(question)) e.preventDefault();
   });
 
+  // The board's Key closes on a click outside it or on Escape.
+  function closeKeys(except) {
+    document.querySelectorAll("details.key[open]").forEach(function (d) {
+      if (d !== except) d.open = false;
+    });
+  }
+  document.addEventListener("click", function (e) {
+    closeKeys(e.target instanceof Element ? e.target.closest("details.key") : null);
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") closeKeys(null);
+  });
+
   document.addEventListener("change", function (e) {
     var t = e.target;
     if (t && t.hasAttribute && t.hasAttribute("data-autosubmit") && t.form) t.form.submit();

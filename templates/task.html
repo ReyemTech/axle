@@ -46,7 +46,7 @@
       <li class="child" data-status="{{ c.status }}">
         <span class="station" data-status="{{ c.status }}" title="{{ c.status }}" aria-hidden="true"></span>
         <a class="child-title" href="/ui/tasks/{{ c.id }}"><span class="project" data-line="{{ c.project.line }}" title="{{ c.project.key }}">{{ c.project.name }}</span> {{ c.title }}</a>
-        <span class="child-owner"><span class="child-state">{{ c.status }}</span> · {% if let Some(o) = c.owner %}{{ o }}{% else %}(open){% endif %}</span>
+        <span class="child-owner"><span class="child-state">{{ c.status }}</span>{% if let Some(o) = c.owner %} · {{ o }}{% endif %}</span>
       </li>
     {% endfor %}
     </ul>
