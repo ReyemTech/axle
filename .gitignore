@@ -1,0 +1,5 @@
+.concord/
+/target/
+*.db
+*.db-*
+.env
