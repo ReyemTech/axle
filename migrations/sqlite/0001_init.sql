@@ -90,8 +90,11 @@ CREATE INDEX task_events_task ON task_events (task_id, created_at);
 
 -- ---------------------------------------------------------------- messages
 
+-- `seq` is the rowid (INTEGER PRIMARY KEY), so it is stable across VACUUM and can back the
+-- FTS index; it also orders messages and positions agent cursors.
 CREATE TABLE messages (
-    id               TEXT PRIMARY KEY,
+    seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+    id               TEXT NOT NULL UNIQUE,
     project_id       TEXT REFERENCES projects(id),
     from_agent_id    TEXT REFERENCES agents(id),           -- both NULL = human
     from_session_id  TEXT REFERENCES sessions(id),
@@ -113,23 +116,25 @@ CREATE INDEX messages_task ON messages (task_id, created_at);
 CREATE INDEX messages_project ON messages (project_id, created_at);
 
 CREATE VIRTUAL TABLE messages_fts USING fts5(
-    subject, body, content = 'messages', content_rowid = 'rowid'
+    subject, body, content = 'messages', content_rowid = 'seq'
 );
 CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts (rowid, subject, body) VALUES (new.rowid, new.subject, new.body);
+    INSERT INTO messages_fts (rowid, subject, body) VALUES (new.seq, new.subject, new.body);
 END;
 CREATE TRIGGER messages_fts_update AFTER UPDATE OF subject, body ON messages BEGIN
     INSERT INTO messages_fts (messages_fts, rowid, subject, body)
-        VALUES ('delete', old.rowid, old.subject, old.body);
-    INSERT INTO messages_fts (rowid, subject, body) VALUES (new.rowid, new.subject, new.body);
+        VALUES ('delete', old.seq, old.subject, old.body);
+    INSERT INTO messages_fts (rowid, subject, body) VALUES (new.seq, new.subject, new.body);
 END;
 CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
     INSERT INTO messages_fts (messages_fts, rowid, subject, body)
-        VALUES ('delete', old.rowid, old.subject, old.body);
+        VALUES ('delete', old.seq, old.subject, old.body);
 END;
 
--- Per-recipient delivery for agent-, session- and human-addressed messages.
--- Agent rows are acked once per agent; session rows per session; both NULL = human.
+-- Per-recipient delivery. Agent-, session- and human-addressed messages get their row at
+-- send time; project- and task-addressed ones get an agent (or human) row when a recipient
+-- first reads or acks its inbox. Agent rows (session NULL) are acked once per agent; session
+-- rows (agent NULL) per session; both NULL = the human.
 CREATE TABLE message_recipients (
     message_id            TEXT NOT NULL REFERENCES messages(id),
     recipient_agent_id    TEXT REFERENCES agents(id),
@@ -144,13 +149,14 @@ CREATE UNIQUE INDEX message_recipients_unique ON message_recipients
 CREATE INDEX message_recipients_agent ON message_recipients (recipient_agent_id, acked_at);
 CREATE INDEX message_recipients_session ON message_recipients (recipient_session_id, acked_at);
 
--- Project-wide messages are resolved at read time from this per-agent cursor.
+-- Project-wide messages are resolved at read time from this per-agent cursor: an agent sees
+-- messages to its home project with `seq > acked_seq`. Written with the agent, at the newest
+-- message then, so an agent that first appears later starts at its creation.
 CREATE TABLE agent_cursors (
-    agent_id         TEXT NOT NULL REFERENCES agents(id),
-    project_id       TEXT NOT NULL REFERENCES projects(id),
-    acked_until      TEXT NOT NULL,       -- messages created at or before this are acked
-    last_message_id  TEXT REFERENCES messages(id),
-    updated_at       TEXT NOT NULL,
+    agent_id    TEXT NOT NULL REFERENCES agents(id),
+    project_id  TEXT NOT NULL REFERENCES projects(id),
+    acked_seq   INTEGER NOT NULL,
+    updated_at  TEXT NOT NULL,
     PRIMARY KEY (agent_id, project_id)
 );
 

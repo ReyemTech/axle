@@ -10,12 +10,13 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 use time::{Duration as TimeDuration, OffsetDateTime};
 
 use super::{
-    ClaimAttempt, ClaimRequest, LeaseUpdate, Store, StoreError, StoreResult, TaskFilter,
-    TransitionRequest, child_event, children_complete_event, claim_event, closes_child,
+    ClaimAttempt, ClaimRequest, InboxFilter, LeaseUpdate, Recipient, Store, StoreError,
+    StoreResult, TaskFilter, TransitionRequest, child_event, children_complete_event, claim_event,
+    closes_child, send_time_recipient,
 };
 use crate::domain::{
-    Actor, Agent, AgentId, Eligibility, Project, ProjectId, Session, SessionId, Task, TaskEvent,
-    TaskId, TokenId,
+    Actor, Address, Agent, AgentId, Eligibility, InboxItem, Message, MessageId, Project, ProjectId,
+    Session, SessionId, Task, TaskEvent, TaskId, TokenId,
 };
 
 /// Write transactions take the write lock up front, so a read-then-update inside one is
@@ -348,6 +349,175 @@ async fn claim_locked(
     })
 }
 
+/// Message columns (alias `m`) as a literal, so queries stay static SQL.
+macro_rules! message_cols {
+    () => {
+        "m.id, m.project_id, m.from_agent_id, m.from_session_id, m.to_kind, m.to_id, m.task_id,
+         m.subject, m.body, m.importance, m.reply_to, m.created_at"
+    };
+}
+
+/// Recipient rows (alias-free, so usable in `UPDATE`) belonging to `?1` agent / `?2` session:
+/// the agent's own rows, or the session's. For the human both are NULL, which matches only
+/// the human's rows.
+macro_rules! owned_rows {
+    () => {
+        "((recipient_agent_id IS ?1 AND recipient_session_id IS NULL)
+          OR (recipient_agent_id IS NULL AND recipient_session_id = ?2))"
+    };
+}
+
+/// `owned_rows` joined to `messages m`, minus agent rows for mail the agent sent itself.
+macro_rules! inbox_rows {
+    () => {
+        concat!(
+            owned_rows!(),
+            " AND (recipient_session_id IS NOT NULL OR m.from_agent_id IS NOT ?1)"
+        )
+    };
+}
+
+/// Project / task messages (alias `m`) due to `?1` (agent, or NULL for the human) that it has
+/// no row for yet: broadcasts to its home project after its cursor, and posts in threads of
+/// tasks it owns or created. Never its own mail.
+macro_rules! pending_messages {
+    () => {
+        "m.from_agent_id IS NOT ?1
+         AND ((m.to_kind = 'project'
+               AND EXISTS (SELECT 1 FROM agent_cursors c
+                           WHERE c.agent_id = ?1 AND c.project_id = m.to_id
+                             AND m.seq > c.acked_seq))
+              OR (m.to_kind = 'task'
+                  AND EXISTS (SELECT 1 FROM tasks t
+                              WHERE t.id = m.task_id
+                                AND (t.owner_agent_id = ?1 OR t.created_by_agent_id IS ?1))))
+         AND NOT EXISTS (SELECT 1 FROM message_recipients r
+                         WHERE r.message_id = m.id AND r.recipient_agent_id IS ?1
+                           AND r.recipient_session_id IS NULL)"
+    };
+}
+
+fn message_from(row: &SqliteRow) -> StoreResult<Message> {
+    let to_id: Option<uuid::Uuid> = opt_uuid(row, "to_id")?;
+    let created_at = ts::dec(row.try_get("created_at")?)?;
+    Ok(Message {
+        id: uuid_of(row.try_get("id")?)?,
+        project_id: opt_uuid(row, "project_id")?,
+        from: Actor::from_ids(
+            opt_uuid(row, "from_agent_id")?,
+            opt_uuid(row, "from_session_id")?,
+        ),
+        to: Address::from_columns(row.try_get("to_kind")?, to_id).map_err(StoreError::Corrupt)?,
+        subject: row.try_get("subject")?,
+        body: row.try_get("body")?,
+        importance: parse_text(row.try_get("importance")?)?,
+        task_id: opt_uuid(row, "task_id")?,
+        reply_to: opt_uuid(row, "reply_to")?,
+        created_at,
+    })
+}
+
+async fn insert_message(
+    conn: &mut SqliteConnection,
+    m: &Message,
+    token: Option<TokenId>,
+) -> StoreResult<()> {
+    let (from_agent, from_session) = m.from.ids();
+    let (to_kind, to_id) = m.to.columns();
+    sqlx::query(
+        "INSERT INTO messages
+             (id, project_id, from_agent_id, from_session_id, token_id, to_kind, to_id, task_id,
+              subject, body, importance, reply_to, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(m.id.to_string())
+    .bind(m.project_id.map(|p| p.to_string()))
+    .bind(from_agent.map(|a| a.to_string()))
+    .bind(from_session.map(|s| s.to_string()))
+    .bind(token.map(|t| t.to_string()))
+    .bind(to_kind)
+    .bind(to_id.map(|i| i.to_string()))
+    .bind(m.task_id.map(|t| t.to_string()))
+    .bind(&m.subject)
+    .bind(&m.body)
+    .bind(m.importance.as_str())
+    .bind(m.reply_to.map(|r| r.to_string()))
+    .bind(ts::enc(m.created_at))
+    .execute(&mut *conn)
+    .await?;
+    if let Some((agent, session)) = send_time_recipient(&m.to) {
+        sqlx::query(
+            "INSERT INTO message_recipients (message_id, recipient_agent_id, recipient_session_id)
+             VALUES (?, ?, ?)",
+        )
+        .bind(m.id.to_string())
+        .bind(agent.map(|a| a.to_string()))
+        .bind(session.map(|s| s.to_string()))
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// `(agent, session)` bind values of a recipient.
+fn recipient_binds(to: Recipient) -> (Option<String>, Option<String>) {
+    let (agent, session) = to.ids();
+    (agent.map(|a| a.to_string()), session.map(|s| s.to_string()))
+}
+
+/// Gives the recipient a row for every project / task message now due to it.
+async fn materialize(conn: &mut SqliteConnection, to: Recipient) -> StoreResult<()> {
+    let (agent, _) = recipient_binds(to);
+    sqlx::query(concat!(
+        "INSERT INTO message_recipients (message_id, recipient_agent_id)
+         SELECT m.id, ?1 FROM messages m WHERE ",
+        pending_messages!(),
+        " ON CONFLICT DO NOTHING"
+    ))
+    .bind(agent)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Runs a per-id `UPDATE` (binds `?1` agent, `?2` session, `?3` now, `?4` message id) on the
+/// recipient's rows after materialising them; returns the rows changed.
+async fn update_owned(
+    pool: &SqlitePool,
+    to: Recipient,
+    ids: &[MessageId],
+    now: OffsetDateTime,
+    sql: &'static str,
+) -> StoreResult<u64> {
+    let (agent, session) = recipient_binds(to);
+    let now = ts::enc(now);
+    let mut tx = pool.begin_with(BEGIN_WRITE).await?;
+    materialize(&mut tx, to).await?;
+    let mut changed = 0;
+    for id in ids {
+        changed += sqlx::query(sql)
+            .bind(&agent)
+            .bind(&session)
+            .bind(&now)
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    }
+    tx.commit().await?;
+    Ok(changed)
+}
+
+/// An FTS5 query matching every whitespace-separated word of `query` as a literal phrase, so
+/// FTS syntax characters in the input are never parsed as operators.
+fn fts_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|w| format!("\"{}\"", w.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Session columns (alias `s`) as a literal, so queries stay static SQL.
 macro_rules! session_cols {
     () => {
@@ -388,6 +558,16 @@ impl Store for SqliteStore {
             .transpose()
     }
 
+    async fn get_project(&self, id: ProjectId) -> StoreResult<Option<Project>> {
+        sqlx::query("SELECT id, key, display_name, created_at FROM projects WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .as_ref()
+            .map(project_from)
+            .transpose()
+    }
+
     async fn list_projects(&self) -> StoreResult<Vec<Project>> {
         sqlx::query("SELECT id, key, display_name, created_at FROM projects ORDER BY key")
             .fetch_all(&self.pool)
@@ -417,17 +597,32 @@ impl Store for SqliteStore {
         now: OffsetDateTime,
     ) -> StoreResult<Agent> {
         let project = project.map(|p| p.to_string());
-        sqlx::query(
+        let id = AgentId::new().to_string();
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let inserted = sqlx::query(
             "INSERT INTO agents (id, project_id, host, harness, created_at) VALUES (?, ?, ?, ?, ?)
              ON CONFLICT DO NOTHING",
         )
-        .bind(AgentId::new().to_string())
+        .bind(&id)
         .bind(&project)
         .bind(host)
         .bind(harness)
         .bind(ts::enc(now))
-        .execute(&self.pool)
-        .await?;
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        if inserted && project.is_some() {
+            sqlx::query(
+                "INSERT INTO agent_cursors (agent_id, project_id, acked_seq, updated_at)
+                 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) FROM messages), ?)",
+            )
+            .bind(&id)
+            .bind(&project)
+            .bind(ts::enc(now))
+            .execute(&mut *tx)
+            .await?;
+        }
         let row = sqlx::query(
             "SELECT id, project_id, host, harness, created_at FROM agents
              WHERE project_id IS ? AND host = ? AND harness = ?",
@@ -435,9 +630,20 @@ impl Store for SqliteStore {
         .bind(&project)
         .bind(host)
         .bind(harness)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         agent_from(&row, "")
+    }
+
+    async fn get_agent(&self, id: AgentId) -> StoreResult<Option<Agent>> {
+        sqlx::query("SELECT id, project_id, host, harness, created_at FROM agents WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .as_ref()
+            .map(|row| agent_from(row, ""))
+            .transpose()
     }
 
     async fn create_session(
@@ -539,6 +745,7 @@ impl Store for SqliteStore {
         extra_projects: &[ProjectId],
         token: Option<TokenId>,
         event: &TaskEvent,
+        first_message: &Message,
     ) -> StoreResult<()> {
         let (by_agent, by_session) = task.created_by.ids();
         let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
@@ -582,6 +789,7 @@ impl Store for SqliteStore {
             .await?;
         }
         insert_event(&mut tx, event, token).await?;
+        insert_message(&mut tx, first_message, token).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -782,5 +990,179 @@ impl Store for SqliteStore {
         }
         tx.commit().await?;
         Ok(live.len() as u64)
+    }
+
+    async fn insert_message(&self, message: &Message, token: Option<TokenId>) -> StoreResult<()> {
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        insert_message(&mut tx, message, token).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn get_message(&self, id: MessageId) -> StoreResult<Option<Message>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            message_cols!(),
+            " FROM messages m WHERE m.id = ?"
+        ))
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(message_from)
+        .transpose()
+    }
+
+    async fn inbox(
+        &self,
+        to: Recipient,
+        filter: &InboxFilter,
+        now: OffsetDateTime,
+    ) -> StoreResult<Vec<InboxItem>> {
+        let (agent, session) = recipient_binds(to);
+        let now = ts::enc(now);
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        materialize(&mut tx, to).await?;
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            message_cols!(),
+            ", r.rowid AS r_rowid, r.delivered_at AS r_delivered_at, r.read_at AS r_read_at
+             FROM message_recipients r JOIN messages m ON m.id = r.message_id
+             WHERE r.acked_at IS NULL AND ",
+            inbox_rows!(),
+            " AND (?3 IS NULL OR m.project_id = ?3)
+              AND (?4 IS NULL OR m.task_id = ?4)
+              AND (?5 IS NULL OR m.importance = ?5)
+             ORDER BY m.seq LIMIT ?6"
+        ))
+        .bind(&agent)
+        .bind(&session)
+        .bind(filter.project.map(|p| p.to_string()))
+        .bind(filter.task.map(|t| t.to_string()))
+        .bind(filter.importance.map(|i| i.as_str()))
+        .bind(filter.limit.map_or(-1, i64::from))
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let delivered: Option<&str> = row.try_get("r_delivered_at")?;
+            let delivered_at = match delivered {
+                Some(t) => ts::dec(t)?,
+                None => {
+                    sqlx::query("UPDATE message_recipients SET delivered_at = ? WHERE rowid = ?")
+                        .bind(&now)
+                        .bind(row.try_get::<i64, _>("r_rowid")?)
+                        .execute(&mut *tx)
+                        .await?;
+                    ts::dec(&now)?
+                }
+            };
+            let read: Option<&str> = row.try_get("r_read_at")?;
+            items.push(InboxItem {
+                message: message_from(row)?,
+                delivered_at,
+                read_at: read.map(ts::dec).transpose()?,
+            });
+        }
+        tx.commit().await?;
+        Ok(items)
+    }
+
+    async fn ack_messages(
+        &self,
+        to: Recipient,
+        ids: &[MessageId],
+        now: OffsetDateTime,
+    ) -> StoreResult<u64> {
+        update_owned(
+            &self.pool,
+            to,
+            ids,
+            now,
+            concat!(
+                "UPDATE message_recipients
+                    SET acked_at = ?3, acked_by_session_id = ?2,
+                        delivered_at = COALESCE(delivered_at, ?3)
+                  WHERE message_id = ?4 AND acked_at IS NULL AND ",
+                owned_rows!()
+            ),
+        )
+        .await
+    }
+
+    async fn mark_read(
+        &self,
+        to: Recipient,
+        ids: &[MessageId],
+        now: OffsetDateTime,
+    ) -> StoreResult<u64> {
+        update_owned(
+            &self.pool,
+            to,
+            ids,
+            now,
+            concat!(
+                "UPDATE message_recipients
+                    SET read_at = ?3, delivered_at = COALESCE(delivered_at, ?3)
+                  WHERE message_id = ?4 AND read_at IS NULL AND ",
+                owned_rows!()
+            ),
+        )
+        .await
+    }
+
+    async fn unread_count(&self, to: Recipient) -> StoreResult<u64> {
+        let (agent, session) = recipient_binds(to);
+        let n: i64 = sqlx::query_scalar(concat!(
+            "SELECT (SELECT COUNT(*) FROM message_recipients r
+                     JOIN messages m ON m.id = r.message_id
+                     WHERE r.acked_at IS NULL AND ",
+            inbox_rows!(),
+            ") + (SELECT COUNT(*) FROM messages m WHERE ",
+            pending_messages!(),
+            ")"
+        ))
+        .bind(&agent)
+        .bind(&session)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n as u64)
+    }
+
+    async fn search_messages(
+        &self,
+        query: &str,
+        project: Option<ProjectId>,
+        limit: u32,
+    ) -> StoreResult<Vec<Message>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            message_cols!(),
+            " FROM messages_fts JOIN messages m ON m.seq = messages_fts.rowid
+             WHERE messages_fts MATCH ?1 AND (?2 IS NULL OR m.project_id = ?2)
+             ORDER BY m.seq DESC LIMIT ?3"
+        ))
+        .bind(fts_query(query))
+        .bind(project.map(|p| p.to_string()))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(message_from)
+        .collect()
+    }
+
+    async fn task_thread(&self, task: TaskId) -> StoreResult<Vec<Message>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            message_cols!(),
+            " FROM messages m WHERE m.task_id = ? ORDER BY m.seq"
+        ))
+        .bind(task.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(message_from)
+        .collect()
     }
 }

@@ -13,8 +13,8 @@ use time::{Duration, OffsetDateTime};
 
 use crate::config::Backend;
 use crate::domain::{
-    Actor, Agent, AgentId, Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind,
-    TaskId, TaskStatus, TokenId,
+    Actor, Address, Agent, AgentId, Importance, InboxItem, Message, MessageId, Project, ProjectId,
+    Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +45,7 @@ pub trait Store: Send + Sync {
         now: OffsetDateTime,
     ) -> StoreResult<Project>;
     async fn get_project_by_key(&self, key: &str) -> StoreResult<Option<Project>>;
+    async fn get_project(&self, id: ProjectId) -> StoreResult<Option<Project>>;
     /// All projects ordered by key.
     async fn list_projects(&self) -> StoreResult<Vec<Project>>;
     /// Changes only the display name; `NotFound` if the project does not exist.
@@ -54,6 +55,8 @@ pub trait Store: Send + Sync {
 
     /// Returns the agent for `(project, host, harness)`, creating it if needed. A `None`
     /// project is a real identity component (agents with no home project dedupe too).
+    /// Creating an agent with a home project also starts its project-message cursor at the
+    /// newest message, in the same transaction.
     async fn upsert_agent(
         &self,
         project: Option<ProjectId>,
@@ -61,6 +64,7 @@ pub trait Store: Send + Sync {
         harness: &str,
         now: OffsetDateTime,
     ) -> StoreResult<Agent>;
+    async fn get_agent(&self, id: AgentId) -> StoreResult<Option<Agent>>;
 
     // ---- sessions ----
 
@@ -86,14 +90,15 @@ pub trait Store: Send + Sync {
 
     // ---- tasks ----
 
-    /// Inserts a new task, its extra participating projects and its `created` event in one
-    /// transaction. The event's token is `task`'s writer token (`token`).
+    /// Inserts a new task, its extra participating projects, its `created` event and the first
+    /// message of its thread in one transaction. `token` is the writer's token.
     async fn insert_task(
         &self,
         task: &Task,
         extra_projects: &[ProjectId],
         token: Option<TokenId>,
         event: &TaskEvent,
+        first_message: &Message,
     ) -> StoreResult<()>;
     async fn get_task(&self, id: TaskId) -> StoreResult<Option<Task>>;
     /// The extra participating projects listed for `id` (not its home project).
@@ -131,6 +136,92 @@ pub trait Store: Send + Sync {
         now: OffsetDateTime,
         default_ttl: Duration,
     ) -> StoreResult<u64>;
+
+    // ---- messages ----
+
+    /// Inserts the message and, for agent-, session- and human-addressed messages, its
+    /// recipient row. Project and task messages get recipient rows when read.
+    async fn insert_message(&self, message: &Message, token: Option<TokenId>) -> StoreResult<()>;
+    async fn get_message(&self, id: MessageId) -> StoreResult<Option<Message>>;
+    /// The recipient's unacked messages matching `filter`, oldest first. In one write
+    /// transaction: first gives the recipient a row for every project / task message now
+    /// due to it, then stamps `delivered_at` (once) on the rows returned.
+    async fn inbox(
+        &self,
+        to: Recipient,
+        filter: &InboxFilter,
+        now: OffsetDateTime,
+    ) -> StoreResult<Vec<InboxItem>>;
+    /// Acks the recipient's rows for `ids` (once per agent for agent rows, per session for
+    /// session rows). Ids that are not the recipient's, or already acked, are skipped.
+    /// Returns how many rows were newly acked.
+    async fn ack_messages(
+        &self,
+        to: Recipient,
+        ids: &[MessageId],
+        now: OffsetDateTime,
+    ) -> StoreResult<u64>;
+    /// Sets `read_at` (once) on the recipient's rows for `ids`; returns how many changed.
+    async fn mark_read(
+        &self,
+        to: Recipient,
+        ids: &[MessageId],
+        now: OffsetDateTime,
+    ) -> StoreResult<u64>;
+    /// How many messages `inbox` with no filter would return, without writing anything.
+    async fn unread_count(&self, to: Recipient) -> StoreResult<u64>;
+    /// Full-text match of every word of `query` over subject + body, newest first.
+    /// `query` must contain at least one non-blank word.
+    async fn search_messages(
+        &self,
+        query: &str,
+        project: Option<ProjectId>,
+        limit: u32,
+    ) -> StoreResult<Vec<Message>>;
+    /// A task's thread, oldest first.
+    async fn task_thread(&self, task: TaskId) -> StoreResult<Vec<Message>>;
+}
+
+/// Whose inbox an operation works on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recipient {
+    /// Sees its agent's rows (agent-, project- and task-addressed mail) and its session's.
+    Agent {
+        agent: AgentId,
+        session: SessionId,
+    },
+    Human,
+}
+
+impl Recipient {
+    /// `(agent, session)` bind values; both `None` for the human.
+    pub fn ids(&self) -> (Option<AgentId>, Option<SessionId>) {
+        match *self {
+            Recipient::Agent { agent, session } => (Some(agent), Some(session)),
+            Recipient::Human => (None, None),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InboxFilter {
+    /// Only messages whose `project_id` is this.
+    pub project: Option<ProjectId>,
+    pub task: Option<TaskId>,
+    /// Only messages of exactly this importance.
+    pub importance: Option<Importance>,
+    /// `None`: no limit.
+    pub limit: Option<u32>,
+}
+
+/// The recipient row a message gets at send time, if any: `(agent, session)`.
+pub fn send_time_recipient(to: &Address) -> Option<(Option<AgentId>, Option<SessionId>)> {
+    match *to {
+        Address::Agent(a) => Some((Some(a), None)),
+        Address::Session(s) => Some((None, Some(s))),
+        Address::Human => Some((None, None)),
+        Address::Project(_) | Address::Task(_) => None,
+    }
 }
 
 /// The caller of a claim, with everything the eligibility guard needs.

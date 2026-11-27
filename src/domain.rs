@@ -245,6 +245,88 @@ pub struct TaskEvent {
     pub payload: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Importance {
+    #[default]
+    Normal,
+    High,
+    Urgent,
+}
+
+text_enum!(Importance {
+    Normal => "normal",
+    High => "high",
+    Urgent => "urgent",
+});
+
+/// Where a message goes (spec §9). The project is part of the address, not an access
+/// barrier: any agent may address any project or agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Address {
+    /// Every agent whose home project this is.
+    Project(ProjectId),
+    /// Durable: any session of the agent may read it; acked once for the agent.
+    Agent(AgentId),
+    /// One live session only; acked per session.
+    Session(SessionId),
+    /// The task's thread: delivered to its current owner and its creator.
+    Task(TaskId),
+    /// Mario's inbox.
+    Human,
+}
+
+impl Address {
+    /// `(to_kind, to_id)` columns.
+    pub fn columns(&self) -> (&'static str, Option<Uuid>) {
+        match *self {
+            Address::Project(p) => ("project", Some(p.as_uuid())),
+            Address::Agent(a) => ("agent", Some(a.as_uuid())),
+            Address::Session(s) => ("session", Some(s.as_uuid())),
+            Address::Task(t) => ("task", Some(t.as_uuid())),
+            Address::Human => ("human", None),
+        }
+    }
+
+    /// Inverse of `columns`.
+    pub fn from_columns(kind: &str, id: Option<Uuid>) -> Result<Address, String> {
+        Ok(match (kind, id) {
+            ("project", Some(id)) => Address::Project(id.into()),
+            ("agent", Some(id)) => Address::Agent(id.into()),
+            ("session", Some(id)) => Address::Session(id.into()),
+            ("task", Some(id)) => Address::Task(id.into()),
+            ("human", None) => Address::Human,
+            (kind, id) => return Err(format!("bad message address {kind:?} {id:?}")),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+    pub id: MessageId,
+    /// The project the message is about: the addressed project, the addressed agent's /
+    /// session's home project or the task's project; for `Human`, the sender's home project.
+    pub project_id: Option<ProjectId>,
+    pub from: Actor,
+    pub to: Address,
+    pub subject: Option<String>,
+    pub body: String,
+    pub importance: Importance,
+    /// Set for task-thread messages.
+    pub task_id: Option<TaskId>,
+    pub reply_to: Option<MessageId>,
+    pub created_at: OffsetDateTime,
+}
+
+/// A message as one recipient sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxItem {
+    pub message: Message,
+    /// When this recipient first fetched it.
+    pub delivered_at: OffsetDateTime,
+    pub read_at: Option<OffsetDateTime>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

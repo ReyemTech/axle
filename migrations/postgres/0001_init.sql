@@ -88,8 +88,10 @@ CREATE INDEX task_events_task ON task_events (task_id, created_at);
 
 -- ---------------------------------------------------------------- messages
 
+-- `seq` orders messages and positions agent cursors (kept in step with SQLite's rowid).
 CREATE TABLE messages (
     id               uuid PRIMARY KEY,
+    seq              bigint GENERATED ALWAYS AS IDENTITY UNIQUE,
     project_id       uuid REFERENCES projects(id),
     from_agent_id    uuid REFERENCES agents(id),           -- both NULL = human
     from_session_id  uuid REFERENCES sessions(id),
@@ -113,8 +115,10 @@ CREATE INDEX messages_task ON messages (task_id, created_at);
 CREATE INDEX messages_project ON messages (project_id, created_at);
 CREATE INDEX messages_search ON messages USING gin (search);
 
--- Per-recipient delivery for agent-, session- and human-addressed messages.
--- Agent rows are acked once per agent; session rows per session; both NULL = human.
+-- Per-recipient delivery. Agent-, session- and human-addressed messages get their row at
+-- send time; project- and task-addressed ones get an agent (or human) row when a recipient
+-- first reads or acks its inbox. Agent rows (session NULL) are acked once per agent; session
+-- rows (agent NULL) per session; both NULL = the human.
 CREATE TABLE message_recipients (
     message_id            uuid NOT NULL REFERENCES messages(id),
     recipient_agent_id    uuid REFERENCES agents(id),
@@ -129,13 +133,14 @@ CREATE TABLE message_recipients (
 CREATE INDEX message_recipients_agent ON message_recipients (recipient_agent_id, acked_at);
 CREATE INDEX message_recipients_session ON message_recipients (recipient_session_id, acked_at);
 
--- Project-wide messages are resolved at read time from this per-agent cursor.
+-- Project-wide messages are resolved at read time from this per-agent cursor: an agent sees
+-- messages to its home project with `seq > acked_seq`. Written with the agent, at the newest
+-- message then, so an agent that first appears later starts at its creation.
 CREATE TABLE agent_cursors (
-    agent_id         uuid NOT NULL REFERENCES agents(id),
-    project_id       uuid NOT NULL REFERENCES projects(id),
-    acked_until      timestamptz NOT NULL,  -- messages created at or before this are acked
-    last_message_id  uuid REFERENCES messages(id),
-    updated_at       timestamptz NOT NULL,
+    agent_id    uuid NOT NULL REFERENCES agents(id),
+    project_id  uuid NOT NULL REFERENCES projects(id),
+    acked_seq   bigint NOT NULL,
+    updated_at  timestamptz NOT NULL,
     PRIMARY KEY (agent_id, project_id)
 );
 

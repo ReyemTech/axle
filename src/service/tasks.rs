@@ -11,10 +11,11 @@ use uuid::Uuid;
 use crate::clock::Clock;
 use crate::config::ServerConfig;
 use crate::domain::{
-    Actor, AgentId, Eligibility, ProjectId, SessionId, Task, TaskEvent, TaskEventKind, TaskId,
-    TaskStatus, TokenId,
+    Actor, Address, AgentId, Eligibility, Importance, Message, MessageId, ProjectId, SessionId,
+    Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId,
 };
 use crate::service::identity::Resolved;
+use crate::service::messages::{MessageError, check_body};
 use crate::store::{
     ClaimRequest, Claimant, LeaseUpdate, Store, StoreError, TaskFilter, TransitionRequest,
 };
@@ -155,6 +156,9 @@ pub enum TaskError {
     ChildExtraProjects,
     #[error("a child task's project must be its parent's project or one the parent spans")]
     ChildProjectMismatch,
+    /// The task body is over the message cap, or a promoted message does not exist.
+    #[error(transparent)]
+    Message(#[from] MessageError),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -188,7 +192,45 @@ impl TaskService {
         Self::new(store, clock, cfg.lease_ttl, cfg.idle_renew_cap)
     }
 
+    /// Creates an open task; its body becomes the first message of its thread (same
+    /// transaction).
     pub async fn create(&self, by: Caller<'_>, new: NewTask) -> Result<Task, TaskError> {
+        self.insert(by, new, None).await
+    }
+
+    /// Promotes a message to a task. An empty title defaults to the message's subject (else
+    /// the first line of its body) and an empty body to the message's body; the task's first
+    /// thread message replies to the promoted one.
+    pub async fn create_from_message(
+        &self,
+        by: Caller<'_>,
+        source: MessageId,
+        mut new: NewTask,
+    ) -> Result<Task, TaskError> {
+        let message = self
+            .store
+            .get_message(source)
+            .await?
+            .ok_or(MessageError::NotFound("message"))?;
+        if new.title.trim().is_empty() {
+            new.title = message
+                .subject
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| message.body.lines().next().unwrap_or_default().to_string());
+        }
+        if new.body.trim().is_empty() {
+            new.body = message.body;
+        }
+        self.insert(by, new, Some(source)).await
+    }
+
+    async fn insert(
+        &self,
+        by: Caller<'_>,
+        new: NewTask,
+        reply_to: Option<MessageId>,
+    ) -> Result<Task, TaskError> {
+        check_body(&new.body)?;
         let lease_ttl = match new.lease_ttl {
             Some(d) if d < Duration::SECOND => return Err(TaskError::InvalidLeaseTtl),
             Some(d) => Some(Duration::seconds(d.whole_seconds())),
@@ -235,8 +277,20 @@ impl TaskService {
             version: 0,
         };
         let event = self.event(task.id, by.actor(), TaskEventKind::Created, None, None);
+        let first = Message {
+            id: MessageId::new(),
+            project_id: Some(task.project_id),
+            from: task.created_by,
+            to: Address::Task(task.id),
+            subject: Some(task.title.clone()),
+            body: task.body.clone(),
+            importance: Importance::Normal,
+            task_id: Some(task.id),
+            reply_to,
+            created_at: now,
+        };
         self.store
-            .insert_task(&task, &new.extra_projects, by.token(), &event)
+            .insert_task(&task, &new.extra_projects, by.token(), &event, &first)
             .await?;
         Ok(task)
     }

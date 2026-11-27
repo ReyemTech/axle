@@ -7,12 +7,13 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use super::{
-    ClaimAttempt, ClaimRequest, LeaseUpdate, Store, StoreError, StoreResult, TaskFilter,
-    TransitionRequest, child_event, children_complete_event, claim_event, closes_child,
+    ClaimAttempt, ClaimRequest, InboxFilter, LeaseUpdate, Recipient, Store, StoreError,
+    StoreResult, TaskFilter, TransitionRequest, child_event, children_complete_event, claim_event,
+    closes_child, send_time_recipient,
 };
 use crate::domain::{
-    Actor, Agent, AgentId, Eligibility, Project, ProjectId, Session, SessionId, Task, TaskEvent,
-    TaskId, TokenId,
+    Actor, Address, Agent, AgentId, Eligibility, InboxItem, Message, MessageId, Project, ProjectId,
+    Session, SessionId, Task, TaskEvent, TaskId, TokenId,
 };
 
 pub struct PostgresStore {
@@ -294,6 +295,163 @@ async fn claim_locked(
     })
 }
 
+/// Message columns (alias `m`) as a literal, so queries stay static SQL.
+macro_rules! message_cols {
+    () => {
+        "m.id, m.project_id, m.from_agent_id, m.from_session_id, m.to_kind, m.to_id, m.task_id,
+         m.subject, m.body, m.importance, m.reply_to, m.created_at"
+    };
+}
+
+/// Recipient rows belonging to `$1` agent / `$2` session: the agent's own rows, or the
+/// session's. For the human both are NULL, which matches only the human's rows.
+macro_rules! owned_rows {
+    () => {
+        "((recipient_agent_id IS NOT DISTINCT FROM $1::uuid AND recipient_session_id IS NULL)
+          OR (recipient_agent_id IS NULL AND recipient_session_id = $2::uuid))"
+    };
+}
+
+/// `owned_rows` joined to `messages m`, minus agent rows for mail the agent sent itself.
+macro_rules! inbox_rows {
+    () => {
+        concat!(
+            owned_rows!(),
+            " AND (recipient_session_id IS NOT NULL
+                   OR m.from_agent_id IS DISTINCT FROM $1::uuid)"
+        )
+    };
+}
+
+/// Project / task messages (alias `m`) due to `$1` (agent, or NULL for the human) that it has
+/// no row for yet: broadcasts to its home project after its cursor, and posts in threads of
+/// tasks it owns or created. Never its own mail.
+macro_rules! pending_messages {
+    () => {
+        "m.from_agent_id IS DISTINCT FROM $1::uuid
+         AND ((m.to_kind = 'project'
+               AND EXISTS (SELECT 1 FROM agent_cursors c
+                           WHERE c.agent_id = $1::uuid AND c.project_id = m.to_id
+                             AND m.seq > c.acked_seq))
+              OR (m.to_kind = 'task'
+                  AND EXISTS (SELECT 1 FROM tasks t
+                              WHERE t.id = m.task_id
+                                AND (t.owner_agent_id = $1::uuid
+                                     OR t.created_by_agent_id IS NOT DISTINCT FROM $1::uuid))))
+         AND NOT EXISTS (SELECT 1 FROM message_recipients r
+                         WHERE r.message_id = m.id
+                           AND r.recipient_agent_id IS NOT DISTINCT FROM $1::uuid
+                           AND r.recipient_session_id IS NULL)"
+    };
+}
+
+fn message_from(row: &PgRow) -> StoreResult<Message> {
+    Ok(Message {
+        id: row.try_get::<Uuid, _>("id")?.into(),
+        project_id: opt_id(row, "project_id")?,
+        from: Actor::from_ids(
+            opt_id(row, "from_agent_id")?,
+            opt_id(row, "from_session_id")?,
+        ),
+        to: Address::from_columns(row.try_get("to_kind")?, row.try_get("to_id")?)
+            .map_err(StoreError::Corrupt)?,
+        subject: row.try_get("subject")?,
+        body: row.try_get("body")?,
+        importance: parse_text(row.try_get("importance")?)?,
+        task_id: opt_id(row, "task_id")?,
+        reply_to: opt_id(row, "reply_to")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+async fn insert_message(
+    conn: &mut PgConnection,
+    m: &Message,
+    token: Option<TokenId>,
+) -> StoreResult<()> {
+    let (from_agent, from_session) = m.from.ids();
+    let (to_kind, to_id) = m.to.columns();
+    sqlx::query(
+        "INSERT INTO messages
+             (id, project_id, from_agent_id, from_session_id, token_id, to_kind, to_id, task_id,
+              subject, body, importance, reply_to, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+    )
+    .bind(m.id.as_uuid())
+    .bind(m.project_id.map(|p| p.as_uuid()))
+    .bind(from_agent.map(|a| a.as_uuid()))
+    .bind(from_session.map(|s| s.as_uuid()))
+    .bind(token.map(|t| t.as_uuid()))
+    .bind(to_kind)
+    .bind(to_id)
+    .bind(m.task_id.map(|t| t.as_uuid()))
+    .bind(&m.subject)
+    .bind(&m.body)
+    .bind(m.importance.as_str())
+    .bind(m.reply_to.map(|r| r.as_uuid()))
+    .bind(m.created_at)
+    .execute(&mut *conn)
+    .await?;
+    if let Some((agent, session)) = send_time_recipient(&m.to) {
+        sqlx::query(
+            "INSERT INTO message_recipients (message_id, recipient_agent_id, recipient_session_id)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(m.id.as_uuid())
+        .bind(agent.map(|a| a.as_uuid()))
+        .bind(session.map(|s| s.as_uuid()))
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// `(agent, session)` bind values of a recipient.
+fn recipient_binds(to: Recipient) -> (Option<Uuid>, Option<Uuid>) {
+    let (agent, session) = to.ids();
+    (agent.map(|a| a.as_uuid()), session.map(|s| s.as_uuid()))
+}
+
+/// Gives the recipient a row for every project / task message now due to it.
+async fn materialize(conn: &mut PgConnection, to: Recipient) -> StoreResult<()> {
+    let (agent, _) = recipient_binds(to);
+    sqlx::query(concat!(
+        "INSERT INTO message_recipients (message_id, recipient_agent_id)
+         SELECT m.id, $1::uuid FROM messages m WHERE ",
+        pending_messages!(),
+        " ON CONFLICT ON CONSTRAINT message_recipients_unique DO NOTHING"
+    ))
+    .bind(agent)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Runs an `UPDATE` (binds `$1` agent, `$2` session, `$3` now, `$4` message ids) on the
+/// recipient's rows after materialising them; returns the rows changed.
+async fn update_owned(
+    pool: &PgPool,
+    to: Recipient,
+    ids: &[MessageId],
+    now: OffsetDateTime,
+    sql: &'static str,
+) -> StoreResult<u64> {
+    let (agent, session) = recipient_binds(to);
+    let ids: Vec<Uuid> = ids.iter().map(|i| i.as_uuid()).collect();
+    let mut tx = pool.begin().await?;
+    materialize(&mut tx, to).await?;
+    let changed = sqlx::query(sql)
+        .bind(agent)
+        .bind(session)
+        .bind(now)
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok(changed)
+}
+
 /// Session columns (alias `s`) as a literal, so queries stay static SQL.
 macro_rules! session_cols {
     () => {
@@ -334,6 +492,16 @@ impl Store for PostgresStore {
             .transpose()
     }
 
+    async fn get_project(&self, id: ProjectId) -> StoreResult<Option<Project>> {
+        sqlx::query("SELECT id, key, display_name, created_at FROM projects WHERE id = $1")
+            .bind(id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await?
+            .as_ref()
+            .map(project_from)
+            .transpose()
+    }
+
     async fn list_projects(&self) -> StoreResult<Vec<Project>> {
         sqlx::query("SELECT id, key, display_name, created_at FROM projects ORDER BY key")
             .fetch_all(&self.pool)
@@ -363,18 +531,33 @@ impl Store for PostgresStore {
         now: OffsetDateTime,
     ) -> StoreResult<Agent> {
         let project = project.map(|p| p.as_uuid());
-        sqlx::query(
+        let id = AgentId::new().as_uuid();
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query(
             "INSERT INTO agents (id, project_id, host, harness, created_at)
              VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT ON CONSTRAINT agents_identity DO NOTHING",
         )
-        .bind(AgentId::new().as_uuid())
+        .bind(id)
         .bind(project)
         .bind(host)
         .bind(harness)
         .bind(now)
-        .execute(&self.pool)
-        .await?;
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        if inserted && project.is_some() {
+            sqlx::query(
+                "INSERT INTO agent_cursors (agent_id, project_id, acked_seq, updated_at)
+                 VALUES ($1, $2, (SELECT COALESCE(MAX(seq), 0) FROM messages), $3)",
+            )
+            .bind(id)
+            .bind(project)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
         let row = sqlx::query(
             "SELECT id, project_id, host, harness, created_at FROM agents
              WHERE project_id IS NOT DISTINCT FROM $1 AND host = $2 AND harness = $3",
@@ -382,9 +565,20 @@ impl Store for PostgresStore {
         .bind(project)
         .bind(host)
         .bind(harness)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         agent_from(&row, "")
+    }
+
+    async fn get_agent(&self, id: AgentId) -> StoreResult<Option<Agent>> {
+        sqlx::query("SELECT id, project_id, host, harness, created_at FROM agents WHERE id = $1")
+            .bind(id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await?
+            .as_ref()
+            .map(|row| agent_from(row, ""))
+            .transpose()
     }
 
     async fn create_session(
@@ -479,6 +673,7 @@ impl Store for PostgresStore {
         extra_projects: &[ProjectId],
         token: Option<TokenId>,
         event: &TaskEvent,
+        first_message: &Message,
     ) -> StoreResult<()> {
         let (by_agent, by_session) = task.created_by.ids();
         let mut tx = self.pool.begin().await?;
@@ -523,6 +718,7 @@ impl Store for PostgresStore {
             .await?;
         }
         insert_event(&mut tx, event, token).await?;
+        insert_message(&mut tx, first_message, token).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -705,5 +901,181 @@ impl Store for PostgresStore {
         .execute(&self.pool)
         .await?;
         Ok(done.rows_affected())
+    }
+
+    async fn insert_message(&self, message: &Message, token: Option<TokenId>) -> StoreResult<()> {
+        let mut tx = self.pool.begin().await?;
+        insert_message(&mut tx, message, token).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn get_message(&self, id: MessageId) -> StoreResult<Option<Message>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            message_cols!(),
+            " FROM messages m WHERE m.id = $1"
+        ))
+        .bind(id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(message_from)
+        .transpose()
+    }
+
+    async fn inbox(
+        &self,
+        to: Recipient,
+        filter: &InboxFilter,
+        now: OffsetDateTime,
+    ) -> StoreResult<Vec<InboxItem>> {
+        let (agent, session) = recipient_binds(to);
+        let mut tx = self.pool.begin().await?;
+        materialize(&mut tx, to).await?;
+        // Stamp first delivery and read the rows back in one statement: the CTE picks the
+        // rows, the UPDATE stamps the unstamped ones, and the join returns every picked row.
+        let rows = sqlx::query(concat!(
+            "WITH picked AS (
+                 SELECT r.ctid AS rid, m.seq FROM message_recipients r
+                   JOIN messages m ON m.id = r.message_id
+                  WHERE r.acked_at IS NULL AND ",
+            inbox_rows!(),
+            "     AND ($3::uuid IS NULL OR m.project_id = $3)
+                  AND ($4::uuid IS NULL OR m.task_id = $4)
+                  AND ($5::text IS NULL OR m.importance = $5)
+                  ORDER BY m.seq LIMIT $6
+             ),
+             stamped AS (
+                 UPDATE message_recipients r SET delivered_at = $7
+                   FROM picked p WHERE r.ctid = p.rid AND r.delivered_at IS NULL
+                 RETURNING r.message_id
+             )
+             SELECT ",
+            message_cols!(),
+            ", COALESCE(r.delivered_at, $7) AS r_delivered_at, r.read_at AS r_read_at
+               FROM picked p
+               JOIN message_recipients r ON r.ctid = p.rid
+               JOIN messages m ON m.id = r.message_id
+              ORDER BY p.seq"
+        ))
+        .bind(agent)
+        .bind(session)
+        .bind(filter.project.map(|p| p.as_uuid()))
+        .bind(filter.task.map(|t| t.as_uuid()))
+        .bind(filter.importance.map(|i| i.as_str()))
+        .bind(filter.limit.map(i64::from))
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| {
+                Ok(InboxItem {
+                    message: message_from(row)?,
+                    delivered_at: row.try_get("r_delivered_at")?,
+                    read_at: row.try_get("r_read_at")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn ack_messages(
+        &self,
+        to: Recipient,
+        ids: &[MessageId],
+        now: OffsetDateTime,
+    ) -> StoreResult<u64> {
+        update_owned(
+            &self.pool,
+            to,
+            ids,
+            now,
+            concat!(
+                "UPDATE message_recipients
+                    SET acked_at = $3, acked_by_session_id = $2::uuid,
+                        delivered_at = COALESCE(delivered_at, $3)
+                  WHERE message_id = ANY($4) AND acked_at IS NULL AND ",
+                owned_rows!()
+            ),
+        )
+        .await
+    }
+
+    async fn mark_read(
+        &self,
+        to: Recipient,
+        ids: &[MessageId],
+        now: OffsetDateTime,
+    ) -> StoreResult<u64> {
+        update_owned(
+            &self.pool,
+            to,
+            ids,
+            now,
+            concat!(
+                "UPDATE message_recipients
+                    SET read_at = $3, delivered_at = COALESCE(delivered_at, $3)
+                  WHERE message_id = ANY($4) AND read_at IS NULL AND ",
+                owned_rows!()
+            ),
+        )
+        .await
+    }
+
+    async fn unread_count(&self, to: Recipient) -> StoreResult<u64> {
+        let (agent, session) = recipient_binds(to);
+        let n: i64 = sqlx::query_scalar(concat!(
+            "SELECT (SELECT COUNT(*) FROM message_recipients r
+                     JOIN messages m ON m.id = r.message_id
+                     WHERE r.acked_at IS NULL AND ",
+            inbox_rows!(),
+            ") + (SELECT COUNT(*) FROM messages m WHERE ",
+            pending_messages!(),
+            ")"
+        ))
+        .bind(agent)
+        .bind(session)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n as u64)
+    }
+
+    async fn search_messages(
+        &self,
+        query: &str,
+        project: Option<ProjectId>,
+        limit: u32,
+    ) -> StoreResult<Vec<Message>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            message_cols!(),
+            " FROM messages m
+             WHERE m.search @@ plainto_tsquery('simple', $1)
+               AND ($2::uuid IS NULL OR m.project_id = $2)
+             ORDER BY m.seq DESC LIMIT $3"
+        ))
+        .bind(query)
+        .bind(project.map(|p| p.as_uuid()))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(message_from)
+        .collect()
+    }
+
+    async fn task_thread(&self, task: TaskId) -> StoreResult<Vec<Message>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            message_cols!(),
+            " FROM messages m WHERE m.task_id = $1 ORDER BY m.seq"
+        ))
+        .bind(task.as_uuid())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(message_from)
+        .collect()
     }
 }
