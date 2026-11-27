@@ -15,7 +15,8 @@ The server binds `127.0.0.1:7420`. On a loopback bind the web UI at
 <http://127.0.0.1:7420/ui> needs no sign-in, and it only answers requests whose `Host` is
 `localhost`, `127.0.0.1` or `[::1]`, which blocks DNS-rebinding attacks from web pages you
 visit. Agents always need a token. With the server running, `axl install --server
-http://127.0.0.1:7420` (or `axl login`) gets one and configures your harnesses; `axl install`
+http://127.0.0.1:7420` gets one and configures your harnesses (`axl login` gets a token
+without touching them); `axl install`
 alone sets up this whole arrangement as a background service. To create a token by hand
 instead:
 

@@ -390,7 +390,8 @@ pub async fn deny(
     decide(state, session, id, false).await
 }
 
-/// The command the connect panel tells a person to paste (`axl login`'s positional URL).
+/// The command the connect panel tells a person with `axl` already installed to paste. It
+/// is `axl install`, not `axl login`, so the harnesses get configured too.
 pub fn login_command(url: &str, code: &str) -> String {
-    format!("axl login {url} --code {code}")
+    format!("axl install --server {url} --code {code}")
 }

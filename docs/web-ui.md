@@ -138,8 +138,9 @@ off at once, after a confirmation. The UI never shows an existing token's value.
 
 Give the machine a label and press the button: the page shows, once, a one-time code with
 two ready-to-copy commands, the one-line installer
-(`curl -fsSL https://axle.example.com/install.sh | sh -s -- <code>`) and `axl login`
-with the code. The code works once and expires after 15 minutes; only its label and expiry
+(`curl -fsSL https://axle.example.com/install.sh | sh -s -- <code>`) and
+`axl install --server <url> --code <code>` for machines that already have `axl` (it also
+configures the harnesses). The code works once and expires after 15 minutes; only its label and expiry
 are listed afterwards, under pending connections, where **Revoke** cancels it. If the server
 has no `AXL_PUBLIC_URL` the form is replaced by a hint to set it.
 

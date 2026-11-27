@@ -113,7 +113,8 @@ Run `axl status` first; it names what is wrong and the fix. Common causes:
   **Tokens → Connect a machine**.
 - **429**: more than 10 enrollment requests a minute from one IP. Wait for `Retry-After`.
   Behind a proxy, set `AXL_TRUSTED_PROXY_HEADER` so clients are counted separately.
-- **Already connected to another server**: pass `--force` to `axl login` to switch.
+- **Already connected to another server**: pass `--force` to `axl install --server URL` (or `axl login`) to switch. A
+  `--code` on `axl install` counts as consent.
 
 ## Still stuck
 

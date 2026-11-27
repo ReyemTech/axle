@@ -86,6 +86,12 @@ enum Command {
         /// Ask nothing: without a configured server or --server, use local mode
         #[arg(long)]
         yes: bool,
+        /// Switch to --server even if this machine is connected to another server
+        #[arg(long, requires = "server")]
+        force: bool,
+        /// Port for the local service (implies --local)
+        #[arg(long, value_name = "PORT", conflicts_with = "server")]
+        port: Option<u16>,
     },
     /// Undo `axl install`: remove what it added to each harness (optionally also the local
     /// service and this machine's token)
@@ -216,6 +222,8 @@ async fn main() -> ExitCode {
             local,
             dry_run,
             yes,
+            force,
+            port,
         } => {
             return install(axle::cli::InstallArgs {
                 server,
@@ -224,6 +232,8 @@ async fn main() -> ExitCode {
                 local,
                 dry_run,
                 yes,
+                force,
+                port,
             })
             .await;
         }
@@ -531,17 +541,18 @@ mod tests {
         let shown = axle::ui::connect::login_command(url, code);
         let argv: Vec<&str> = shown.split(' ').collect();
         match Cli::try_parse_from(&argv).unwrap().command {
-            Command::Login {
-                url: u,
+            Command::Install {
+                server: u,
                 code: c,
-                url_flag,
+                force,
+                local,
                 ..
             } => {
                 assert_eq!(u.as_deref(), Some(url));
                 assert_eq!(c.as_deref(), Some(code));
-                assert_eq!(url_flag, None);
+                assert!(!force && !local);
             }
-            _ => panic!("not a login command"),
+            _ => panic!("not an install command"),
         }
     }
 

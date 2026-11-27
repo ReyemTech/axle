@@ -221,7 +221,7 @@ async fn connect_form_shows_code_and_both_commands_once() {
         "{text}"
     );
     assert!(
-        text.contains(&format!("axl login http://127.0.0.1:7420 --code {code}")),
+        text.contains(&format!("axl install --server http://127.0.0.1:7420 --code {code}")),
         "{text}"
     );
     assert!(page.text().contains("15 minutes"), "{text}");

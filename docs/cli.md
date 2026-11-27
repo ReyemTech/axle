@@ -18,7 +18,7 @@ set up a machine. This page covers the setup commands and the server and token c
 ## `axl install`
 
 ```sh
-axl install [--server URL] [--code CODE] [--harness NAME]... [--local] [--dry-run] [--yes]
+axl install [--server URL] [--code CODE] [--harness NAME]... [--local] [--port PORT] [--force] [--dry-run] [--yes]
 ```
 
 Sets up this machine in one step: gets a token (logging in first when there is none), then
@@ -30,12 +30,16 @@ adds the bridge, hooks and a short instructions block to each harness it finds.
 | `--code CODE` | A one-time code from the web UI (`XXXXX-XXXXX`), used with `--server`. Skips the browser. |
 | `--harness NAME` | Only configure this harness: `claude-code`, `codex` or `opencode`. Repeat for several. |
 | `--local` | Run the server on this machine as a [background service](#axl-service). |
+| `--port PORT` | Port for the local service (implies `--local`; default 7420). |
+| `--force` | With `--server`: switch even if this machine is connected to another server. A `--code` counts as consent already. |
 | `--dry-run` | Print the planned changes as a diff and write nothing. |
 | `--yes` | Ask nothing. With no configured server and no `--server`, use local mode. |
 
 With no server configured and no `--server`, an interactive terminal is asked "Run Axle on
 this machine, or connect to a server?". A non-interactive run starts the local service
-unless you pass `--server`.
+unless you pass `--server`. If the machine is connected to a different server, `--server`
+with a `--code` switches and says "Switching from X to Y"; without a code, an interactive
+terminal is asked, and a script gets an error naming `axl install --server Y --force`.
 
 What it changes, per harness:
 

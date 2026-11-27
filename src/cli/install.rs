@@ -95,6 +95,10 @@ pub struct InstallArgs {
     pub local: bool,
     pub dry_run: bool,
     pub yes: bool,
+    /// Switch to `server` without asking when this machine is connected elsewhere.
+    pub force: bool,
+    /// Port for the local service (implies local mode).
+    pub port: Option<u16>,
 }
 
 /// Builds the service manager on demand, so runs that never need local mode never probe
@@ -209,8 +213,10 @@ async fn ensure_server(
     dir: &AxlDir,
     args: &InstallArgs,
 ) -> Result<Option<String>, ClientError> {
-    if args.local {
-        return local_mode(env, dir, args.dry_run).await.map(|()| None);
+    if args.local || args.port.is_some() {
+        return local_mode(env, dir, args.dry_run, args.port)
+            .await
+            .map(|()| None);
     }
     let has_token = read_token(None, dir).is_ok();
     let configured_url = load_config(dir)?.server_url;
@@ -227,7 +233,35 @@ async fn ensure_server(
             }
             return Ok(check_server(&url).await);
         }
-        return log_in(env, url, args.code.clone(), args.dry_run)
+        let mut force = args.force;
+        if has_token && !args.dry_run {
+            // An explicit code or --force is consent; otherwise ask, or say how to consent.
+            if args.code.is_some() || args.force {
+                let _ = writeln!(env.out, "Switching from {current} to {url}");
+                force = true;
+            } else if env.interactive && !args.yes {
+                let answer = env
+                    .prompt
+                    .ask(&format!(
+                        "This machine is connected to {current}. Switch to {url}? [y/N]"
+                    ))
+                    .map_err(ClientError::Io)?;
+                if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    return Err(usage(format!(
+                        "staying connected to {current}; run `axl install --server {url} --force` \
+                         to switch"
+                    )));
+                }
+                let _ = writeln!(env.out, "Switching from {current} to {url}");
+                force = true;
+            } else {
+                return Err(usage(format!(
+                    "already connected to {current}; run `axl install --server {url} --force` \
+                     to switch this machine"
+                )));
+            }
+        }
+        return log_in(env, url, args.code.clone(), args.dry_run, force)
             .await
             .map(|()| None);
     }
@@ -256,10 +290,14 @@ async fn ensure_server(
                 .ask("Server URL (for example https://axle.example.com):")
                 .map_err(ClientError::Io)?;
             let url = normalise_url(&raw)?;
-            return log_in(env, url, None, args.dry_run).await.map(|()| None);
+            return log_in(env, url, None, args.dry_run, false)
+                .await
+                .map(|()| None);
         }
     }
-    local_mode(env, dir, args.dry_run).await.map(|()| None)
+    local_mode(env, dir, args.dry_run, None)
+        .await
+        .map(|()| None)
 }
 
 async fn check_server(url: &str) -> Option<String> {
@@ -269,13 +307,14 @@ async fn check_server(url: &str) -> Option<String> {
     }
 }
 
-/// The `axl login` flow (code exchange, or the device flow without a code). Its
-/// "already connected; pass --force" refusal comes back unchanged.
+/// The `axl login` flow (code exchange, or the device flow without a code). `force`
+/// switches servers; the caller has already got consent for that.
 async fn log_in(
     env: &mut InstallEnv<'_>,
     url: String,
     code: Option<String>,
     dry_run: bool,
+    force: bool,
 ) -> Result<(), ClientError> {
     if dry_run {
         let _ = writeln!(env.out, "would log in to {url}");
@@ -288,7 +327,7 @@ async fn log_in(
             url: Some(url),
             code,
             no_browser: false,
-            force: false,
+            force,
         },
         env.out,
         hooks,
@@ -303,9 +342,10 @@ async fn local_mode(
     env: &mut InstallEnv<'_>,
     dir: &AxlDir,
     dry_run: bool,
+    port: Option<u16>,
 ) -> Result<(), ClientError> {
     let cfg = load_config(dir)?;
-    let port = cfg.port.unwrap_or(DEFAULT_PORT);
+    let port = port.or(cfg.port).unwrap_or(DEFAULT_PORT);
     let url = format!("http://127.0.0.1:{port}");
     let token = read_token(None, dir).ok();
     let (current, _) = resolve_server_url_with_warning(None, dir);

@@ -223,6 +223,8 @@ fn args() -> InstallArgs {
         local: false,
         dry_run: false,
         yes: true,
+        force: false,
+        port: None,
     }
 }
 
@@ -392,14 +394,14 @@ async fn install_with_server_and_code_logs_in_then_configures() {
 }
 
 #[tokio::test]
-async fn server_conflict_surfaces_login_force_error() {
+async fn explicit_code_switches_servers_and_says_so() {
     let srv = server().await;
     let other = server().await;
     let home = TempHome::new();
     home.mkdir(".claude");
     connect(&home, &srv).await;
     let issued = other.state.enroll.issue_code("x").await.unwrap();
-    let (report, _) = run(
+    let (report, out) = run(
         &home,
         InstallArgs {
             server: Some(other.base.clone()),
@@ -412,9 +414,152 @@ async fn server_conflict_surfaces_login_force_error() {
         T1,
     )
     .await;
-    let err = report.unwrap_err().to_string();
-    assert!(err.contains("--force"), "{err}");
+    report.unwrap();
+    assert!(
+        out.contains(&format!("Switching from {} to {}", srv.base, other.base)),
+        "{out}"
+    );
+    let cfg = load_config(&AxlDir::new(home.path())).unwrap();
+    assert_eq!(cfg.server_url.as_deref(), Some(other.base.as_str()));
+    assert!(home.path().join(".claude/skills/axle").exists());
+}
+
+#[tokio::test]
+async fn interactive_switch_without_code_asks_and_declines_by_default() {
+    let srv = server().await;
+    let other = server().await;
+    let home = TempHome::new();
+    home.mkdir(".claude");
+    connect(&home, &srv).await;
+    let prompt = Answers {
+        choice: 0,
+        text: String::new(),
+        asked: Mutex::new(Vec::new()),
+    };
+    let (report, _) = run(
+        &home,
+        InstallArgs {
+            server: Some(other.base.clone()),
+            yes: false,
+            ..args()
+        },
+        &prompt,
+        true,
+        &FakeService::default(),
+        T1,
+    )
+    .await;
+    let asked = prompt.asked.lock().unwrap().clone();
+    assert_eq!(
+        asked,
+        [format!(
+            "This machine is connected to {}. Switch to {}? [y/N]",
+            srv.base, other.base
+        )]
+    );
+    assert!(report.is_err(), "an empty answer means no");
+    let cfg = load_config(&AxlDir::new(home.path())).unwrap();
+    assert_eq!(cfg.server_url.as_deref(), Some(srv.base.as_str()));
     assert!(!home.path().join(".claude/skills/axle").exists());
+}
+
+#[tokio::test]
+async fn non_interactive_switch_without_code_names_the_force_command() {
+    let srv = server().await;
+    let other = server().await;
+    let home = TempHome::new();
+    home.mkdir(".claude");
+    connect(&home, &srv).await;
+    let (report, _) = run(
+        &home,
+        InstallArgs {
+            server: Some(other.base.clone()),
+            ..args()
+        },
+        &NoPrompt,
+        false,
+        &FakeService::default(),
+        T1,
+    )
+    .await;
+    let err = report.unwrap_err().to_string();
+    assert!(
+        err.contains(&format!("axl install --server {} --force", other.base)),
+        "{err}"
+    );
+    assert!(!home.path().join(".claude/skills/axle").exists());
+}
+
+#[tokio::test]
+async fn force_flag_switches_servers() {
+    let srv = server().await;
+    let other = server().await;
+    let home = TempHome::new();
+    home.mkdir(".claude");
+    connect(&home, &srv).await;
+    let issued = other.state.enroll.issue_code("x").await.unwrap();
+    let (report, out) = run(
+        &home,
+        InstallArgs {
+            server: Some(other.base.clone()),
+            code: Some(issued.code),
+            force: true,
+            ..args()
+        },
+        &NoPrompt,
+        false,
+        &FakeService::default(),
+        T1,
+    )
+    .await;
+    report.unwrap();
+    assert!(out.contains("Switching from"), "{out}");
+}
+
+#[tokio::test]
+async fn install_port_goes_to_the_service_and_busy_port_is_reported() {
+    let home = TempHome::new();
+    home.mkdir(".claude");
+    let port = free_port();
+    let service = FakeService::default();
+    let (report, _) = run(
+        &home,
+        InstallArgs {
+            port: Some(port),
+            ..args()
+        },
+        &NoPrompt,
+        false,
+        &service,
+        T1,
+    )
+    .await;
+    report.unwrap();
+    assert_eq!(
+        service.calls.lock().unwrap().as_slice(),
+        [format!("install {port}")]
+    );
+    let cfg = load_config(&AxlDir::new(home.path())).unwrap();
+    assert_eq!(cfg.port, Some(port));
+
+    let busy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let busy_port = busy.local_addr().unwrap().port();
+    let home2 = TempHome::new();
+    home2.mkdir(".claude");
+    let (report, _) = run(
+        &home2,
+        InstallArgs {
+            port: Some(busy_port),
+            ..args()
+        },
+        &NoPrompt,
+        false,
+        &FakeService::default(),
+        T1,
+    )
+    .await;
+    let err = report.unwrap_err().to_string();
+    assert!(err.contains("in use") && err.contains("--port"), "{err}");
 }
 
 #[tokio::test]
