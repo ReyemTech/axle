@@ -10,6 +10,7 @@ use std::convert::Infallible;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use futures_util::Stream;
@@ -37,6 +38,27 @@ pub fn routes() -> Router<AppState> {
         .route("/heartbeat", post(heartbeat))
         .route("/events", get(events))
         .route("/inbox/summary", get(inbox_summary))
+        .route("/whoami", get(whoami))
+}
+
+// ---------------------------------------------------------------- whoami
+
+/// The calling token's label and the server version (what `axl doctor` checks).
+async fn whoami(
+    State(state): State<AppState>,
+    Extension(AuthToken(token)): Extension<AuthToken>,
+) -> Result<Response, ApiError> {
+    let tokens = state.auth.list().await.map_err(ApiError::internal)?;
+    let label = tokens
+        .into_iter()
+        .find(|t| t.id == token && t.revoked_at.is_none())
+        .map(|t| t.label)
+        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized"))?;
+    Ok(super::enroll::no_store(
+        Json(serde_json::json!({ "label": label, "version": env!("CARGO_PKG_VERSION") }))
+            .into_response(),
+    )
+    .await)
 }
 
 // ---------------------------------------------------------------- register

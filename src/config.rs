@@ -18,6 +18,11 @@ pub enum ConfigError {
     BadBool(&'static str, String),
     #[error("invalid trusted header name: {0:?}")]
     BadHeader(String),
+    #[error(
+        "AXL_PUBLIC_URL must be an http(s) address with a host and no path, using only letters, \
+         digits and . : / - [ ], got {0:?}"
+    )]
+    BadPublicUrl(String),
     #[error("AXL_ADMIN_SECRET must be at least {0} characters")]
     ShortSecret(usize),
     #[error("AXL_UI_AUTH must be auto, none, secret or trusted-header, got {0:?}")]
@@ -226,6 +231,42 @@ pub struct ServerConfig {
     /// Mark the UI session cookie `Secure` (`AXL_COOKIE_SECURE`, default false). Set it
     /// whenever the UI is reached over https, e.g. behind a TLS ingress.
     pub cookie_secure: bool,
+    /// The address clients reach this server at (`AXL_PUBLIC_URL`), without a trailing `/`.
+    pub public_url: Option<String>,
+    /// Header naming the client IP behind a proxy (`AXL_TRUSTED_PROXY_HEADER`); its right-most
+    /// entry keys the per-IP limits. Unset: the socket address is used and the header ignored.
+    pub trusted_proxy_header: Option<String>,
+}
+
+/// The server cannot tell clients its own address: it is bound beyond loopback and
+/// `AXL_PUBLIC_URL` is unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "set AXL_PUBLIC_URL to this server's public address (for example https://axle.example.com)"
+)]
+pub struct MissingPublicUrl;
+
+/// A validated `AXL_PUBLIC_URL`: trimmed, no trailing `/`. The value is spliced into a shell
+/// script, so only a conservative character set is accepted.
+fn parse_public_url(raw: &str) -> Result<Option<String>, ConfigError> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let bad = || ConfigError::BadPublicUrl(raw.to_string());
+    let url = value.strip_suffix('/').unwrap_or(value);
+    let safe = |c: char| c.is_ascii_alphanumeric() || ".:/-[]".contains(c);
+    if !url.chars().all(safe) {
+        return Err(bad());
+    }
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or_else(bad)?;
+    if rest.is_empty() || rest.contains('/') || rest.starts_with(':') {
+        return Err(bad());
+    }
+    Ok(Some(url.to_string()))
 }
 
 const DEFAULT_BIND: &str = "127.0.0.1:7420";
@@ -330,6 +371,14 @@ impl ServerConfig {
             Some(raw) => trusted_header_name(&raw)?,
             None => None,
         };
+        let public_url = match get("AXL_PUBLIC_URL") {
+            Some(raw) => parse_public_url(&raw)?,
+            None => None,
+        };
+        let trusted_proxy_header = match get("AXL_TRUSTED_PROXY_HEADER") {
+            Some(raw) => trusted_header_name(&raw)?,
+            None => None,
+        };
         Ok(Self {
             backend: Backend::from_url(&url)?,
             bind,
@@ -341,7 +390,34 @@ impl ServerConfig {
             rate_limit_per_sec: positive(&get, "AXL_RATE_LIMIT_PER_SEC", 20)?,
             rate_limit_burst: positive(&get, "AXL_RATE_LIMIT_BURST", 100)?,
             cookie_secure: boolean(&get, "AXL_COOKIE_SECURE", false)?,
+            public_url,
+            trusted_proxy_header,
         })
+    }
+
+    /// The address to give clients: `AXL_PUBLIC_URL` if set; on a loopback bind, the request's
+    /// `Host` when it names a loopback host, else the bind address; otherwise an error (a
+    /// `Host` header on a reachable server is client-controlled and the scheme is unknown
+    /// behind a TLS proxy).
+    pub fn advertised_url(&self, host_header: Option<&str>) -> Result<String, MissingPublicUrl> {
+        if let Some(url) = &self.public_url {
+            return Ok(url.clone());
+        }
+        if !self.bind.ip().is_loopback() {
+            return Err(MissingPublicUrl);
+        }
+        if let Some(host) = host_header.map(str::trim)
+            && matches!(
+                host_without_port(host).as_str(),
+                "127.0.0.1" | "localhost" | "[::1]"
+            )
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || ".:-[]".contains(c))
+        {
+            return Ok(format!("http://{host}"));
+        }
+        Ok(format!("http://{}", self.bind))
     }
 
     /// Whether the UI answers a request for `host` (a `Host` header value, port allowed).
@@ -739,5 +815,75 @@ mod tests {
         .unwrap();
         assert!(!c.host_allowed("0.0.0.0:7420"));
         assert_eq!(c.allowed_hosts, ["127.0.0.1", "[::1]", "localhost"]);
+    }
+
+    fn cfg(extra: &[(&'static str, &'static str)]) -> Result<ServerConfig, ConfigError> {
+        let base = [
+            ("DATABASE_URL", "sqlite://./axl.db"),
+            ("AXL_ADMIN_SECRET", "s3cret-s3cret-s3cret"),
+        ];
+        let vars: Vec<(&str, &str)> = base.iter().chain(extra).copied().collect();
+        ServerConfig::from_lookup(lookup(&vars))
+    }
+
+    #[test]
+    fn public_url_parsed_and_trimmed() {
+        let c = cfg(&[("AXL_PUBLIC_URL", " https://axle.example.com/ ")]).unwrap();
+        assert_eq!(c.public_url.as_deref(), Some("https://axle.example.com"));
+        let c = cfg(&[("AXL_PUBLIC_URL", "http://10.0.0.7:7420")]).unwrap();
+        assert_eq!(c.public_url.as_deref(), Some("http://10.0.0.7:7420"));
+        assert_eq!(cfg(&[]).unwrap().public_url, None);
+        assert_eq!(cfg(&[("AXL_PUBLIC_URL", "  ")]).unwrap().public_url, None);
+    }
+
+    #[test]
+    fn public_url_rejects_unsafe_values() {
+        for bad in [
+            "https://a.example/'x",
+            "https://a b",
+            "ftp://a",
+            "https://a.example/sub",
+            "https://$(id)",
+            "https://",
+            "axle.example.com",
+        ] {
+            let e = cfg(&[("AXL_PUBLIC_URL", bad)]).unwrap_err();
+            assert!(matches!(e, ConfigError::BadPublicUrl(_)), "{bad}: {e}");
+            assert!(e.to_string().contains("AXL_PUBLIC_URL"), "{e}");
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_header_parsed() {
+        let c = cfg(&[("AXL_TRUSTED_PROXY_HEADER", " X-Forwarded-For ")]).unwrap();
+        assert_eq!(c.trusted_proxy_header.as_deref(), Some("X-Forwarded-For"));
+        assert_eq!(cfg(&[]).unwrap().trusted_proxy_header, None);
+        assert!(cfg(&[("AXL_TRUSTED_PROXY_HEADER", "x y")]).is_err());
+    }
+
+    #[test]
+    fn advertised_url_rules() {
+        let c = cfg(&[]).unwrap();
+        assert_eq!(
+            c.advertised_url(Some("localhost:7420")).unwrap(),
+            "http://localhost:7420"
+        );
+        assert_eq!(
+            c.advertised_url(Some("evil.example")).unwrap(),
+            "http://127.0.0.1:7420"
+        );
+        assert_eq!(c.advertised_url(None).unwrap(), "http://127.0.0.1:7420");
+        let lan = cfg(&[("AXL_BIND", "0.0.0.0:7420")]).unwrap();
+        let e = lan.advertised_url(Some("localhost")).unwrap_err();
+        assert!(e.to_string().contains("AXL_PUBLIC_URL"));
+        let public = cfg(&[
+            ("AXL_BIND", "0.0.0.0:7420"),
+            ("AXL_PUBLIC_URL", "https://axle.example.com"),
+        ])
+        .unwrap();
+        assert_eq!(
+            public.advertised_url(Some("evil.example")).unwrap(),
+            "https://axle.example.com"
+        );
     }
 }

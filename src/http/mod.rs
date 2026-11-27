@@ -1,6 +1,7 @@
 //! The axum server: shared state, bearer-token auth, health probes, the `/v1` API, the MCP
 //! endpoint and the web UI.
 
+pub mod enroll;
 pub mod rate_limit;
 pub mod v1;
 
@@ -43,6 +44,8 @@ pub struct AppState {
     /// Fired when the server starts shutting down; long-lived responses (SSE) end on it.
     pub shutdown: Shutdown,
     pub rate_limit: Arc<RateLimiter>,
+    /// Per-client-IP limit on the unauthenticated `/v1/enroll` and `/v1/login/*` endpoints.
+    pub enroll_limit: Arc<RateLimiter<String>>,
     /// Web UI sessions and login limits.
     pub ui: Arc<UiState>,
 }
@@ -132,6 +135,7 @@ impl AppState {
                 config.rate_limit_per_sec,
                 config.rate_limit_burst,
             )),
+            enroll_limit: Arc::new(RateLimiter::per_minute(enroll::ENROLL_PER_MINUTE)),
             ui: Arc::new(UiState::new()),
             config: Arc::new(config),
             store,
@@ -156,7 +160,9 @@ pub fn router(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .nest(
             "/v1",
-            v1::routes().route_layer(middleware::from_fn_with_state(state.clone(), require_token)),
+            v1::routes()
+                .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
+                .merge(enroll::routes()),
         )
         .merge(crate::ui::routes(state.clone()))
         .merge(mcp)
@@ -201,7 +207,7 @@ fn bearer(value: &str) -> Option<&str> {
 }
 
 /// 429 `{"error":"rate_limited"}` with `Retry-After` in whole seconds.
-fn rate_limited(retry_after: u64) -> Response {
+pub(crate) fn rate_limited(retry_after: u64) -> Response {
     let mut res = ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited").into_response();
     res.headers_mut()
         .insert(header::RETRY_AFTER, header::HeaderValue::from(retry_after));

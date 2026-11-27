@@ -18,11 +18,9 @@ pub mod views;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::net::SocketAddr;
 use std::sync::Mutex;
 
 use axum::body::Body;
-use axum::extract::connect_info::ConnectInfo;
 use axum::extract::{Form, Path, Request, State};
 use axum::http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -38,6 +36,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::config::UiAuth;
 use crate::http::AppState;
+use crate::http::enroll::client_ip;
 use crate::http::rate_limit::RateLimiter;
 
 /// The session cookie.
@@ -379,16 +378,9 @@ struct LoginForm {
     secret: String,
 }
 
-/// The client IP the login limit is keyed by (`unknown` when the server was not started
-/// with connection info, e.g. in tests).
-fn client_ip(extensions: &Extensions) -> String {
-    extensions
-        .get::<ConnectInfo<SocketAddr>>()
-        .map_or_else(|| "unknown".to_string(), |ci| ci.0.ip().to_string())
-}
-
 async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     extensions: Extensions,
     Form(form): Form<LoginForm>,
 ) -> Response {
@@ -396,7 +388,12 @@ async fn login(
     if state.config.ui_auth == UiAuth::None {
         return Redirect::to("/ui/").into_response();
     }
-    if let Err(retry_after) = state.ui.login_limit.check(client_ip(&extensions), now) {
+    let ip = client_ip(
+        &headers,
+        &extensions,
+        state.config.trusted_proxy_header.as_deref(),
+    );
+    if let Err(retry_after) = state.ui.login_limit.check(ip, now) {
         let mut res = views::login_page(
             StatusCode::TOO_MANY_REQUESTS,
             Some("Too many login attempts. Wait a minute and try again."),
