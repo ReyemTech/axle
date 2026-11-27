@@ -2,7 +2,7 @@
 //! login. They sit outside bearer auth and are limited per client IP instead. Responses never
 //! carry anything but the token itself, and always `Cache-Control: no-store`.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use axum::extract::State;
 use axum::extract::connect_info::ConnectInfo;
@@ -39,19 +39,21 @@ pub async fn no_store(mut res: Response) -> Response {
 
 /// The client IP the per-IP limits are keyed by. With `trusted` set (the header a proxy
 /// fills in), its right-most non-empty comma-separated entry, the one the nearest proxy
-/// appended; a client cannot forge that one. Otherwise, or when the header is absent, the
-/// socket address; `unknown` when the server was not started with connection info (tests).
-pub fn client_ip(headers: &HeaderMap, extensions: &Extensions, trusted: Option<&str>) -> String {
-    let forwarded = trusted
+/// appended; a client cannot forge that one. It must parse as an IP address, otherwise (or
+/// when the header is absent) the socket peer is used, so a caller cannot mint arbitrary keys.
+/// `0.0.0.0` when the server was not started with connection info (tests).
+pub fn client_ip(headers: &HeaderMap, extensions: &Extensions, trusted: Option<&str>) -> IpAddr {
+    trusted
         .and_then(|name| headers.get(name))
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.rsplit(',').map(str::trim).find(|e| !e.is_empty()));
-    match forwarded {
-        Some(ip) => ip.to_string(),
-        None => extensions
-            .get::<ConnectInfo<SocketAddr>>()
-            .map_or_else(|| "unknown".to_string(), |ci| ci.0.ip().to_string()),
-    }
+        .and_then(|v| v.rsplit(',').map(str::trim).find(|e| !e.is_empty()))
+        .and_then(|e| e.parse().ok())
+        .or_else(|| {
+            extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ci| ci.0.ip())
+        })
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
 }
 
 /// Takes one request from the caller's per-IP bucket; the 429 response when it is empty.
@@ -59,13 +61,13 @@ fn limit(
     state: &AppState,
     headers: &HeaderMap,
     extensions: &Extensions,
-) -> Result<String, Box<Response>> {
+) -> Result<IpAddr, Box<Response>> {
     let ip = client_ip(
         headers,
         extensions,
         state.config.trusted_proxy_header.as_deref(),
     );
-    match state.enroll_limit.check(ip.clone(), state.clock.now()) {
+    match state.enroll_limit.check(ip, state.clock.now()) {
         Ok(()) => Ok(ip),
         Err(retry_after) => Err(Box::new(super::rate_limited(retry_after))),
     }
@@ -106,7 +108,11 @@ async fn enroll(
         Ok(url) => url,
         Err(res) => return *res,
     };
-    match state.enroll.exchange(&req.code, &req.host, Some(&ip)).await {
+    match state
+        .enroll
+        .exchange(&req.code, &req.host, Some(&ip.to_string()))
+        .await
+    {
         Ok(Some(token)) => {
             Json(json!({ "token": token, "server_url": server_url })).into_response()
         }
@@ -135,7 +141,11 @@ async fn login_start(
         Ok(url) => url,
         Err(res) => return *res,
     };
-    match state.enroll.start_device(&req.host, Some(&ip)).await {
+    match state
+        .enroll
+        .start_device(&req.host, Some(&ip.to_string()))
+        .await
+    {
         Ok(start) => Json(json!({
             "device_code": start.device_code,
             "user_code": start.user_code,

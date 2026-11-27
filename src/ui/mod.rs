@@ -53,7 +53,7 @@ const FORM_LIMIT: usize = 256 * 1024;
 /// Server-side UI sessions and the login rate limit.
 pub struct UiState {
     sessions: Mutex<HashMap<String, UiSession>>,
-    login_limit: RateLimiter<String>,
+    login_limit: RateLimiter<std::net::IpAddr>,
 }
 
 #[derive(Debug, Clone)]

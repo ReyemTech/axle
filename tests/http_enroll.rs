@@ -439,3 +439,31 @@ async fn public_url_is_advertised() {
         "https://axle.example.com/ui/connect"
     );
 }
+
+#[tokio::test]
+async fn unparseable_forwarded_value_is_keyed_by_peer_address() {
+    let app = app_with(&[("AXL_TRUSTED_PROXY_HEADER", "X-Forwarded-For")]).await;
+    let send = |xff: String| {
+        let app = &app;
+        async move {
+            app.post_from(
+                "/v1/enroll",
+                json!({"code": "ZZZZZ-ZZZZZ", "host": "h"}),
+                Some("192.0.2.1"),
+                &[("X-Forwarded-For", &xff)],
+            )
+            .await
+            .status
+        }
+    };
+    for i in 0..10 {
+        assert_eq!(send(format!("garbage-{i}")).await, StatusCode::BAD_REQUEST);
+    }
+    // Every junk value shares the peer's bucket, however it is spelled.
+    assert_eq!(
+        send("1.1.1.1:99".into()).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // A real forwarded address is still its own bucket.
+    assert_eq!(send("10.0.0.9".into()).await, StatusCode::BAD_REQUEST);
+}

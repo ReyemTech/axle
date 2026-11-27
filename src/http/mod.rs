@@ -45,7 +45,7 @@ pub struct AppState {
     pub shutdown: Shutdown,
     pub rate_limit: Arc<RateLimiter>,
     /// Per-client-IP limit on the unauthenticated `/v1/enroll` and `/v1/login/*` endpoints.
-    pub enroll_limit: Arc<RateLimiter<String>>,
+    pub enroll_limit: Arc<RateLimiter<std::net::IpAddr>>,
     /// Web UI sessions and login limits.
     pub ui: Arc<UiState>,
 }
