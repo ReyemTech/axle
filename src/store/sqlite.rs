@@ -317,7 +317,11 @@ async fn claim_locked(
           WHERE id = ?
             AND (status = 'open'
                  OR (status = 'claimed' AND lease_expires_at < ?)
-                 OR (status IN ('claimed', 'blocked', 'review') AND owner_agent_id = ?))
+                 OR (status IN ('claimed', 'blocked', 'review') AND owner_agent_id = ?
+                     AND (owner_session_id = ?
+                          OR NOT EXISTS (SELECT 1 FROM sessions s
+                                          WHERE s.id = tasks.owner_session_id
+                                            AND s.last_heartbeat_at >= ?))))
             AND ",
         eligible!(),
         " RETURNING ",
@@ -330,6 +334,8 @@ async fn claim_locked(
     .bind(&id)
     .bind(&now)
     .bind(&agent)
+    .bind(c.session.to_string())
+    .bind(ts::enc(req.live_since))
     .bind(&c.harness)
     .bind(&c.host)
     .bind(&project)

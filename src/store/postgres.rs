@@ -266,7 +266,11 @@ async fn claim_locked(
           WHERE id = $1
             AND (status = 'open'
                  OR (status = 'claimed' AND lease_expires_at < $8)
-                 OR (status IN ('claimed', 'blocked', 'review') AND owner_agent_id = $6))
+                 OR (status IN ('claimed', 'blocked', 'review') AND owner_agent_id = $6
+                     AND (owner_session_id = $5
+                          OR NOT EXISTS (SELECT 1 FROM sessions s
+                                          WHERE s.id = tasks.owner_session_id
+                                            AND s.last_heartbeat_at >= $9))))
             AND ",
         eligible!(),
         " RETURNING ",
@@ -280,6 +284,7 @@ async fn claim_locked(
     .bind(c.agent.as_uuid())
     .bind(req.lease_until(&previous))
     .bind(req.now)
+    .bind(req.live_since)
     .fetch_optional(&mut *conn)
     .await?
     .as_ref()

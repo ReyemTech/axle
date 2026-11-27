@@ -178,6 +178,8 @@ pub struct TaskService {
     clock: Arc<dyn Clock>,
     lease_ttl: Duration,
     idle_renew_cap: Duration,
+    /// A session is stale (open to same-agent takeover) after this long without a heartbeat.
+    presence_stale: Duration,
     events: Option<EventBus>,
 }
 
@@ -190,12 +192,14 @@ impl TaskService {
         clock: Arc<dyn Clock>,
         lease_ttl: Duration,
         idle_renew_cap: Duration,
+        presence_stale: Duration,
     ) -> Self {
         Self {
             store,
             clock,
             lease_ttl,
             idle_renew_cap,
+            presence_stale,
             events: None,
         }
     }
@@ -208,7 +212,13 @@ impl TaskService {
     }
 
     pub fn from_config(store: Arc<dyn Store>, clock: Arc<dyn Clock>, cfg: &ServerConfig) -> Self {
-        Self::new(store, clock, cfg.lease_ttl, cfg.idle_renew_cap)
+        Self::new(
+            store,
+            clock,
+            cfg.lease_ttl,
+            cfg.idle_renew_cap,
+            cfg.presence_stale,
+        )
     }
 
     /// Creates an open task; its body becomes the first message of its thread (same
@@ -653,6 +663,7 @@ impl TaskService {
                 host: caller.agent.host.clone(),
             },
             now,
+            live_since: now - self.presence_stale,
             default_ttl: self.lease_ttl,
             event_id: Uuid::now_v7(),
         }

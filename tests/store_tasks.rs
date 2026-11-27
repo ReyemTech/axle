@@ -32,6 +32,7 @@ impl Env {
             clock.clone(),
             Duration::minutes(15),
             Duration::hours(2),
+            Duration::seconds(90),
         ));
         Self { store, clock, svc }
     }
@@ -195,39 +196,95 @@ store_matrix!(lease_boundary, |store: Arc<dyn Store>| async move {
     ));
 });
 
-store_matrix!(
-    same_agent_takeover_immediate,
-    |store: Arc<dyn Store>| async move {
-        let env = Env::new(store);
-        let a = env.session("mac", "claude-code").await;
-        let other = env.session("linux", "claude-code").await;
-        let task = env.task(&a, Eligibility::default()).await;
-        claimed(env.svc.claim(&a, task.id).await.unwrap());
+store_matrix!(same_agent_takeover_after_stale_session, |store: Arc<
+    dyn Store,
+>| async move {
+    let env = Env::new(store);
+    let a = env.session("mac", "claude-code").await; // last heartbeat at t0
+    let other = env.session("linux", "claude-code").await;
+    let task = env.task(&a, Eligibility::default()).await;
+    claimed(env.svc.claim(&a, task.id).await.unwrap());
 
-        env.set_time(Duration::minutes(1));
-        assert!(matches!(
-            env.svc.claim(&other, task.id).await.unwrap(),
-            ClaimOutcome::AlreadyOwned { .. }
-        ));
+    // Past the 90 s presence window the old session is stale: the `--resume` case.
+    env.set_time(Duration::minutes(2));
+    assert!(matches!(
+        env.svc.claim(&other, task.id).await.unwrap(),
+        ClaimOutcome::AlreadyOwned { .. }
+    ));
 
-        let a2 = env.session("mac", "claude-code").await;
-        assert_eq!(a2.agent.id, a.agent.id);
-        assert_ne!(a2.session.id, a.session.id);
-        let taken = claimed(env.svc.claim(&a2, task.id).await.unwrap());
-        assert_eq!(taken.owner_session_id, Some(a2.session.id));
-        assert_eq!(taken.lease_expires_at, Some(T0 + Duration::minutes(16)));
+    let a2 = env.session("mac", "claude-code").await;
+    assert_eq!(a2.agent.id, a.agent.id);
+    assert_ne!(a2.session.id, a.session.id);
+    let taken = claimed(env.svc.claim(&a2, task.id).await.unwrap());
+    assert_eq!(taken.owner_session_id, Some(a2.session.id));
+    assert_eq!(taken.lease_expires_at, Some(T0 + Duration::minutes(17)));
+    let last = env.svc.get(task.id).await.unwrap().events.pop().unwrap();
+    assert_eq!(last.kind, TaskEventKind::Claimed);
+    assert!(
+        last.note.unwrap().starts_with("same-agent takeover"),
+        "takeover is recorded"
+    );
 
-        assert!(matches!(
-            env.svc.renew(&a, task.id).await,
-            Err(TaskError::LeaseLost)
-        ));
-        assert!(matches!(
-            env.svc.release(&a, task.id, None).await,
-            Err(TaskError::LeaseLost)
-        ));
-        env.svc.renew(&a2, task.id).await.unwrap();
-    }
-);
+    assert!(matches!(
+        env.svc.renew(&a, task.id).await,
+        Err(TaskError::LeaseLost)
+    ));
+    assert!(matches!(
+        env.svc.release(&a, task.id, None).await,
+        Err(TaskError::LeaseLost)
+    ));
+    env.svc.renew(&a2, task.id).await.unwrap();
+});
+
+store_matrix!(same_agent_live_sibling_is_refused, |store: Arc<
+    dyn Store,
+>| async move {
+    let env = Env::new(store);
+    let a = env.session("mac", "claude-code").await;
+    let blocked = env.task(&a, Eligibility::default()).await;
+    let task = env.task(&a, Eligibility::default()).await;
+    claimed(env.svc.claim(&a, task.id).await.unwrap());
+    claimed(env.svc.claim(&a, blocked.id).await.unwrap());
+    env.svc.block(&a, blocked.id, "waiting").await.unwrap();
+
+    // A second live session of the same agent is refused like any other agent, for
+    // claimed, blocked and review tasks alike.
+    env.set_time(Duration::seconds(60));
+    let sibling = env.session("mac", "claude-code").await;
+    assert_eq!(sibling.agent.id, a.agent.id);
+    assert_eq!(
+        env.svc.claim(&sibling, task.id).await.unwrap(),
+        ClaimOutcome::AlreadyOwned {
+            by: a.agent.id,
+            until: Some(T0 + Duration::minutes(15)),
+        }
+    );
+    assert_eq!(
+        env.svc.claim(&sibling, blocked.id).await.unwrap(),
+        ClaimOutcome::AlreadyOwned {
+            by: a.agent.id,
+            until: None,
+        }
+    );
+
+    // Heartbeats keep the owner live well past the window.
+    env.set_time(Duration::minutes(10));
+    env.store
+        .touch_heartbeat(a.session.id, env.clock.now())
+        .await
+        .unwrap();
+    env.set_time(Duration::minutes(11));
+    assert!(matches!(
+        env.svc.claim(&sibling, task.id).await.unwrap(),
+        ClaimOutcome::AlreadyOwned { .. }
+    ));
+
+    // The owner itself always may claim again (a renewal).
+    let again = claimed(env.svc.claim(&a, task.id).await.unwrap());
+    assert_eq!(again.owner_session_id, Some(a.session.id));
+    let stored = env.store.get_task(task.id).await.unwrap().unwrap();
+    assert_eq!(stored.owner_session_id, Some(a.session.id));
+});
 
 store_matrix!(
     same_agent_two_sessions_race,
@@ -237,6 +294,8 @@ store_matrix!(
         let task = env.task(&a1, Eligibility::default()).await;
         claimed(env.svc.claim(&a1, task.id).await.unwrap());
 
+        // a1 goes stale; two fresh sessions of the same agent race for its task.
+        env.set_time(Duration::minutes(2));
         let a2 = env.session("mac", "claude-code").await;
         let a3 = env.session("mac", "claude-code").await;
         let spawn_claim = |r: Resolved| {
@@ -244,25 +303,35 @@ store_matrix!(
             tokio::spawn(async move { svc.claim(&r, task.id).await.unwrap() })
         };
         let (h2, h3) = (spawn_claim(a2.clone()), spawn_claim(a3.clone()));
-        let (t2, t3) = (claimed(h2.await.unwrap()), claimed(h3.await.unwrap()));
+        let outcomes = [h2.await.unwrap(), h3.await.unwrap()];
 
-        // Both claims succeed (same-agent takeover), but they are serialised: each got its
-        // own epoch and the later one owns the task.
-        let mut epochs = [t2.lease_epoch, t3.lease_epoch];
-        epochs.sort();
-        assert_eq!(epochs, [2, 3]);
-        let (owner, loser) = if t3.lease_epoch > t2.lease_epoch {
-            (&a3, &a2)
-        } else {
+        // Exactly one takes it over; the other then meets a live owner and is refused.
+        let winners: Vec<&Task> = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                ClaimOutcome::Claimed(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(winners.len(), 1, "exactly one owner: {outcomes:?}");
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, ClaimOutcome::AlreadyOwned { by, .. } if *by == a1.agent.id)),
+            "{outcomes:?}"
+        );
+        let (owner, loser) = if winners[0].owner_session_id == Some(a2.session.id) {
             (&a2, &a3)
+        } else {
+            (&a3, &a2)
         };
         let stored = env.store.get_task(task.id).await.unwrap().unwrap();
         assert_eq!(stored.owner_session_id, Some(owner.session.id));
-        assert_eq!(stored.lease_epoch, 3);
+        assert_eq!(stored.lease_epoch, 2);
 
         assert!(matches!(
             env.svc.renew(loser, task.id).await,
-            Err(TaskError::LeaseLost)
+            Err(TaskError::NotOwner)
         ));
         env.svc.renew(owner, task.id).await.unwrap();
     }
@@ -1056,6 +1125,7 @@ store_matrix!(edit_is_guarded_attributed_and_published, |store: Arc<
         env.clock.clone(),
         Duration::minutes(15),
         Duration::hours(2),
+        Duration::seconds(90),
     )
     .with_events(bus.clone());
     let mut rx = bus.subscribe();
@@ -1101,7 +1171,9 @@ store_matrix!(edit_is_guarded_attributed_and_published, |store: Arc<
             .await,
         Err(TaskError::NotOwner)
     ));
-    // ...and once it takes the task over, the first session has lost it.
+    // ...and once it takes the task over (the first session gone stale), the first session
+    // has lost it.
+    env.set_time(Duration::minutes(2));
     claimed(svc.claim(&worker_again, task.id).await.unwrap());
     assert!(matches!(
         svc.edit(&worker, task.id, None, Some("z".into())).await,

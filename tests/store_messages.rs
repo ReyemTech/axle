@@ -33,6 +33,7 @@ impl Env {
                 clock.clone(),
                 Duration::minutes(15),
                 Duration::hours(2),
+                Duration::seconds(90),
             ),
             store,
             clock,

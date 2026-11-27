@@ -338,6 +338,10 @@ pub struct Claimant {
 pub struct ClaimRequest {
     pub claimant: Claimant,
     pub now: OffsetDateTime,
+    /// Sessions whose last heartbeat is at or after this are live. A same-agent takeover
+    /// needs the previous owner session to be stale (the `--resume` case); a live sibling
+    /// session of the same agent is refused like any other agent.
+    pub live_since: OffsetDateTime,
     /// Lease length for tasks without their own TTL.
     pub default_ttl: Duration,
     /// Id for the event appended on success.
