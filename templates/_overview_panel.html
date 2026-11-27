@@ -10,7 +10,8 @@
   <span class="muted">seen in the last 24 hours</span>
 </div>
 {% if agents.is_empty() %}
-<p class="empty">No agent has been seen in the last 24 hours. Agents appear here once they connect with a token.</p>
+<p class="empty">No agents yet. Connect a machine to get started.</p>
+<p class="empty-action"><a class="button-like" href="/ui/tokens#connect">Connect a machine</a></p>
 {% else %}
 <ul class="agents">
 {% for a in agents %}

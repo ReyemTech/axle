@@ -135,6 +135,56 @@
   setInterval(tickLeases, 1000);
   document.addEventListener("htmx:load", tickLeases);
 
+  // `data-countdown` holds the seconds left when rendered (a pending code or login); the text
+  // counts down from when this page first saw the element, like the lease bars.
+  var countdownSeen = new WeakMap();
+
+  function tickCountdowns() {
+    var now = performance.now();
+    document.querySelectorAll("[data-countdown]").forEach(function (el) {
+      if (!countdownSeen.has(el)) countdownSeen.set(el, now);
+      var left = Number(el.getAttribute("data-countdown")) - (now - countdownSeen.get(el)) / 1000;
+      var s = Math.max(0, Math.ceil(left));
+      var text = s === 0
+        ? "expired"
+        : "expires in " + Math.floor(s / 60) + ":" + ("0" + (s % 60)).slice(-2);
+      if (el.textContent !== text) el.textContent = text;
+    });
+  }
+  tickCountdowns();
+  setInterval(tickCountdowns, 1000);
+  document.addEventListener("htmx:load", tickCountdowns);
+
+  // Copy buttons (`data-copy` names the element whose text to copy). The button says what
+  // happened: "Copied", or "Press Ctrl+C" when the browser blocks clipboard access and the
+  // text is selected instead.
+  document.addEventListener("click", function (e) {
+    var btn = e.target instanceof Element ? e.target.closest("[data-copy]") : null;
+    if (!btn) return;
+    var target = document.getElementById(btn.getAttribute("data-copy"));
+    if (!target) return;
+    var text = target.textContent.trim();
+    var original = btn.getAttribute("data-label") || btn.textContent;
+    btn.setAttribute("data-label", original);
+    function say(message) {
+      btn.textContent = message;
+      setTimeout(function () { btn.textContent = original; }, 2000);
+    }
+    function selectText() {
+      var range = document.createRange();
+      range.selectNodeContents(target);
+      var sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      say("Press Ctrl+C");
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { say("Copied"); }, selectText);
+    } else {
+      selectText();
+    }
+  });
+
   // Live swaps replace elements: keep the filter, the selection and open subtask lists.
   function afterSwap() {
     applySearch();

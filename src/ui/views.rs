@@ -113,10 +113,13 @@ struct LoginPage<'a> {
     pulse: Option<Pulse>,
     nav: &'static str,
     error: Option<&'a str>,
+    /// Where to return after signing in (only ever `/ui/connect`).
+    next: Option<&'static str>,
 }
 
-pub fn login_page(status: StatusCode, error: Option<&str>) -> Response {
+pub fn login_page(status: StatusCode, error: Option<&str>, next: Option<&'static str>) -> Response {
     let page = LoginPage {
+        next,
         csrf: None,
         logout: false,
         pulse: None,
