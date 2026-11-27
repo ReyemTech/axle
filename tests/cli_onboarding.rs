@@ -134,6 +134,8 @@ impl Prompt for Answers {
 struct FakeService {
     calls: Arc<Mutex<Vec<String>>>,
     running: Arc<Mutex<bool>>,
+    /// Serve a stand-in whose `/readyz` works and `/v1/whoami` answers 500.
+    whoami_fails: bool,
 }
 
 impl ServiceControl for FakeService {
@@ -147,6 +149,24 @@ impl ServiceControl for FakeService {
             *running = true;
             let db = format!("sqlite://{}/.axl/axl.db", spec.home.display());
             let port = spec.port;
+            if self.whoami_fails {
+                tokio::spawn(async move {
+                    use axum::http::StatusCode;
+                    let app = axum::Router::new()
+                        .route("/readyz", axum::routing::get(|| async { "ok" }))
+                        .route(
+                            "/v1/whoami",
+                            axum::routing::get(|| async {
+                                (StatusCode::INTERNAL_SERVER_ERROR, "boom")
+                            }),
+                        );
+                    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                        .await
+                        .unwrap();
+                    axum::serve(listener, app).await.unwrap();
+                });
+                return Ok(());
+            }
             tokio::spawn(async move {
                 let store = Arc::new(SqliteStore::connect(&db).await.unwrap());
                 let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
@@ -822,6 +842,102 @@ async fn adopted_entries_are_listed() {
     );
 }
 
+#[tokio::test]
+async fn local_token_check_failure_does_not_mint() {
+    let home = TempHome::new();
+    home.mkdir(".claude");
+    let dir = AxlDir::new(home.path());
+    let port = free_port();
+    let url = format!("http://127.0.0.1:{port}");
+    save_config(
+        &dir,
+        &ClientConfig {
+            server_url: Some(url.clone()),
+            port: Some(port),
+        },
+    )
+    .unwrap();
+    write_token(&dir, "axl_existing").unwrap();
+    let service = FakeService {
+        whoami_fails: true,
+        ..FakeService::default()
+    };
+    let (report, _) = run(
+        &home,
+        InstallArgs {
+            local: true,
+            ..args()
+        },
+        &NoPrompt,
+        false,
+        &service,
+        T1,
+    )
+    .await;
+    let err = report.unwrap_err().to_string();
+    assert!(err.contains("cannot check this machine's token"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(dir.token_path()).unwrap(),
+        "axl_existing"
+    );
+    // No database was opened to mint into.
+    assert!(!dir.db_path().exists());
+}
+
+#[tokio::test]
+async fn failed_apply_still_records_what_landed() {
+    let srv = server().await;
+    let home = full_home(&srv).await;
+    // Codex's directory cannot be written: its backup and edit fail, after Claude Code's.
+    let codex = home.path().join(".codex");
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o555)).unwrap();
+    struct Restore(PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _restore = Restore(codex.clone());
+    let (report, _) = run(&home, args(), &NoPrompt, false, &FakeService::default(), T1).await;
+    let err = report.unwrap_err().to_string();
+    assert!(err.contains("Codex"), "{err}");
+    assert!(err.contains("install-manifest.json"), "{err}");
+
+    let dir = AxlDir::new(home.path());
+    let manifest = axle::install::Manifest::load(&dir).unwrap();
+    assert!(
+        manifest
+            .entries
+            .iter()
+            .any(|e| e.harness == Harness::ClaudeCode && e.kind == axle::install::EntryKind::Link),
+        "{:?}",
+        manifest.entries
+    );
+    assert!(
+        manifest
+            .entries
+            .iter()
+            .all(|e| e.harness != Harness::Codex || !e.file.starts_with(&codex)),
+        "recorded Codex edits that never landed: {:?}",
+        manifest.entries
+    );
+    let link = home.path().join(".claude/skills/axle");
+    assert!(std::fs::read_link(&link).is_ok());
+
+    // Uninstall finds what was recorded and removes it.
+    let plan = axle::install::claude_code::plan_uninstall(home.path(), &manifest).unwrap();
+    axle::install::apply(&plan, T2).unwrap();
+    assert!(
+        std::fs::symlink_metadata(&link).is_err(),
+        "link left behind"
+    );
+    assert!(
+        !dir.integrations_dir()
+            .join("claude-code/.mcp.json")
+            .exists()
+    );
+}
+
 // ---- end to end, real binary ----
 
 struct Child(std::process::Child);
@@ -903,7 +1019,7 @@ fn e2e_serve_login_install_dry_run() {
     };
 
     let login = axl(home.path())
-        .args(["login", "--url", &base, "--code", &code])
+        .args(["login", &base, "--code", &code])
         .output()
         .unwrap();
     let out = check(&login, "login");
@@ -973,4 +1089,52 @@ async fn adopted_server_url_from_first_harness_wins() {
         .collect();
     assert_eq!(url_entries.len(), 1, "{manifest}");
     assert_eq!(url_entries[0]["harness"], "claude-code");
+}
+
+#[test]
+fn e2e_hand_made_token_is_never_printed() {
+    let home = TempHome::new();
+    let secret = format!("axl_{}", "0123456789abcdef".repeat(4));
+    home.write(
+        ".claude.json",
+        &format!(
+            "{{\n  \"mcpServers\": {{\n    \"axle\": {{\n      \"command\": \"axl\",\n      \"args\": [\"bridge\"],\n      \"env\": {{ \"AXL_SERVER_URL\": \"http://127.0.0.1:1\", \"AXL_TOKEN\": \"{secret}\" }}\n    }}\n  }}\n}}\n"
+        ),
+    )
+    .mkdir(".claude")
+    .write(
+        ".codex/config.toml",
+        &format!(
+            "[mcp_servers.axle]\ncommand = \"axl\"\nargs = [\"bridge\"]\nenv = {{ AXL_SERVER_URL = \"http://127.0.0.1:1\", AXL_TOKEN = \"{secret}\" }}\n"
+        ),
+    );
+    // Configured but unreachable: no login, no local service.
+    let dir = AxlDir::new(home.path());
+    save_config(
+        &dir,
+        &ClientConfig {
+            server_url: Some("http://127.0.0.1:1".into()),
+            port: None,
+        },
+    )
+    .unwrap();
+    write_token(&dir, &secret).unwrap();
+    for argv in [
+        &["install", "--dry-run", "--yes"][..],
+        &["install", "--yes"][..],
+    ] {
+        let out = axl(home.path()).args(argv).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{argv:?}\n{stdout}\n{stderr}");
+        assert!(
+            !stdout.contains("axl_"),
+            "{argv:?} printed a token:\n{stdout}"
+        );
+        assert!(
+            !stderr.contains("axl_"),
+            "{argv:?} printed a token:\n{stderr}"
+        );
+        assert!(stdout.contains("<redacted>") || argv.len() == 2, "{stdout}");
+    }
 }

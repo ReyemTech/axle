@@ -50,8 +50,11 @@ enum Command {
     /// browser
     Login {
         /// Server URL (default: AXL_SERVER_URL, then ~/.axl/config.toml, then localhost)
-        #[arg(long)]
+        #[arg(value_name = "URL")]
         url: Option<String>,
+        /// The server URL as a flag (same as the positional URL; kept for older scripts)
+        #[arg(long = "url", value_name = "URL", conflicts_with = "url", hide = true)]
+        url_flag: Option<String>,
         /// One-time code from the web UI (XXXXX-XXXXX)
         #[arg(long)]
         code: Option<String>,
@@ -175,12 +178,13 @@ async fn main() -> ExitCode {
         } => serve(bind, trusted_header).await,
         Command::Login {
             url,
+            url_flag,
             code,
             no_browser,
             force,
         } => {
             login(axle::cli::LoginArgs {
-                url,
+                url: url.or(url_flag),
                 code,
                 no_browser,
                 force,
@@ -326,7 +330,8 @@ async fn install(args: axle::cli::InstallArgs) -> ExitCode {
             home,
             path_env: std::env::var_os("PATH"),
             current_exe: std::env::current_exe()?,
-            interactive: std::io::stdin().is_terminal(),
+            // Both ends: with stdout redirected the question would be invisible.
+            interactive: std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
             prompt: &axle::cli::TerminalPrompt,
             out: &mut stdout,
             service: &service,
@@ -339,7 +344,7 @@ async fn install(args: axle::cli::InstallArgs) -> ExitCode {
     match run.await {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("axl: {e}");
+            eprintln!("axl: {}", axle::cli::install::redact(&e.to_string()));
             ExitCode::FAILURE
         }
     }
@@ -412,4 +417,48 @@ async fn token(command: TokenCommand) -> CliResult {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn login_url(argv: &[&str]) -> Option<String> {
+        match Cli::try_parse_from(argv).unwrap().command {
+            Command::Login { url, url_flag, .. } => url.or(url_flag),
+            _ => panic!("not a login command"),
+        }
+    }
+
+    /// The exact command the web UI's "Connect a machine" panel shows.
+    #[test]
+    fn ui_login_command_parses() {
+        let url = "https://axle.example.com";
+        let code = "ABCDE-FGHJK";
+        let shown = axle::ui::connect::login_command(url, code);
+        let argv: Vec<&str> = shown.split(' ').collect();
+        match Cli::try_parse_from(&argv).unwrap().command {
+            Command::Login {
+                url: u,
+                code: c,
+                url_flag,
+                ..
+            } => {
+                assert_eq!(u.as_deref(), Some(url));
+                assert_eq!(c.as_deref(), Some(code));
+                assert_eq!(url_flag, None);
+            }
+            _ => panic!("not a login command"),
+        }
+    }
+
+    #[test]
+    fn login_url_flag_still_works_and_conflicts_with_positional() {
+        assert_eq!(
+            login_url(&["axl", "login", "--url", "http://h:7420"]).as_deref(),
+            Some("http://h:7420")
+        );
+        assert_eq!(login_url(&["axl", "login"]), None);
+        assert!(Cli::try_parse_from(["axl", "login", "http://a", "--url", "http://b"]).is_err());
+    }
 }

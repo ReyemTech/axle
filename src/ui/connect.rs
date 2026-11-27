@@ -185,7 +185,7 @@ pub async fn connect_machine(
     let panel = ConnectPanel {
         issued: Some(IssuedPanel {
             install_cmd: format!("curl -fsSL {url}/install.sh | sh -s -- {}", issued.code),
-            login_cmd: format!("axl login {url} --code {}", issued.code),
+            login_cmd: login_command(&url, &issued.code),
             expires_iso: issued
                 .expires_at
                 .to_offset(time::UtcOffset::UTC)
@@ -388,4 +388,9 @@ pub async fn deny(
     Path(id): Path<String>,
 ) -> UiResult<Response> {
     decide(state, session, id, false).await
+}
+
+/// The command the connect panel tells a person to paste (`axl login`'s positional URL).
+pub fn login_command(url: &str, code: &str) -> String {
+    format!("axl login {url} --code {code}")
 }

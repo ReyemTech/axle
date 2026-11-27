@@ -236,7 +236,7 @@ async fn ensure_server(
         let mut warning = check_server(&current).await;
         if !has_token {
             let no_token =
-                format!("This machine has no token for {current}; run axl login --url {current}.");
+                format!("This machine has no token for {current}; run axl login {current}.");
             warning = Some(match warning {
                 Some(w) => format!("{w} {no_token}"),
                 None => no_token,
@@ -330,12 +330,21 @@ async fn local_mode(
     let _ = writeln!(env.out, "Local service installed on {url}");
     wait_ready(&url).await?;
 
-    let api = Api::new(&url);
-    if let Some(t) = &token
-        && api.whoami(t).await.is_ok()
-    {
-        let _ = writeln!(env.out, "Already connected to {url}");
-        return Ok(());
+    if let Some(t) = &token {
+        match Api::new(&url).whoami(t).await {
+            Ok(_) => {
+                let _ = writeln!(env.out, "Already connected to {url}");
+                return Ok(());
+            }
+            // The local server does not know this token (say, after `--purge`): mint anew.
+            Err(ClientError::Server(m)) if m == "unauthorized" || m == "HTTP 401" => {}
+            // Anything else would mint a token on every re-run; say what went wrong.
+            Err(e) => {
+                return Err(usage(format!(
+                    "cannot check this machine's token with {url}: {e}; see `axl service logs`"
+                )));
+            }
+        }
     }
     let host = short_hostname();
     let db = format!("sqlite://{}", dir.db_path().display());
@@ -436,7 +445,7 @@ fn configure_harnesses(
                 manual.push(format!("{}: {e}", display_name(h)));
                 rows.push(HarnessRow {
                     harness: h,
-                    outcome: Outcome::NeedsManual(e.to_string()),
+                    outcome: Outcome::NeedsManual(redact(&e.to_string())),
                     next_step: Some("make the change shown above, then re-run".into()),
                 });
             }
@@ -463,39 +472,30 @@ fn configure_harnesses(
         merged.notes.extend(p.plan.notes.iter().cloned());
     }
 
+    // Everything below can quote the user's files (a hand-made entry may carry a token),
+    // so it all goes through `redact`.
     for m in &manual {
-        let _ = writeln!(env.out, "needs manual step: {m}");
+        let _ = writeln!(env.out, "{}", redact(&format!("needs manual step: {m}")));
     }
     for p in &planned {
         for a in &p.adopted {
-            let _ = writeln!(env.out, "adopted hand-made {a}");
+            let _ = writeln!(env.out, "{}", redact(&format!("adopted hand-made {a}")));
         }
     }
 
     if args.dry_run {
         let diff = render_diff(&merged);
         if !diff.is_empty() {
-            let _ = write!(env.out, "{diff}");
+            let _ = write!(env.out, "{}", redact(&diff));
         }
     } else {
         for n in &merged.notes {
-            let _ = writeln!(env.out, "note: {n}");
+            let _ = writeln!(env.out, "{}", redact(&format!("note: {n}")));
         }
         // Also tightens an existing ~/.axl to 0700, and must precede apply, which would
         // otherwise create it with the default mode.
         dir.ensure()?;
-        if changes_something(&merged) {
-            apply(&merged, env.now)?;
-        }
-        let before = manifest.entries.len();
-        for p in &planned {
-            for e in &p.entries {
-                manifest.record(e.clone());
-            }
-        }
-        if manifest.entries.len() != before {
-            manifest.save(dir)?;
-        }
+        apply_and_record(&planned, dir, manifest, env.now)?;
     }
 
     for p in &planned {
@@ -512,6 +512,169 @@ fn configure_harnesses(
     }
     rows.sort_by_key(|r| Harness::ALL.iter().position(|h| *h == r.harness));
     Ok(rows)
+}
+
+/// Applies each harness's plan one edit at a time, then records the manifest entries for
+/// every file that is now in its planned state. When an edit fails, the entries for what
+/// already landed are still saved, so uninstall can find them, and the error names the
+/// harness.
+fn apply_and_record(
+    planned: &[Planned],
+    dir: &AxlDir,
+    manifest: &mut Manifest,
+    now: OffsetDateTime,
+) -> Result<(), ClientError> {
+    let mut done: HashSet<PathBuf> = HashSet::new();
+    let mut failure: Option<(Harness, io::Error)> = None;
+    'harnesses: for p in planned {
+        for e in &p.plan.edits {
+            let one = Plan {
+                edits: vec![e.clone()],
+                ..Plan::default()
+            };
+            if let Err(err) = apply(&one, now) {
+                failure = Some((p.harness, err));
+                break 'harnesses;
+            }
+            done.insert(e.path.clone());
+        }
+        for l in &p.plan.links {
+            let one = Plan {
+                links: vec![l.clone()],
+                ..Plan::default()
+            };
+            if let Err(err) = apply(&one, now) {
+                failure = Some((p.harness, err));
+                break 'harnesses;
+            }
+            done.insert(l.path.clone());
+        }
+    }
+    let before = manifest.entries.len();
+    for p in planned {
+        for e in p.entries.iter().filter(|e| done.contains(&e.file)) {
+            manifest.record(e.clone());
+        }
+    }
+    if manifest.entries.len() != before {
+        manifest.save(dir)?;
+    }
+    match failure {
+        None => Ok(()),
+        Some((h, err)) => Err(usage(redact(&format!(
+            "configuring {} failed: {err}. What was already changed is recorded in {}; \
+             fix the problem and re-run",
+            display_name(h),
+            dir.manifest_path().display()
+        )))),
+    }
+}
+
+/// Key names whose values are never printed.
+const SENSITIVE_KEYS: [&str; 4] = ["TOKEN", "SECRET", "AUTHORIZATION", "PASSWORD"];
+
+/// Hides secrets in text that may quote the user's files: Axle tokens and device codes
+/// (`axl_…`, `axld_…`) anywhere, and the value after any key whose name contains TOKEN,
+/// SECRET, AUTHORIZATION or PASSWORD (`KEY = "v"`, `"KEY": "v"`, inline tables alike).
+pub fn redact(text: &str) -> String {
+    let text = redact_prefixed(text);
+    text.split_inclusive('\n').map(redact_keys).collect()
+}
+
+fn redact_prefixed(text: &str) -> String {
+    const MIN_SECRET_CHARS: usize = 8;
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let (mut i, mut copied) = (0, 0);
+    while i < b.len() {
+        let prefix = ["axld_", "axl_"]
+            .into_iter()
+            .find(|p| b[i..].starts_with(p.as_bytes()));
+        if let Some(p) = prefix {
+            let start = i + p.len();
+            let end = start
+                + b[start..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_alphanumeric() || **c == b'-')
+                    .count();
+            if end - start >= MIN_SECRET_CHARS {
+                out.push_str(&text[copied..i]);
+                out.push_str("<redacted>");
+                copied = end;
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+fn redact_keys(line: &str) -> String {
+    let b = line.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'-';
+    let is_blank = |c: u8| c == b' ' || c == b'\t';
+    let mut out = String::with_capacity(line.len());
+    let (mut i, mut copied) = (0, 0);
+    while i < b.len() {
+        if !is_ident(b[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && is_ident(b[i]) {
+            i += 1;
+        }
+        let word = line[start..i].to_ascii_uppercase();
+        if !SENSITIVE_KEYS.iter().any(|k| word.contains(k)) {
+            continue;
+        }
+        let mut j = i;
+        if j < b.len() && (b[j] == b'"' || b[j] == b'\'') {
+            j += 1;
+        }
+        while j < b.len() && is_blank(b[j]) {
+            j += 1;
+        }
+        if j >= b.len() || (b[j] != b'=' && b[j] != b':') {
+            continue;
+        }
+        j += 1;
+        while j < b.len() && is_blank(b[j]) {
+            j += 1;
+        }
+        let value_start = j;
+        let value_end = match b.get(j) {
+            Some(&q) if q == b'"' || q == b'\'' => {
+                let mut k = j + 1;
+                while k < b.len() && b[k] != q {
+                    k += if b[k] == b'\\' { 2 } else { 1 };
+                }
+                (k + 1).min(b.len())
+            }
+            // An object or array: the keys inside get their own turn.
+            Some(b'{') | Some(b'[') | None => continue,
+            Some(_) => {
+                let mut k = j;
+                while k < b.len()
+                    && !matches!(b[k], b',' | b'}' | b']' | b'\n' | b'\r')
+                    && !is_blank(b[k])
+                {
+                    k += 1;
+                }
+                k
+            }
+        };
+        if value_end > value_start {
+            out.push_str(&line[copied..value_start]);
+            out.push_str("\"<redacted>\"");
+            copied = value_end.min(b.len());
+            i = copied;
+        }
+    }
+    out.push_str(&line[copied..]);
+    out
 }
 
 fn print_summary(out: &mut dyn Write, rows: &[HarnessRow], dry_run: bool, warning: Option<&str>) {
@@ -553,6 +716,48 @@ fn print_summary(out: &mut dyn Write, rows: &[HarnessRow], dry_run: bool, warnin
     }
     if let Some(w) = warning {
         let _ = writeln!(out);
-        let _ = writeln!(out, "WARNING: {w}");
+        let _ = writeln!(out, "{}", redact(&format!("WARNING: {w}")));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact;
+
+    #[test]
+    fn redact_hides_tokens_and_sensitive_values() {
+        let hex = "0123456789abcdef0123456789abcdef";
+        let cases = [
+            (
+                format!("+    \"AXL_TOKEN\": \"axl_{hex}\",\n"),
+                "+    \"AXL_TOKEN\": \"<redacted>\",\n",
+            ),
+            (
+                format!("-env = {{ AXL_SERVER_URL = \"http://h\", AXL_TOKEN = \"axl_{hex}\" }}\n"),
+                "-env = { AXL_SERVER_URL = \"http://h\", AXL_TOKEN = \"<redacted>\" }\n",
+            ),
+            (
+                "api_secret = hunter2\n".to_string(),
+                "api_secret = \"<redacted>\"\n",
+            ),
+            (
+                format!("Authorization: Bearer axl_{hex}"),
+                "Authorization: \"<redacted>\" <redacted>",
+            ),
+            (format!("see axld_{hex} here"), "see <redacted> here"),
+            ("\"tokens\": {\n".to_string(), "\"tokens\": {\n"),
+            (
+                "command = \"/bin/axl\"\n".to_string(),
+                "command = \"/bin/axl\"\n",
+            ),
+            ("is axl_hook short\n".to_string(), "is axl_hook short\n"),
+            (
+                "héllo TOKEN='é\\'x' ok\n".to_string(),
+                "héllo TOKEN=\"<redacted>\" ok\n",
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(redact(&input), want, "{input}");
+        }
     }
 }
