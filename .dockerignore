@@ -1,0 +1,8 @@
+target
+.git
+.superpowers
+.concord
+docs
+*.db
+*.db-*
+.env
