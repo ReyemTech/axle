@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use axle::client::{
     AxlDir, ClientConfig, ClientError, load_config, read_token, remove_token, resolve_server_url,
-    save_config, write_token,
+    resolve_server_url_with_warning, save_config, write_token,
 };
 
 struct TempHome(PathBuf);
@@ -112,4 +112,14 @@ fn missing_config_is_default_and_bad_toml_is_an_error() {
     assert!(matches!(load_config(&dir), Err(ClientError::Toml(_))));
     // A broken file never blocks resolution.
     assert_eq!(resolve_server_url(None, &dir), "http://127.0.0.1:7420");
+    let (url, warning) = resolve_server_url_with_warning(None, &dir);
+    assert_eq!(url, "http://127.0.0.1:7420");
+    let warning = warning.expect("a malformed config warns");
+    assert!(
+        warning.starts_with("axl: ignoring ~/.axl/config.toml: "),
+        "{warning}"
+    );
+    // The env decides the URL, so the file is not consulted and nothing is warned about.
+    let (url, warning) = resolve_server_url_with_warning(Some("http://h:1"), &dir);
+    assert_eq!((url.as_str(), warning), ("http://h:1", None));
 }

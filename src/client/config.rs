@@ -94,23 +94,38 @@ pub fn save_config(dir: &AxlDir, cfg: &ClientConfig) -> Result<(), ClientError> 
 }
 
 /// `AXL_SERVER_URL` (when not blank), then `config.toml`'s `server_url`, then the default.
-/// Never ends in `/`. An unreadable or malformed config falls through to the default.
+/// Never ends in `/`. An unreadable or malformed config fails open to the default, with a
+/// one-line warning on stderr (stdout is the bridge's MCP channel).
 pub fn resolve_server_url(env_url: Option<&str>, dir: &AxlDir) -> String {
+    let (url, warning) = resolve_server_url_with_warning(env_url, dir);
+    if let Some(w) = warning {
+        eprintln!("{w}");
+    }
+    url
+}
+
+/// As `resolve_server_url`, but returns the warning instead of printing it. The config is
+/// only read (and so only warned about) when the environment does not decide the URL.
+pub fn resolve_server_url_with_warning(
+    env_url: Option<&str>,
+    dir: &AxlDir,
+) -> (String, Option<String>) {
     let non_blank = |s: &str| {
         let s = s.trim();
         (!s.is_empty()).then(|| s.to_string())
     };
+    let mut warning = None;
     let url = env_url
         .and_then(non_blank)
-        .or_else(|| {
-            load_config(dir)
-                .ok()
-                .and_then(|c| c.server_url)
-                .as_deref()
-                .and_then(non_blank)
+        .or_else(|| match load_config(dir) {
+            Ok(c) => c.server_url.as_deref().and_then(non_blank),
+            Err(e) => {
+                warning = Some(format!("axl: ignoring ~/.axl/config.toml: {e}"));
+                None
+            }
         })
         .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
-    url.trim_end_matches('/').to_string()
+    (url.trim_end_matches('/').to_string(), warning)
 }
 
 /// `AXL_TOKEN` (when not blank), then `~/.axl/token`.
