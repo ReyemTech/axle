@@ -549,6 +549,37 @@ store_matrix!(refused_task_update_writes_nothing, |store: Arc<
     creator.cancel().await.unwrap();
 });
 
+store_matrix!(
+    invalid_task_update_input_leaves_task_unchanged,
+    |store: Arc<dyn Store>| async move {
+        let server = start(store).await;
+        let agent = server.agent("mac", "claude-code").await;
+        let task = ok(&agent, "task_create", json!({"title": "Old", "body": "b"})).await;
+        let id = task["id"].as_str().unwrap();
+        ok(&agent, "task_claim", json!({"next": true})).await;
+        let before = ok(&agent, "task_get", json!({"id": id})).await;
+
+        let long_title = "x".repeat(201);
+        let long_body = "y".repeat(70_000);
+        for args in [
+            json!({"id": id, "status": "review", "title": long_title}),
+            json!({"id": id, "status": "blocked", "reason": "r", "title": long_title}),
+            json!({"id": id, "status": "review", "body": long_body}),
+            json!({"id": id, "status": "blocked", "reason": "r", "body": long_body}),
+            json!({"id": id, "status": "blocked", "reason": long_body}),
+        ] {
+            let (is_error, text) = call(&agent, "task_update", args).await;
+            assert!(is_error, "{text}");
+            let after = ok(&agent, "task_get", json!({"id": id})).await;
+            assert_eq!(after, before, "task changed after a rejected update");
+        }
+        // The task is still claimed, so a valid transition still works.
+        let done = ok(&agent, "task_update", json!({"id": id, "status": "review"})).await;
+        assert_eq!(done["status"], "review");
+        agent.cancel().await.unwrap();
+    }
+);
+
 store_matrix!(lists_are_paged, |store: Arc<dyn Store>| async move {
     let server = start(store).await;
     let a = server.agent("mac", "claude-code").await;

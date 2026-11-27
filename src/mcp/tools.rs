@@ -20,7 +20,7 @@ use crate::domain::{
     TaskId, TaskStatus,
 };
 use crate::service::identity::Resolved;
-use crate::service::messages::{InboxFilter, NewMessage, check_body};
+use crate::service::messages::{InboxFilter, NewMessage, check_body, check_subject};
 use crate::service::tasks::{Caller, ClaimOutcome, Completion, NewTask};
 use crate::store::TaskFilter;
 
@@ -947,8 +947,9 @@ impl AxleMcp {
         Ok(json!({ "id": message.id, "task": id }))
     }
 
-    /// Everything that can be refused without writing is checked first; the status change
-    /// (owner-guarded) runs before the edit, so a refused update writes nothing. After a
+    /// Every input is validated before the first write (title, body, reason, project names),
+    /// so rejected input leaves the task untouched. The status change (owner-guarded) runs
+    /// before the edit. After a
     /// successful status change the caller holds the task, so the edit's guard passes.
     async fn task_update_impl(&self, me: &Resolved, p: TaskUpdateParams) -> ToolResult {
         let id: TaskId = parse_id("task", &p.id)?;
@@ -970,10 +971,16 @@ impl AxleMcp {
         if p.title.as_deref().is_some_and(|t| t.trim().is_empty()) {
             return Err(ToolError::invalid("a task needs a title"));
         }
+        if let Some(title) = &p.title {
+            check_subject("title", title).map_err(ToolError::from)?;
+        }
         if let Some(body) = &p.body {
             check_body(body).map_err(ToolError::from)?;
         }
         let reason = non_blank(p.reason);
+        if let Some(reason) = &reason {
+            check_body(reason).map_err(ToolError::from)?;
+        }
         if matches!(p.status, Some(UpdateStatusParam::Blocked)) && reason.is_none() {
             return Err(ToolError::invalid("a reason is required to block a task"));
         }
