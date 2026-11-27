@@ -362,6 +362,23 @@ async fn events_stream_delivers_message() {
 }
 
 #[tokio::test]
+async fn enrollment_events_are_not_sent_to_agents() {
+    let app = app().await;
+    let token = app.token().await;
+    let (session, _) = app.register(&token, "github.com/acme/platform-infra").await;
+    let mut stream = app.events(&token, session).await;
+
+    app.state.enroll.issue_code("work laptop").await.unwrap();
+
+    assert!(
+        next_event(&mut stream, Duration::from_millis(200))
+            .await
+            .is_none(),
+        "enrollment changes must not reach agent streams"
+    );
+}
+
+#[tokio::test]
 async fn events_not_leaked_across_projects() {
     let app = app().await;
     let token = app.token().await;

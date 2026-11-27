@@ -256,7 +256,7 @@ impl Watcher {
             Event::MessageCreated { id, to, .. } => self.wants_message(id, to).await,
             Event::TaskChanged { id, project_id, .. } => self.wants_task(id, project_id).await,
             // The human's inbox is not an agent's business.
-            Event::HumanArchived { .. } => Ok(false),
+            Event::HumanArchived { .. } | Event::EnrollmentChanged { .. } => Ok(false),
         };
         result.unwrap_or_else(|e| {
             eprintln!("axl: dropping event for session {}: {e}", self.session);

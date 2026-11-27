@@ -23,6 +23,7 @@ use crate::domain::TokenId;
 use crate::events::EventBus;
 use crate::http::rate_limit::RateLimiter;
 use crate::service::auth::AuthService;
+use crate::service::enroll::EnrollService;
 use crate::service::messages::MessageService;
 use crate::service::tasks::TaskService;
 use crate::store::Store;
@@ -38,6 +39,7 @@ pub struct AppState {
     pub auth: Arc<AuthService>,
     pub messages: Arc<MessageService>,
     pub tasks: Arc<TaskService>,
+    pub enroll: Arc<EnrollService>,
     /// Fired when the server starts shutting down; long-lived responses (SSE) end on it.
     pub shutdown: Shutdown,
     pub rate_limit: Arc<RateLimiter>,
@@ -119,6 +121,11 @@ impl AppState {
                 TaskService::from_config(store.clone(), clock.clone(), &config)
                     .with_events(bus.clone()),
             ),
+            enroll: Arc::new(EnrollService::new(
+                store.clone(),
+                clock.clone(),
+                bus.clone(),
+            )),
             bus,
             shutdown: Shutdown::new(),
             rate_limit: Arc::new(RateLimiter::new(
