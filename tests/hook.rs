@@ -192,7 +192,7 @@ struct Live {
 async fn live(store: Arc<dyn Store>, home: &Path) -> Live {
     let config = ServerConfig::from_lookup(|k| match k {
         "DATABASE_URL" => Some("sqlite::memory:".into()),
-        "COORD_ADMIN_SECRET" => Some("test-secret".into()),
+        "COORD_ADMIN_SECRET" => Some("test-secret-0123456789".into()),
         _ => None,
     })
     .unwrap();

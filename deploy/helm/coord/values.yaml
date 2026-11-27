@@ -26,8 +26,10 @@ persistence:
   storageClass: ""
 
 adminSecret:
-  # Name of an existing Secret holding the UI sign-in secret. When empty the chart generates
-  # one (kept across upgrades) and stores it under `key` in a Secret named after the release.
+  # Name of an existing Secret holding the UI sign-in secret (at least 16 characters). When
+  # empty the chart generates one (kept across upgrades) and stores it under `key` in a Secret
+  # named after the release. Set this for GitOps or Pulumi: they render with `helm template`,
+  # where the chart cannot look up the existing Secret, so a generated one changes every render.
   existingSecret: ""
   key: COORD_ADMIN_SECRET
 

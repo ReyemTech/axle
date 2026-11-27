@@ -269,7 +269,7 @@ async fn bridge_without_token_fails_open() {
 store_matrix!(bridge_end_to_end, |store: Arc<dyn Store>| async move {
     let config = ServerConfig::from_lookup(|k| match k {
         "DATABASE_URL" => Some("sqlite::memory:".into()),
-        "COORD_ADMIN_SECRET" => Some("test-secret".into()),
+        "COORD_ADMIN_SECRET" => Some("test-secret-0123456789".into()),
         _ => None,
     })
     .unwrap();

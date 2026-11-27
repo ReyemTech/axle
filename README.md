@@ -39,7 +39,7 @@ coord serve --bind 0.0.0.0:7420
 ```sh
 docker build -t coord .
 
-docker run -d --name coord -p 7420:7420 \
+docker run -d --name coord -p 127.0.0.1:7420:7420 \
   -v coord-data:/data \
   -e DATABASE_URL=sqlite:///data/coord.db \
   -e COORD_ADMIN_SECRET="$(openssl rand -hex 16)" \
@@ -48,8 +48,9 @@ docker run -d --name coord -p 7420:7420 \
 docker exec -e DATABASE_URL=sqlite:///data/coord.db coord coord token create --label my-laptop
 ```
 
-The image runs as a non-root user, listens on `0.0.0.0:7420`, and keeps SQLite data in the
-`/data` volume. For Postgres, pass a `postgres://` `DATABASE_URL` instead. `tests/smoke.sh`
+The image runs as a non-root user, listens on `0.0.0.0:7420` inside the container, and keeps
+SQLite data in the `/data` volume. The `-p 127.0.0.1:…` mapping publishes it on loopback only,
+matching local mode; widen it only behind TLS. For Postgres, pass a `postgres://` `DATABASE_URL` instead. `tests/smoke.sh`
 builds the image and checks it end to end.
 
 ## Kubernetes (Helm)
@@ -82,7 +83,10 @@ database:
 
 The UI sign-in secret is generated on first install and kept across upgrades; read it with
 the command `helm install` prints. To supply your own, set `adminSecret.existingSecret` (and
-`adminSecret.key`, default `COORD_ADMIN_SECRET`). `cookieSecure` turns on automatically when
+`adminSecret.key`, default `COORD_ADMIN_SECRET`); it must be at least 16 characters. **With
+GitOps or Pulumi, always use `adminSecret.existingSecret`:** they render the chart with
+`helm template`, where the chart cannot look up the existing Secret, so a generated secret
+would change on every render. `cookieSecure` turns on automatically when
 `ingress.tls` is set; `trustedHeader` enables trusted-header sign-in behind an auth proxy.
 Other server settings go in `extraEnv`.
 
@@ -126,14 +130,14 @@ credentials, and you should not paste a token into prompts, chat or committed co
 | Variable | Default | Purpose |
 |---|---|---|
 | `DATABASE_URL` | required | `sqlite://path` or `postgres://...`; used by `serve`, `migrate` and `token` |
-| `COORD_ADMIN_SECRET` | required for `serve` | UI sign-in secret |
+| `COORD_ADMIN_SECRET` | required for `serve` | UI sign-in secret, at least 16 characters |
 | `COORD_BIND` | `127.0.0.1:7420` | Listen address (`serve --bind` overrides) |
 | `COORD_COOKIE_SECURE` | `false` | Mark the UI cookie `Secure`; set when the UI is served over https |
 | `COORD_TRUSTED_HEADER` | off | Sign UI requests in by this header, set by an auth proxy (`serve --trusted-header` overrides) |
 | `COORD_RATE_LIMIT_PER_SEC` | `20` | Sustained requests per second, per token |
 | `COORD_RATE_LIMIT_BURST` | `100` | Burst size, per token |
 | `COORD_TOKEN` | `~/.coord/token` | Bearer token for `bridge` and `hook` |
-| `COORD_SERVER_URL` | | Server URL for `bridge` and `hook` |
+| `COORD_SERVER_URL` | `http://127.0.0.1:7420` | Server URL for `bridge` and `hook` |
 | `COORD_PROJECT` | from `.coordination` or git origin | Pin the project for a session |
 
 ## Security

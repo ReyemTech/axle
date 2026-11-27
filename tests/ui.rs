@@ -22,7 +22,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use time::macros::datetime;
 use tower::ServiceExt;
 
-const SECRET: &str = "test-secret";
+const SECRET: &str = "test-secret-0123456789";
 const IAC: &str = "github.com/reyemtech/iac";
 
 struct App {

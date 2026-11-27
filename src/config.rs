@@ -18,7 +18,12 @@ pub enum ConfigError {
     BadBool(&'static str, String),
     #[error("invalid trusted header name: {0:?}")]
     BadHeader(String),
+    #[error("COORD_ADMIN_SECRET must be at least {0} characters")]
+    ShortSecret(usize),
 }
+
+/// Shortest accepted `COORD_ADMIN_SECRET`, in characters (ignoring surrounding whitespace).
+pub const ADMIN_SECRET_MIN: usize = 16;
 
 /// A trusted-header-mode header name: blank means off; otherwise it must be a valid HTTP
 /// header name.
@@ -134,6 +139,9 @@ impl ServerConfig {
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let url = required(&get, "DATABASE_URL")?;
         let admin_secret = required(&get, "COORD_ADMIN_SECRET")?;
+        if admin_secret.trim().chars().count() < ADMIN_SECRET_MIN {
+            return Err(ConfigError::ShortSecret(ADMIN_SECRET_MIN));
+        }
         let bind_raw = get("COORD_BIND").unwrap_or_else(|| DEFAULT_BIND.to_string());
         let bind = bind_raw
             .parse()
@@ -184,7 +192,7 @@ mod tests {
     fn defaults() {
         let c = ServerConfig::from_lookup(|k| match k {
             "DATABASE_URL" => Some("sqlite://./coord.db".into()),
-            "COORD_ADMIN_SECRET" => Some("s3cret".into()),
+            "COORD_ADMIN_SECRET" => Some("s3cret-s3cret-s3cret".into()),
             _ => None,
         })
         .unwrap();
@@ -202,7 +210,7 @@ mod tests {
     fn cookie_secure_and_trusted_header() {
         let base = [
             ("DATABASE_URL", "sqlite://./coord.db"),
-            ("COORD_ADMIN_SECRET", "s3cret"),
+            ("COORD_ADMIN_SECRET", "s3cret-s3cret-s3cret"),
         ];
         let with = |extra: &[(&'static str, &'static str)]| {
             let vars: Vec<(&str, &str)> = base.iter().chain(extra).copied().collect();
@@ -238,7 +246,7 @@ mod tests {
     fn rate_limit_overrides_and_bad_values() {
         let base = [
             ("DATABASE_URL", "sqlite://./coord.db"),
-            ("COORD_ADMIN_SECRET", "s3cret"),
+            ("COORD_ADMIN_SECRET", "s3cret-s3cret-s3cret"),
         ];
         let with = |extra: &[(&'static str, &'static str)]| {
             let vars: Vec<(&str, &str)> = base.iter().chain(extra).copied().collect();
@@ -292,7 +300,7 @@ mod tests {
     fn empty_database_url_is_rejected() {
         let e = ServerConfig::from_lookup(lookup(&[
             ("DATABASE_URL", ""),
-            ("COORD_ADMIN_SECRET", "s3cret"),
+            ("COORD_ADMIN_SECRET", "s3cret-s3cret-s3cret"),
         ]))
         .unwrap_err();
         assert!(matches!(e, ConfigError::Empty("DATABASE_URL")), "{e}");
@@ -310,7 +318,7 @@ mod tests {
     fn bind_override_and_bad_bind() {
         let c = ServerConfig::from_lookup(lookup(&[
             ("DATABASE_URL", "sqlite://./coord.db"),
-            ("COORD_ADMIN_SECRET", "s3cret"),
+            ("COORD_ADMIN_SECRET", "s3cret-s3cret-s3cret"),
             ("COORD_BIND", "0.0.0.0:8080"),
         ]))
         .unwrap();
@@ -318,13 +326,36 @@ mod tests {
 
         let e = ServerConfig::from_lookup(lookup(&[
             ("DATABASE_URL", "sqlite://./coord.db"),
-            ("COORD_ADMIN_SECRET", "s3cret"),
+            ("COORD_ADMIN_SECRET", "s3cret-s3cret-s3cret"),
             ("COORD_BIND", "localhost"),
         ]))
         .unwrap_err();
         assert!(
             matches!(e, ConfigError::BadBind(ref b) if b == "localhost"),
             "{e}"
+        );
+    }
+
+    #[test]
+    fn short_admin_secret_is_rejected() {
+        let with = |secret: &'static str| {
+            ServerConfig::from_lookup(lookup(&[
+                ("DATABASE_URL", "sqlite://./coord.db"),
+                ("COORD_ADMIN_SECRET", secret),
+            ]))
+        };
+        let e = with("fifteen-chars-x").unwrap_err();
+        assert!(matches!(e, ConfigError::ShortSecret(16)), "{e}");
+        assert!(e.to_string().contains("COORD_ADMIN_SECRET"), "{e}");
+        assert!(e.to_string().contains("16"), "{e}");
+        // Surrounding whitespace does not count.
+        assert!(matches!(
+            with("   fifteen-chars-x   "),
+            Err(ConfigError::ShortSecret(16))
+        ));
+        assert_eq!(
+            with("sixteen-chars-xx").unwrap().admin_secret,
+            "sixteen-chars-xx"
         );
     }
 }
