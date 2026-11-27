@@ -12,7 +12,12 @@ and enrollment hand to clients. Leave it empty to derive it from the first ingre
 (`https` when `ingress.tls` is set, else `http`); set it explicitly when the public address
 differs from the ingress, for example `publicUrl: https://axle.example.com`. With neither,
 the variable is unset and a server bound beyond loopback answers 503 on those endpoints.
-Behind an ingress, also pass `AXL_TRUSTED_PROXY_HEADER` through `extraEnv`; see
+
+`trustedProxyHeader` sets `AXL_TRUSTED_PROXY_HEADER`, the header the enrollment rate limit
+reads the client address from. Without it every client behind an ingress shares one limit of
+10 requests a minute. When `ingress.enabled` is true and the value is unset (`null`), the chart
+sets `X-Forwarded-For`; set another header (`trustedProxyHeader: X-Real-IP`) or `""` to send
+none. The header is trusted as sent, so use it only when your ingress overwrites it; see
 [security](../../../docs/security.md#enrollment).
 
 ## UI sign-in (`ui`)

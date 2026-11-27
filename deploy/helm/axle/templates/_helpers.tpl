@@ -90,6 +90,15 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end }}
 
+{{/* AXL_TRUSTED_PROXY_HEADER: explicit value ("" disables), else X-Forwarded-For behind an ingress. */}}
+{{- define "axle.trustedProxyHeader" -}}
+{{- if kindIs "invalid" .Values.trustedProxyHeader -}}
+{{- if .Values.ingress.enabled }}X-Forwarded-For{{ end -}}
+{{- else -}}
+{{- trim .Values.trustedProxyHeader -}}
+{{- end -}}
+{{- end }}
+
 {{/* AXL_PUBLIC_URL: explicit publicUrl, else derived from the first ingress host, else empty. */}}
 {{- define "axle.publicUrl" -}}
 {{- if .Values.publicUrl -}}

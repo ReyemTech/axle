@@ -80,6 +80,10 @@ spec:
             - name: AXL_PUBLIC_URL
               value: {{ . | quote }}
             {{- end }}
+            {{- with include "axle.trustedProxyHeader" . }}
+            - name: AXL_TRUSTED_PROXY_HEADER
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

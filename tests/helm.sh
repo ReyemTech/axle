@@ -104,6 +104,17 @@ expect "$(env_val AXL_COOKIE_SECURE --set ingress.enabled=true --set 'ingress.ho
   --set 'ingress.tls[0].secretName=t' --set 'ingress.tls[0].hosts[0]=a')" true "cookie secure with TLS"
 expect "$(env_val AXL_COOKIE_SECURE --set ui.cookieSecure=true)" true "cookie secure forced"
 
+# trustedProxyHeader: AXL_TRUSTED_PROXY_HEADER defaults to X-Forwarded-For with an ingress
+expect "$(has_env AXL_TRUSTED_PROXY_HEADER)" 0 "no trusted proxy header without an ingress"
+expect "$(env_val AXL_TRUSTED_PROXY_HEADER --set ingress.enabled=true)" X-Forwarded-For \
+  "trusted proxy header defaults with an ingress"
+expect "$(env_val AXL_TRUSTED_PROXY_HEADER --set ingress.enabled=true --set trustedProxyHeader=X-Real-IP)" \
+  X-Real-IP "explicit trustedProxyHeader wins"
+expect "$(env_val AXL_TRUSTED_PROXY_HEADER --set trustedProxyHeader=X-Real-IP)" X-Real-IP \
+  "explicit trustedProxyHeader without an ingress"
+expect "$(has_env AXL_TRUSTED_PROXY_HEADER --set ingress.enabled=true --set trustedProxyHeader=)" 0 \
+  "empty trustedProxyHeader disables the default"
+
 # publicUrl: AXL_PUBLIC_URL is explicit, else derived from the first ingress host, else absent
 expect "$(has_env AXL_PUBLIC_URL)" 0 "no AXL_PUBLIC_URL by default"
 expect "$(env_val AXL_PUBLIC_URL --set ingress.enabled=true --set 'ingress.hosts[0].host=axle.example.com' \

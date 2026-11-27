@@ -62,6 +62,12 @@ ui:
 # with no ingress host the variable is left unset and a non-loopback server answers 503.
 publicUrl: ""
 
+# The header your ingress sets to the real client address (AXL_TRUSTED_PROXY_HEADER); the
+# enrollment rate limit counts clients by it. Behind an ingress every client would otherwise
+# share one limit. null: X-Forwarded-For when ingress.enabled, else unset. "": never set.
+# The header is trusted blindly, so only use it when the ingress overwrites it.
+trustedProxyHeader: null
+
 service:
   type: ClusterIP
   port: 7420
