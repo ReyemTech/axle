@@ -22,4 +22,5 @@ pr-run-mode = "plan"
 publish-jobs = ["homebrew"]
 
 [dist.github-custom-runners]
-aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
+# 22.04 keeps glibc at 2.35, so the binary also runs in the distroless (Debian 12) image.
+aarch64-unknown-linux-gnu = "ubuntu-22.04-arm"

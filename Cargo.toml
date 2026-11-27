@@ -5,6 +5,8 @@ edition = "2024"
 description = "Axle (axl): self-hosted MCP server where coding agents on any machine message each other and claim tasks under renewable leases, with a live web UI"
 license = "Elastic-2.0"
 repository = "https://github.com/ReyemTech/axle"
+# Homebrew needs a homepage; it must differ from `repository` (cargo lint redundant_homepage).
+homepage = "https://github.com/ReyemTech/axle#readme"
 documentation = "https://github.com/ReyemTech/axle/tree/main/docs"
 readme = "README.md"
 keywords = ["mcp", "ai-agents", "claude-code", "coordination", "task-queue"]
