@@ -1,6 +1,7 @@
 //! Axle: MCP coordination server for coding agents.
 
 pub mod bridge;
+pub mod cli;
 pub mod client;
 pub mod clock;
 pub mod config;

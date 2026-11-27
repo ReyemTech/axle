@@ -39,6 +39,7 @@ pub fn routes() -> Router<AppState> {
         .route("/events", get(events))
         .route("/inbox/summary", get(inbox_summary))
         .route("/whoami", get(whoami))
+        .route("/token/revoke", post(revoke_self))
 }
 
 // ---------------------------------------------------------------- whoami
@@ -59,6 +60,15 @@ async fn whoami(
             .into_response(),
     )
     .await)
+}
+
+/// Revokes the calling token (`axl logout --revoke`); no other token is touched.
+async fn revoke_self(
+    State(state): State<AppState>,
+    Extension(AuthToken(token)): Extension<AuthToken>,
+) -> Result<Response, ApiError> {
+    state.auth.revoke(token).await.map_err(ApiError::internal)?;
+    Ok(super::enroll::no_store(Json(serde_json::json!({ "revoked": true })).into_response()).await)
 }
 
 // ---------------------------------------------------------------- register

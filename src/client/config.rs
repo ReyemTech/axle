@@ -17,6 +17,9 @@ pub enum ClientError {
     Http(String),
     #[error("server: {0}")]
     Server(String),
+    /// A problem on this machine or with what the user asked for, not the server's doing.
+    #[error("{0}")]
+    Usage(String),
 }
 
 /// The `~/.axl` directory and the files in it.

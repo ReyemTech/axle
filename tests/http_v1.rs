@@ -185,6 +185,33 @@ async fn next_event(
 }
 
 #[tokio::test]
+async fn revoke_self_revokes_caller_only() {
+    let app = app().await;
+    let mine = app.token().await;
+    let other = app.token().await;
+    let (status, _) = app.post(&mine, "/v1/token/revoke", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let whoami = |token: String| {
+        let app = &app;
+        async move {
+            app.call(
+                Request::get("/v1/whoami")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .status()
+        }
+    };
+    assert_eq!(whoami(mine.clone()).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(whoami(other).await, StatusCode::OK);
+    // Revoking again is refused like any request with a dead token.
+    let (status, _) = app.post(&mine, "/v1/token/revoke", json!({})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn rejects_without_token() {
     let app = app().await;
     for req in [

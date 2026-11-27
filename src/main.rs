@@ -45,6 +45,28 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Connect this machine to an Axle server: with a one-time code, or by approving in the
+    /// browser
+    Login {
+        /// Server URL (default: AXL_SERVER_URL, then ~/.axl/config.toml, then localhost)
+        #[arg(long)]
+        url: Option<String>,
+        /// One-time code from the web UI (XXXXX-XXXXX)
+        #[arg(long)]
+        code: Option<String>,
+        /// Print the approval URL instead of opening a browser
+        #[arg(long)]
+        no_browser: bool,
+        /// Switch to a different server than the one this machine is connected to
+        #[arg(long)]
+        force: bool,
+    },
+    /// Forget this machine's token (optionally revoking it on the server)
+    Logout {
+        /// Also revoke the token on the server
+        #[arg(long)]
+        revoke: bool,
+    },
     /// Run database migrations (needs DATABASE_URL)
     Migrate,
     /// Manage projects
@@ -100,6 +122,21 @@ async fn main() -> ExitCode {
             bind,
             trusted_header,
         } => serve(bind, trusted_header).await,
+        Command::Login {
+            url,
+            code,
+            no_browser,
+            force,
+        } => {
+            login(axle::cli::LoginArgs {
+                url,
+                code,
+                no_browser,
+                force,
+            })
+            .await
+        }
+        Command::Logout { revoke } => logout(revoke).await,
         Command::Migrate => migrate().await,
         Command::Token { command } => token(command).await,
         Command::Project => Err("not implemented".into()),
@@ -193,6 +230,23 @@ async fn stop_signal() {
         () = terminate => {}
     }
     eprintln!("axl: shutting down");
+}
+
+fn home_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|h| !h.as_os_str().is_empty())
+        .ok_or_else(|| "HOME is not set".into())
+}
+
+async fn login(args: axle::cli::LoginArgs) -> CliResult {
+    axle::cli::login(&home_dir()?, args, &mut std::io::stdout()).await?;
+    Ok(())
+}
+
+async fn logout(revoke: bool) -> CliResult {
+    axle::cli::logout(&home_dir()?, revoke, &mut std::io::stdout()).await?;
+    Ok(())
 }
 
 async fn migrate() -> CliResult {
