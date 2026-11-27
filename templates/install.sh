@@ -44,6 +44,8 @@ version_ge() {
 is_loopback_host() {
   host=${1#*://}
   host=${host%%/*}
+  host=${host%%\?*}
+  host=${host%%\#*}
   host=${host##*@}
   case "$host" in
     '['*) host="${host%%]*}]" ;;
@@ -76,7 +78,7 @@ main() {
   # From here on `axl` is the binary resolved above, run with the terminal as stdin when there is
   # one, else with none, so it can never read the rest of this script when piped into sh.
   axl() {
-    if { : </dev/tty; } 2>/dev/null; then
+    if (exec </dev/tty) 2>/dev/null; then
       "$AXL" "$@" </dev/tty
     else
       "$AXL" "$@" </dev/null

@@ -202,7 +202,13 @@ fn run_script(server_url: &str, uid: &str, os: &str, allow_root: bool, args: &[&
     );
     let home = dir.path().join("home");
     std::fs::create_dir(&home).unwrap();
-    let mut cmd = Command::new("sh");
+    // dash (Debian/Ubuntu's /bin/sh) is stricter than macOS sh, so prefer it when present.
+    let shell = if Command::new("dash").arg("-c").arg(":").output().is_ok() {
+        "dash"
+    } else {
+        "sh"
+    };
+    let mut cmd = Command::new(shell);
     cmd.args(["-s", "--"])
         .args(args)
         .env_clear()
@@ -275,6 +281,9 @@ fn plain_http_warns_unless_the_host_is_exactly_loopback() {
         "http://127.0.0.1.evil.com:7420",
         "http://localhostx:7420/path",
         "http://10.0.0.5:7420",
+        "http://evil.com#@localhost",
+        "http://evil.com?x@localhost",
+        "http://evil.com/p@localhost",
     ] {
         let r = run_script(url, "1000", "Linux", false, &[]);
         assert!(r.stderr.contains("plain http"), "{url}: {}", r.stderr);
