@@ -19,7 +19,7 @@ use crate::service::identity::{IdentityError, NAME_MAX, Resolved, check_label};
 use crate::service::messages::{MessageError, SUBJECT_MAX, check_body, check_subject};
 use crate::store::{
     ClaimRequest, Claimant, EditRequest, LeaseUpdate, Store, StoreError, TaskFilter,
-    TransitionRequest, claim_event,
+    TransitionRequest, Transitioned, claim_event,
 };
 
 /// Who is calling a task operation that agents and the human may both perform.
@@ -632,9 +632,19 @@ impl TaskService {
     /// After a committed transition: publishes the change and, for a child, tells the
     /// coordinator (spec §8). A child that is blocked, done or cancelled posts a message into
     /// the parent's thread (delivered to the parent's owner and creator), as does the closing
-    /// of the last open child; the parent's move to `review` that the store makes then is
-    /// published too. The transition has already committed, so failures here are logged.
-    async fn after_transition(&self, task: &Task, event: &TaskEvent, token: Option<TokenId>) {
+    /// of the last open child (the store reports it wrote `children_complete`); the parent's
+    /// move to `review` that the store makes then is published too. The transition has already committed, so failures here are logged.
+    async fn after_transition(
+        &self,
+        done: &Transitioned,
+        event: &TaskEvent,
+        token: Option<TokenId>,
+    ) {
+        let Transitioned {
+            task,
+            children_complete,
+        } = done;
+        let children_complete = *children_complete;
         self.changed(task, event.kind).await;
         let Some(parent_id) = task.parent_id else {
             return;
@@ -679,21 +689,7 @@ impl TaskService {
             importance,
         )
         .await;
-        if !matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled) {
-            return;
-        }
-        // The store records `children_complete` (at this event's time) in the same
-        // transaction when this child was the last open one.
-        let completed = match self.store.task_events(parent_id).await {
-            Ok(events) => events
-                .iter()
-                .any(|e| e.kind == TaskEventKind::ChildrenComplete && e.at == event.at),
-            Err(e) => {
-                eprintln!("coord: failed to read parent task {parent_id}: {e}");
-                return;
-            }
-        };
-        if !completed {
+        if !children_complete {
             return;
         }
         if parent.status == TaskStatus::Review {
@@ -816,11 +812,11 @@ impl TaskService {
                 token: Some(caller.session.token_id),
                 event: self.event(id, actor_of(caller), kind, note.clone(), payload.clone()),
             };
-            if let Some(task) = self.store.transition_task(&req).await? {
+            if let Some(done) = self.store.transition_task(&req).await? {
                 if kind != TaskEventKind::Renewed {
-                    self.after_transition(&task, &req.event, req.token).await;
+                    self.after_transition(&done, &req.event, req.token).await;
                 }
-                return Ok(task);
+                return Ok(done.task);
             }
             let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
             if !from.contains(&task.status) {
@@ -865,9 +861,9 @@ impl TaskService {
             event: self.event(id, actor, kind, None, None),
         };
         match self.store.transition_task(&req).await? {
-            Some(task) => {
-                self.after_transition(&task, &req.event, req.token).await;
-                Ok(task)
+            Some(done) => {
+                self.after_transition(&done, &req.event, req.token).await;
+                Ok(done.task)
             }
             None => {
                 let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;

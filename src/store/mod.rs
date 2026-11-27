@@ -167,7 +167,7 @@ pub trait Store: Send + Sync {
     /// A guarded state change: applies only if the task's status is in `from` and (when
     /// `owner` is set) `owner_session_id = owner`. Appends `event` in the same transaction.
     /// `None` when the guard did not match (callers re-read to explain why).
-    async fn transition_task(&self, req: &TransitionRequest) -> StoreResult<Option<Task>>;
+    async fn transition_task(&self, req: &TransitionRequest) -> StoreResult<Option<Transitioned>>;
     /// A guarded edit, in one transaction: applies only if the task is not `done` /
     /// `cancelled` and `req.agent` created it or `req.session` holds it (`claimed`, `blocked`
     /// or `review`). Sets the title and/or body (`None` keeps each), bumps `version` /
@@ -379,6 +379,15 @@ pub struct TransitionRequest {
     pub now: OffsetDateTime,
     pub token: Option<TokenId>,
     pub event: TaskEvent,
+}
+
+/// A transition that applied.
+#[derive(Debug, Clone)]
+pub struct Transitioned {
+    pub task: Task,
+    /// Whether this transition closed its parent's last open child, so the store recorded
+    /// `children_complete` on the parent (and moved a `claimed` parent to `review`).
+    pub children_complete: bool,
 }
 
 #[derive(Debug, Clone, Default)]

@@ -1112,6 +1112,66 @@ store_matrix!(coordinator_is_notified_in_parent_thread, |store: Arc<
     assert_eq!(subjects.last().unwrap(), "child tasks complete");
 });
 
+store_matrix!(
+    children_complete_with_sub_microsecond_clock,
+    |store: Arc<dyn Store>| async move {
+        // Stores keep microseconds; the clock here has nanoseconds, like SystemClock.
+        let clock = Arc::new(TestClock::new(datetime!(2026-01-01 0:00:00.123456789 UTC)));
+        let bus = coord::events::EventBus::new(store.clone(), clock.clone());
+        let svc = Arc::new(
+            TaskService::new(
+                store.clone(),
+                clock.clone(),
+                Duration::minutes(15),
+                Duration::hours(2),
+                Duration::seconds(90),
+            )
+            .with_events(bus.clone()),
+        );
+        let env = Env {
+            store: store.clone(),
+            clock,
+            svc,
+        };
+        let coordinator = env.session("mac", "claude-code").await;
+        let worker = env.session("linux", "codex").await;
+        let parent = env.task(&coordinator, Eligibility::default()).await;
+        claimed(env.svc.claim(&coordinator, parent.id).await.unwrap());
+        let child = child_of(&env, &parent).await;
+        claimed(env.svc.claim(&worker, child.id).await.unwrap());
+        let mut rx = bus.subscribe();
+        env.svc
+            .complete(&worker, child.id, done("ok"))
+            .await
+            .unwrap();
+
+        let thread = env.store.task_thread(parent.id).await.unwrap();
+        let subjects: Vec<_> = thread[1..]
+            .iter()
+            .filter_map(|m| m.subject.as_deref())
+            .collect();
+        assert_eq!(subjects, ["child task done", "child tasks complete"]);
+
+        let mut kinds = vec![];
+        while let Ok(e) = rx.try_recv() {
+            if let coord::events::Event::TaskChanged {
+                id, kind, status, ..
+            } = e
+            {
+                kinds.push((id, kind, status));
+            }
+        }
+        assert!(
+            kinds.contains(&(
+                parent.id,
+                TaskEventKind::ChildrenComplete,
+                TaskStatus::Review
+            )),
+            "{kinds:?}"
+        );
+    }
+);
+
 store_matrix!(parent_open_stays_open, |store: Arc<dyn Store>| async move {
     let env = Env::new(store);
     let a = env.session("mac", "claude-code").await;

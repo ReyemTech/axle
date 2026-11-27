@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use super::{
     ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate, MessageReceipt, Recipient,
-    Store, StoreError, StoreResult, TaskFilter, TransitionRequest, child_event,
+    Store, StoreError, StoreResult, TaskFilter, TransitionRequest, Transitioned, child_event,
     children_complete_event, claim_event, closes_child, edit_payload, send_time_recipient,
 };
 use crate::domain::{
@@ -158,13 +158,13 @@ async fn record_event(
     task: &Task,
     event: &TaskEvent,
     token: Option<TokenId>,
-) -> StoreResult<()> {
+) -> StoreResult<bool> {
     insert_event(conn, event, token).await?;
     let Some(parent) = task.parent_id else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(bubbled) = child_event(task, parent, event) else {
-        return Ok(());
+        return Ok(false);
     };
     // Lock the parent before anything references it: the event insert below takes a shared
     // key lock on the parent row, and two children each holding one while waiting for the
@@ -176,7 +176,7 @@ async fn record_event(
             .await?;
     insert_event(conn, &bubbled, token).await?;
     if !closes_child(event) {
-        return Ok(());
+        return Ok(false);
     }
     let open: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM tasks WHERE parent_id = $1 AND status NOT IN ('done', 'cancelled')",
@@ -185,7 +185,7 @@ async fn record_event(
     .fetch_one(&mut *conn)
     .await?;
     if open > 0 {
-        return Ok(());
+        return Ok(false);
     }
     match status.as_deref() {
         Some("claimed") => {
@@ -200,9 +200,10 @@ async fn record_event(
             .await?;
         }
         Some("open" | "blocked" | "review") => {}
-        _ => return Ok(()),
+        _ => return Ok(false),
     }
-    insert_event(conn, &children_complete_event(parent, event), token).await
+    insert_event(conn, &children_complete_event(parent, event), token).await?;
+    Ok(true)
 }
 
 /// Task columns as a literal, so queries stay static SQL.
@@ -968,7 +969,7 @@ impl Store for PostgresStore {
         Ok(claimed)
     }
 
-    async fn transition_task(&self, req: &TransitionRequest) -> StoreResult<Option<Task>> {
+    async fn transition_task(&self, req: &TransitionRequest) -> StoreResult<Option<Transitioned>> {
         let from: Vec<&str> = req.from.iter().map(|s| s.as_str()).collect();
         let (keep_lease, lease) = match req.lease {
             LeaseUpdate::Keep => (true, None),
@@ -1003,11 +1004,16 @@ impl Store for PostgresStore {
         .as_ref()
         .map(task_from)
         .transpose()?;
-        if let Some(task) = &updated {
-            record_event(&mut tx, task, &req.event, req.token).await?;
-        }
+        let Some(task) = updated else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let children_complete = record_event(&mut tx, &task, &req.event, req.token).await?;
         tx.commit().await?;
-        Ok(updated)
+        Ok(Some(Transitioned {
+            task,
+            children_complete,
+        }))
     }
 
     async fn edit_task(&self, req: &EditRequest<'_>) -> StoreResult<Option<Task>> {
