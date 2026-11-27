@@ -132,6 +132,8 @@ pub fn normalize_origin(url: &str) -> Option<String> {
     };
     let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     let host = host.split_once(':').map_or(host, |(h, _)| h);
+    // Lowercase before stripping, so `.GIT` collapses like `.git`.
+    let path = path.to_lowercase();
     let path = path.trim_matches('/');
     let path = path
         .strip_suffix(".git")

@@ -9,6 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use coord::bridge::project::{Env, normalize_origin, resolve_project};
@@ -62,6 +63,11 @@ fn normalize_variants() {
         // Extra shapes: credentials, trailing slash, no path, local paths.
         (
             "https://user:pw@GitHub.com:443/ReyemTech/IaC.git/",
+            Some("github.com/reyemtech/iac"),
+        ),
+        ("https://github.com/A/B.GIT", Some("github.com/a/b")),
+        (
+            "git@GitHub.com:ReyemTech/IaC.Git",
             Some("github.com/reyemtech/iac"),
         ),
         ("https://github.com", None),
@@ -308,6 +314,18 @@ store_matrix!(bridge_end_to_end, |store: Arc<dyn Store>| async move {
         7
     );
 
+    // Registered through /v1/register before any MCP call (/mcp would also create it).
+    let sid: coord::domain::SessionId = session_id.parse().unwrap();
+    let mut registered = false;
+    for _ in 0..100 {
+        if store.get_session(sid).await.unwrap().is_some() {
+            registered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(registered, "bridge registers its session at startup");
+
     let tools = bridge.client.list_all_tools().await.unwrap();
     assert_eq!(tools.len(), CoordMcp::tool_definitions().len());
 
@@ -323,12 +341,121 @@ store_matrix!(bridge_end_to_end, |store: Arc<dyn Store>| async move {
         "short host: {host}"
     );
 
-    // The bridge registered its session with /v1/register at startup.
-    let sid: coord::domain::SessionId = session_id.parse().unwrap();
-    assert!(store.get_session(sid).await.unwrap().is_some());
-
     let (ok, stderr) = bridge.close().await;
     assert!(ok, "exit code 0 on stdin close");
     assert!(!file.exists(), "session file removed on exit");
     assert!(!stderr.contains(&token), "token must never be logged");
 });
+
+/// What a fake server saw on `/v1`: (endpoint, authorization header, body).
+type Seen = Arc<Mutex<Vec<(&'static str, String, Value)>>>;
+
+/// A fake `/v1` that records requests and answers register with 200. The first heartbeat
+/// gets 404 (a server that forgot the session), the second a 500 whose body is `x` then
+/// two-byte characters (so byte 200 is mid-character), later ones 200.
+async fn fake_v1(seen: Seen) -> String {
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::post;
+
+    fn record(seen: &Seen, what: &'static str, headers: &HeaderMap, body: Value) -> usize {
+        let auth = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let mut seen = seen.lock().unwrap();
+        seen.push((what, auth, body));
+        seen.iter().filter(|(w, _, _)| *w == what).count()
+    }
+    let reg = seen.clone();
+    let beat = seen.clone();
+    let app = axum::Router::new()
+        .route(
+            "/v1/register",
+            post(
+                move |headers: HeaderMap, body: axum::Json<Value>| async move {
+                    record(&reg, "register", &headers, body.0);
+                    StatusCode::OK
+                },
+            ),
+        )
+        .route(
+            "/v1/heartbeat",
+            post(
+                move |headers: HeaderMap, body: axum::Json<Value>| async move {
+                    match record(&beat, "heartbeat", &headers, body.0) {
+                        1 => (StatusCode::NOT_FOUND, String::new()),
+                        2 => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("x{}", "é".repeat(150)),
+                        ),
+                        _ => (StatusCode::OK, String::new()),
+                    }
+                },
+            ),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(axum::serve(listener, app).into_future());
+    url
+}
+
+#[tokio::test]
+async fn bridge_heartbeats_and_reregisters_when_forgotten() {
+    let seen: Seen = Arc::default();
+    let server = fake_v1(seen.clone()).await;
+    let home = TempDir::new();
+    let work = TempDir::new();
+    let bridge = spawn_bridge(
+        &work.0,
+        &[
+            ("HOME", home.0.to_str().unwrap()),
+            ("COORD_SERVER_URL", server.as_str()),
+            ("COORD_TOKEN", "tok-123"),
+            ("COORD_PROJECT", "github.com/reyemtech/beat"),
+            ("COORD_HEARTBEAT_MS", "50"),
+        ],
+    )
+    .await;
+
+    // Expect: register, heartbeat (404), register again, heartbeat (500), and heartbeats
+    // that keep coming after the 500.
+    let mut log = vec![];
+    for _ in 0..200 {
+        log = seen.lock().unwrap().clone();
+        if log.iter().filter(|(w, _, _)| *w == "heartbeat").count() >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let order: Vec<_> = log.iter().map(|(w, _, _)| *w).take(5).collect();
+    assert_eq!(
+        order,
+        [
+            "register",
+            "heartbeat",
+            "register",
+            "heartbeat",
+            "heartbeat"
+        ]
+    );
+    assert!(log.iter().filter(|(w, _, _)| *w == "heartbeat").count() >= 4);
+
+    let saved: Value =
+        serde_json::from_str(&std::fs::read_to_string(session_file(&home.0)).unwrap()).unwrap();
+    for (what, auth, body) in &log {
+        assert_eq!(auth, "Bearer tok-123", "{what}");
+        assert_eq!(body["session_id"], saved["session_id"], "{what}");
+        if *what == "register" {
+            assert_eq!(body["harness"], "test-harness");
+            assert_eq!(body["project_key"], "github.com/reyemtech/beat");
+            assert!(body["host"].as_str().is_some_and(|h| !h.is_empty()));
+        }
+    }
+
+    let (ok, stderr) = bridge.close().await;
+    assert!(ok, "exit code 0 on stdin close");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(stderr.contains("heartbeat rejected (500"), "{stderr}");
+    assert!(!stderr.contains("tok-123"), "token must never be logged");
+}

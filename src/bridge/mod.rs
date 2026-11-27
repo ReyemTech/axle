@@ -12,11 +12,13 @@ pub mod session_file;
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use axum::http::{HeaderName, HeaderValue, StatusCode};
+use futures_util::FutureExt;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities, ClientConfig,
     ContentBlock, Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
@@ -40,6 +42,8 @@ use crate::service::identity::NAME_MAX;
 pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:7420";
 /// How often the bridge heartbeats (or, while unregistered, retries registering).
 pub const HEARTBEAT: Duration = Duration::from_secs(30);
+/// Overrides `HEARTBEAT`, in milliseconds. For tests and tuning only; not a user setting.
+pub const HEARTBEAT_ENV: &str = "COORD_HEARTBEAT_MS";
 /// Every tool result while the server cannot be used starts with this.
 pub const UNAVAILABLE: &str = "coord unavailable";
 
@@ -56,6 +60,8 @@ pub struct Config {
     pub project_key: Option<String>,
     /// Without a trailing `/`.
     pub server_url: String,
+    /// `HEARTBEAT`, unless `COORD_HEARTBEAT_MS` (tests and tuning only) sets another.
+    pub heartbeat: Duration,
     /// `COORD_TOKEN`, if set; otherwise the token is read from `~/.coord/token` on use, so
     /// a token written after startup is picked up by the next retry.
     env_token: Option<String>,
@@ -78,6 +84,11 @@ impl Config {
                 .unwrap_or(DEFAULT_SERVER_URL)
                 .trim_end_matches('/')
                 .to_string(),
+            heartbeat: env
+                .get(HEARTBEAT_ENV)
+                .and_then(|ms| ms.parse::<u64>().ok())
+                .filter(|&ms| ms > 0)
+                .map_or(HEARTBEAT, Duration::from_millis),
             env_token: env.get("COORD_TOKEN").map(str::to_string),
             home: env.get("HOME").map(PathBuf::from),
         }
@@ -258,8 +269,9 @@ impl Bridge {
 
     // ------------------------------------------------------------ presence
 
-    /// Registers the session, then heartbeats every 30 s; while unregistered (no token,
-    /// server down, rejected) it retries on the same schedule. Runs until the process ends.
+    /// Registers the session, then heartbeats every `heartbeat` (30 s by default); while
+    /// unregistered (no token, server down, rejected) it retries on the same schedule. A
+    /// failing (even panicking) round never ends the loop; it runs until the process ends.
     pub async fn presence_loop(self) {
         let http = match reqwest::Client::builder().timeout(HTTP_TIMEOUT).build() {
             Ok(h) => h,
@@ -269,42 +281,59 @@ impl Bridge {
             }
         };
         let mut registered = false;
-        let mut tick = tokio::time::interval(HEARTBEAT);
+        let mut tick = tokio::time::interval(self.inner.config.heartbeat);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            if registered {
-                match self
-                    .post(
-                        &http,
-                        "heartbeat",
-                        json!({ "session_id": self.inner.config.session_id }),
-                    )
-                    .await
-                {
-                    Ok(()) => continue,
-                    // The server forgot the session (e.g. a fresh database): register again.
-                    Err(Rejected::NotFound) => registered = false,
-                    Err(Rejected::Other(reason)) => {
-                        self.problem(&reason);
-                        continue;
-                    }
+            registered = match AssertUnwindSafe(self.presence_round(&http, registered))
+                .catch_unwind()
+                .await
+            {
+                Ok(registered) => registered,
+                Err(_) => {
+                    self.problem("presence round failed unexpectedly; retrying");
+                    false
+                }
+            };
+        }
+    }
+
+    /// One heartbeat (when `registered`) or registration; whether the session is now
+    /// registered.
+    async fn presence_round(&self, http: &reqwest::Client, registered: bool) -> bool {
+        let c = &self.inner.config;
+        if registered {
+            match self
+                .post(http, "heartbeat", json!({ "session_id": c.session_id }))
+                .await
+            {
+                Ok(()) => return true,
+                // The server forgot the session (e.g. a fresh database): register again.
+                Err(Rejected::NotFound) => {}
+                Err(Rejected::Other(reason)) => {
+                    self.problem(&reason);
+                    return true;
                 }
             }
-            let c = &self.inner.config;
-            let body = json!({
-                "session_id": c.session_id,
-                "host": c.host,
-                "harness": c.harness,
-                "project_key": c.project_key,
-            });
-            match self.post(&http, "register", body).await {
-                Ok(()) => {
-                    registered = true;
-                    self.recovered();
-                }
-                Err(Rejected::NotFound) => self.problem("register: the server has no /v1/register"),
-                Err(Rejected::Other(reason)) => self.problem(&reason),
+        }
+        let body = json!({
+            "session_id": c.session_id,
+            "host": c.host,
+            "harness": c.harness,
+            "project_key": c.project_key,
+        });
+        match self.post(http, "register", body).await {
+            Ok(()) => {
+                self.recovered();
+                true
+            }
+            Err(Rejected::NotFound) => {
+                self.problem("register: the server has no /v1/register");
+                false
+            }
+            Err(Rejected::Other(reason)) => {
+                self.problem(&reason);
+                false
             }
         }
     }
@@ -331,8 +360,8 @@ impl Bridge {
         if status == StatusCode::NOT_FOUND {
             return Err(Rejected::NotFound);
         }
-        let mut detail = response.text().await.unwrap_or_default();
-        detail.truncate(200);
+        let body = response.text().await.unwrap_or_default();
+        let detail: String = body.chars().take(200).collect();
         Err(Rejected::Other(format!(
             "{what} rejected ({status}): {detail}"
         )))
