@@ -7,6 +7,17 @@ include breaking changes.
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/ReyemTech/axle/compare/v0.1.0...v0.1.1) - 2026-11-27
+
+### Fixed
+
+- *(release)* define the dist cargo profile and fix the CLA allowlist
+
+### Other
+
+- drop homepage that duplicates repository
+- add package metadata and social preview for discoverability
+
 ## [0.1.0] - 2026-11-27
 
 The first release: the MVP.
