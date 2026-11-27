@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use coord::clock::{Clock, TestClock};
 use coord::domain::{
-    Actor, Eligibility, ProjectId, SessionId, Task, TaskEventKind, TaskId, TaskStatus, TokenId,
+    Actor, Eligibility, ProjectId, SessionId, Task, TaskEventKind, TaskId, TaskStatus,
 };
 use coord::service::identity::{IdentityInput, IdentityService, Resolved};
 use coord::service::tasks::{
@@ -50,7 +50,7 @@ impl Env {
                 host: host.into(),
                 harness: harness.into(),
                 session: SessionId::new(),
-                token: TokenId::new(),
+                token: common::token(&*self.store).await,
             },
         )
         .await

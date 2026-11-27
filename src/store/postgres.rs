@@ -13,7 +13,7 @@ use super::{
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, Eligibility, InboxItem, Message, MessageId, Project, ProjectId,
-    Session, SessionId, Task, TaskEvent, TaskId, TokenId,
+    Session, SessionId, Task, TaskEvent, TaskId, TokenId, TokenInfo,
 };
 
 pub struct PostgresStore {
@@ -459,8 +459,95 @@ macro_rules! session_cols {
     };
 }
 
+fn token_from(row: &PgRow) -> StoreResult<TokenInfo> {
+    Ok(TokenInfo {
+        id: row.try_get::<Uuid, _>("id")?.into(),
+        label: row.try_get("label")?,
+        created_at: row.try_get("created_at")?,
+        last_used_at: row.try_get("last_used_at")?,
+        revoked_at: row.try_get("revoked_at")?,
+    })
+}
+
 #[async_trait]
 impl Store for PostgresStore {
+    async fn ping(&self) -> StoreResult<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn insert_token(
+        &self,
+        id: TokenId,
+        label: &str,
+        hash: &str,
+        now: OffsetDateTime,
+    ) -> StoreResult<()> {
+        sqlx::query("INSERT INTO tokens (id, label, hash, created_at) VALUES ($1, $2, $3, $4)")
+            .bind(id.as_uuid())
+            .bind(label)
+            .bind(hash)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn use_token(&self, hash: &str, now: OffsetDateTime) -> StoreResult<Option<TokenId>> {
+        let id: Option<Uuid> = sqlx::query_scalar(
+            "UPDATE tokens SET last_used_at = $1 WHERE hash = $2 AND revoked_at IS NULL
+             RETURNING id",
+        )
+        .bind(now)
+        .bind(hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id.map(Into::into))
+    }
+
+    async fn revoke_token(&self, id: TokenId, now: OffsetDateTime) -> StoreResult<()> {
+        let found: Option<Uuid> = sqlx::query_scalar(
+            "UPDATE tokens SET revoked_at = COALESCE(revoked_at, $1) WHERE id = $2 RETURNING id",
+        )
+        .bind(now)
+        .bind(id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        found.map(|_| ()).ok_or(StoreError::NotFound("token"))
+    }
+
+    async fn list_tokens(&self) -> StoreResult<Vec<TokenInfo>> {
+        sqlx::query(
+            "SELECT id, label, created_at, last_used_at, revoked_at FROM tokens
+             ORDER BY created_at, id",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(token_from)
+        .collect()
+    }
+
+    async fn insert_outbox(
+        &self,
+        kind: &str,
+        project: Option<ProjectId>,
+        payload: &serde_json::Value,
+        now: OffsetDateTime,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO outbox (kind, project_id, payload, created_at, published_at)
+             VALUES ($1, $2, $3::jsonb, $4, $4)",
+        )
+        .bind(kind)
+        .bind(project.map(|p| p.as_uuid()))
+        .bind(payload.to_string())
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn upsert_project(
         &self,
         key: &str,

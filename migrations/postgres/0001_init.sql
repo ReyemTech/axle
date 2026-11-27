@@ -31,7 +31,7 @@ CREATE TABLE agents (
 CREATE TABLE sessions (
     id                 uuid PRIMARY KEY,
     agent_id           uuid NOT NULL REFERENCES agents(id),
-    token_id           uuid NOT NULL,
+    token_id           uuid NOT NULL REFERENCES tokens(id),
     started_at         timestamptz NOT NULL,
     last_heartbeat_at  timestamptz NOT NULL,
     last_tool_call_at  timestamptz NOT NULL
@@ -57,7 +57,7 @@ CREATE TABLE tasks (
     eligible_host          text,
     created_by_agent_id    uuid REFERENCES agents(id),     -- both NULL = human
     created_by_session_id  uuid REFERENCES sessions(id),
-    token_id               uuid,
+    token_id               uuid REFERENCES tokens(id),
     created_at             timestamptz NOT NULL,
     updated_at             timestamptz NOT NULL,
     version                bigint NOT NULL DEFAULT 0
@@ -79,7 +79,7 @@ CREATE TABLE task_events (
     kind              text NOT NULL,
     actor_agent_id    uuid REFERENCES agents(id),          -- both NULL = human / system
     actor_session_id  uuid REFERENCES sessions(id),
-    token_id          uuid,
+    token_id          uuid REFERENCES tokens(id),
     note              text,
     payload           jsonb,
     created_at        timestamptz NOT NULL
@@ -95,7 +95,7 @@ CREATE TABLE messages (
     project_id       uuid REFERENCES projects(id),
     from_agent_id    uuid REFERENCES agents(id),           -- both NULL = human
     from_session_id  uuid REFERENCES sessions(id),
-    token_id         uuid,
+    token_id         uuid REFERENCES tokens(id),
     to_kind          text NOT NULL
                      CHECK (to_kind IN ('project', 'agent', 'session', 'task', 'human')),
     to_id            uuid,                                 -- NULL only for 'human'

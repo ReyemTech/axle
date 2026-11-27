@@ -14,7 +14,7 @@ use time::{Duration, OffsetDateTime};
 use crate::config::Backend;
 use crate::domain::{
     Actor, Address, Agent, AgentId, Importance, InboxItem, Message, MessageId, Project, ProjectId,
-    Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId,
+    Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId, TokenInfo,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +34,39 @@ pub type StoreResult<T> = Result<T, StoreError>;
 
 #[async_trait]
 pub trait Store: Send + Sync {
+    /// A trivial round trip, for the readiness probe.
+    async fn ping(&self) -> StoreResult<()>;
+
+    // ---- tokens ----
+
+    /// Stores a new token by the hex SHA-256 `hash` of its plaintext.
+    async fn insert_token(
+        &self,
+        id: TokenId,
+        label: &str,
+        hash: &str,
+        now: OffsetDateTime,
+    ) -> StoreResult<()>;
+    /// The unrevoked token whose hash is `hash`, stamping its `last_used_at = now`.
+    async fn use_token(&self, hash: &str, now: OffsetDateTime) -> StoreResult<Option<TokenId>>;
+    /// Sets `revoked_at` (once; revoking again is a no-op). `NotFound` for an unknown token.
+    async fn revoke_token(&self, id: TokenId, now: OffsetDateTime) -> StoreResult<()>;
+    /// Every token, oldest first.
+    async fn list_tokens(&self) -> StoreResult<Vec<TokenInfo>>;
+
+    // ---- events ----
+
+    /// Appends an event to the outbox. The MVP's one replica delivers it in-process right
+    /// after the insert, so the row is written as published (`published_at = now`); a
+    /// multi-replica relay would insert it unpublished instead.
+    async fn insert_outbox(
+        &self,
+        kind: &str,
+        project: Option<ProjectId>,
+        payload: &serde_json::Value,
+        now: OffsetDateTime,
+    ) -> StoreResult<()>;
+
     // ---- projects ----
 
     /// Creates the project on first contact; an existing project is returned unchanged

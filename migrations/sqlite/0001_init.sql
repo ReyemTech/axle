@@ -33,7 +33,7 @@ CREATE UNIQUE INDEX agents_identity ON agents (IFNULL(project_id, ''), host, har
 CREATE TABLE sessions (
     id                 TEXT PRIMARY KEY,
     agent_id           TEXT NOT NULL REFERENCES agents(id),
-    token_id           TEXT NOT NULL,
+    token_id           TEXT NOT NULL REFERENCES tokens(id),
     started_at         TEXT NOT NULL,
     last_heartbeat_at  TEXT NOT NULL,
     last_tool_call_at  TEXT NOT NULL
@@ -59,7 +59,7 @@ CREATE TABLE tasks (
     eligible_host          TEXT,
     created_by_agent_id    TEXT REFERENCES agents(id),     -- both NULL = human
     created_by_session_id  TEXT REFERENCES sessions(id),
-    token_id               TEXT,
+    token_id               TEXT REFERENCES tokens(id),
     created_at             TEXT NOT NULL,
     updated_at             TEXT NOT NULL,
     version                INTEGER NOT NULL DEFAULT 0
@@ -81,7 +81,7 @@ CREATE TABLE task_events (
     kind              TEXT NOT NULL,
     actor_agent_id    TEXT REFERENCES agents(id),          -- both NULL = human / system
     actor_session_id  TEXT REFERENCES sessions(id),
-    token_id          TEXT,
+    token_id          TEXT REFERENCES tokens(id),
     note              TEXT,
     payload           TEXT,                                -- JSON
     created_at        TEXT NOT NULL
@@ -98,7 +98,7 @@ CREATE TABLE messages (
     project_id       TEXT REFERENCES projects(id),
     from_agent_id    TEXT REFERENCES agents(id),           -- both NULL = human
     from_session_id  TEXT REFERENCES sessions(id),
-    token_id         TEXT,
+    token_id         TEXT REFERENCES tokens(id),
     to_kind          TEXT NOT NULL
                      CHECK (to_kind IN ('project', 'agent', 'session', 'task', 'human')),
     to_id            TEXT,                                 -- NULL only for 'human'

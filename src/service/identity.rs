@@ -28,6 +28,9 @@ pub enum IdentityError {
     Missing(&'static str),
     #[error("session {session} already belongs to another agent")]
     SessionAgentMismatch { session: SessionId },
+    /// A session is bound to the token that created it.
+    #[error("session {session} was registered with a different token")]
+    SessionTokenMismatch { session: SessionId },
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -72,6 +75,11 @@ impl IdentityService {
         let session = store
             .create_session(input.session, agent.id, input.token, now)
             .await?;
+        if session.token_id != input.token {
+            return Err(IdentityError::SessionTokenMismatch {
+                session: session.id,
+            });
+        }
         if session.agent_id != agent.id {
             return Err(IdentityError::SessionAgentMismatch {
                 session: session.id,
@@ -82,6 +90,31 @@ impl IdentityService {
             agent,
             session,
         })
+    }
+
+    /// The identity of an already-registered session; `None` if the session is unknown.
+    pub async fn load(store: &dyn Store, id: SessionId) -> Result<Option<Resolved>, IdentityError> {
+        let Some(session) = store.get_session(id).await? else {
+            return Ok(None);
+        };
+        let agent = store
+            .get_agent(session.agent_id)
+            .await?
+            .ok_or(StoreError::NotFound("agent"))?;
+        let project = match agent.project_id {
+            Some(p) => Some(
+                store
+                    .get_project(p)
+                    .await?
+                    .ok_or(StoreError::NotFound("project"))?,
+            ),
+            None => None,
+        };
+        Ok(Some(Resolved {
+            project,
+            agent,
+            session,
+        }))
     }
 }
 

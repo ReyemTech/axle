@@ -18,6 +18,7 @@ use crate::clock::Clock;
 use crate::domain::{
     Actor, Address, Importance, InboxItem, Message, MessageId, ProjectId, TaskId, TokenId,
 };
+use crate::events::{Event, EventBus};
 use crate::service::identity::Resolved;
 use crate::service::tasks::Caller;
 use crate::store::{Recipient, Store, StoreError};
@@ -58,11 +59,22 @@ pub fn check_body(body: &str) -> Result<(), MessageError> {
 pub struct MessageService {
     store: Arc<dyn Store>,
     clock: Arc<dyn Clock>,
+    events: Option<EventBus>,
 }
 
 impl MessageService {
     pub fn new(store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Self {
-        Self { store, clock }
+        Self {
+            store,
+            clock,
+            events: None,
+        }
+    }
+
+    /// Publishes `MessageCreated` on `bus` after every send.
+    pub fn with_events(mut self, bus: EventBus) -> Self {
+        self.events = Some(bus);
+        self
     }
 
     pub async fn send(&self, caller: &Actor, new: NewMessage) -> Result<Message, MessageError> {
@@ -87,6 +99,14 @@ impl MessageService {
             created_at: self.clock.now(),
         };
         self.store.insert_message(&message, token).await?;
+        if let Some(bus) = &self.events {
+            bus.emit(Event::MessageCreated {
+                id: message.id,
+                to: message.to,
+                project_id: message.project_id,
+            })
+            .await;
+        }
         Ok(message)
     }
 

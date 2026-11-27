@@ -87,6 +87,17 @@ pub struct Session {
     pub last_tool_call_at: OffsetDateTime,
 }
 
+/// A bearer token as listed to the admin (the plaintext is shown once, at creation, and
+/// only its SHA-256 hash is stored).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenInfo {
+    pub id: TokenId,
+    pub label: String,
+    pub created_at: OffsetDateTime,
+    pub last_used_at: Option<OffsetDateTime>,
+    pub revoked_at: Option<OffsetDateTime>,
+}
+
 /// Generates `as_str` / `FromStr` / `Display` for a fieldless enum stored as text.
 macro_rules! text_enum {
     ($name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
@@ -262,7 +273,10 @@ text_enum!(Importance {
 
 /// Where a message goes (spec §9). The project is part of the address, not an access
 /// barrier: any agent may address any project or agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Serialised as `{"kind": "agent", "id": "<uuid>"}` (`{"kind": "human"}` for the human).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum Address {
     /// Every agent whose home project this is.
     Project(ProjectId),

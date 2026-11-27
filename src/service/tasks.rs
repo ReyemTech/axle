@@ -14,10 +14,12 @@ use crate::domain::{
     Actor, Address, AgentId, Eligibility, Importance, Message, MessageId, ProjectId, SessionId,
     Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId,
 };
+use crate::events::{Event, EventBus};
 use crate::service::identity::Resolved;
 use crate::service::messages::{MessageError, check_body};
 use crate::store::{
     ClaimRequest, Claimant, LeaseUpdate, Store, StoreError, TaskFilter, TransitionRequest,
+    claim_event,
 };
 
 /// Who is calling a task operation that agents and the human may both perform.
@@ -168,6 +170,7 @@ pub struct TaskService {
     clock: Arc<dyn Clock>,
     lease_ttl: Duration,
     idle_renew_cap: Duration,
+    events: Option<EventBus>,
 }
 
 /// A guarded write that agents retry only when a re-read says the guard should now pass.
@@ -185,7 +188,15 @@ impl TaskService {
             clock,
             lease_ttl,
             idle_renew_cap,
+            events: None,
         }
+    }
+
+    /// Publishes `TaskChanged` on `bus` after every status change (creation, claims and the
+    /// lifecycle transitions; lease renewals are not changes).
+    pub fn with_events(mut self, bus: EventBus) -> Self {
+        self.events = Some(bus);
+        self
     }
 
     pub fn from_config(store: Arc<dyn Store>, clock: Arc<dyn Clock>, cfg: &ServerConfig) -> Self {
@@ -292,19 +303,21 @@ impl TaskService {
         self.store
             .insert_task(&task, &new.extra_projects, by.token(), &event, &first)
             .await?;
+        self.changed(&task, TaskEventKind::Created).await;
         Ok(task)
     }
 
     pub async fn claim(&self, caller: &Resolved, id: TaskId) -> Result<ClaimOutcome, TaskError> {
-        let attempt = self
-            .store
-            .claim_task(id, &self.claim_request(caller))
-            .await?;
+        let req = self.claim_request(caller);
+        let attempt = self.store.claim_task(id, &req).await?;
         let Some(previous) = attempt.previous else {
             return Ok(ClaimOutcome::NotFound);
         };
         Ok(match attempt.claimed {
-            Some(task) => ClaimOutcome::Claimed(task),
+            Some(task) => {
+                self.changed(&task, claim_event(&previous, &req).kind).await;
+                ClaimOutcome::Claimed(task)
+            }
             None => match (previous.status, previous.owner_agent_id) {
                 (s @ (TaskStatus::Done | TaskStatus::Cancelled), _) => ClaimOutcome::Closed(s),
                 _ if !attempt.eligible => ClaimOutcome::NotEligible,
@@ -329,10 +342,14 @@ impl TaskService {
         caller: &Resolved,
         project: ProjectId,
     ) -> Result<Option<Task>, TaskError> {
-        Ok(self
+        let task = self
             .store
             .claim_next_task(project, &self.claim_request(caller))
-            .await?)
+            .await?;
+        if let Some(task) = &task {
+            self.changed(task, TaskEventKind::Claimed).await;
+        }
+        Ok(task)
     }
 
     /// Explicitly extends the caller's lease on a `claimed` task to `now + ttl` (the task's
@@ -535,6 +552,40 @@ impl TaskService {
 
     // ---------------------------------------------------------------- internals
 
+    async fn changed(&self, task: &Task, kind: TaskEventKind) {
+        if let Some(bus) = &self.events {
+            bus.emit(Event::TaskChanged {
+                id: task.id,
+                project_id: task.project_id,
+                status: task.status,
+                kind,
+            })
+            .await;
+        }
+    }
+
+    /// Publishes the change and, when a child closed, the parent's move to `review` that the
+    /// store makes in the same transaction once every child is closed.
+    async fn after_transition(&self, task: &Task, kind: TaskEventKind) {
+        if self.events.is_none() {
+            return;
+        }
+        self.changed(task, kind).await;
+        let Some(parent) = task.parent_id else {
+            return;
+        };
+        if !matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled) {
+            return;
+        }
+        match self.store.get_task(parent).await {
+            Ok(Some(p)) if p.status == TaskStatus::Review => {
+                self.changed(&p, TaskEventKind::ChildrenComplete).await;
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("coord: failed to read parent task {parent}: {e}"),
+        }
+    }
+
     fn claim_request(&self, caller: &Resolved) -> ClaimRequest {
         let now = self.clock.now();
         ClaimRequest {
@@ -601,6 +652,9 @@ impl TaskService {
                 event: self.event(id, actor_of(caller), kind, note.clone(), payload.clone()),
             };
             if let Some(task) = self.store.transition_task(&req).await? {
+                if kind != TaskEventKind::Renewed {
+                    self.after_transition(&task, kind).await;
+                }
                 return Ok(task);
             }
             let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
@@ -646,7 +700,10 @@ impl TaskService {
             event: self.event(id, actor, kind, None, None),
         };
         match self.store.transition_task(&req).await? {
-            Some(task) => Ok(task),
+            Some(task) => {
+                self.after_transition(&task, kind).await;
+                Ok(task)
+            }
             None => {
                 let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
                 Err(TaskError::InvalidTransition {

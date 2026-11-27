@@ -8,6 +8,8 @@ pub enum ConfigError {
     UnknownScheme(String),
     #[error("missing required environment variable {0}")]
     Missing(&'static str),
+    #[error("environment variable {0} must not be empty")]
+    Empty(&'static str),
     #[error("invalid COORD_BIND address: {0}")]
     BadBind(String),
 }
@@ -41,6 +43,28 @@ pub struct ServerConfig {
 
 const DEFAULT_BIND: &str = "127.0.0.1:7420";
 
+/// A required variable that is set and not blank.
+fn required(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+) -> Result<String, ConfigError> {
+    let value = get(name).ok_or(ConfigError::Missing(name))?;
+    if value.trim().is_empty() {
+        return Err(ConfigError::Empty(name));
+    }
+    Ok(value)
+}
+
+/// The backend named by `DATABASE_URL` (what the admin commands need, without the server's
+/// other settings).
+pub fn backend_from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Backend, ConfigError> {
+    Backend::from_url(&required(&get, "DATABASE_URL")?)
+}
+
+pub fn backend_from_env() -> Result<Backend, ConfigError> {
+    backend_from_lookup(|k| std::env::var(k).ok())
+}
+
 impl ServerConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|k| std::env::var(k).ok())
@@ -48,9 +72,8 @@ impl ServerConfig {
 
     /// Builds config from an arbitrary variable lookup (testable without mutating the process env).
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
-        let url = get("DATABASE_URL").ok_or(ConfigError::Missing("DATABASE_URL"))?;
-        let admin_secret =
-            get("COORD_ADMIN_SECRET").ok_or(ConfigError::Missing("COORD_ADMIN_SECRET"))?;
+        let url = required(&get, "DATABASE_URL")?;
+        let admin_secret = required(&get, "COORD_ADMIN_SECRET")?;
         let bind_raw = get("COORD_BIND").unwrap_or_else(|| DEFAULT_BIND.to_string());
         let bind = bind_raw
             .parse()
@@ -106,5 +129,64 @@ mod tests {
     #[test]
     fn missing_required_vars_error() {
         assert!(ServerConfig::from_lookup(|_| None).is_err());
+    }
+
+    fn lookup<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            vars.iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn empty_admin_secret_is_rejected() {
+        let e = ServerConfig::from_lookup(lookup(&[
+            ("DATABASE_URL", "sqlite://./coord.db"),
+            ("COORD_ADMIN_SECRET", "  "),
+        ]))
+        .unwrap_err();
+        assert!(matches!(e, ConfigError::Empty("COORD_ADMIN_SECRET")), "{e}");
+        assert!(e.to_string().contains("COORD_ADMIN_SECRET"));
+    }
+
+    #[test]
+    fn empty_database_url_is_rejected() {
+        let e = ServerConfig::from_lookup(lookup(&[
+            ("DATABASE_URL", ""),
+            ("COORD_ADMIN_SECRET", "s3cret"),
+        ]))
+        .unwrap_err();
+        assert!(matches!(e, ConfigError::Empty("DATABASE_URL")), "{e}");
+        assert!(matches!(
+            backend_from_lookup(lookup(&[("DATABASE_URL", "")])),
+            Err(ConfigError::Empty("DATABASE_URL"))
+        ));
+        assert!(matches!(
+            backend_from_lookup(lookup(&[])),
+            Err(ConfigError::Missing("DATABASE_URL"))
+        ));
+    }
+
+    #[test]
+    fn bind_override_and_bad_bind() {
+        let c = ServerConfig::from_lookup(lookup(&[
+            ("DATABASE_URL", "sqlite://./coord.db"),
+            ("COORD_ADMIN_SECRET", "s3cret"),
+            ("COORD_BIND", "0.0.0.0:8080"),
+        ]))
+        .unwrap();
+        assert_eq!(c.bind.to_string(), "0.0.0.0:8080");
+
+        let e = ServerConfig::from_lookup(lookup(&[
+            ("DATABASE_URL", "sqlite://./coord.db"),
+            ("COORD_ADMIN_SECRET", "s3cret"),
+            ("COORD_BIND", "localhost"),
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(e, ConfigError::BadBind(ref b) if b == "localhost"),
+            "{e}"
+        );
     }
 }

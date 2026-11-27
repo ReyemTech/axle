@@ -16,7 +16,7 @@ use super::{
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, Eligibility, InboxItem, Message, MessageId, Project, ProjectId,
-    Session, SessionId, Task, TaskEvent, TaskId, TokenId,
+    Session, SessionId, Task, TaskEvent, TaskId, TokenId, TokenInfo,
 };
 
 /// Write transactions take the write lock up front, so a read-then-update inside one is
@@ -525,8 +525,99 @@ macro_rules! session_cols {
     };
 }
 
+fn token_from(row: &SqliteRow) -> StoreResult<TokenInfo> {
+    let last_used: Option<&str> = row.try_get("last_used_at")?;
+    let revoked: Option<&str> = row.try_get("revoked_at")?;
+    Ok(TokenInfo {
+        id: uuid_of(row.try_get("id")?)?,
+        label: row.try_get("label")?,
+        created_at: ts::dec(row.try_get("created_at")?)?,
+        last_used_at: last_used.map(ts::dec).transpose()?,
+        revoked_at: revoked.map(ts::dec).transpose()?,
+    })
+}
+
 #[async_trait]
 impl Store for SqliteStore {
+    async fn ping(&self) -> StoreResult<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn insert_token(
+        &self,
+        id: TokenId,
+        label: &str,
+        hash: &str,
+        now: OffsetDateTime,
+    ) -> StoreResult<()> {
+        sqlx::query("INSERT INTO tokens (id, label, hash, created_at) VALUES (?, ?, ?, ?)")
+            .bind(id.to_string())
+            .bind(label)
+            .bind(hash)
+            .bind(ts::enc(now))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn use_token(&self, hash: &str, now: OffsetDateTime) -> StoreResult<Option<TokenId>> {
+        let id: Option<String> = sqlx::query_scalar(
+            "UPDATE tokens SET last_used_at = ? WHERE hash = ? AND revoked_at IS NULL
+             RETURNING id",
+        )
+        .bind(ts::enc(now))
+        .bind(hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        id.as_deref().map(uuid_of).transpose()
+    }
+
+    async fn revoke_token(&self, id: TokenId, now: OffsetDateTime) -> StoreResult<()> {
+        let found: Option<String> = sqlx::query_scalar(
+            "UPDATE tokens SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ? RETURNING id",
+        )
+        .bind(ts::enc(now))
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        found.map(|_| ()).ok_or(StoreError::NotFound("token"))
+    }
+
+    async fn list_tokens(&self) -> StoreResult<Vec<TokenInfo>> {
+        sqlx::query(
+            "SELECT id, label, created_at, last_used_at, revoked_at FROM tokens
+             ORDER BY created_at, id",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(token_from)
+        .collect()
+    }
+
+    async fn insert_outbox(
+        &self,
+        kind: &str,
+        project: Option<ProjectId>,
+        payload: &serde_json::Value,
+        now: OffsetDateTime,
+    ) -> StoreResult<()> {
+        let now = ts::enc(now);
+        sqlx::query(
+            "INSERT INTO outbox (kind, project_id, payload, created_at, published_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(kind)
+        .bind(project.map(|p| p.to_string()))
+        .bind(payload.to_string())
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn upsert_project(
         &self,
         key: &str,

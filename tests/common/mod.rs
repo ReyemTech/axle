@@ -65,6 +65,21 @@ where
     resume(catch_body(body).await);
 }
 
+/// A fresh token row (sessions, tasks and messages reference the writer's token).
+pub async fn token(store: &dyn Store) -> coord::domain::TokenId {
+    let id = coord::domain::TokenId::new();
+    store
+        .insert_token(
+            id,
+            "test",
+            &format!("test-hash-{id}"),
+            time::macros::datetime!(2026-01-01 0:00 UTC),
+        )
+        .await
+        .expect("insert test token");
+    id
+}
+
 /// A temp SQLite database file (plus `-wal` / `-shm`), deleted on drop.
 pub struct TempDb(PathBuf);
 

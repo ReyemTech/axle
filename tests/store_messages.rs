@@ -4,7 +4,7 @@ mod common;
 use std::sync::Arc;
 
 use coord::clock::{Clock, TestClock};
-use coord::domain::{Actor, Address, Importance, MessageId, ProjectId, SessionId, TokenId};
+use coord::domain::{Actor, Address, Importance, MessageId, ProjectId, SessionId};
 use coord::service::identity::{IdentityInput, IdentityService, Resolved};
 use coord::service::messages::{InboxFilter, MessageError, MessageService, NewMessage};
 use coord::service::tasks::{Caller, ClaimOutcome, NewTask, TaskError, TaskService};
@@ -49,7 +49,7 @@ impl Env {
                 host: host.into(),
                 harness: "claude-code".into(),
                 session: SessionId::new(),
-                token: TokenId::new(),
+                token: common::token(&*self.store).await,
             },
         )
         .await
