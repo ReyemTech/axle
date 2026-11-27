@@ -389,3 +389,29 @@ async fn poll_rate_limit_waits_retry_after() {
         Some(base.as_str())
     );
 }
+
+#[tokio::test]
+async fn malformed_config_fails_before_redeeming_the_code() {
+    let srv = server().await;
+    let home = TempHome::new();
+    let dir = AxlDir::new(home.path());
+    dir.ensure().unwrap();
+    std::fs::write(dir.config_path(), "server_url = [not toml").unwrap();
+    let issued = srv.state.enroll.issue_code("x").await.unwrap();
+    let mut out = Vec::new();
+    let with_code = |code: String| LoginArgs {
+        code: Some(code),
+        ..args(&srv.base)
+    };
+    let err = login(home.path(), with_code(issued.code.clone()), &mut out)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("config.toml"), "{err}");
+    assert!(!dir.token_path().exists());
+    // The code was not consumed: it works once the file is fixed.
+    std::fs::remove_file(dir.config_path()).unwrap();
+    login(home.path(), with_code(issued.code), &mut out)
+        .await
+        .unwrap();
+    assert!(dir.token_path().exists());
+}

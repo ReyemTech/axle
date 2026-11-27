@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::bridge::short_hostname;
 use crate::client::{
-    Api, AxlDir, ClientError, PollStatus, load_config, read_token, remove_token,
+    Api, AxlDir, ClientConfig, ClientError, PollStatus, load_config, read_token, remove_token,
     resolve_server_url, resolve_server_url_with_warning, save_config, write_token,
 };
 
@@ -14,6 +14,26 @@ use crate::client::{
 const SLOW_DOWN_STEP: Duration = Duration::from_secs(5);
 /// Poll interval when the server names none.
 const DEFAULT_POLL: Duration = Duration::from_secs(7);
+/// Bounds on what a server may tell us: the device flow lasts at most this long (the server
+/// uses 10 minutes) and polls between these intervals.
+const MAX_EXPIRES: Duration = Duration::from_secs(15 * 60);
+const MIN_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The poll interval to use for a server-supplied `interval` in seconds.
+fn clamp_interval(secs: u64) -> Duration {
+    if secs == 0 {
+        DEFAULT_POLL
+    } else {
+        Duration::from_secs(secs).clamp(MIN_INTERVAL, MAX_INTERVAL)
+    }
+}
+
+/// How long the device flow may last for a server-supplied `expires_in` in seconds.
+fn clamp_expires(secs: u64) -> Duration {
+    Duration::from_secs(secs).clamp(Duration::from_secs(1), MAX_EXPIRES)
+}
+
 /// Consecutive transport failures tolerated while polling.
 const POLL_FAILURES: u32 = 5;
 
@@ -117,6 +137,13 @@ pub async fn login_with(
         }
     }
 
+    // Read the config before anything is redeemed: a malformed file must not burn a code.
+    let old = load_config(&dir).map_err(|e| {
+        usage(format!(
+            "cannot read {}: {e}; fix or remove it, then run `axl login` again",
+            dir.config_path().display()
+        ))
+    })?;
     let host = short_hostname();
     let api = Api::new(&url);
     api.readyz().await?;
@@ -127,9 +154,10 @@ pub async fn login_with(
     };
 
     // The URL the user typed is what we saved, not whatever the server advertises.
-    let old = load_config(&dir)?;
-    let mut cfg = load_config(&dir)?;
-    cfg.server_url = Some(url.clone());
+    let cfg = ClientConfig {
+        server_url: Some(url.clone()),
+        port: old.port,
+    };
     save_config(&dir, &cfg)?;
     if let Err(e) = write_token(&dir, &token) {
         let _ = save_config(&dir, &old);
@@ -162,12 +190,10 @@ async fn device_flow(
     let _ = writeln!(out, "Waiting for approval...");
     let _ = out.flush();
 
-    let mut interval = hooks.interval.unwrap_or(if start.interval > 0 {
-        Duration::from_secs(start.interval)
-    } else {
-        DEFAULT_POLL
-    });
-    let deadline = Instant::now() + Duration::from_secs(start.expires_in.max(1));
+    let mut interval = hooks
+        .interval
+        .unwrap_or_else(|| clamp_interval(start.interval));
+    let deadline = Instant::now() + clamp_expires(start.expires_in);
     let mut failures = 0;
     loop {
         tokio::time::sleep(interval).await;
@@ -179,12 +205,15 @@ async fn device_flow(
             Ok(PollStatus::Pending) => failures = 0,
             Ok(PollStatus::SlowDown) => {
                 failures = 0;
-                interval += SLOW_DOWN_STEP;
+                interval = (interval + SLOW_DOWN_STEP).min(MAX_INTERVAL);
             }
             Ok(PollStatus::RateLimited(wait)) => {
                 failures = 0;
-                tokio::time::sleep(wait.map_or(Duration::ZERO, Duration::from_secs)).await;
-                interval += SLOW_DOWN_STEP.min(interval);
+                let wait = wait
+                    .map_or(Duration::ZERO, |s| Duration::from_secs(s).min(MAX_INTERVAL))
+                    .min(deadline.saturating_duration_since(Instant::now()));
+                tokio::time::sleep(wait).await;
+                interval = (interval + SLOW_DOWN_STEP.min(interval)).min(MAX_INTERVAL);
             }
             Ok(PollStatus::Denied) => return Err(usage("login was denied")),
             Ok(PollStatus::Expired) => {
@@ -222,4 +251,22 @@ pub async fn logout(home: &Path, revoke: bool, out: &mut dyn Write) -> Result<()
         let _ = writeln!(out, "Not logged in");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_supplied_timings_are_clamped() {
+        assert_eq!(clamp_interval(0), DEFAULT_POLL);
+        assert_eq!(clamp_interval(1), Duration::from_secs(1));
+        assert_eq!(clamp_interval(7), Duration::from_secs(7));
+        assert_eq!(clamp_interval(u64::MAX), MAX_INTERVAL);
+        assert_eq!(clamp_expires(0), Duration::from_secs(1));
+        assert_eq!(clamp_expires(600), Duration::from_secs(600));
+        assert_eq!(clamp_expires(u64::MAX), MAX_EXPIRES);
+        // Adding a clamped value to Instant::now() cannot overflow.
+        let _ = Instant::now() + clamp_expires(u64::MAX);
+    }
 }
