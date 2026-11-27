@@ -963,6 +963,25 @@ impl AxleMcp {
         for name in &add_projects {
             projects.push(self.project(name).await?.id);
         }
+        if !projects.is_empty() {
+            let current = self
+                .state
+                .tasks
+                .get(id)
+                .await
+                .map_err(ToolError::from)?
+                .task;
+            if current.parent_id.is_some() {
+                return Err(ToolError::from(
+                    crate::service::tasks::TaskError::ChildExtraProjects,
+                ));
+            }
+            if matches!(current.status, TaskStatus::Done | TaskStatus::Cancelled) {
+                return Err(ToolError::from(crate::service::tasks::TaskError::Closed(
+                    current.status,
+                )));
+            }
+        }
         if p.reason.is_some() && p.status.is_none() {
             return Err(ToolError::invalid(
                 "`reason` goes with `status`; pass `status: blocked` or `status: review`",
