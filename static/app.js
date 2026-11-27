@@ -84,14 +84,36 @@
     if (e.target && e.target.id === "search") applySearch();
   });
 
-  // Live swaps replace elements: keep the filter and the selection.
-  document.addEventListener("htmx:afterSettle", function () {
+  // Cards whose subtask list is open; a live swap re-renders a card closed, so reopen it
+  // (which also reloads the children).
+  var openCards = new Set();
+  document.addEventListener("toggle", function (e) {
+    var d = e.target;
+    if (!(d instanceof HTMLDetailsElement) || !d.classList.contains("children")) return;
+    var card = d.closest(".card");
+    if (!card || !card.id) return;
+    if (d.open) openCards.add(card.id);
+    else openCards.delete(card.id);
+  }, true);
+
+  function restoreOpen() {
+    openCards.forEach(function (id) {
+      var d = document.querySelector("#" + CSS.escape(id) + " > details.children");
+      if (d && !d.open) d.open = true;
+    });
+  }
+
+  // Live swaps replace elements: keep the filter, the selection and open subtask lists.
+  function afterSwap() {
     applySearch();
+    restoreOpen();
     if (selectedId) {
       var el = document.getElementById(selectedId);
       if (el) el.classList.add("selected");
     }
-  });
+  }
+  document.addEventListener("htmx:afterSettle", afterSwap);
+  document.addEventListener("htmx:sseMessage", afterSwap);
 
   // Destructive forms ask first (`data-confirm` holds the question).
   document.addEventListener("submit", function (e) {

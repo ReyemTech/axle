@@ -237,6 +237,8 @@ pub struct CardView {
 pub struct ProgressView {
     pub done: u32,
     pub total: u32,
+    /// Children that are `blocked`, shown as a badge so they are seen without expanding.
+    pub blocked: u32,
     pub owners: Vec<OwnerGroup>,
 }
 
@@ -272,6 +274,7 @@ async fn card(labels: &mut Labels<'_>, task: &Task) -> StoreResult<CardView> {
         Some(ProgressView {
             done: p.done,
             total: p.total,
+            blocked: p.blocked,
             owners,
         })
     };

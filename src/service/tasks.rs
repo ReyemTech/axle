@@ -89,6 +89,8 @@ pub struct Progress {
     /// Children that are `done` or `cancelled`.
     pub done: u32,
     pub total: u32,
+    /// Children that are `blocked`.
+    pub blocked: u32,
     /// Agents currently holding an unfinished child (`claimed`, `blocked` or `review`),
     /// grouped by the child's project, in first-seen order.
     pub owners_by_project: Vec<(ProjectId, Vec<AgentId>)>,
@@ -104,6 +106,9 @@ impl Progress {
             if matches!(child.status, TaskStatus::Done | TaskStatus::Cancelled) {
                 progress.done += 1;
                 continue;
+            }
+            if child.status == TaskStatus::Blocked {
+                progress.blocked += 1;
             }
             let Some(owner) = child.owner_agent_id else {
                 continue;

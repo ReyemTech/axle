@@ -9,6 +9,7 @@
   <div class="progress">
     <progress value="{{ p.done }}" max="{{ p.total }}" aria-label="children done">{{ p.done }}/{{ p.total }}</progress>
     <span class="ratio">{{ p.done }}/{{ p.total }}</span>
+    {% if p.blocked > 0 %}<span class="badge-blocked">{{ p.blocked }} blocked</span>{% endif %}
   </div>
   {% if !p.owners.is_empty() %}
   <ul class="owners">

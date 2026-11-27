@@ -409,6 +409,10 @@ async fn board_columns_and_progress() {
     );
     let text = page.text();
     assert!(text.contains("1/3"), "{text}");
+    assert!(
+        select_texts(&page, ".card .badge-blocked").is_empty(),
+        "no badge without a blocked child"
+    );
     // Children are not cards of their own; the parent sits in Claimed with its owner.
     let claimed = select_texts(&page, ".column[data-status=claimed] .card-title");
     assert_eq!(claimed, ["Rotate DB creds"]);
@@ -431,6 +435,14 @@ async fn board_columns_and_progress() {
     assert!(rows[0].contains("update Pulumi secret") && rows[0].contains("codex@cac-1"));
     assert!(rows[1].contains("roll CNPG users") && rows[1].contains("claude-code@mac"));
     assert!(rows[2].contains("(open)"), "{rows:?}");
+
+    // A blocked child shows on the parent card without expanding it.
+    app.state.tasks.block(&iac, b.id, "waiting").await.unwrap();
+    let page = app.get("/ui/board", Some(&cookie)).await;
+    assert_eq!(
+        select_texts(&page, ".column[data-status=claimed] .card .badge-blocked"),
+        ["1 blocked"]
+    );
 
     let missing = app
         .get(
@@ -887,6 +899,75 @@ fn stylesheet_hides_hidden_elements() {
         css.contains("[hidden] { display: none !important; }"),
         "app.css must force [hidden] to display: none"
     );
+}
+
+/// WCAG contrast ratio of two `#rrggbb` colours.
+fn contrast(a: &str, b: &str) -> f64 {
+    let lum = |hex: &str| {
+        let c: Vec<f64> = (0..3)
+            .map(|i| {
+                let v =
+                    f64::from(u8::from_str_radix(&hex[1 + 2 * i..3 + 2 * i], 16).unwrap()) / 255.0;
+                if v <= 0.03928 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            })
+            .collect();
+        0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    };
+    let (x, y) = (lum(a), lum(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
+/// The value of `--name` in the first (light theme) `:root` block.
+fn light_token(css: &str, name: &str) -> String {
+    let root = &css[css.find(":root {").unwrap()..];
+    let root = &root[..root.find('}').unwrap()];
+    let at = root.find(&format!("--{name}:")).unwrap();
+    root[at..]
+        .split(':')
+        .nth(1)
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn stylesheet_polish() {
+    let css = include_str!("../static/app.css");
+    // Light-theme status colours are readable small text on every surface.
+    for token in ["ok", "warn", "danger", "muted", "accent"] {
+        let fg = light_token(css, token);
+        for bg in ["bg", "surface", "surface-2"] {
+            let ratio = contrast(&fg, &light_token(css, bg));
+            assert!(ratio >= 4.5, "--{token} on --{bg}: {ratio:.2}");
+        }
+    }
+    // Five board columns fit a 1280 px window.
+    assert!(css.contains("grid-auto-columns: minmax(220px, 1fr);"));
+    // The compose form inside the reader is not pushed right.
+    assert!(css.contains(".reader .compose { margin-left: 0; }"));
+    // No coloured side-tab borders.
+    for side in [
+        "border-left:",
+        "border-right:",
+        "border-left-color",
+        "border-inline-start",
+    ] {
+        assert!(!css.contains(side), "{side}");
+    }
+}
+
+#[test]
+fn live_updates_keep_subtasks_open() {
+    let js = include_str!("../static/app.js");
+    assert!(js.contains("openCards") && js.contains("restoreOpen"));
+    assert!(js.contains("htmx:afterSettle") && js.contains("htmx:sseMessage"));
 }
 
 // ---------------------------------------------------------------- task 10: task page, inbox, actions
