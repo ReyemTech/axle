@@ -93,8 +93,16 @@ pub async fn status_with(
         ));
     }
     lines.push(line("server", url.clone(), None));
-    server_lines(&mut lines, &url, read_token(env_token, &dir)).await;
-    service_line(&mut lines, env);
+    let service = service_line(env);
+    let stopped = service.as_ref().is_some_and(|l| l.fix.is_some());
+    server_lines(
+        &mut lines,
+        &url,
+        read_token(env_token, &dir),
+        service,
+        stopped,
+    )
+    .await;
     harness_lines(&mut lines, env, &dir);
 
     let ok = lines.iter().all(|l| l.fix.is_none());
@@ -113,27 +121,66 @@ fn is_local(url: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
-async fn server_lines(lines: &mut Vec<StatusLine>, url: &str, token: Result<String, String>) {
+/// The HTTP status in a `readyz` error, when the server answered at all.
+fn http_status(e: &ClientError) -> Option<u16> {
+    let ClientError::Http(m) = e else { return None };
+    let rest = m.split("(HTTP ").nth(1)?;
+    rest.trim_end_matches(')').parse().ok()
+}
+
+async fn server_lines(
+    lines: &mut Vec<StatusLine>,
+    url: &str,
+    token: Result<String, String>,
+    service: Option<StatusLine>,
+    service_stopped: bool,
+) {
     let api = Api::new(url);
     let login = format!("axl login {url}");
+    let local = is_local(url);
     let reachable = api.readyz().await;
+    let mut service = service;
     match &reachable {
         Ok(()) => lines.push(line("reachable", "yes (/readyz)", None)),
-        Err(e) => lines.push(line(
-            "reachable",
-            format!("no ({e})"),
-            Some(format!("{login}   (or check the VPN and the URL)")),
-        )),
+        Err(e) => {
+            // A stopped local service is the root cause: list it first, with the fix.
+            if local && service_stopped {
+                lines.extend(service.take());
+            }
+            let (value, fix) = match http_status(e) {
+                Some(code) => (
+                    format!("server at {url} returned {code}"),
+                    if local {
+                        "axl service restart".to_string()
+                    } else {
+                        "check the server's logs, then re-run axl status".to_string()
+                    },
+                ),
+                None => (
+                    format!("cannot reach {url}"),
+                    if local {
+                        "axl service start".to_string()
+                    } else {
+                        "check the VPN and the URL, then re-run axl status".to_string()
+                    },
+                ),
+            };
+            // Already pointed at the service above; don't repeat the same fix.
+            let fix = (!(local && service_stopped)).then_some(fix);
+            lines.push(line("reachable", value, fix));
+        }
     }
     let token = match token {
         Ok(t) => t,
         Err(_) => {
             lines.push(line("token", "none for this server", Some(login)));
+            lines.extend(service);
             return;
         }
     };
     if reachable.is_err() {
         lines.push(line("token", "not checked (server unreachable)", None));
+        lines.extend(service);
         return;
     }
     match api.whoami(&token).await {
@@ -146,7 +193,7 @@ async fn server_lines(lines: &mut Vec<StatusLine>, url: &str, token: Result<Stri
                     None,
                 ));
             } else {
-                let fix = if is_local(url) {
+                let fix = if local {
                     "axl service restart".to_string()
                 } else {
                     format!(
@@ -161,31 +208,43 @@ async fn server_lines(lines: &mut Vec<StatusLine>, url: &str, token: Result<Stri
                 ));
             }
         }
-        Err(ClientError::Server(why)) => {
+        // Only a 401 means the token itself is bad.
+        Err(ClientError::Server(m)) if m == "unauthorized" || m == "HTTP 401" => {
             lines.push(line(
                 "token",
-                format!("rejected by the server ({why})"),
+                "rejected by the server (unauthorized)",
                 Some(login),
+            ));
+        }
+        Err(ClientError::Server(why)) => {
+            let fix = if local {
+                "axl service restart".to_string()
+            } else {
+                "retry, or check the server's logs".to_string()
+            };
+            lines.push(line(
+                "token",
+                format!("server error checking the token ({why})"),
+                Some(fix),
             ));
         }
         Err(e) => lines.push(line("token", format!("could not check ({e})"), None)),
     }
+    lines.extend(service);
 }
 
-fn service_line(lines: &mut Vec<StatusLine>, env: &InstallEnv<'_>) {
+fn service_line(env: &InstallEnv<'_>) -> Option<StatusLine> {
     // No service manager means no local service to report on.
-    let Ok(service) = (env.service)() else {
-        return;
-    };
+    let service = (env.service)().ok()?;
     match service.status() {
-        Ok(ServiceState::Running) => lines.push(line("service", "running", None)),
-        Ok(ServiceState::Stopped) => lines.push(line(
+        Ok(ServiceState::Running) => Some(line("service", "running", None)),
+        Ok(ServiceState::Stopped) => Some(line(
             "service",
             "installed but not running",
             Some("axl service start".into()),
         )),
-        Ok(ServiceState::NotInstalled) => {}
-        Err(e) => lines.push(line("service", format!("could not check ({e})"), None)),
+        Ok(ServiceState::NotInstalled) => None,
+        Err(e) => Some(line("service", format!("could not check ({e})"), None)),
     }
 }
 

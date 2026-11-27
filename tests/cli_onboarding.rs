@@ -1588,10 +1588,18 @@ async fn status_reports_missing_token_with_fix() {
     };
     let (report, text) = run_status(&home, &service, home.exe("bin/axl")).await;
     assert!(
-        value_of(&report, "reachable").value.starts_with("no"),
+        !text.contains("axl login"),
+        "unreachable is not a login problem: {text}"
+    );
+    assert!(
+        value_of(&report, "reachable")
+            .value
+            .starts_with("cannot reach"),
         "{text}"
     );
-    assert!(text.contains(&format!("fix: axl login {dead}")), "{text}");
+    // Root cause first: the stopped local service, with its fix, before "reachable".
+    let pos = |l: &str| report.lines.iter().position(|x| x.label == l).unwrap();
+    assert!(pos("service") < pos("reachable"), "{text}");
     assert_eq!(
         value_of(&report, "service").fix.as_deref(),
         Some("axl service start")
@@ -1683,4 +1691,75 @@ async fn status_is_read_only() {
         "status changed the home tree"
     );
     assert!(service.calls.lock().unwrap().is_empty());
+}
+
+/// A stub server with a fixed `/readyz` and `/v1/whoami` status, and a home logged in to it.
+async fn stub_home(readyz: u16, whoami: u16) -> (TempHome, String) {
+    use axum::{Router, http::StatusCode, routing::get};
+    let code = |c: u16| StatusCode::from_u16(c).unwrap();
+    let app = Router::new()
+        .route("/readyz", get(move || async move { (code(readyz), "x") }))
+        .route(
+            "/v1/whoami",
+            get(move || async move {
+                let body = if whoami == 401 {
+                    r#"{"error":"unauthorized"}"#
+                } else {
+                    r#"{"error":"boom"}"#
+                };
+                (code(whoami), body)
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let home = TempHome::new();
+    let dir = AxlDir::new(home.path());
+    save_config(
+        &dir,
+        &ClientConfig {
+            server_url: Some(base.clone()),
+            port: None,
+        },
+    )
+    .unwrap();
+    write_token(&dir, "axl_0123456789abcdef").unwrap();
+    (home, base)
+}
+
+#[tokio::test]
+async fn status_whoami_401_means_login_but_500_does_not() {
+    let (home, base) = stub_home(200, 401).await;
+    let (report, text) = run_status(&home, &FakeService::default(), home.exe("bin/axl")).await;
+    assert!(
+        value_of(&report, "token").value.contains("rejected"),
+        "{text}"
+    );
+    assert_eq!(
+        value_of(&report, "token").fix.as_deref(),
+        Some(format!("axl login {base}").as_str())
+    );
+
+    let (home, _) = stub_home(200, 500).await;
+    let (report, text) = run_status(&home, &FakeService::default(), home.exe("bin/axl")).await;
+    let token = value_of(&report, "token");
+    assert!(token.value.contains("server error"), "{text}");
+    assert!(
+        !text.contains("axl login") && !text.contains("rejected"),
+        "{text}"
+    );
+    assert!(token.fix.is_some() && !report.ok);
+}
+
+#[tokio::test]
+async fn status_readyz_500_is_a_server_error_not_unreachable() {
+    let (home, base) = stub_home(503, 200).await;
+    let (report, text) = run_status(&home, &FakeService::default(), home.exe("bin/axl")).await;
+    let r = value_of(&report, "reachable");
+    assert_eq!(r.value, format!("server at {base} returned 503"), "{text}");
+    assert!(
+        !text.contains("axl login") && !text.contains("cannot reach"),
+        "{text}"
+    );
+    assert!(r.fix.is_some());
 }
