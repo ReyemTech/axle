@@ -96,6 +96,8 @@ pub trait Store: Send + Sync {
         event: &TaskEvent,
     ) -> StoreResult<()>;
     async fn get_task(&self, id: TaskId) -> StoreResult<Option<Task>>;
+    /// The extra participating projects listed for `id` (not its home project).
+    async fn task_projects(&self, id: TaskId) -> StoreResult<Vec<ProjectId>>;
     /// Tasks matching every set filter field, oldest first. `project` also matches tasks
     /// that list it as an extra participating project.
     async fn list_tasks(&self, filter: &TaskFilter) -> StoreResult<Vec<Task>>;
@@ -250,6 +252,47 @@ pub fn claim_event(previous: &Task, req: &ClaimRequest) -> TaskEvent {
         kind,
         note,
         payload,
+    }
+}
+
+/// The parent-thread event a child's own event bubbles up as (spec §8), if it does.
+pub fn child_event(child: &Task, parent: TaskId, source: &TaskEvent) -> Option<TaskEvent> {
+    let kind = match source.kind {
+        TaskEventKind::Claimed | TaskEventKind::LeaseExpiredTakeover => TaskEventKind::ChildClaimed,
+        TaskEventKind::Blocked => TaskEventKind::ChildBlocked,
+        TaskEventKind::Done => TaskEventKind::ChildDone,
+        TaskEventKind::Cancelled => TaskEventKind::ChildCancelled,
+        _ => return None,
+    };
+    Some(TaskEvent {
+        id: uuid::Uuid::now_v7(),
+        task_id: parent,
+        at: source.at,
+        actor: source.actor,
+        kind,
+        note: source.note.clone(),
+        payload: Some(serde_json::json!({
+            "child_id": child.id.to_string(),
+            "child_title": child.title,
+        })),
+    })
+}
+
+/// Whether a child event can be the one that finishes the last open child.
+pub fn closes_child(source: &TaskEvent) -> bool {
+    matches!(source.kind, TaskEventKind::Done | TaskEventKind::Cancelled)
+}
+
+/// The event recorded on a parent whose children are all `done` / `cancelled`.
+pub fn children_complete_event(parent: TaskId, source: &TaskEvent) -> TaskEvent {
+    TaskEvent {
+        id: uuid::Uuid::now_v7(),
+        task_id: parent,
+        at: source.at,
+        actor: source.actor,
+        kind: TaskEventKind::ChildrenComplete,
+        note: Some("all child tasks are done or cancelled".to_string()),
+        payload: None,
     }
 }
 

@@ -80,10 +80,60 @@ pub enum ClaimOutcome {
     Closed(TaskStatus),
 }
 
+/// How far a parent's direct children have got.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Progress {
+    /// Children that are `done` or `cancelled`.
+    pub done: u32,
+    pub total: u32,
+    /// Agents currently holding an unfinished child (`claimed`, `blocked` or `review`),
+    /// grouped by the child's project, in first-seen order.
+    pub owners_by_project: Vec<(ProjectId, Vec<AgentId>)>,
+}
+
+impl Progress {
+    fn of(children: &[Task]) -> Self {
+        let mut progress = Progress {
+            total: children.len() as u32,
+            ..Progress::default()
+        };
+        for child in children {
+            if matches!(child.status, TaskStatus::Done | TaskStatus::Cancelled) {
+                progress.done += 1;
+                continue;
+            }
+            let Some(owner) = child.owner_agent_id else {
+                continue;
+            };
+            let slot = match progress
+                .owners_by_project
+                .iter()
+                .position(|(p, _)| *p == child.project_id)
+            {
+                Some(i) => &mut progress.owners_by_project[i].1,
+                None => {
+                    progress.owners_by_project.push((child.project_id, vec![]));
+                    &mut progress
+                        .owners_by_project
+                        .last_mut()
+                        .expect("just pushed")
+                        .1
+                }
+            };
+            if !slot.contains(&owner) {
+                slot.push(owner);
+            }
+        }
+        progress
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskDetail {
     pub task: Task,
     pub children: Vec<Task>,
+    /// Counts direct children only.
+    pub progress: Progress,
     pub events: Vec<TaskEvent>,
 }
 
@@ -101,6 +151,10 @@ pub enum TaskError {
     ReasonRequired,
     #[error("a task lease TTL must be at least one second")]
     InvalidLeaseTtl,
+    #[error("child tasks belong to one project")]
+    ChildExtraProjects,
+    #[error("a child task's project must be its parent's project or one the parent spans")]
+    ChildProjectMismatch,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -140,6 +194,27 @@ impl TaskService {
             Some(d) => Some(Duration::seconds(d.whole_seconds())),
             None => None,
         };
+        if let Some(parent_id) = new.parent_id {
+            if !new.extra_projects.is_empty() {
+                return Err(TaskError::ChildExtraProjects);
+            }
+            let parent = self
+                .store
+                .get_task(parent_id)
+                .await?
+                .ok_or(TaskError::NotFound)?;
+            // A task's projects never change after creation, so checking outside the insert
+            // is safe.
+            if parent.project_id != new.project_id
+                && !self
+                    .store
+                    .task_projects(parent_id)
+                    .await?
+                    .contains(&new.project_id)
+            {
+                return Err(TaskError::ChildProjectMismatch);
+            }
+        }
         let now = self.clock.now();
         let task = Task {
             id: TaskId::new(),
@@ -394,6 +469,7 @@ impl TaskService {
         let events = self.store.task_events(id).await?;
         Ok(TaskDetail {
             task,
+            progress: Progress::of(&children),
             children,
             events,
         })

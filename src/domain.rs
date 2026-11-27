@@ -207,6 +207,11 @@ pub enum TaskEventKind {
     Cancelled,
     LeaseExpiredTakeover,
     ForceReleased,
+    ChildClaimed,
+    ChildBlocked,
+    ChildDone,
+    ChildCancelled,
+    ChildrenComplete,
 }
 
 text_enum!(TaskEventKind {
@@ -220,6 +225,11 @@ text_enum!(TaskEventKind {
     Cancelled => "cancelled",
     LeaseExpiredTakeover => "lease_expired_takeover",
     ForceReleased => "force_released",
+    ChildClaimed => "child_claimed",
+    ChildBlocked => "child_blocked",
+    ChildDone => "child_done",
+    ChildCancelled => "child_cancelled",
+    ChildrenComplete => "children_complete",
 });
 
 /// One append-only entry in a task's history.

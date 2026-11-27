@@ -5,10 +5,12 @@ use std::sync::Arc;
 
 use coord::clock::{Clock, TestClock};
 use coord::domain::{
-    Actor, Eligibility, ProjectId, SessionId, Task, TaskEventKind, TaskStatus, TokenId,
+    Actor, Eligibility, ProjectId, SessionId, Task, TaskEventKind, TaskId, TaskStatus, TokenId,
 };
 use coord::service::identity::{IdentityInput, IdentityService, Resolved};
-use coord::service::tasks::{Caller, ClaimOutcome, Completion, NewTask, TaskError, TaskService};
+use coord::service::tasks::{
+    Caller, ClaimOutcome, Completion, NewTask, Progress, TaskError, TaskService,
+};
 use coord::store::{Store, TaskFilter};
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
@@ -746,3 +748,300 @@ store_matrix!(claim_next_takes_over_expired_claims, |store: Arc<
         vec![TaskEventKind::Created, TaskEventKind::Claimed]
     );
 });
+
+async fn child_in(env: &Env, parent: &Task, project: ProjectId) -> Result<Task, TaskError> {
+    env.svc
+        .create(
+            Caller::Human,
+            NewTask {
+                project_id: project,
+                parent_id: Some(parent.id),
+                title: "child".into(),
+                ..NewTask::default()
+            },
+        )
+        .await
+}
+
+async fn child_of(env: &Env, parent: &Task) -> Task {
+    child_in(env, parent, parent.project_id).await.unwrap()
+}
+
+fn done(summary: &str) -> Completion {
+    Completion {
+        summary: summary.into(),
+        ..Completion::default()
+    }
+}
+
+store_matrix!(
+    child_belongs_to_one_project,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let a = env.session("mac", "claude-code").await;
+        let other = env
+            .session_in(Some("github.com/reyemtech/other"), "mac", "codex")
+            .await;
+        let third = env
+            .session_in(Some("github.com/reyemtech/third"), "mac", "codex")
+            .await;
+        let parent = env
+            .svc
+            .create(
+                Caller::Agent(&a),
+                NewTask {
+                    project_id: project_of(&a),
+                    title: "span two repos".into(),
+                    extra_projects: vec![project_of(&other)],
+                    ..NewTask::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let err = env
+            .svc
+            .create(
+                Caller::Human,
+                NewTask {
+                    project_id: project_of(&a),
+                    parent_id: Some(parent.id),
+                    title: "bad".into(),
+                    extra_projects: vec![project_of(&other)],
+                    ..NewTask::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TaskError::ChildExtraProjects));
+        assert_eq!(err.to_string(), "child tasks belong to one project");
+
+        // Home project and spanned projects are fine; others are not.
+        child_in(&env, &parent, project_of(&a)).await.unwrap();
+        child_in(&env, &parent, project_of(&other)).await.unwrap();
+        assert!(matches!(
+            child_in(&env, &parent, project_of(&third)).await,
+            Err(TaskError::ChildProjectMismatch)
+        ));
+
+        // The parent must exist.
+        let ghost = Task {
+            id: TaskId::new(),
+            ..parent.clone()
+        };
+        assert!(matches!(
+            child_in(&env, &ghost, project_of(&a)).await,
+            Err(TaskError::NotFound)
+        ));
+        assert_eq!(env.svc.get(parent.id).await.unwrap().children.len(), 2);
+    }
+);
+
+store_matrix!(
+    child_events_bubble_to_parent,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let a = env.session("mac", "claude-code").await;
+        let b = env.session("linux", "claude-code").await;
+        let parent = env.task(&a, Eligibility::default()).await;
+        let c1 = child_of(&env, &parent).await;
+        let c2 = child_of(&env, &parent).await;
+        let c3 = child_of(&env, &parent).await;
+
+        claimed(env.svc.claim(&b, c1.id).await.unwrap());
+        env.svc.block(&b, c1.id, "waiting on schema").await.unwrap();
+        claimed(env.svc.claim(&b, c2.id).await.unwrap());
+        env.svc.complete(&b, c2.id, done("shipped")).await.unwrap();
+        env.svc.cancel(Caller::Human, c3.id).await.unwrap();
+
+        let detail = env.svc.get(parent.id).await.unwrap();
+        let bubbled: Vec<_> = detail
+            .events
+            .iter()
+            .filter(|e| e.kind != TaskEventKind::Created)
+            .map(|e| {
+                (
+                    e.kind,
+                    e.note.clone(),
+                    e.payload.as_ref().unwrap()["child_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            bubbled,
+            vec![
+                (TaskEventKind::ChildClaimed, None, c1.id.to_string()),
+                (
+                    TaskEventKind::ChildBlocked,
+                    Some("waiting on schema".into()),
+                    c1.id.to_string()
+                ),
+                (TaskEventKind::ChildClaimed, None, c2.id.to_string()),
+                (
+                    TaskEventKind::ChildDone,
+                    Some("shipped".into()),
+                    c2.id.to_string()
+                ),
+                (TaskEventKind::ChildCancelled, None, c3.id.to_string()),
+            ]
+        );
+        // The actor is whoever changed the child.
+        assert_eq!(
+            detail.events[1].actor,
+            Actor::Agent(b.agent.id, b.session.id)
+        );
+        assert_eq!(detail.events[5].actor, Actor::Human);
+        // Renewals and the child's own created event do not bubble.
+        assert_eq!(kinds(&env, &parent).await.len(), 6);
+    }
+);
+
+store_matrix!(parent_moves_to_review_when_children_finish, |store: Arc<
+    dyn Store,
+>| async move {
+    let env = Env::new(store);
+    let a = env.session("mac", "claude-code").await;
+    let b = env.session("linux", "claude-code").await;
+    let parent = env.task(&a, Eligibility::default()).await;
+    claimed(env.svc.claim(&a, parent.id).await.unwrap());
+    let c1 = child_of(&env, &parent).await;
+    let c2 = child_of(&env, &parent).await;
+
+    claimed(env.svc.claim(&b, c1.id).await.unwrap());
+    env.svc.complete(&b, c1.id, done("one")).await.unwrap();
+    // One child still open: the parent keeps running.
+    let mid = env.svc.get(parent.id).await.unwrap();
+    assert_eq!(mid.task.status, TaskStatus::Claimed);
+    assert!(
+        !mid.events
+            .iter()
+            .any(|e| e.kind == TaskEventKind::ChildrenComplete)
+    );
+
+    env.svc.cancel(Caller::Human, c2.id).await.unwrap();
+    let detail = env.svc.get(parent.id).await.unwrap();
+    assert_eq!(detail.task.status, TaskStatus::Review);
+    assert_eq!(detail.task.owner_agent_id, Some(a.agent.id));
+    assert_eq!(detail.task.lease_expires_at, None);
+    assert_eq!(
+        detail.events.last().map(|e| e.kind),
+        Some(TaskEventKind::ChildrenComplete)
+    );
+    assert_eq!(
+        detail
+            .events
+            .iter()
+            .filter(|e| e.kind == TaskEventKind::ChildrenComplete)
+            .count(),
+        1
+    );
+    // The coordinator can still close it.
+    let closed = env
+        .svc
+        .complete(&a, parent.id, done("all merged"))
+        .await
+        .unwrap();
+    assert_eq!(closed.status, TaskStatus::Done);
+});
+
+store_matrix!(parent_open_stays_open, |store: Arc<dyn Store>| async move {
+    let env = Env::new(store);
+    let a = env.session("mac", "claude-code").await;
+    let parent = env.task(&a, Eligibility::default()).await;
+    let c1 = child_of(&env, &parent).await;
+    claimed(env.svc.claim(&a, c1.id).await.unwrap());
+    env.svc.complete(&a, c1.id, done("done")).await.unwrap();
+
+    let detail = env.svc.get(parent.id).await.unwrap();
+    assert_eq!(detail.task.status, TaskStatus::Open);
+    assert_eq!(
+        detail.events.last().map(|e| e.kind),
+        Some(TaskEventKind::ChildrenComplete)
+    );
+});
+
+store_matrix!(progress_counts, |store: Arc<dyn Store>| async move {
+    let env = Env::new(store);
+    let a = env.session("mac", "claude-code").await;
+    let b = env.session("linux", "claude-code").await;
+    let other = env
+        .session_in(Some("github.com/reyemtech/other"), "mac", "codex")
+        .await;
+    let parent = env
+        .svc
+        .create(
+            Caller::Agent(&a),
+            NewTask {
+                project_id: project_of(&a),
+                title: "span".into(),
+                extra_projects: vec![project_of(&other)],
+                ..NewTask::default()
+            },
+        )
+        .await
+        .unwrap();
+    let c1 = child_of(&env, &parent).await;
+    let c2 = child_of(&env, &parent).await;
+    let c3 = child_in(&env, &parent, project_of(&other)).await.unwrap();
+    // A grandchild is not counted.
+    let grandchild = child_of(&env, &c1).await;
+    claimed(env.svc.claim(&a, grandchild.id).await.unwrap());
+
+    claimed(env.svc.claim(&b, c1.id).await.unwrap());
+    env.svc.complete(&b, c1.id, done("x")).await.unwrap();
+    env.svc.cancel(Caller::Human, c2.id).await.unwrap();
+    claimed(env.svc.claim(&other, c3.id).await.unwrap());
+
+    let progress = env.svc.get(parent.id).await.unwrap().progress;
+    assert_eq!((progress.done, progress.total), (2, 3));
+    assert_eq!(
+        progress.owners_by_project,
+        vec![(project_of(&other), vec![other.agent.id])]
+    );
+    assert_eq!(
+        env.svc.get(c3.id).await.unwrap().progress,
+        Progress::default()
+    );
+});
+
+store_matrix!(
+    last_children_closing_concurrently_review_the_parent,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let a = env.session("mac", "claude-code").await;
+        let parent = env.task(&a, Eligibility::default()).await;
+        claimed(env.svc.claim(&a, parent.id).await.unwrap());
+        let mut work = vec![];
+        for i in 0..4 {
+            let worker = env.session(&format!("host-{i}"), "claude-code").await;
+            let child = child_of(&env, &parent).await;
+            claimed(env.svc.claim(&worker, child.id).await.unwrap());
+            work.push((worker, child));
+        }
+        let handles: Vec<_> = work
+            .into_iter()
+            .map(|(worker, child)| {
+                let svc = env.svc.clone();
+                tokio::spawn(async move {
+                    svc.complete(&worker, child.id, done("ok")).await.unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.await.unwrap();
+        }
+        let detail = env.svc.get(parent.id).await.unwrap();
+        assert_eq!(detail.task.status, TaskStatus::Review);
+        assert_eq!(
+            detail
+                .events
+                .iter()
+                .filter(|e| e.kind == TaskEventKind::ChildrenComplete)
+                .count(),
+            1
+        );
+    }
+);

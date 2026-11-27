@@ -11,7 +11,7 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 
 use super::{
     ClaimAttempt, ClaimRequest, LeaseUpdate, Store, StoreError, StoreResult, TaskFilter,
-    TransitionRequest, claim_event,
+    TransitionRequest, child_event, children_complete_event, claim_event, closes_child,
 };
 use crate::domain::{
     Actor, Agent, AgentId, Eligibility, Project, ProjectId, Session, SessionId, Task, TaskEvent,
@@ -199,6 +199,57 @@ async fn insert_event(
     Ok(())
 }
 
+/// Appends `event` to the task's history and, when it belongs to a child, bubbles it into the
+/// parent's thread; the last child closing moves a `claimed` parent to `review`. Runs inside
+/// the write transaction of the child's state change.
+async fn record_event(
+    conn: &mut SqliteConnection,
+    task: &Task,
+    event: &TaskEvent,
+    token: Option<TokenId>,
+) -> StoreResult<()> {
+    insert_event(conn, event, token).await?;
+    let Some(parent) = task.parent_id else {
+        return Ok(());
+    };
+    let Some(bubbled) = child_event(task, parent, event) else {
+        return Ok(());
+    };
+    insert_event(conn, &bubbled, token).await?;
+    if !closes_child(event) {
+        return Ok(());
+    }
+    let open: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tasks WHERE parent_id = ? AND status NOT IN ('done', 'cancelled')",
+    )
+    .bind(parent.to_string())
+    .fetch_one(&mut *conn)
+    .await?;
+    if open > 0 {
+        return Ok(());
+    }
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM tasks WHERE id = ?")
+        .bind(parent.to_string())
+        .fetch_optional(&mut *conn)
+        .await?;
+    match status.as_deref() {
+        Some("claimed") => {
+            sqlx::query(
+                "UPDATE tasks SET status = 'review', lease_expires_at = NULL,
+                        version = version + 1, updated_at = ?
+                  WHERE id = ?",
+            )
+            .bind(ts::enc(event.at))
+            .bind(parent.to_string())
+            .execute(&mut *conn)
+            .await?;
+        }
+        Some("open" | "blocked" | "review") => {}
+        _ => return Ok(()),
+    }
+    insert_event(conn, &children_complete_event(parent, event), token).await
+}
+
 /// Task columns as a literal, so queries stay static SQL.
 macro_rules! task_cols {
     () => {
@@ -287,8 +338,8 @@ async fn claim_locked(
     .map(task_from)
     .transpose()?;
 
-    if claimed.is_some() {
-        insert_event(conn, &claim_event(&previous, req), Some(c.token)).await?;
+    if let Some(task) = &claimed {
+        record_event(conn, task, &claim_event(&previous, req), Some(c.token)).await?;
     }
     Ok(ClaimAttempt {
         previous: Some(previous),
@@ -545,6 +596,18 @@ impl Store for SqliteStore {
             .transpose()
     }
 
+    async fn task_projects(&self, id: TaskId) -> StoreResult<Vec<ProjectId>> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT project_id FROM task_projects WHERE task_id = ? ORDER BY project_id",
+        )
+        .bind(id.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|p| uuid_of(p))
+        .collect()
+    }
+
     async fn list_tasks(&self, filter: &TaskFilter) -> StoreResult<Vec<Task>> {
         let project = filter.project.map(|p| p.to_string());
         let status = filter.status.map(|s| s.as_str());
@@ -673,8 +736,8 @@ impl Store for SqliteStore {
         .as_ref()
         .map(task_from)
         .transpose()?;
-        if updated.is_some() {
-            insert_event(&mut tx, &req.event, req.token).await?;
+        if let Some(task) = &updated {
+            record_event(&mut tx, task, &req.event, req.token).await?;
         }
         tx.commit().await?;
         Ok(updated)
