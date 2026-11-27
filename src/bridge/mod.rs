@@ -24,7 +24,7 @@ use rmcp::model::{
     ContentBlock, Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
     ServerConfig,
 };
-use rmcp::service::{RequestContext, RunningService};
+use rmcp::service::{RequestContext, RunningService, ServiceError};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{ErrorData, RoleClient, RoleServer, ServerHandler, ServiceExt};
@@ -252,10 +252,19 @@ impl Bridge {
         }
     }
 
+    /// Forwards one call. `Err` (the server is unusable) only for transport failures and
+    /// timeouts, which also drop the connection.
     async fn forward(&self, request: CallToolRequestParams) -> Result<CallToolResult, String> {
         let client = self.upstream().await?;
         match tokio::time::timeout(CALL_TIMEOUT, client.call_tool(request)).await {
             Ok(Ok(result)) => Ok(result),
+            // The server answered with a JSON-RPC error (an unknown tool, say): that is its
+            // answer to this call, and the connection is fine.
+            Ok(Err(ServiceError::McpError(e))) => {
+                Ok(CallToolResult::error(vec![ContentBlock::text(
+                    e.message.to_string(),
+                )]))
+            }
             Ok(Err(e)) => {
                 self.discard(&client).await;
                 Err(format!("call to the server failed: {e}"))

@@ -341,10 +341,22 @@ store_matrix!(bridge_end_to_end, |store: Arc<dyn Store>| async move {
         "short host: {host}"
     );
 
+    // Bad calls are the server's answer, not an outage, and keep the connection: bad
+    // arguments, and an unknown tool (a JSON-RPC error from the server).
+    for name in ["send_message", "no_such_tool"] {
+        let (is_error, text) = bridge.call(name).await;
+        assert!(is_error, "{name}: {text}");
+        assert!(!text.starts_with("coord unavailable"), "{name}: {text}");
+        assert!(!text.is_empty(), "{name}");
+    }
+    let (is_error, text) = bridge.call("whoami").await;
+    assert!(!is_error, "{text}");
+
     let (ok, stderr) = bridge.close().await;
     assert!(ok, "exit code 0 on stdin close");
     assert!(!file.exists(), "session file removed on exit");
     assert!(!stderr.contains(&token), "token must never be logged");
+    assert!(!stderr.contains("coord unavailable"), "{stderr}");
 });
 
 /// What a fake server saw on `/v1`: (endpoint, authorization header, body).
