@@ -1,0 +1,87 @@
+name: Bug report
+description: Something in Axle does not work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Check [troubleshooting](https://github.com/ReyemTech/axle/blob/main/docs/troubleshooting.md) first.
+        Remove tokens (they start with `axl_`) and secrets from anything you paste.
+        Security problems go to a [private advisory](https://github.com/ReyemTech/axle/security/advisories/new) instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. axl serve with ...
+        2. In Claude Code, call ...
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Axle version
+      description: Output of `axl --version`.
+      placeholder: axl 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How Axle is installed
+      options:
+        - Homebrew
+        - Shell installer
+        - cargo binstall / cargo install
+        - Docker image
+        - Helm chart
+        - Built from source
+    validations:
+      required: true
+  - type: dropdown
+    id: database
+    attributes:
+      label: Database
+      options:
+        - SQLite
+        - Postgres
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Server
+        - MCP tools
+        - Bridge
+        - Claude Code hooks
+        - Web UI
+        - Docker
+        - Helm chart
+        - Documentation
+  - type: input
+    id: harness
+    attributes:
+      label: Harness and version
+      placeholder: Claude Code 2.x, Codex, OpenCode, ...
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15 arm64, Ubuntu 24.04 x86_64, ...
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant lines from `axl serve`, the bridge or the hook, with tokens removed.
+      render: text
