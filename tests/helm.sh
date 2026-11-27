@@ -130,6 +130,20 @@ expect "$(env_val AXL_PUBLIC_URL --set ingress.enabled=true --set 'ingress.hosts
 expect "$(has_env AXL_PUBLIC_URL --set ingress.enabled=true --set 'ingress.hosts[0].paths[0].path=/')" 0 \
   "no AXL_PUBLIC_URL when no ingress entry has a host"
 
+# extraEnv overrides chart-rendered env without duplicate entries
+expect "$(has_env AXL_TRUSTED_PROXY_HEADER --set ingress.enabled=true \
+  --set 'extraEnv[0].name=AXL_TRUSTED_PROXY_HEADER' --set 'extraEnv[0].value=X-Real-IP')" 1 \
+  "extraEnv AXL_TRUSTED_PROXY_HEADER: exactly one entry"
+expect "$(env_val AXL_TRUSTED_PROXY_HEADER --set ingress.enabled=true \
+  --set 'extraEnv[0].name=AXL_TRUSTED_PROXY_HEADER' --set 'extraEnv[0].value=X-Real-IP')" X-Real-IP \
+  "extraEnv AXL_TRUSTED_PROXY_HEADER wins"
+expect "$(has_env AXL_PUBLIC_URL --set publicUrl=https://x.test \
+  --set 'extraEnv[0].name=AXL_PUBLIC_URL' --set 'extraEnv[0].value=https://y.test')" 1 \
+  "extraEnv AXL_PUBLIC_URL: exactly one entry"
+expect "$(env_val AXL_PUBLIC_URL --set publicUrl=https://x.test \
+  --set 'extraEnv[0].name=AXL_PUBLIC_URL' --set 'extraEnv[0].value=https://y.test')" https://y.test \
+  "extraEnv AXL_PUBLIC_URL wins"
+
 # invalid UI settings are rejected (schema or template)
 rejects() { local why="$1"; shift; if helm template t "$CHART" -f "$S" "$@" >/dev/null 2>&1; then fail "$why was accepted"; fi; }
 rejects "ui.auth.mode=open" --set ui.auth.mode=open

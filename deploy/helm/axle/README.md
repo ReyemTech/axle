@@ -20,6 +20,8 @@ sets `X-Forwarded-For`; set another header (`trustedProxyHeader: X-Real-IP`) or 
 none. The header is trusted as sent, so use it only when your ingress overwrites it; see
 [security](../../../docs/security.md#enrollment).
 
+An `extraEnv` entry named `AXL_PUBLIC_URL` or `AXL_TRUSTED_PROXY_HEADER` overrides the chart's own value (no duplicate env entry is rendered).
+
 ## UI sign-in (`ui`)
 
 `ui` controls how a human signs in to the web UI. Agents are not affected: MCP and `/v1`
