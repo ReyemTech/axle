@@ -1591,3 +1591,50 @@ async fn live_stream_pings_task_pages_and_inbox() {
             .is_some()
     );
 }
+
+#[tokio::test]
+async fn task_thread_is_paged() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let iac = app.agent(IAC, "mac", "claude-code").await;
+    let task = app.task(&iac, "Chatty", None).await;
+    for i in 0..60 {
+        app.clock.advance(time::Duration::seconds(1));
+        app.state
+            .messages
+            .send(
+                &Actor::Agent(iac.agent.id, iac.session.id),
+                NewMessage {
+                    to: Address::Task(task.id),
+                    subject: None,
+                    body: format!("post {i}"),
+                    importance: Importance::Normal,
+                    reply_to: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let path = format!("/ui/tasks/{}", task.id);
+    let first = app.get(&path, Some(&cookie)).await;
+    let bodies = select_texts(&first, ".thread .peer-text");
+    assert_eq!(bodies.len(), 50, "the newest 50 posts");
+    assert_eq!(bodies.first().unwrap(), "post 10", "shown oldest first");
+    assert_eq!(bodies.last().unwrap(), "post 59");
+    let earlier = Selector::parse("a.earlier").unwrap();
+    let href = first
+        .html()
+        .select(&earlier)
+        .next()
+        .expect("earlier link")
+        .value()
+        .attr("href")
+        .unwrap()
+        .to_string();
+    let second = app.get(&href, Some(&cookie)).await;
+    let bodies = select_texts(&second, ".thread .peer-text");
+    assert_eq!(bodies.len(), 11, "posts 0-9 and the task body");
+    assert_eq!(bodies.first().unwrap(), "body");
+    assert_eq!(bodies.last().unwrap(), "post 9");
+    assert!(second.html().select(&earlier).next().is_none());
+}

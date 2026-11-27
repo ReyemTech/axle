@@ -135,6 +135,8 @@ pub(super) struct Labels<'a> {
     pub(super) store: &'a dyn Store,
     pub(super) projects: HashMap<ProjectId, Project>,
     agents: HashMap<AgentId, Option<Agent>>,
+    /// Task titles, fetched once per render.
+    task_titles: HashMap<TaskId, Option<String>>,
 }
 
 impl<'a> Labels<'a> {
@@ -149,7 +151,17 @@ impl<'a> Labels<'a> {
             store,
             projects,
             agents: HashMap::new(),
+            task_titles: HashMap::new(),
         })
+    }
+
+    /// A task's title (`None` for an unknown task), read once per render.
+    pub(super) async fn task_title(&mut self, id: TaskId) -> StoreResult<Option<String>> {
+        if !self.task_titles.contains_key(&id) {
+            let title = self.store.get_task(id).await?.map(|t| t.title);
+            self.task_titles.insert(id, title);
+        }
+        Ok(self.task_titles[&id].clone())
     }
 
     pub(super) fn project(&self, id: ProjectId) -> ProjectLabel {
@@ -201,8 +213,8 @@ impl<'a> Labels<'a> {
                 ),
                 None => "unknown session".into(),
             },
-            Address::Task(t) => match self.store.get_task(t).await? {
-                Some(task) => format!("thread: {}", task.title),
+            Address::Task(t) => match self.task_title(t).await? {
+                Some(title) => format!("thread: {title}"),
                 None => "unknown task".into(),
             },
             Address::Human => "you".into(),

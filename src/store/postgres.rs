@@ -669,6 +669,19 @@ impl Store for PostgresStore {
             .transpose()
     }
 
+    async fn list_agents(&self, limit: u32) -> StoreResult<Vec<Agent>> {
+        sqlx::query(
+            "SELECT id, project_id, host, harness, created_at FROM agents
+             ORDER BY created_at DESC, id DESC LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|row| agent_from(row, ""))
+        .collect()
+    }
+
     async fn create_session(
         &self,
         id: SessionId,
@@ -1239,6 +1252,30 @@ impl Store for PostgresStore {
             " FROM messages m WHERE m.task_id = $1 ORDER BY m.seq"
         ))
         .bind(task.as_uuid())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(message_from)
+        .collect()
+    }
+
+    async fn task_thread_page(
+        &self,
+        task: TaskId,
+        before: Option<MessageId>,
+        limit: u32,
+    ) -> StoreResult<Vec<Message>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            message_cols!(),
+            " FROM messages m
+             WHERE m.task_id = $1
+               AND ($2::uuid IS NULL OR m.seq < (SELECT b.seq FROM messages b WHERE b.id = $2))
+             ORDER BY m.seq DESC LIMIT $3"
+        ))
+        .bind(task.as_uuid())
+        .bind(before.map(|b| b.as_uuid()))
+        .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await?
         .iter()

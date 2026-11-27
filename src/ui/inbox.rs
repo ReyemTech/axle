@@ -22,6 +22,8 @@ pub const FEED_PER_PAGE: u32 = 50;
 pub const INBOX_LIMIT: u32 = 100;
 /// Most search results shown.
 pub const SEARCH_LIMIT: u32 = 50;
+/// Most agents offered as compose recipients (newest first).
+pub const COMPOSE_AGENTS: u32 = 200;
 
 #[derive(Deserialize, Default)]
 pub struct InboxQuery {
@@ -241,13 +243,9 @@ pub async fn inbox(
         None => (None, None, false),
     };
 
-    // Compose targets: projects and every agent that ever had a session.
+    // Compose targets: projects and the newest `COMPOSE_AGENTS` agents.
     let mut agents: Vec<AgentOption> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for (agent, _) in store.list_sessions(None).await? {
-        if !seen.insert(agent.id) {
-            continue;
-        }
+    for agent in store.list_agents(COMPOSE_AGENTS).await? {
         let project = agent
             .project_id
             .map(|p| format!(" · {}", labels.project(p).name))

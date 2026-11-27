@@ -721,3 +721,63 @@ store_matrix!(
         assert!(env.store.message_receipts(&[]).await.unwrap().is_empty());
     }
 );
+
+store_matrix!(
+    task_thread_paged_newest_first,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let a = env.session(IAC, "mac").await;
+        let task = env
+            .tasks
+            .create(
+                Caller::Agent(&a),
+                NewTask {
+                    project_id: project_of(&a),
+                    title: "t".into(),
+                    body: "first".into(),
+                    ..NewTask::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut sent = Vec::new();
+        for i in 0..4 {
+            sent.push(env.send(&a, Address::Task(task.id), &format!("m{i}")).await);
+        }
+        let bodies =
+            |ms: &[coord::domain::Message]| ms.iter().map(|m| m.body.clone()).collect::<Vec<_>>();
+        let page = env.store.task_thread_page(task.id, None, 2).await.unwrap();
+        assert_eq!(bodies(&page), ["m3", "m2"]);
+        let rest = env
+            .store
+            .task_thread_page(task.id, Some(page[1].id), 10)
+            .await
+            .unwrap();
+        assert_eq!(bodies(&rest), ["m1", "m0", "first"]);
+        // Only this task's thread.
+        env.send(&a, Address::Project(project_of(&a)), "elsewhere")
+            .await;
+        assert_eq!(
+            env.store.task_thread_page(task.id, None, 1).await.unwrap()[0].body,
+            "m3"
+        );
+    }
+);
+
+store_matrix!(
+    list_agents_newest_first,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let a1 = env.session(IAC, "mac").await;
+        let _again = env.session(IAC, "mac").await; // same agent, second session
+        env.clock.advance(Duration::seconds(1));
+        let b = env.session(NIMBUS, "mbp").await;
+        let agents = env.store.list_agents(10).await.unwrap();
+        assert_eq!(
+            agents.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![b.agent.id, a1.agent.id],
+            "one row per agent, however many sessions"
+        );
+        assert_eq!(env.store.list_agents(1).await.unwrap().len(), 1);
+    }
+);

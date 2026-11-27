@@ -98,6 +98,8 @@ pub trait Store: Send + Sync {
         now: OffsetDateTime,
     ) -> StoreResult<Agent>;
     async fn get_agent(&self, id: AgentId) -> StoreResult<Option<Agent>>;
+    /// Up to `limit` agents, newest first (one row per agent, however many sessions).
+    async fn list_agents(&self, limit: u32) -> StoreResult<Vec<Agent>>;
 
     // ---- sessions ----
 
@@ -231,6 +233,14 @@ pub trait Store: Send + Sync {
     ) -> StoreResult<Vec<Message>>;
     /// A task's thread, oldest first.
     async fn task_thread(&self, task: TaskId) -> StoreResult<Vec<Message>>;
+    /// A page of a task's thread, newest first; with `before`, only messages sent before
+    /// that one (an unknown `before` gives nothing).
+    async fn task_thread_page(
+        &self,
+        task: TaskId,
+        before: Option<MessageId>,
+        limit: u32,
+    ) -> StoreResult<Vec<Message>>;
     /// Every message (or only those whose `project_id` is `project`), newest first; with
     /// `before`, only messages sent before that one. An unknown `before` gives nothing.
     async fn list_messages(

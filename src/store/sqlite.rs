@@ -738,6 +738,19 @@ impl Store for SqliteStore {
             .transpose()
     }
 
+    async fn list_agents(&self, limit: u32) -> StoreResult<Vec<Agent>> {
+        sqlx::query(
+            "SELECT id, project_id, host, harness, created_at FROM agents
+             ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|row| agent_from(row, ""))
+        .collect()
+    }
+
     async fn create_session(
         &self,
         id: SessionId,
@@ -1329,6 +1342,30 @@ impl Store for SqliteStore {
             " FROM messages m WHERE m.task_id = ? ORDER BY m.seq"
         ))
         .bind(task.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(message_from)
+        .collect()
+    }
+
+    async fn task_thread_page(
+        &self,
+        task: TaskId,
+        before: Option<MessageId>,
+        limit: u32,
+    ) -> StoreResult<Vec<Message>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            message_cols!(),
+            " FROM messages m
+             WHERE m.task_id = ?1
+               AND (?2 IS NULL OR m.seq < (SELECT b.seq FROM messages b WHERE b.id = ?2))
+             ORDER BY m.seq DESC LIMIT ?3"
+        ))
+        .bind(task.to_string())
+        .bind(before.map(|b| b.to_string()))
+        .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await?
         .iter()

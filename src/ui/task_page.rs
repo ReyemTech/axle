@@ -13,12 +13,14 @@ use super::SessionCtx;
 use super::views::{
     Labels, ProjectLabel, ProjectOption, UiError, UiResult, ago, html, status_icon,
 };
-use crate::domain::{Message, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus};
+use crate::domain::{Message, MessageId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus};
 use crate::http::AppState;
 use crate::store::{StoreResult, TaskFilter};
 
 /// Events per page of a task's history.
 pub const EVENTS_PER_PAGE: u32 = 50;
+/// Messages per page of a task's thread.
+pub const THREAD_PER_PAGE: u32 = 50;
 
 /// A point in time three ways: readable, machine (`datetime`) and relative.
 pub struct Stamp {
@@ -82,10 +84,9 @@ pub(super) async fn message_view(
 ) -> StoreResult<MessageView> {
     let task = match m.task_id {
         Some(t) => labels
-            .store
-            .get_task(t)
+            .task_title(t)
             .await?
-            .map(|task| (t.to_string(), task.title)),
+            .map(|title| (t.to_string(), title)),
         None => None,
     };
     Ok(MessageView {
@@ -164,6 +165,10 @@ struct TaskPage {
     older: Option<String>,
     /// Whether this is a later page of the history.
     paged: bool,
+    /// Link to the previous (earlier) page of the thread.
+    earlier: Option<String>,
+    /// Whether this is an earlier page of the thread.
+    thread_paged: bool,
     children: Vec<ChildLink>,
     evidence: Option<Evidence>,
     /// Projects a subtask may be created in.
@@ -175,6 +180,9 @@ pub struct TaskQuery {
     /// History cursor: show events older than this event id.
     #[serde(default)]
     pub before: Option<String>,
+    /// Thread cursor: show messages sent before this message id.
+    #[serde(default)]
+    pub thread_before: Option<String>,
 }
 
 fn lease_text(now: OffsetDateTime, task: &Task, owner: Option<&str>) -> String {
@@ -280,14 +288,30 @@ pub async fn task_page(
         can_cancel: !matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled),
     };
 
-    let mut thread = Vec::new();
-    for m in state
-        .messages
-        .thread(id)
-        .await
-        .map_err(|e| UiError::Internal(e.to_string()))?
-    {
-        thread.push(message_view(&mut labels, now, &m).await?);
+    // The newest page of the thread (one extra tells whether an earlier page exists),
+    // shown oldest first.
+    let thread_before = match q.thread_before.as_deref().filter(|b| !b.is_empty()) {
+        Some(b) => Some(
+            b.parse::<MessageId>()
+                .map_err(|_| UiError::Invalid("Bad thread cursor.".into()))?,
+        ),
+        None => None,
+    };
+    let mut posts = store
+        .task_thread_page(id, thread_before, THREAD_PER_PAGE + 1)
+        .await?;
+    let earlier = if posts.len() > THREAD_PER_PAGE as usize {
+        posts.truncate(THREAD_PER_PAGE as usize);
+        posts
+            .last()
+            .map(|m| format!("/ui/tasks/{id}?thread_before={}", m.id))
+    } else {
+        None
+    };
+    posts.reverse();
+    let mut thread = Vec::with_capacity(posts.len());
+    for m in &posts {
+        thread.push(message_view(&mut labels, now, m).await?);
     }
 
     // One extra event tells whether an older page exists.
@@ -361,6 +385,8 @@ pub async fn task_page(
         events,
         older,
         paged: before.is_some(),
+        earlier,
+        thread_paged: thread_before.is_some(),
         children,
         evidence,
         child_projects,

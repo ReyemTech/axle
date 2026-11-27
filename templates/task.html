@@ -47,7 +47,9 @@
   </section>
 
   <section class="panel" aria-label="Thread">
-    <h2 class="panel-title">Thread <span class="count">{{ thread.len() }}</span></h2>
+    <h2 class="panel-title">Thread{% if thread_paged %} <span class="muted">(earlier)</span>{% endif %}</h2>
+    {% if let Some(href) = earlier %}<p><a class="earlier" href="{{ href }}">Earlier messages</a></p>{% endif %}
+    {% if thread_paged %}<p><a href="/ui/tasks/{{ task.id }}">Latest messages</a></p>{% endif %}
     <ol class="thread">
     {% for m in thread %}
       <li class="msg" id="msg-{{ m.id }}" data-importance="{{ m.importance }}">
