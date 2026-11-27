@@ -1,0 +1,97 @@
+# coord MVP — rulings and follow-ups
+
+Recorded during the subagent-driven build of feat/mvp (2026-11-27).
+
+## Rulings made without Mario
+- Ruling: skip `git init` in T1 — already done — no cost.
+- Ruling: default bind 127.0.0.1:7420 in T1 — T6/T8 rely on 7420 — trivial to change.
+- Ruling: edit migrations/*/0001_init.sql in place until first release (no prod data) — keeps one migration per phase — if wrong, split into 0002 later.
+- Ruling: T6 events — messages addressed to `human` are not streamed to agent sessions — matches spec intent — low.
+- Ruling: accept T2 departures (upsert_project takes now; matrix names name::sqlite; rename returns NotFound; list_sessions(None)=all; touch_tool_call also bumps heartbeat) — consistent with constraints — low.
+- Ruling: claims require caller's home project ∈ task project ∪ task_projects — matches spec §8 eligibility — low.
+- Ruling: owner may renew after expiry until taken over; heartbeat never revives expired — consistent with spec — low.
+- Ruling: force_release human-only by not exposing in MCP (T7 must not expose) — low.
+- Ruling: T3 per-task TTL (brief omitted, spec §8 requires) — implement per spec — small extra work.
+- Ruling: child release/force_release don't bubble; parent cancel doesn't cascade — not in spec — low (add later if wanted).
+- Ruling: owners_by_project = owners of unfinished children grouped by child project — matches board card intent — low.
+- Ruling: T5 delivery details (thread → owner+creator; self-sent excluded; unread_count = unacked inbox) — fills spec §9 gaps — low.
+- Ruling: cursor acked_seq fixed at agent creation + per-message acks (rescan) — OK at MVP volume — perf only.
+- Ruling: new task owner receives thread unacked backlog — useful context on takeover — low.
+- Ruling: /v1/inbox/summary marking delivered is correct (hook shows it to the session; ack still required) — low.
+- Ruling: T6 per-token rate limit (spec §7, unassigned by plan) — implement in T6 HTTP layer, 20/s burst 100 — low.
+- Ruling: session id fallback = UUIDv5(token+identity headers) when no X-Coord-Session/Mcp-Session-Id — stable for stateless clients — low.
+- Ruling: rmcp Host validation off (bearer token required on every request; needed for cluster ingress hosts) — low.
+- Ruling: accept edit_task/TaskService::edit addition (task_update needs it) — low.
+- Ruling: T7 pagination (spec §7; brief omitted) — implement limit default 20 max 100 — low.
+- Ruling: no auto-retry of tool calls after server restart (non-idempotent tools) — reconnect on next call — low.
+- Ruling: Unix-only bridge acceptable (Mac/Linux harnesses) — low.
+- Ruling: T9 adds COORD_COOKIE_SECURE (default false), in-memory UI sessions 12h, login rate limit 10/min/IP, embedded static assets — spec §7/§12 details — low.
+- Ruling: login rate limit keyed on peer IP, no X-Forwarded-For trust — safe default — shared limit behind ingress (low).
+- Ruling: open-tasks counter = status open (matches Open column) — low.
+- Ruling: T9 login POST without CSRF — single shared secret, SameSite=Strict, nothing to fixate — accepted.
+- Ruling: accept POST /ui/inbox/{id}/archive (human ack) — needed for capped inbox — low.
+- Ruling: GET marking delivered/read acceptable (idempotent, SameSite=Strict) — low.
+- Ruling: T11 exit-2-on-bad-args promoted to Important — verified contract: exit 2 blocks UserPromptSubmit — violates §2 anti-goal.
+- Ruling: accept release.yml extras (tag vs Cargo version check, chart version from tag, qemu) — sensible release hygiene — low.
+- Ruling: final #4 — post child blocked/done/cancelled + children_complete messages into parent task thread — delivers spec §8 owner notification via existing inbox/hooks — extra thread messages (low).
+- Ruling: final #5 — same-agent takeover only if previous owner session stale (>90 s no heartbeat) — matches spec intent (--resume), prevents live sibling double ownership — a resumed session within 90 s must wait (low).
+- Ruling: final deferred-minor triage accepted (only T8 McpError fix-before-merge); fix wave also takes M2, M8, M9, M10.
+- Ruling: deviate from 'no second fix wave' for a narrow correction of I4+I6 (+ MCP defuse whitespace variants) — I4 is a regression introduced by the fix wave itself and shipping it would break parent review notifications — cost: one more small round.
+
+## Deferred minor findings (follow-ups)
+- Task 3: minor (deferred): heartbeat renewal writes no event/version bump (ruled OK: avoids 30s write noise; UI reads lease_expires_at)
+- Task 3: minor (deferred): same-session re-claim bumps lease_epoch
+- Task 3: minor (deferred): now computed before write lock; event/updated_at clock reads separate
+- Task 3: minor (deferred): owner_transition error mapping hides cause (LeaseLost vs InvalidTransition)
+- Task 3: minor (deferred): renew_by_heartbeat Ok(0) for unknown session
+- Task 3: minor (deferred → T4 owns): create doesn't enforce child rules
+- Task 3: minor (deferred): tests missing claim via task_projects membership; cancel/release from review
+- Task 3: minor (deferred): owner_transition has 10 positional args
+- Task 3: minor (deferred): to_review accepts blocked
+- Task 4: minor (deferred): parent-status decision duplicated in pg/sqlite (could be pure helper)
+- Task 4: minor (deferred): tests missing parent blocked/review/done cases, takeover bubbling, repeat children_complete
+- Task 4: minor (deferred): create allows child under done/cancelled parent
+- Task 5: minor (deferred, FINAL REVIEW SHOULD FIX): tests/store_messages.rs:236 cross-project assertion passes via self-exclusion; add 2nd IaC agent
+- Task 5: minor (deferred, FINAL REVIEW SHOULD FIX): PG recipient-row multi-lock without fixed order → possible deadlocks between sibling sessions
+- Task 5: minor (deferred): replace ctid join with unique-key join
+- Task 5: minor (deferred): acked_seq/updated_at naming misleading (start_seq)
+- Task 5: minor (deferred): create_from_message can produce empty title
+- Task 6: minor (deferred): revoked token doesn't cut open SSE streams
+- Task 6: minor (deferred, FINAL REVIEW): tests missing Lagged, other-agent/session filtering, no-publish-on-rejected-op
+- Task 6: minor (deferred): task create publishes no MessageCreated for first thread message
+- Task 6: minor (deferred): claim_next reports kind claimed on takeover
+- Task 6: minor (deferred): outbox failure skips in-process broadcast; no outbox pruning
+- Task 6: minor (deferred): malformed JSON → plain-text 4xx (want JSON)
+- Task 6: minor (deferred): invalid tokens not rate limited (DB lookup per request); drain arm untested
+- Task 7: minor (deferred): non-UUID X-Coord-Session hashed without token/host/harness → collisions
+- Task 7: minor (deferred): no MCP-level test for cross-token/cross-agent session rejection
+- Task 7: minor (deferred): CoordMcp::agent scans list_sessions
+- Task 7: minor (deferred): tools.rs 1008 lines (split params/views/impls)
+- Task 7: minor (deferred): header-less clients share unknown/unknown agent inbox — document
+- Task 7: minor (deferred): system event notes labelled with actor
+- Task 7: minor (deferred): edit guard ignores lease_expires_at (consistent with other guards)
+- Task 8: minor (deferred, FINAL REVIEW SHOULD FIX): server JSON-RPC errors (McpError) reported as 'coord unavailable' and drop healthy connection
+- Task 8: minor (deferred): log-once only suppresses consecutive repeats; no 'connected' on heartbeat recovery
+- Task 8: minor (deferred): blackholed server → 10s timeouts serialized under mutex; no fail-fast memory
+- Task 8: minor (deferred): failed proxied list silent; temp file leftover; existing ~/.coord dir mode not tightened
+- Task 8: minor (deferred): '/' in URL password mis-split; no automated SIGTERM test
+- Task 8: minor (deferred): problem()/recovered() eprintln under std Mutex with expect → poison could break loop (use into_inner)
+- Task 9: minor (deferred, FINAL REVIEW SHOULD FIX): board/overview unbounded scans (Done history, all sessions, N+1) vs spec §7 pagination
+- Task 9: minor (deferred): board filter single project (spec says project(s))
+- Task 9: minor (deferred): trusted header may name a standard header; no startup warning
+- Task 9: minor (deferred): login limiter buckets never pruned; re-login leaves old session; no security-header tests; Secure suffix duplication
+- Task 9: minor (deferred): status pill contrast at 12px unverified (WCAG); CSS regression test exact-string
+- Task 10: minor (deferred, FINAL REVIEW SHOULD FIX): receipts N+1 (one query per id)
+- Task 10: minor (deferred, FINAL REVIEW SHOULD FIX): revoke doesn't close agent SSE; tokens page copy claims 'stop working at once'
+- Task 10: minor (deferred): misplaced Agent doc comment by DISPLAY_NAME_MAX; hard-coded 80 in error text
+- Task 10: minor (deferred): inbox list snaps to page 1 on live refresh; CSRF refusal tested for one route only; redundant pre-check in post_to_thread
+- Task 10: minor (deferred): MCP task_get thread still unbounded; session address labels uncached
+- Task 11: minor (deferred): .seen torn writes (temp+rename), mode only on create, stale files
+- Task 11: minor (deferred): Stop reason not peer-framed (sanitised, capped)
+- Task 11: minor (deferred): weak tests (corrupt .seen recovery, ancestor walk, timeout, panic path)
+- Task 11: minor (deferred): env::args non-UTF-8 panic (use args_os); misplaced SEEN_KEEP doc; backlog >100 hides newest (server importance filter)
+- Task 12: minor (deferred): README COORD_SERVER_URL default blank (should be http://127.0.0.1:7420); redundant docker exec -e (secret exposure in smoke.sh); smoke build -q hides errors; mention /healthz probes
+- Task 13: minor (deferred): github.actor interpolated in run:; latest pushed for prerelease tags; lookup secret re-randomizes under helm template (GitOps) — recommend existingSecret; helm.sh doesn't assert secret non-empty; image.repository hardcoded lowercase owner; rust-toolchain@stable floating; redundant buildx in smoke job
+- Final: minor (deferred): zero-width chars between frame words not defused (low); live-subtasks test is string check (browser recheck pending); badge dark-theme contrast unasserted
+- Final: minor (deferred): zero-width chars between frame words not defused (low); live-subtasks test is string check (browser recheck pending); badge dark-theme contrast unasserted
+- UI visual check: no Important; queued polish 1-5 (ui-polish-findings.md) for the correction round. Deferred: block reason callout on task page; inbox sort by importance; urgent pill colour mismatch; token active badge unstyled; 375px header wraps 3 rows.
