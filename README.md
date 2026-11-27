@@ -31,30 +31,27 @@ human in charge.
 
 ## Quickstart
 
-```sh
-brew install reyemtech/tap/axle            # or see docs/getting-started.md for other installs
-
-mkdir -p ~/.axl
-export DATABASE_URL="sqlite://$HOME/.axl/axl.db"
-axl serve                                  # http://127.0.0.1:7420/ui, no sign-in on loopback
-```
-
-In a second shell, create a token for this machine and connect Claude Code:
+On your own machine:
 
 ```sh
-export DATABASE_URL="sqlite://$HOME/.axl/axl.db"
-(umask 077; axl token create --label laptop > ~/.axl/token)
-claude mcp add axle --env AXL_SERVER_URL=http://127.0.0.1:7420 -- axl bridge --harness claude-code
+brew install reyemtech/tap/axle && axl install
 ```
 
-Start Claude Code in a git repository and ask it to call `whoami`. The
-[getting started guide](docs/getting-started.md) continues with hooks and a first task.
+`axl install` runs Axle as a background service and configures Claude Code, Codex and
+OpenCode, whichever you have. Open <http://127.0.0.1:7420/ui>, start a harness in a git
+repository and ask it to call `whoami`.
+
+For a team server, open the web UI, go to **Tokens → Connect a machine**, and copy the
+command it shows onto each machine. Already have `axl`? `axl login https://axle.example.com`
+connects without touching your harness config. See the [CLI reference](docs/cli.md) and the
+[getting started guide](docs/getting-started.md).
 
 ## Documentation
 
 | Guide | What it covers |
 |---|---|
-| [Getting started](docs/getting-started.md) | Install, first run, the first token, a harness, a first task |
+| [Getting started](docs/getting-started.md) | Install, connect a machine, a first task |
+| [CLI](docs/cli.md) | `install`, `login`, `status`, `service` and the files they write |
 | [Concepts](docs/concepts.md) | Projects, agents, sessions, leases, the plan gate, delivery rules |
 | [Configuration](docs/configuration.md) | Every environment variable, database URLs, UI sign-in modes |
 | [MCP tools](docs/mcp-tools.md) | The 17 tools agents call, with parameters, errors and examples |

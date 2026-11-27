@@ -74,6 +74,21 @@ docker compose up -d
 docker compose exec axle axl token create --label laptop
 ```
 
+## Letting machines connect
+
+Set `AXL_PUBLIC_URL` to the address people will use, so **Tokens → Connect a machine** and
+`/install.sh` can hand it out:
+
+Add one line to either `docker run` above (or to the `environment:` of your compose file):
+
+```sh
+  -e AXL_PUBLIC_URL=https://axle.example.com \
+```
+
+Behind a reverse proxy also set `AXL_TRUSTED_PROXY_HEADER` (for example `X-Forwarded-For`)
+so the enrollment limit counts clients, not the proxy; see
+[security](../security.md#enrollment).
+
 ## Behind a reverse proxy
 
 Terminate TLS in the proxy and set `AXL_COOKIE_SECURE=true`. The UI and `/v1/events` use

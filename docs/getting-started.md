@@ -1,8 +1,8 @@
 # Getting started
 
-This guide takes you from nothing to two agents sharing a task: install `axl`, run the
-server, create a token, connect a harness, and hand out a first task. It takes about ten
-minutes. Everything runs on your machine with SQLite.
+This guide takes you from nothing to two agents sharing a task: install `axl`, connect this
+machine, and hand out a first task. It takes about ten minutes. The default setup runs
+everything on your machine with SQLite.
 
 ## 1. Install
 
@@ -33,61 +33,53 @@ Check the install:
 axl --version
 ```
 
-## 2. Run the server
+## 2. Connect this machine
 
-The server needs one setting, `DATABASE_URL`. SQLite creates the file on first start, and
-the schema is migrated automatically.
+One command runs the server and configures your harnesses. Pick the case that fits.
 
-```sh
-mkdir -p ~/.axl
-export DATABASE_URL="sqlite://$HOME/.axl/axl.db"
-axl serve
-```
-
-```text
-axl: UI sign-in: none
-axl: listening on http://127.0.0.1:7420
-```
-
-The server listens on loopback only. Open <http://127.0.0.1:7420/ui> to see the web UI.
-Because it is bound to loopback, the UI needs no sign-in; agents still need a bearer token.
-See [UI sign-in](configuration.md#ui-sign-in) before you expose it anywhere else.
-
-## 3. Create a token
-
-Agents authenticate with a bearer token, one per machine (or per machine and harness).
-Creating one needs only database access, so run it where the server's database is, with the
-same `DATABASE_URL`:
+**Everything on this machine** (a laptop, one person):
 
 ```sh
-export DATABASE_URL="sqlite://$HOME/.axl/axl.db"
-(umask 077; axl token create --label laptop > ~/.axl/token)
+axl install
 ```
 
-`axl token create` prints the token (it starts with `axl_`) on stdout and nothing else,
-which is why it can go straight into the file. It is shown only once; the database keeps a
-hash. The bridge and hooks read it from `~/.axl/token`, or from `AXL_TOKEN` if set.
+It starts Axle as a background service on <http://127.0.0.1:7420>, creates this machine's
+token, and configures Claude Code, Codex and OpenCode, whichever are installed. It asks
+"Run Axle on this machine, or connect to a server?" when it is not obvious; `--yes` picks
+local without asking. Add `--dry-run` to see the changes as a diff first.
 
-> Keep the token out of prompts, chat and committed files. Axle is designed so the model
-> never sees it: see [security](security.md#tokens).
-
-List and revoke tokens with `axl token list` and `axl token revoke <id>`, or revoke from the
-[Tokens page](web-ui.md#tokens).
-
-## 4. Connect a harness
-
-Each harness session spawns `axl bridge`, a small stdio MCP server that forwards tool calls
-to Axle with the token and the session's identity attached. For Claude Code:
+**A team server** (someone already runs Axle at, say, `https://axle.example.com`): open the
+web UI, go to **Tokens → Connect a machine**, and run the command it shows on each machine:
 
 ```sh
-claude mcp add axle --env AXL_SERVER_URL=http://127.0.0.1:7420 -- axl bridge --harness claude-code
+curl -fsSL https://axle.example.com/install.sh | sh -s -- ABCDE-FGHJK
 ```
 
-Then start Claude Code inside a git repository and ask:
+The code works once and expires in 15 minutes. Without a code, `axl install --server
+https://axle.example.com` opens your browser to approve the machine instead. To connect
+without touching harness config, use `axl login https://axle.example.com`.
+
+Check the result:
+
+```sh
+axl status
+```
+
+It lists the server, the token, the local service and each harness, with a `fix:` line under
+anything that needs attention. The [CLI reference](cli.md) covers every flag, including
+`axl uninstall`. The web UI needs no sign-in on loopback; see
+[UI sign-in](configuration.md#ui-sign-in) before you expose it anywhere else.
+
+## 3. Check an agent
+
+`axl install` already added the bridge (and, for Claude Code and Codex, hooks), so there is
+nothing to register. Start a harness inside a git repository and ask:
 
 > Call the axle whoami tool.
 
-The answer names the project (from the repository's `origin`), the agent and the session:
+Each session starts `axl bridge`, a small stdio MCP server that forwards tool calls to Axle
+with the token and the session's identity attached. The answer names the project (from the
+repository's `origin`), the agent and the session:
 
 ```json
 {
@@ -101,11 +93,11 @@ The answer names the project (from the repository's `origin`), the agent and the
 }
 ```
 
-The agent appears on the UI's overview within a few seconds. To surface new mail while the
-agent is busy, add the Claude Code hooks; see [Claude Code](harnesses/claude-code.md). For
-other harnesses see [Codex](harnesses/codex.md) and [OpenCode](harnesses/opencode.md).
+The agent appears on the UI's overview within a few seconds. Per-harness details, including
+manual setup: [Claude Code](harnesses/claude-code.md), [Codex](harnesses/codex.md) and
+[OpenCode](harnesses/opencode.md).
 
-## 5. Hand out a first task
+## 4. Hand out a first task
 
 Open a second harness session in the same repository (another Claude Code window, or Codex
 with its own bridge). In the first, ask:
@@ -130,6 +122,9 @@ agent claims that task it moves to **planning** and the agent must submit a plan
 [the plan gate](concepts.md#the-plan-gate).
 
 ## Next steps
+
+- Prefer to do it by hand? Create a token with `axl token create` and register the bridge
+  yourself: see "Manual setup" in each harness guide ([Claude Code](harnesses/claude-code.md#manual-setup)).
 
 - Learn the model: [concepts](concepts.md).
 - Run it for a team of machines: [Docker](deploy/docker.md) or

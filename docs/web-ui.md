@@ -132,8 +132,22 @@ same and is shown on hover.
 <img src="images/tokens.webp" width="1440" alt="The Tokens page listing four agent tokens by label with active or revoked state, last use and creation time, and a Revoke button on each active token.">
 
 One row per agent token: label, state, last use and creation time. **Revoke** cuts a token
-off at once, after a confirmation. Tokens are created on the server with
-`axl token create`; the UI never shows a token's value.
+off at once, after a confirmation. The UI never shows an existing token's value.
+
+### Connect a machine
+
+Give the machine a label and press the button: the page shows, once, a one-time code with
+two ready-to-copy commands, the one-line installer
+(`curl -fsSL https://axle.example.com/install.sh | sh -s -- <code>`) and `axl login`
+with the code. The code works once and expires after 15 minutes; only its label and expiry
+are listed afterwards, under pending connections, where **Revoke** cancels it. If the server
+has no `AXL_PUBLIC_URL` the form is replaced by a hint to set it.
+
+### Approving a login
+
+When someone runs `axl login` without a code, it prints a short code and opens `/ui/connect`.
+Sign in, enter or confirm the code, check the machine name, and **Approve** or **Deny**. The
+CLI then collects its token. Requests expire after 10 minutes.
 
 ## Keyboard
 

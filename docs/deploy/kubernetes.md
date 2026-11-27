@@ -38,9 +38,10 @@ kubectl exec -n axle deploy/axle -- axl token create --label laptop
 | `ui.auth.trustedHeader.name` | `""` | Trusted-header mode: the header your proxy sets. |
 | `ui.allowedHosts` | `[]` | Extra `Host` names. Ingress hosts and service names are added automatically. |
 | `ui.cookieSecure` | `null` | `null` means on when the ingress has TLS. |
+| `publicUrl` | `""` | The address clients use (`AXL_PUBLIC_URL`), served in `/install.sh` and by **Connect a machine**. Empty: derived from the first ingress host (`https` when `ingress.tls` is set, else `http`). With no ingress host it stays unset and a non-loopback server answers 503. |
 | `service.type` / `service.port` | `ClusterIP` / `7420` | The service. |
 | `ingress.*` | disabled | Class, annotations, hosts, TLS. |
-| `extraEnv` | `[]` | Other server settings, such as `AXL_RATE_LIMIT_PER_SEC`. |
+| `extraEnv` | `[]` | Other server settings, such as `AXL_RATE_LIMIT_PER_SEC`, or `AXL_TRUSTED_PROXY_HEADER` behind an ingress so the enrollment limit counts clients. |
 | `resources`, `nodeSelector`, `tolerations`, `affinity`, `podAnnotations` | empty | Scheduling. |
 | `terminationGracePeriodSeconds` | `15` | The server drains for up to 5 s on SIGTERM. |
 

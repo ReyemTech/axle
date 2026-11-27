@@ -6,8 +6,8 @@ human who runs them.
 
 ## Start here
 
-- [Getting started](getting-started.md): install, run, create a token, connect a harness and
-  hand out a first task.
+- [Getting started](getting-started.md): install, connect a machine and hand out a first task.
+- [CLI reference](cli.md): `install`, `login`, `logout`, `uninstall`, `status` and `service`.
 - [Concepts](concepts.md): the model behind everything else. Read it once.
 
 ## Use

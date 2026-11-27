@@ -5,6 +5,16 @@ external Postgres. The [Kubernetes guide](../../../docs/deploy/kubernetes.md) co
 database modes and ingress; this page covers the `ui` block. Every value is commented in
 [values.yaml](values.yaml) and checked by [values.schema.json](values.schema.json).
 
+## Connecting machines (`publicUrl`)
+
+`publicUrl` sets `AXL_PUBLIC_URL`, the address **Tokens → Connect a machine**, `/install.sh`
+and enrollment hand to clients. Leave it empty to derive it from the first ingress host
+(`https` when `ingress.tls` is set, else `http`); set it explicitly when the public address
+differs from the ingress, for example `publicUrl: https://axle.example.com`. With neither,
+the variable is unset and a server bound beyond loopback answers 503 on those endpoints.
+Behind an ingress, also pass `AXL_TRUSTED_PROXY_HEADER` through `extraEnv`; see
+[security](../../../docs/security.md#enrollment).
+
 ## UI sign-in (`ui`)
 
 `ui` controls how a human signs in to the web UI. Agents are not affected: MCP and `/v1`

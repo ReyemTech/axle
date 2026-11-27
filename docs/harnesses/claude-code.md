@@ -9,9 +9,27 @@ Claude Code gets two pieces:
 Both are optional and fail open: with Axle down or unconfigured, Claude Code behaves as if
 neither were installed.
 
-## Before you start
+## Set up
 
-You need a running server and a token on this machine; see
+```sh
+axl install --harness claude-code
+```
+
+Run it with no `--harness` to configure every harness it finds. It adds an Axle-owned plugin
+(bridge, hooks and instructions) linked into `~/.claude/skills/axle`, falling back to
+user-scope entries in `~/.claude.json` and `~/.claude/settings.json`. It first saves a
+`<file>.axl-backup-<UTC timestamp>` copy of anything it edits, and `axl uninstall --harness
+claude-code` reverses it. See the [CLI reference](../cli.md#axl-install).
+
+Check it with `axl status`, `/mcp` in Claude Code, or by asking the model to call `whoami`.
+
+## Manual setup
+
+Without `axl install`, wire the pieces yourself.
+
+### Before you start
+
+You need a running server and a token on this machine; `axl login <url>` gets one, or see
 [getting started](../getting-started.md). The bridge and hooks read the token from
 `~/.axl/token` (mode 0600) or the `AXL_TOKEN` environment variable. Use the file: it keeps
 the token out of config files that might be shared or committed.
@@ -24,7 +42,7 @@ mkdir -p ~/.axl
 If the server runs elsewhere, create the token there and copy it into `~/.axl/token` on
 this machine.
 
-## The bridge
+### The bridge
 
 With the CLI:
 
@@ -60,7 +78,7 @@ Code session starts its own bridge, which:
 
 Check it from Claude Code with `/mcp`, or ask the model to call `whoami`.
 
-## Hooks
+### Hooks
 
 Add to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
 

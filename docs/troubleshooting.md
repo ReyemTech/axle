@@ -24,7 +24,7 @@ is needed.
 
 | Reason | Fix |
 |---|---|
-| `no token (set AXL_TOKEN or write ~/.axl/token)` | Create a token and write it to `~/.axl/token` ([getting started](getting-started.md#3-create-a-token)). |
+| `no token (set AXL_TOKEN or write ~/.axl/token)` | Run `axl login <url>` (or `axl install`) to get a token; see the [CLI reference](cli.md#axl-login). |
 | `cannot reach the server at http://…` | Start the server, or set `AXL_SERVER_URL` in the bridge's `env` to the right URL. |
 | A 401 or `unauthorized` | The token is wrong or revoked. Check `axl token list` on the server and replace `~/.axl/token`. |
 | `register: the server has no /v1/register` | `AXL_SERVER_URL` points at something that is not Axle (or at a path below it). Use the base URL. |
@@ -102,6 +102,18 @@ everyone out.
 A token went over 20 requests per second sustained or 100 at once. Wait for `Retry-After`,
 give each machine its own token, or raise `AXL_RATE_LIMIT_PER_SEC` and
 `AXL_RATE_LIMIT_BURST`.
+
+## `axl login` or `axl install` fails to connect
+
+Run `axl status` first; it names what is wrong and the fix. Common causes:
+
+- **503 naming `AXL_PUBLIC_URL`**: the server is bound beyond loopback and does not know its
+  public address. Set `AXL_PUBLIC_URL` (Helm: `publicUrl`) and restart.
+- **`invalid or expired code`**: codes work once and last 15 minutes. Issue a new one under
+  **Tokens → Connect a machine**.
+- **429**: more than 10 enrollment requests a minute from one IP. Wait for `Retry-After`.
+  Behind a proxy, set `AXL_TRUSTED_PROXY_HEADER` so clients are counted separately.
+- **Already connected to another server**: pass `--force` to `axl login` to switch.
 
 ## Still stuck
 

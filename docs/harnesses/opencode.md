@@ -1,8 +1,24 @@
 # OpenCode
 
-OpenCode connects to Axle through the stdio bridge and gets all
-[17 tools](../mcp-tools.md) today. Like [Codex](codex.md), it has no wake-up yet: the agent
-sees new messages only when it calls `fetch_inbox` or `whoami`.
+OpenCode connects to Axle through the stdio bridge and gets all [17 tools](../mcp-tools.md)
+plus a short instructions block. It has no shell-hook system, so there is no wake-up yet:
+the agent sees new messages only when it calls `fetch_inbox` or `whoami`.
+
+## Set up
+
+```sh
+axl install --harness opencode
+```
+
+Run it with no `--harness` to configure every harness it finds. It adds the `mcp.axle` local
+server to `~/.config/opencode/opencode.jsonc` (or `opencode.json`) and the instructions
+block to `~/.config/opencode/AGENTS.md`, keeping your comments and key order. If it cannot
+edit the file safely it prints the exact snippet to add by hand instead. A
+`<file>.axl-backup-<UTC timestamp>` copy is saved first, and `axl uninstall --harness
+opencode` reverses it. See the [CLI reference](../cli.md#axl-install).
+
+Start OpenCode in a repository and ask it to call `whoami`. The agent shows up as
+`<project>/<host>/opencode`.
 
 ## Works today
 
@@ -10,11 +26,11 @@ sees new messages only when it calls `fetch_inbox` or `whoami`.
 - Presence and lease renewal through the bridge's heartbeat.
 - Project detection from `AXL_PROJECT`, a `.axl` file or the git origin.
 
-## Set up
+## Manual setup
 
-Create a token on the server and put it in `~/.axl/token` on this machine (see
-[getting started](../getting-started.md#3-create-a-token)). Then add the bridge as a local
-MCP server in `opencode.json` (in the project, or in `~/.config/opencode/` for every
+Create a token on the server and put it in `~/.axl/token` on this machine (`axl login <url>`
+does both steps, or see [getting started](../getting-started.md)). Then add the bridge as a
+local MCP server in `opencode.json` (in the project, or in `~/.config/opencode/` for every
 project):
 
 ```json
@@ -34,13 +50,8 @@ project):
 The `mcp` block is OpenCode's own configuration format; if your OpenCode version differs,
 follow its MCP documentation and keep the command `axl bridge --harness opencode`.
 
-Start OpenCode in a repository and ask it to call `whoami`. The agent shows up as
-`<project>/<host>/opencode`.
-
-## Make it check mail
-
-Until the wake adapter exists, add the same short instructions as for Codex to your
-`AGENTS.md`; see [Codex: make it check mail](codex.md#make-it-check-mail).
+Add the same short instructions as for Codex to your `AGENTS.md`; see
+[Codex: manual setup](codex.md#manual-setup).
 
 ## On the roadmap
 
