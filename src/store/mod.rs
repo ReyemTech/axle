@@ -13,7 +13,7 @@ use time::{Duration, OffsetDateTime};
 
 use crate::config::Backend;
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, Enrollment, EnrollmentId, EnrollmentKind, Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState, Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, WaitingOn, ProjectWakeSettings, ServerSettings, WakeAttempt, WakeKind, WakeOutcome, WakeTrigger,
+    Actor, Address, Agent, AgentId, BlockDetail, Enrollment, EnrollmentId, EnrollmentKind, Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState, Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, WaitingOn, ProjectWakeSettings, ServerSettings, WakeAttempt, WakeKind, WakeOutcome, WakeTrigger, TurnState, WakeChannel,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -288,6 +288,46 @@ pub trait Store: Send + Sync {
     async fn count_requests_by(&self, from: AgentId, since: OffsetDateTime) -> StoreResult<u32>;
     /// Tasks in `project` still waiting for approval (status `requested`).
     async fn count_pending_requests(&self, project: ProjectId) -> StoreResult<u32>;
+    // ---- wake-up: turn state, reservations and the queue ----
+
+    /// Records what `session`'s harness reports: `state` and `channel` are each kept when
+    /// `None`, and `turn_state_at` moves to `now` only when the state changes. Reporting
+    /// `Busy` clears a reservation that has no task (a wake to read the inbox was delivered)
+    /// and returns the session; reservations for a task are cleared by the claim. `NotFound`
+    /// for an unknown session.
+    async fn report_turn(
+        &self,
+        session: SessionId,
+        state: Option<TurnState>,
+        channel: Option<WakeChannel>,
+        now: OffsetDateTime,
+    ) -> StoreResult<Option<SessionId>>;
+    /// Reserves the session for one wake with a single guarded write; `false` when the
+    /// session is not free (see `Reservation`) or another reserver won the race.
+    async fn reserve_session(&self, r: &Reservation) -> StoreResult<bool>;
+    /// Clears every reservation pointing at `task` and returns those sessions.
+    async fn clear_task_reservations(&self, task: TaskId) -> StoreResult<Vec<SessionId>>;
+    /// Clears every reservation with `wake_until <= now` and returns each session with the
+    /// task it was reserved for.
+    async fn expire_reservations(
+        &self,
+        now: OffsetDateTime,
+    ) -> StoreResult<Vec<(SessionId, Option<TaskId>)>>;
+    /// Sessions that are live (heartbeat at or after `live_since`), idle since at or before
+    /// `idle_before`, wakeable and not reserved at `now`, with their agents: never-woken
+    /// first, then least recently woken, then idle the longest. Leases, eligibility and the
+    /// requester are the router's to filter.
+    async fn wake_candidates(
+        &self,
+        live_since: OffsetDateTime,
+        idle_before: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> StoreResult<Vec<(Agent, Session)>>;
+    /// Sanctioned tasks waiting for a session: `open`, or `claimed` / `planning` with a lease
+    /// expired at `now`, and no unexpired reservation pointing at them. FIFO by the latest
+    /// `queued` event (else the lease expiry, else creation), then id.
+    async fn list_queued(&self, now: OffsetDateTime) -> StoreResult<Vec<Task>>;
+
     /// The extra participating projects listed for `id` (not its home project).
     async fn task_projects(&self, id: TaskId) -> StoreResult<Vec<ProjectId>>;
     /// Tasks matching every set filter field, in `filter.order` (oldest first by default). `project` also matches tasks
@@ -710,6 +750,24 @@ pub fn unblocked_records(
         options: Vec::new(),
     };
     (event, note)
+}
+
+/// One guarded reservation of a session for a wake (`Store::reserve_session`). It applies
+/// only while the session is wakeable, `idle` since at or before `idle_before`, heartbeating
+/// at or after `live_since` and unreserved at `now`; with `new_job` the session must also own
+/// no task in `planning`, `claimed`, `blocked` or `review`. It sets `wake_task_id = task`,
+/// `wake_until = until` and `last_woken_at = now`.
+#[derive(Debug, Clone)]
+pub struct Reservation {
+    pub session: SessionId,
+    /// `None`: a wake with no task (to read the inbox).
+    pub task: Option<TaskId>,
+    pub now: OffsetDateTime,
+    pub until: OffsetDateTime,
+    pub live_since: OffsetDateTime,
+    pub idle_before: OffsetDateTime,
+    /// A wake for work the session does not already hold.
+    pub new_job: bool,
 }
 
 /// Which wake-log rows `Store::count_wake_attempts` counts: `kind` and `outcome` always, and

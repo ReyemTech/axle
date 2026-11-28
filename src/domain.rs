@@ -615,6 +615,8 @@ pub enum TaskEventKind {
     Related,
     /// A top-level task was moved under a parent (in the payload; the note names it).
     MovedUnder,
+    /// No session was free when the task became routable, so it waits in the wake queue.
+    Queued,
     /// The human acknowledged a done task. Only ever published as a live event; it is
     /// never written to a task's history.
     Acked,
@@ -645,6 +647,7 @@ text_enum!(TaskEventKind {
     Unblocked => "unblocked",
     Related => "related",
     MovedUnder => "moved_under",
+    Queued => "queued",
     Acked => "acked",
 });
 

@@ -7,10 +7,10 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use super::{
-    AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate, MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, RelateRequest, Related, Store, StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, UnblockRule, Unblocked, block_previous_payload, child_event, children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label, like_pattern, options_from, options_to, projects_added_note, projects_added_payload, related_payload, send_time_recipient, unblocked_records, AttemptQuery, to_u32,
+    AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate, MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, RelateRequest, Related, Store, StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, UnblockRule, Unblocked, block_previous_payload, child_event, children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label, like_pattern, options_from, options_to, projects_added_note, projects_added_payload, related_payload, send_time_recipient, unblocked_records, AttemptQuery, to_u32, Reservation,
 };
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId, EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, WaitingOn, ProjectWakeSettings, ServerSettings, WakeAttempt,
+    Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId, EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, WaitingOn, ProjectWakeSettings, ServerSettings, WakeAttempt, TurnState, WakeChannel,
 };
 
 pub struct PostgresStore {
@@ -2052,6 +2052,170 @@ impl Store for PostgresStore {
         .into_iter()
         .map(Into::into)
         .collect())
+    }
+
+    async fn report_turn(
+        &self,
+        session: SessionId,
+        state: Option<TurnState>,
+        channel: Option<WakeChannel>,
+        now: OffsetDateTime,
+    ) -> StoreResult<Option<SessionId>> {
+        let mut tx = self.pool.begin().await?;
+        let row =
+            sqlx::query("SELECT wake_task_id, wake_until FROM sessions WHERE id = $1 FOR UPDATE")
+                .bind(session.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(StoreError::NotFound("session"))?;
+        let task: Option<Uuid> = row.try_get("wake_task_id")?;
+        let until: Option<OffsetDateTime> = row.try_get("wake_until")?;
+        let cleared = state == Some(TurnState::Busy) && until.is_some() && task.is_none();
+        sqlx::query(
+            "UPDATE sessions
+                SET turn_state_at = CASE WHEN $1::text IS NOT NULL AND $1 <> turn_state THEN $2
+                                         ELSE turn_state_at END,
+                    turn_state = COALESCE($1, turn_state),
+                    wake_channel = COALESCE($3, wake_channel),
+                    wake_until = CASE WHEN $4 THEN NULL ELSE wake_until END
+              WHERE id = $5",
+        )
+        .bind(state.map(|s| s.as_str()))
+        .bind(now)
+        .bind(channel.map(|c| c.as_str()))
+        .bind(cleared)
+        .bind(session.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(cleared.then_some(session))
+    }
+
+    async fn reserve_session(&self, r: &Reservation) -> StoreResult<bool> {
+        // The guarded UPDATE is the lock: a concurrent reserver waits on the row lock, then
+        // re-checks the guard against the committed row and finds it reserved.
+        let done = sqlx::query(
+            "UPDATE sessions
+                SET wake_task_id = $1, wake_until = $2, last_woken_at = $3
+              WHERE id = $4
+                AND wake_channel <> 'none'
+                AND turn_state = 'idle' AND turn_state_at <= $5
+                AND last_heartbeat_at >= $6
+                AND (wake_until IS NULL OR wake_until <= $3)
+                AND (NOT $7 OR NOT EXISTS (
+                        SELECT 1 FROM tasks t
+                         WHERE t.owner_session_id = sessions.id
+                           AND t.status IN ('planning', 'claimed', 'blocked', 'review')))",
+        )
+        .bind(r.task.map(|t| t.as_uuid()))
+        .bind(r.until)
+        .bind(r.now)
+        .bind(r.session.as_uuid())
+        .bind(r.idle_before)
+        .bind(r.live_since)
+        .bind(r.new_job)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn clear_task_reservations(&self, task: TaskId) -> StoreResult<Vec<SessionId>> {
+        let mut ids: Vec<SessionId> = sqlx::query_scalar::<_, Uuid>(
+            "UPDATE sessions SET wake_task_id = NULL, wake_until = NULL
+              WHERE wake_task_id = $1 RETURNING id",
+        )
+        .bind(task.as_uuid())
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        ids.sort_by_key(|s| s.as_uuid());
+        Ok(ids)
+    }
+
+    async fn expire_reservations(
+        &self,
+        now: OffsetDateTime,
+    ) -> StoreResult<Vec<(SessionId, Option<TaskId>)>> {
+        let mut tx = self.pool.begin().await?;
+        let expired: Vec<(SessionId, Option<TaskId>)> = sqlx::query(
+            "SELECT id, wake_task_id FROM sessions WHERE wake_until <= $1
+              ORDER BY id FOR UPDATE",
+        )
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await?
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<Uuid, _>("id")?.into(),
+                row.try_get::<Option<Uuid>, _>("wake_task_id")?
+                    .map(Into::into),
+            ))
+        })
+        .collect::<StoreResult<_>>()?;
+        let ids: Vec<Uuid> = expired.iter().map(|(s, _)| s.as_uuid()).collect();
+        sqlx::query(
+            "UPDATE sessions SET wake_task_id = NULL, wake_until = NULL WHERE id = ANY($1)",
+        )
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(expired)
+    }
+
+    async fn wake_candidates(
+        &self,
+        live_since: OffsetDateTime,
+        idle_before: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> StoreResult<Vec<(Agent, Session)>> {
+        let sql = concat!(
+            "SELECT ",
+            session_cols!(),
+            ", a.id AS a_id, a.project_id AS a_project_id, a.host AS a_host,
+                    a.harness AS a_harness, a.created_at AS a_created_at
+             FROM sessions s JOIN agents a ON a.id = s.agent_id
+             WHERE s.last_heartbeat_at >= $1
+               AND s.turn_state = 'idle' AND s.turn_state_at <= $2
+               AND s.wake_channel <> 'none'
+               AND (s.wake_until IS NULL OR s.wake_until <= $3)
+             ORDER BY s.last_woken_at NULLS FIRST, s.turn_state_at, s.id"
+        );
+        sqlx::query(sql)
+            .bind(live_since)
+            .bind(idle_before)
+            .bind(now)
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(|row| Ok((agent_from(row, "a_")?, session_from(row)?)))
+            .collect()
+    }
+
+    async fn list_queued(&self, now: OffsetDateTime) -> StoreResult<Vec<Task>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            task_cols!(),
+            " FROM tasks
+               WHERE sanctioned
+                 AND (status = 'open'
+                      OR (status IN ('claimed', 'planning') AND lease_expires_at <= $1))
+                 AND NOT EXISTS (SELECT 1 FROM sessions s
+                                  WHERE s.wake_task_id = tasks.id AND s.wake_until > $1)
+               ORDER BY COALESCE((SELECT MAX(e.created_at) FROM task_events e
+                                   WHERE e.task_id = tasks.id AND e.kind = 'queued'),
+                                 tasks.lease_expires_at, tasks.created_at),
+                        tasks.id"
+        ))
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(task_from)
+        .collect()
     }
 
     async fn list_tasks(&self, filter: &TaskFilter) -> StoreResult<Vec<Task>> {
