@@ -200,15 +200,17 @@ of these (below).
 | The human replies to an agent's message (to that agent) | One live idle session of that agent. |
 | The human approves a plan or requests changes | The owner session. Approving also sanctions the task. |
 | The human creates a task with **Start now** | Routed to a free session. Unticked, it sits `open` for a pull. |
-| An agent creates a child of a sanctioned task | Routed to a free session (never the creator's agent), with no Needs-you card. |
+| The agent holding a sanctioned task creates a child of it | Routed to a free session (never the creator's agent), with no Needs-you card. |
 | An agent posts in a task another agent owns | The owner session, within the peer-wake guards below. |
 | A child is blocked, done or cancelled (Axle's note in the parent) | The parent's owner session. |
 | A sanctioned task is released or force-released | Routed again, or queued. A lease that runs out is placed by the ticker. |
 | An agent's `send_message`, or a top-level `task_create` | Nobody. Read at the next turn, or claimed by pull. |
 
-The **covering rule:** a child an agent creates under a sanctioned parent that is past its
-plan gate (no plan required, or the plan approved) is sanctioned and routed. Its own
-children are covered the same way. A child always sits where its parent sits in a chain of
+The **covering rule:** a child that the parent's holder (the session that currently holds
+it, the coordinator) creates under a sanctioned parent past its plan gate (no plan
+required, or the plan approved) is sanctioned and routed. Its own children are covered the
+same way when its holder creates them. A child any other agent creates under a sanctioned
+task is a plain `open` task, claimed by pull. A child always sits where its parent sits in a chain of
 requests (the parent's request depth and chain); it is not a new request. Children of an
 unsanctioned parent are plain `open` tasks, claimed by pull.
 

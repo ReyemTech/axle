@@ -513,23 +513,58 @@ async fn grandchild_is_covered() {
     let f1 = env.session_of(PA, "f1").await;
     let f2 = env.session_of(PA, "f2").await;
     env.idle(&f1).await;
-    env.idle(&f2).await;
 
     let child = env.child(&coordinator, &parent, "part 1").await;
     assert!(child.sanctioned);
-    let grandchild = env.child(&coordinator, &child, "part 1a").await;
+    assert_eq!(env.reserved_task(&f1).await, Some(child.id));
+    env.claim(&f1, child.id).await;
+    env.idle(&f2).await;
+    // The child's holder coordinates its own children.
+    let grandchild = env.child(&f1, &child, "part 1a").await;
     assert!(
         grandchild.sanctioned,
         "a child of a sanctioned child is covered"
     );
-    let mut reserved = vec![
-        env.reserved_task(&f1).await.unwrap(),
-        env.reserved_task(&f2).await.unwrap(),
-    ];
-    reserved.sort();
-    let mut expected = vec![child.id, grandchild.id];
-    expected.sort();
-    assert_eq!(reserved, expected);
+    assert_eq!(env.reserved_task(&f2).await, Some(grandchild.id));
+}
+
+#[tokio::test]
+async fn child_by_a_non_holder_is_pull_only() {
+    let env = Env::new().await;
+    let coordinator = env.session_of(PA, "c").await;
+    let parent = env.human_task(PA, "epic", true).await;
+    env.claim(&coordinator, parent.id).await;
+    let free = env.session_of(PA, "f").await;
+    env.idle(&free).await;
+
+    // Another agent of the same project, and an agent of another project, each create a
+    // child under the sanctioned task they do not hold.
+    let neighbour = env.session_of(PA, "n").await;
+    let foreign = env.session_of(PB, "x").await;
+    for by in [&neighbour, &foreign] {
+        let child = env.child(by, &parent, "unsanctioned part").await;
+        assert_eq!(child.status, TaskStatus::Open);
+        assert!(!child.sanctioned, "only the parent's holder is covered");
+        assert!(!env.get(child.id).await.sanctioned);
+        let kinds: Vec<_> = env
+            .store
+            .task_events(child.id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(!kinds.contains(&TaskEventKind::Routed));
+        assert!(!kinds.contains(&TaskEventKind::Queued));
+    }
+    assert_eq!(env.reserved_task(&free).await, None);
+    assert_eq!(env.sent().await, 0);
+
+    // The coordinator's covered child is still not the neighbour's to extend.
+    let child = env.child(&coordinator, &parent, "part 1").await;
+    assert!(child.sanctioned);
+    let stray = env.child(&neighbour, &child, "part 1a").await;
+    assert!(!stray.sanctioned);
 }
 
 #[tokio::test]

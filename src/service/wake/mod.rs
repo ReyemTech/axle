@@ -43,7 +43,7 @@ const EVENT_PAGE: u32 = 20;
 /// The window the peer-wake budgets count over.
 const PEER_WINDOW: Duration = Duration::HOUR;
 /// Statuses in which a session holds a task (its lineage source for requests and posts).
-const HELD: [TaskStatus; 4] = [
+pub(crate) const HELD: [TaskStatus; 4] = [
     TaskStatus::Planning,
     TaskStatus::Claimed,
     TaskStatus::Blocked,

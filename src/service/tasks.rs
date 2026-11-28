@@ -21,7 +21,7 @@ use crate::service::messages::{MessageError, SUBJECT_MAX, check_body, check_subj
 use crate::service::wake::guards::{
     self, DEDUPE_WINDOW, GuardError, Lineage, PENDING_PER_PROJECT, REQUESTS_PER_HOUR,
 };
-use crate::service::wake::{RouteOutcome, WakeService, held_origin};
+use crate::service::wake::{HELD, RouteOutcome, WakeService, held_origin};
 use crate::store::{
     AddProjectsRequest, BlockWrite, ClaimRequest, Claimant, EditRequest, LeaseUpdate, MoveRequest,
     Moved, RelateRequest, Related, Store, StoreError, TaskFilter, TransitionRequest, Transitioned,
@@ -734,12 +734,13 @@ impl TaskService {
             parent = Some(p);
         }
         // What routes the task once it is written (spec "Trigger rules"): the human's Start
-        // now, or the covering rule for an agent's child of a sanctioned task past its plan
-        // gate. Work requests route themselves; anything else is pull-only.
+        // now, or the covering rule for a child its parent's holder (the coordinator) creates
+        // under a sanctioned task past its plan gate. Work requests route themselves;
+        // anything else, including another agent's child of a sanctioned task, is pull-only.
         let trigger = match (&request, by, &parent) {
             (Some(_), _, _) => None,
             (None, Caller::Human, _) => new.start_now.then_some(WakeTrigger::StartNow),
-            (None, Caller::Agent(_), Some(p)) if covers_children(p) => {
+            (None, Caller::Agent(r), Some(p)) if covers_children(p, r) => {
                 Some(WakeTrigger::ChildOfSanctioned)
             }
             (None, Caller::Agent(_), _) => None,
@@ -2452,9 +2453,13 @@ impl TaskService {
 }
 
 /// The covering rule: a sanctioned task past its plan gate sanctions (and routes) the
-/// children an agent creates under it.
-fn covers_children(parent: &Task) -> bool {
-    parent.sanctioned && (!parent.requires_plan || parent.plan_state == PlanState::Approved)
+/// children its holder creates under it. Only the session that currently holds the parent
+/// (the coordinator) is covered; any other agent's child is pull-only.
+fn covers_children(parent: &Task, caller: &Resolved) -> bool {
+    parent.sanctioned
+        && (!parent.requires_plan || parent.plan_state == PlanState::Approved)
+        && parent.owner_session_id == Some(caller.session.id)
+        && HELD.contains(&parent.status)
 }
 
 /// Eligibility values are shown to models next to peer data, so they follow the same label

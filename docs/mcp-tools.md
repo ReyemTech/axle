@@ -284,9 +284,9 @@ Create an open task. Its body becomes the first message of its thread.
 ```
 
 Returns the task object with `body`. `task_create` never wakes anyone, with one exception:
-when `parent` is a sanctioned task already past its plan gate, the child is routed to a
-free session of its project at once (no approval card). A top-level `task_create` only
-queues an open task.
+when `parent` is a sanctioned task already past its plan gate and your session holds it, the
+child is routed to a free session of its project at once (no approval card). A child of a
+task you do not hold, and a top-level `task_create`, only queue an open task.
 
 Errors: `a task needs a title`,
 ``you have no home project; pass `project` (key or display name)``,
