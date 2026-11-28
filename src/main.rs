@@ -271,19 +271,25 @@ async fn main() -> ExitCode {
 async fn hook(event: axle::hook::Event, harness: axle::hook::Harness) {
     use std::io::{Read, Write};
     let work = async move {
-        let stdin = tokio::task::spawn_blocking(|| {
-            let mut buf = String::new();
-            let _ = std::io::stdin().take(1 << 20).read_to_string(&mut buf);
-            buf
-        })
-        .await
-        .unwrap_or_default();
+        // SessionStart needs nothing from its input, so it never waits on stdin.
+        let stdin = if event == axle::hook::Event::SessionStart {
+            String::new()
+        } else {
+            tokio::task::spawn_blocking(|| {
+                let mut buf = String::new();
+                let _ = std::io::stdin().take(1 << 20).read_to_string(&mut buf);
+                buf
+            })
+            .await
+            .unwrap_or_default()
+        };
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let token = std::env::var("AXL_TOKEN").ok();
         axle::hook::run(event, harness, &stdin, home.as_deref(), token.as_deref()).await
     };
-    // Hard ceiling on total runtime, including a stdin that never closes.
-    match tokio::time::timeout(std::time::Duration::from_secs(5), tokio::spawn(work)).await {
+    // Hard ceiling on total runtime, including a stdin that never closes: below the
+    // harnesses' 5 s hook timeout, so the hook ends on its own terms.
+    match tokio::time::timeout(axle::hook::CEILING, tokio::spawn(work)).await {
         Ok(Ok(out)) => {
             if let Some(stdout) = out.stdout {
                 let _ = writeln!(std::io::stdout(), "{stdout}");

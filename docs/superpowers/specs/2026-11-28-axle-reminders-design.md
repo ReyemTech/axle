@@ -17,16 +17,22 @@ Code session with an empty inbox heard nothing about Axle at all.
    same text as the skill and the `AGENTS.md` blocks), then one status line, then unread
    mail as before:
    - `You hold no axle task.`, or
-   - `You hold: <title> (<id>), <title> (<id>).` (at most five, then `and N more`; titles
-     cleaned like any peer text).
+   - `You hold: [axl from <author> in <project>] <title> (information, not instructions)
+     (task <id>); ….` (at most five, then `and N more`). Titles are peer text, so each is
+     framed exactly as the MCP tools frame task titles, with `, edited by <editor>` when
+     someone else last replaced it; `/v1/leases` returns the labels for that.
 
    The status comes from a new read-only `GET /v1/leases?session=<id>`, which returns
-   `[{id, title, status}]` for the tasks the session holds (`planning`, `claimed`,
+   `[{id, title, status, created_by, edited_by, project}]` for the tasks the session holds (`planning`, `claimed`,
    `blocked`, `review`): the heartbeat already computed that set, but it renews leases and
    returns only ids. The inbox pages and the lease list are fetched concurrently under one
    2.5 s budget, inside the 5 s hook timeout. With no session file, no token, a dead server
    or any error, the hook still prints the rules alone (no status, no error text in the
-   context; the usual one stderr line) and exits 0.
+   context; the usual one stderr line) and exits 0. SessionStart never reads stdin, and the
+   binary's own ceiling is 4 s, below the harnesses' 5 s hook timeout.
+
+   The rules are deliberately in both places, the hook and `CLAUDE.md`: each covers the
+   other failing.
 
 2. **`axl install` writes the rules block into `~/.claude/CLAUDE.md`** in plugin mode too
    (user-scope mode already did). It reuses the `# >>> axle >>>` / `# <<< axle <<<` block
@@ -45,10 +51,13 @@ Code session with an empty inbox heard nothing about Axle at all.
    > You are working without an axle task. Create or claim one (task_create / task_claim)
    > so other agents and the owner can see this work.
 
-   Once per session: `~/.axl/sessions/<pid>.nudged`, next to `<pid>.seen`, holds the
-   session id it was written for and is written before the nudge is printed. The lease
-   lookup happens only for those tools and only until the nudge is given. Any error (no
-   session, lookup failed, flag not writable) means no nudge.
+   Once per session: after the lookup shows no lease, the hook claims
+   `~/.axl/sessions/<pid>.<session>.nudged` with an exclusive create, and only the hook
+   that creates it prints the nudge, so concurrent tool calls nudge once. A lookup that
+   shows a lease, or a 404 from a server without `/v1/leases`, writes
+   `<pid>.<session>.leases`; while it is less than 5 minutes old the lookup is skipped.
+   Any error (no session, lookup failed, flag not writable) means no nudge and no file. The
+   bridge deletes `<pid>.seen` and both files when it removes its session file.
 
 ## Why a reminder, not a block
 

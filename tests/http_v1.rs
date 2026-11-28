@@ -434,7 +434,27 @@ async fn leases_lists_held_tasks_with_titles_and_renews_nothing() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body,
-        json!([{"id": task.id, "title": "rotate the keys", "status": "claimed"}])
+        json!([{
+            "id": task.id,
+            "title": "rotate the keys",
+            "status": "claimed",
+            "created_by": "human",
+            "edited_by": null,
+            "project": "github.com/acme/platform-infra",
+        }])
+    );
+    // The title's last editor, when not its author, is named so hooks can frame it.
+    app.state
+        .tasks
+        .edit(&resolved, task.id, Some("rotate all keys".into()), None)
+        .await
+        .unwrap();
+    let (_, body) = get(format!("/v1/leases?session={session}")).await;
+    assert_eq!(body[0]["title"], "rotate all keys");
+    assert_eq!(body[0]["created_by"], "human");
+    assert_eq!(
+        body[0]["edited_by"],
+        "github.com/acme/platform-infra/mac/claude-code"
     );
     // A read: the lease is not renewed (that is what the heartbeat is for).
     let after = app

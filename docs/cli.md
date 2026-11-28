@@ -158,7 +158,7 @@ and revocation, and `revoke` cuts one off by id. For normal onboarding use `axl 
 | `~/.axl/config.toml` | `server_url` and `port`, written by `login`, `install` and `service`. |
 | `~/.axl/token` | This machine's token, mode 0600. |
 | `~/.axl/install-manifest.json` | What `axl install` changed, for `axl uninstall`. |
-| `~/.axl/sessions/<pid>.json` | The bridge's session, for the hooks to find. `<pid>.seen` lists messages the hooks already surfaced; `<pid>.nudged` marks the one-time "working without an axle task" reminder as given. |
+| `~/.axl/sessions/<pid>.json` | The bridge's session, for the hooks to find. `<pid>.seen` lists messages the hooks already surfaced; `<pid>.<session>.nudged` marks the one-time "working without an axle task" reminder as given, and `<pid>.<session>.leases` caches "holds a task" for 5 minutes. The bridge removes them with the session file. |
 | `<file>.axl-backup-<UTC timestamp>` | A copy of a harness file from before it was edited. |
 | `~/.axl/logs/axl.log` | The local service's log. |
 

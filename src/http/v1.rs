@@ -225,29 +225,43 @@ async fn held(state: &AppState, r: &Resolved) -> Result<Vec<crate::domain::Task>
 #[derive(Debug, Serialize)]
 pub struct LeaseItem {
     pub id: TaskId,
+    /// Peer-written and not framed: clients frame it with the three labels below, the way
+    /// the MCP tools frame task titles.
     pub title: String,
     pub status: TaskStatus,
+    /// `human` or the author's agent label.
+    pub created_by: String,
+    /// Who last replaced the title, when that is not its author.
+    pub edited_by: Option<String>,
+    /// The task's project key.
+    pub project: String,
 }
 
-/// The tasks this session holds, with titles, for the SessionStart hook's status line. A
-/// plain read: unlike the heartbeat it renews nothing.
+/// The tasks this session holds, with titles, for the hooks. A plain read: unlike the
+/// heartbeat it renews nothing.
 async fn leases(
     State(state): State<AppState>,
     Extension(AuthToken(token)): Extension<AuthToken>,
     Query(q): Query<SessionQuery>,
 ) -> Result<Json<Vec<LeaseItem>>, ApiError> {
     let r = session_for(&state, token, q.session).await?;
-    Ok(Json(
-        held(&state, &r)
-            .await?
-            .into_iter()
-            .map(|t| LeaseItem {
-                id: t.id,
-                title: t.title,
-                status: t.status,
-            })
-            .collect(),
-    ))
+    let mut labels = crate::mcp::Labels::new(&*state.store);
+    let mut out = Vec::new();
+    for t in held(&state, &r).await? {
+        let (created_by, edited_by, project) = labels
+            .title_frame(&t)
+            .await
+            .map_err(|_| ApiError::internal("cannot label a held task"))?;
+        out.push(LeaseItem {
+            id: t.id,
+            title: t.title,
+            status: t.status,
+            created_by,
+            edited_by,
+            project,
+        });
+    }
+    Ok(Json(out))
 }
 
 // ---------------------------------------------------------------- events
