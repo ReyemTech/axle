@@ -4,7 +4,7 @@
 not show it, nobody could tell what the task was waiting on, and the owner could not change
 the reason while blocked ("cannot move a blocked task to blocked").
 
-**Model.** While a task is `blocked`, columns on `tasks` (migration `0007_blocked_detail`,
+**Model.** While a task is `blocked`, columns on `tasks` (migration `0006_blocked_detail`,
 both stores) hold `block_reason`, `blocked_at`, `waiting_kind` (`human` | `task` |
 `external`), `waiting_task_id`, `waiting_text` and `unblock_text`. Every write that leaves
 `blocked` clears them (transitions and claims); history keeps every earlier block. Tasks

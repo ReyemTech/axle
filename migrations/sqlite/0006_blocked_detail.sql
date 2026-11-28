@@ -1,6 +1,6 @@
 -- Blocked tasks say why and what unblocks them
--- (docs/superpowers/specs/2026-11-28-blocked-explained-design.md), Postgres flavour.
--- Kept in step with migrations/sqlite/0007_blocked_detail.sql.
+-- (docs/superpowers/specs/2026-11-28-blocked-explained-design.md), SQLite flavour.
+-- Kept in step with migrations/postgres/0006_blocked_detail.sql.
 --
 -- While a task is `blocked` these hold the reason, when it was blocked, what it waits on
 -- (`human`, another `task`, or `external` free text) and what would unblock it. They are all
@@ -8,13 +8,13 @@
 -- Tasks blocked before this migration get their reason and time from their latest
 -- `blocked` event.
 
-ALTER TABLE tasks ADD COLUMN block_reason text;
-ALTER TABLE tasks ADD COLUMN blocked_at timestamptz;
-ALTER TABLE tasks ADD COLUMN waiting_kind text
+ALTER TABLE tasks ADD COLUMN block_reason TEXT;
+ALTER TABLE tasks ADD COLUMN blocked_at TEXT;
+ALTER TABLE tasks ADD COLUMN waiting_kind TEXT
     CHECK (waiting_kind IS NULL OR waiting_kind IN ('human', 'task', 'external'));
-ALTER TABLE tasks ADD COLUMN waiting_task_id uuid REFERENCES tasks(id);
-ALTER TABLE tasks ADD COLUMN waiting_text text;
-ALTER TABLE tasks ADD COLUMN unblock_text text;
+ALTER TABLE tasks ADD COLUMN waiting_task_id TEXT REFERENCES tasks(id);
+ALTER TABLE tasks ADD COLUMN waiting_text TEXT;
+ALTER TABLE tasks ADD COLUMN unblock_text TEXT;
 
 UPDATE tasks
    SET block_reason = (SELECT e.note FROM task_events e
