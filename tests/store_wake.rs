@@ -13,7 +13,8 @@ use axle::domain::{
 };
 use axle::service::identity::{IdentityInput, IdentityService, Resolved};
 use axle::store::{
-    AttemptQuery, ClaimRequest, Claimant, LeaseUpdate, Store, TaskFilter, TransitionRequest,
+    AttemptQuery, ClaimRequest, Claimant, LeaseUpdate, Store, TaskFilter, TaskInsert,
+    TransitionRequest,
 };
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
@@ -70,6 +71,19 @@ fn task_in(project: ProjectId, title: &str, now: OffsetDateTime) -> Task {
 }
 
 async fn insert(store: &Arc<dyn Store>, task: &Task) {
+    assert_eq!(
+        insert_covered(store, task, None).await,
+        TaskInsert::Inserted {
+            sanctioned: task.sanctioned
+        }
+    );
+}
+
+async fn insert_covered(
+    store: &Arc<dyn Store>,
+    task: &Task,
+    cover: Option<SessionId>,
+) -> TaskInsert {
     let event = TaskEvent {
         id: uuid::Uuid::now_v7(),
         task_id: task.id,
@@ -93,12 +107,10 @@ async fn insert(store: &Arc<dyn Store>, task: &Task) {
         kind: MessageKind::Message,
         options: Vec::new(),
     };
-    assert!(
-        store
-            .insert_task(task, &[], None, &event, &first)
-            .await
-            .unwrap()
-    );
+    store
+        .insert_task(task, &[], cover, None, &event, &first)
+        .await
+        .unwrap()
 }
 
 store_matrix!(
@@ -151,6 +163,75 @@ store_matrix!(
         assert_eq!(store.get_task(t.id).await.unwrap().unwrap(), t);
     }
 );
+
+store_matrix!(covered_child_rechecks_parent_in_insert, |store: Arc<
+    dyn Store,
+>| async move {
+    // The covering rule is re-checked under the insert's lock: a child built from a
+    // snapshot of a parent its creator no longer holds is written pull-only.
+    let clock = TestClock::new(T0);
+    let a = agent(&store, &clock).await;
+    let b = agent(&store, &clock).await;
+    let project = a.project.as_ref().unwrap().id;
+    let mut held = task_in(project, "held", T0);
+    held.status = TaskStatus::Claimed;
+    held.owner_agent_id = Some(a.agent.id);
+    held.owner_session_id = Some(a.session.id);
+    held.lease_expires_at = Some(T0 + Duration::minutes(30));
+    held.sanctioned = true;
+    insert(&store, &held).await;
+    // Released (or force-released) after the snapshot: open, no holder.
+    let mut released = task_in(project, "released", T0);
+    released.sanctioned = true;
+    insert(&store, &released).await;
+    // Cancelled after the snapshot, still naming its last holder.
+    let mut cancelled = held.clone();
+    cancelled.id = TaskId::new();
+    cancelled.status = TaskStatus::Cancelled;
+    insert(&store, &cancelled).await;
+    // Held, but behind an unapproved plan gate.
+    let mut gated = held.clone();
+    gated.id = TaskId::new();
+    gated.requires_plan = true;
+    gated.plan_state = PlanState::Submitted;
+    gated.status = TaskStatus::Review;
+    insert(&store, &gated).await;
+    // Held, but no longer sanctioned.
+    let mut unsanctioned = held.clone();
+    unsanctioned.id = TaskId::new();
+    unsanctioned.sanctioned = false;
+    insert(&store, &unsanctioned).await;
+
+    let child = |parent: TaskId| {
+        let mut c = task_in(project, "child", T0);
+        c.parent_id = Some(parent);
+        c.sanctioned = true;
+        c
+    };
+    let cases = [
+        (held.id, Some(a.session.id), true),
+        (held.id, Some(b.session.id), false),
+        (released.id, Some(a.session.id), false),
+        (cancelled.id, Some(a.session.id), false),
+        (gated.id, Some(a.session.id), false),
+        (unsanctioned.id, Some(a.session.id), false),
+        // No covering rule (the human's Start now): `sanctioned` is written as given.
+        (released.id, None, true),
+    ];
+    for (parent, cover, sanctioned) in cases {
+        let c = child(parent);
+        assert_eq!(
+            insert_covered(&store, &c, cover).await,
+            TaskInsert::Inserted { sanctioned },
+            "parent {parent}, cover {cover:?}"
+        );
+        let got = store.get_task(c.id).await.unwrap().unwrap();
+        assert_eq!(
+            got.sanctioned, sanctioned,
+            "parent {parent}, cover {cover:?}"
+        );
+    }
+});
 
 store_matrix!(
     requested_is_not_claimable,

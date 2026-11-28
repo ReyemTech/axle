@@ -17,7 +17,8 @@ use axle::events::{Event, EventBus};
 use axle::service::identity::{IdentityInput, IdentityService, Resolved};
 use axle::service::wake::{RouteOutcome, WakeService, wake_text};
 use axle::store::{
-    AttemptQuery, ClaimRequest, Claimant, LeaseUpdate, Reservation, Store, TransitionRequest,
+    AttemptQuery, ClaimRequest, Claimant, LeaseUpdate, Reservation, Store, TaskInsert,
+    TransitionRequest,
 };
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
@@ -194,11 +195,14 @@ impl Env {
             kind: MessageKind::Message,
             options: Vec::new(),
         };
-        assert!(
+        assert_eq!(
             self.store
-                .insert_task(&task, &[], None, &event, &first)
+                .insert_task(&task, &[], None, None, &event, &first)
                 .await
-                .unwrap()
+                .unwrap(),
+            TaskInsert::Inserted {
+                sanctioned: task.sanctioned
+            }
         );
         task
     }

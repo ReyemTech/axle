@@ -10,12 +10,13 @@ use super::{
     AddProjectsRequest, AttemptQuery, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter,
     LeaseUpdate, MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome, Priced,
     Pricer, ProjectsAdded, Recipient, RelateRequest, Related, RepriceRow, RequestAdmission,
-    RequestInsert, Reservation, Store, StoreError, StoreResult, StoredUsage, TaskFilter, TaskOrder,
-    TaskScope, TransitionRequest, Transitioned, UnblockRule, Unblocked, UsageBatch, UsageCounts,
-    UsageFilter, UsageGroup, UsageRow, UsageWritten, block_previous_payload, child_event,
-    children_complete_event, claim_event, closes_child, edit_payload, eligible,
-    enrollment_token_label, like_pattern, options_from, options_to, projects_added_note,
-    projects_added_payload, related_payload, send_time_recipient, to_u32, unblocked_records,
+    RequestInsert, Reservation, Store, StoreError, StoreResult, StoredUsage, TaskFilter,
+    TaskInsert, TaskOrder, TaskScope, TransitionRequest, Transitioned, UnblockRule, Unblocked,
+    UsageBatch, UsageCounts, UsageFilter, UsageGroup, UsageRow, UsageWritten,
+    block_previous_payload, child_event, children_complete_event, claim_event, closes_child,
+    edit_payload, eligible, enrollment_token_label, like_pattern, options_from, options_to,
+    projects_added_note, projects_added_payload, related_payload, send_time_recipient, to_u32,
+    unblocked_records,
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId,
@@ -1449,26 +1450,46 @@ impl Store for PostgresStore {
         &self,
         task: &Task,
         extra_projects: &[ProjectId],
+        cover: Option<SessionId>,
         token: Option<TokenId>,
         event: &TaskEvent,
         first_message: &Message,
-    ) -> StoreResult<bool> {
+    ) -> StoreResult<TaskInsert> {
         let mut tx = self.pool.begin().await?;
+        let mut sanctioned = task.sanctioned;
         if let Some(parent) = task.parent_id {
-            // FOR SHARE holds off a concurrent claim moving the parent into `planning`.
-            let status: Option<String> =
-                sqlx::query_scalar("SELECT status FROM tasks WHERE id = $1 FOR SHARE")
-                    .bind(parent.as_uuid())
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            if status.as_deref() == Some("planning") {
+            // FOR SHARE holds off a concurrent claim moving the parent into `planning`, and a
+            // release, force-release or cancel that would end the covering rule. It is the
+            // only `tasks` row this write locks, so it needs no `TASK_LOCK`.
+            let row: Option<(String, bool)> = sqlx::query_as(
+                "SELECT status,
+                        COALESCE(sanctioned AND (NOT requires_plan OR plan_state = 'approved')
+                                   AND owner_session_id = $2
+                                   AND status IN ('planning', 'claimed', 'blocked', 'review'),
+                                 false)
+                   FROM tasks WHERE id = $1 FOR SHARE",
+            )
+            .bind(parent.as_uuid())
+            .bind(cover.map(|s| s.as_uuid()))
+            .fetch_optional(&mut *tx)
+            .await?;
+            if row.as_ref().is_some_and(|(status, _)| status == "planning") {
                 tx.commit().await?;
-                return Ok(false);
+                return Ok(TaskInsert::ParentPlanning);
             }
+            if cover.is_some() {
+                sanctioned &= row.is_some_and(|(_, covered)| covered);
+            }
+        } else if cover.is_some() {
+            sanctioned = false;
         }
-        write_task_rows(&mut tx, task, extra_projects, token, event, first_message).await?;
+        let task = Task {
+            sanctioned,
+            ..task.clone()
+        };
+        write_task_rows(&mut tx, &task, extra_projects, token, event, first_message).await?;
         tx.commit().await?;
-        Ok(true)
+        Ok(TaskInsert::Inserted { sanctioned })
     }
 
     async fn add_task_projects(

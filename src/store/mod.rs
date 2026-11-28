@@ -220,14 +220,21 @@ pub trait Store: Send + Sync {
     /// message of its thread in one transaction. `token` is the writer's token. A child task is
     /// refused (nothing written, `false`) while its parent is `planning`: the parent's status
     /// is read under the write lock, so the check and the insert are atomic.
+    ///
+    /// `cover` is the session the covering rule sanctions a child for: when `Some`, the child
+    /// keeps `task.sanctioned` only if, under the same lock, its parent is still sanctioned,
+    /// past its plan gate and held by that session (`planning`, `claimed`, `blocked` or
+    /// `review`); otherwise it is written pull-only (`sanctioned = false`). The outcome says
+    /// which was written.
     async fn insert_task(
         &self,
         task: &Task,
         extra_projects: &[ProjectId],
+        cover: Option<SessionId>,
         token: Option<TokenId>,
         event: &TaskEvent,
         first_message: &Message,
-    ) -> StoreResult<bool>;
+    ) -> StoreResult<TaskInsert>;
     /// Appends participating projects to a top-level task, in one transaction: locks the task,
     /// applies only if it has no parent, is not `done` / `cancelled` and `req.editor` is `None`
     /// (the human), its creator or the session holding it. Projects already listed are skipped;
@@ -825,6 +832,15 @@ pub struct RequestAdmission {
     pub per_hour: u32,
     /// `requested` tasks a project may hold.
     pub pending_cap: u32,
+}
+
+/// What [`Store::insert_task`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskInsert {
+    /// The task was written, with this `sanctioned` value.
+    Inserted { sanctioned: bool },
+    /// The parent is `planning`; nothing was written.
+    ParentPlanning,
 }
 
 /// What [`Store::insert_request`] did.

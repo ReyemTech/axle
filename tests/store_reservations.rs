@@ -11,7 +11,9 @@ use axle::domain::{
     SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TurnState, WakeChannel,
 };
 use axle::service::identity::{IdentityInput, IdentityService, Resolved};
-use axle::store::{ClaimRequest, Claimant, LeaseUpdate, Reservation, Store, TransitionRequest};
+use axle::store::{
+    ClaimRequest, Claimant, LeaseUpdate, Reservation, Store, TaskInsert, TransitionRequest,
+};
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
@@ -129,11 +131,14 @@ async fn insert(store: &Arc<dyn Store>, project: ProjectId, title: &str, sanctio
         kind: MessageKind::Message,
         options: Vec::new(),
     };
-    assert!(
+    assert_eq!(
         store
-            .insert_task(&task, &[], None, &event, &first)
+            .insert_task(&task, &[], None, None, &event, &first)
             .await
-            .unwrap()
+            .unwrap(),
+        TaskInsert::Inserted {
+            sanctioned: task.sanctioned
+        }
     );
     task
 }

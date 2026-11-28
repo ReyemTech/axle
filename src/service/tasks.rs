@@ -25,7 +25,7 @@ use crate::service::wake::{HELD, RouteOutcome, WakeService, held_origin};
 use crate::store::{
     AddProjectsRequest, BlockWrite, ClaimRequest, Claimant, EditRequest, LeaseUpdate, MoveRequest,
     Moved, RelateRequest, Related, RequestAdmission, RequestInsert, Store, StoreError, TaskFilter,
-    TransitionRequest, Transitioned, UnblockRule, claim_event,
+    TaskInsert, TransitionRequest, Transitioned, UnblockRule, claim_event,
 };
 
 /// The most links one task may have (both directions count).
@@ -773,7 +773,7 @@ impl TaskService {
         // now, or the covering rule for a child its parent's holder (the coordinator) creates
         // under a sanctioned task past its plan gate. Work requests route themselves;
         // anything else, including another agent's child of a sanctioned task, is pull-only.
-        let trigger = match (&request, by, &parent) {
+        let mut trigger = match (&request, by, &parent) {
             (Some(_), _, _) => None,
             (None, Caller::Human, _) => new.start_now.then_some(WakeTrigger::StartNow),
             (None, Caller::Agent(r), Some(p)) if covers_children(p, r) => {
@@ -846,12 +846,35 @@ impl TaskService {
             kind: MessageKind::Message,
             options: Vec::new(),
         };
+        // The covering rule was read from a snapshot; the store re-checks it under the insert's
+        // lock and writes the child pull-only if the parent was released, cancelled or
+        // re-gated in between.
+        let cover = match (trigger, by) {
+            (Some(WakeTrigger::ChildOfSanctioned), Caller::Agent(r)) => Some(r.session.id),
+            _ => None,
+        };
         let written = match admission {
-            None => {
-                self.store
-                    .insert_task(&task, &new.extra_projects, by.token(), &event, &first)
-                    .await?
-            }
+            None => match self
+                .store
+                .insert_task(
+                    &task,
+                    &new.extra_projects,
+                    cover,
+                    by.token(),
+                    &event,
+                    &first,
+                )
+                .await?
+            {
+                TaskInsert::Inserted { sanctioned } => {
+                    if !sanctioned && cover.is_some() {
+                        task.sanctioned = false;
+                        trigger = None;
+                    }
+                    true
+                }
+                TaskInsert::ParentPlanning => false,
+            },
             Some((admit, project_key)) => match self
                 .store
                 .insert_request(&task, by.token(), &event, &first, &admit)
