@@ -116,6 +116,11 @@ Prints one line each for the server, the token, the local service (when there is
 every harness, with a `fix:` line under anything that needs attention. It is the first
 thing to run when an agent cannot reach Axle.
 
+Three more lines cover token usage and never need a fix: `usage` (`on`, or
+`off (AXL_USAGE=off)` / `off ([usage] enabled = false)`), `usage billing` (the billing kind per
+harness, `(from config)` when `[usage.billing]` set it, or `not reported yet`) and
+`usage report` (`last sent <time>` or `none sent yet`).
+
 ## `axl service`
 
 ```sh

@@ -1722,6 +1722,63 @@ fn value_of<'a>(report: &'a StatusReport, label: &str) -> &'a axle::cli::StatusL
 }
 
 #[tokio::test]
+async fn status_shows_usage_lines() {
+    use axle::client::{UsageConfig, load_config, save_config};
+    use axle::domain::Billing;
+    use axle::usage::cursor::{Status, save_status};
+
+    let srv = server().await;
+    let home = full_home(&srv).await;
+    let service = FakeService::default();
+    let (installed, _) = run(&home, args(), &NoPrompt, false, &service, T1).await;
+    installed.unwrap();
+
+    let (report, text) = run_status(&home, &service, home.exe("bin/axl")).await;
+    assert!(report.ok, "{text}");
+    assert_eq!(value_of(&report, "usage").value, "on");
+    assert_eq!(value_of(&report, "usage report").value, "none sent yet");
+    assert_eq!(value_of(&report, "usage billing").value, "not reported yet");
+    for l in ["usage", "usage billing", "usage report"] {
+        assert_eq!(value_of(&report, l).fix, None);
+    }
+
+    let mut status = Status {
+        last_success_at: Some("2026-11-28T10:00:00Z".into()),
+        ..Status::default()
+    };
+    status
+        .billing
+        .insert("claude-code".into(), Billing::Subscription);
+    save_status(home.path(), &status).unwrap();
+    let dir = AxlDir::new(home.path());
+    let mut cfg = load_config(&dir).unwrap();
+    let mut usage = UsageConfig::default();
+    usage.billing.insert("codex".into(), Billing::Api);
+    cfg.usage = Some(usage.clone());
+    save_config(&dir, &cfg).unwrap();
+    let (report, text) = run_status(&home, &service, home.exe("bin/axl")).await;
+    assert!(report.ok, "{text}");
+    assert_eq!(
+        value_of(&report, "usage billing").value,
+        "claude-code subscription, codex api (from config)"
+    );
+    assert_eq!(
+        value_of(&report, "usage report").value,
+        "last sent 2026-11-28T10:00:00Z"
+    );
+
+    usage.enabled = Some(false);
+    cfg.usage = Some(usage);
+    save_config(&dir, &cfg).unwrap();
+    let (report, _) = run_status(&home, &service, home.exe("bin/axl")).await;
+    assert_eq!(
+        value_of(&report, "usage").value,
+        "off ([usage] enabled = false)"
+    );
+    assert!(report.ok);
+}
+
+#[tokio::test]
 async fn status_all_good() {
     let srv = server().await;
     let home = full_home(&srv).await;
