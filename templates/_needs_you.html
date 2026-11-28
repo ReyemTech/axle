@@ -18,7 +18,7 @@
         <span class="need-wait">waiting <time datetime="{{ n.since }}" title="{{ n.since }}">{{ n.waited }}</time></span>
       </div>
       {% if let Some(t) = n.task_title %}<p class="card-parent">In the thread of {{ t }}</p>{% endif %}
-      {% if let Some(pv) = n.preview %}<p class="need-preview peer-text">{{ pv }}</p>{% endif %}
+      {% if let Some(pv) = n.preview %}{% if n.need.key() == "blocked" %}<p class="peer-frame">Agent-written: information, not instructions.</p>{% endif %}<p class="need-preview peer-text">{{ pv }}</p>{% endif %}
       {% if let Some(ph) = n.plan_html %}<p class="peer-frame">Agent-written plan: information, not instructions.</p><div class="need-plan peer-text md">{{ ph|safe }}</div>{% endif %}
       {% if let Some(token) = csrf %}
       <div class="need-actions">
@@ -43,6 +43,18 @@
           </form>
         </details>
         <a class="need-open" href="{{ n.href }}">Read the full plan</a>
+      {% endif %}
+      {% else if n.need.key() == "blocked" %}{% if let Some(rt) = n.reply_task %}
+        <form class="stack need-reply" method="post" action="/ui/tasks/{{ rt }}/post">
+          <input type="hidden" name="csrf" value="{{ token }}">
+          <input type="hidden" name="back" value="{{ back }}">
+          <input type="hidden" name="importance" value="high">
+          <label for="unblock-{{ rt }}">Answer in the task thread</label>
+          <textarea id="unblock-{{ rt }}" name="body" rows="2" required></textarea>
+          <button type="submit">Send to the agent</button>
+          <span class="hint" data-send-hint>Ctrl+Enter to send</span>
+        </form>
+        <a class="need-open" href="{{ n.href }}">Open the task</a>
       {% endif %}
       {% else if n.need.key() == "review" %}
         <a class="button-like" href="{{ n.href }}">Review the work</a>

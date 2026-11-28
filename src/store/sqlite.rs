@@ -12,15 +12,15 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 use super::{
     AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate,
     MessageReceipt, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, Store,
-    StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, child_event,
-    children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label,
-    like_pattern, options_from, options_to, projects_added_note, projects_added_payload,
-    send_time_recipient,
+    StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, UnblockRule,
+    Unblocked, block_previous_payload, child_event, children_complete_event, claim_event,
+    closes_child, edit_payload, enrollment_token_label, like_pattern, options_from, options_to,
+    projects_added_note, projects_added_payload, send_time_recipient, unblocked_records,
 };
 use crate::domain::{
-    Actor, Address, Agent, AgentId, Eligibility, Enrollment, EnrollmentId, EnrollmentStatus,
-    Importance, InboxItem, Message, MessageId, Project, ProjectId, Session, SessionId, Task,
-    TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId, TokenInfo,
+    Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId,
+    EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId, Session,
+    SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId, TokenInfo, WaitingOn,
 };
 
 /// The columns `enrollment_from` reads (a macro so queries can `concat!` it statically).
@@ -169,7 +169,25 @@ fn task_from(row: &SqliteRow) -> StoreResult<Task> {
         version: row.try_get("version")?,
         requires_plan: row.try_get("requires_plan")?,
         plan_state: parse_text(row.try_get("plan_state")?)?,
+        block: block_from(row)?,
     })
+}
+
+fn block_from(row: &SqliteRow) -> StoreResult<Option<BlockDetail>> {
+    let Some(reason) = row.try_get::<Option<String>, _>("block_reason")? else {
+        return Ok(None);
+    };
+    let since: Option<&str> = row.try_get("blocked_at")?;
+    Ok(Some(BlockDetail {
+        reason,
+        since: since.map(ts::dec).transpose()?,
+        waiting_on: WaitingOn::from_columns(
+            row.try_get("waiting_kind")?,
+            opt_uuid(row, "waiting_task_id")?,
+            row.try_get("waiting_text")?,
+        ),
+        unblock: row.try_get("unblock_text")?,
+    }))
 }
 
 fn event_from(row: &SqliteRow) -> StoreResult<TaskEvent> {
@@ -296,7 +314,16 @@ macro_rules! task_cols {
         "id, project_id, parent_id, title, body, status, owner_session_id, owner_agent_id,
          lease_expires_at, lease_epoch, lease_ttl_secs, eligible_harness, eligible_host,
          created_by_agent_id, created_by_session_id, created_at, updated_at, version,
-         requires_plan, plan_state, done_at, acked_at"
+         requires_plan, plan_state, done_at, acked_at, block_reason, blocked_at, waiting_kind,
+         waiting_task_id, waiting_text, unblock_text"
+    };
+}
+
+/// `SET` assignments that empty a task's block detail (a literal, so queries stay static).
+macro_rules! clear_block {
+    () => {
+        "block_reason = NULL, blocked_at = NULL, waiting_kind = NULL, waiting_task_id = NULL,
+         waiting_text = NULL, unblock_text = NULL"
     };
 }
 
@@ -411,7 +438,9 @@ async fn claim_locked(
                                   ELSE plan_state END,
                 lease_expires_at = CASE WHEN status = 'planning' AND plan_state = 'submitted'
                                         THEN NULL ELSE ? END,
-                lease_epoch = lease_epoch + 1, version = version + 1, updated_at = ?
+                lease_epoch = lease_epoch + 1, version = version + 1, updated_at = ?, ",
+        clear_block!(),
+        "
           WHERE id = ?
             AND (status = 'open'
                  OR (status IN ('claimed', 'planning') AND lease_expires_at < ?)
@@ -616,6 +645,111 @@ async fn update_owned(
     }
     tx.commit().await?;
     Ok(changed)
+}
+
+/// Whether `task` may wait on `target` (see `BlockWrite`): the target exists and is not
+/// closed, is neither the task nor one of its ancestors, and the chain of tasks the target
+/// waits on never reaches `task`.
+async fn wait_allowed(
+    conn: &mut SqliteConnection,
+    task: TaskId,
+    target: TaskId,
+) -> StoreResult<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM tasks WHERE id = ?1
+                                              AND status NOT IN ('done', 'cancelled'))
+            AND ?1 <> ?2
+            AND ?1 NOT IN (WITH RECURSIVE anc(id) AS (
+                               SELECT parent_id FROM tasks WHERE id = ?2 AND parent_id IS NOT NULL
+                               UNION
+                               SELECT t.parent_id FROM tasks t JOIN anc ON t.id = anc.id
+                                WHERE t.parent_id IS NOT NULL)
+                           SELECT id FROM anc)
+            AND ?2 NOT IN (WITH RECURSIVE chain(id) AS (
+                               SELECT ?1
+                               UNION
+                               SELECT t.waiting_task_id FROM tasks t JOIN chain ON t.id = chain.id
+                                WHERE t.status = 'blocked' AND t.waiting_kind = 'task'
+                                  AND t.waiting_task_id IS NOT NULL)
+                           SELECT id FROM chain)",
+    )
+    .bind(target.to_string())
+    .bind(task.to_string())
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
+/// `done` just became done: applies `rule` to every blocked task waiting on it.
+async fn unblock_waiting(
+    conn: &mut SqliteConnection,
+    done: &Task,
+    req: &TransitionRequest,
+    rule: UnblockRule,
+) -> StoreResult<Vec<Unblocked>> {
+    let waiting: Vec<Task> = sqlx::query(concat!(
+        "SELECT ",
+        task_cols!(),
+        " FROM tasks
+         WHERE status = 'blocked' AND waiting_kind = 'task' AND waiting_task_id = ?
+         ORDER BY created_at, id"
+    ))
+    .bind(done.id.to_string())
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(task_from)
+    .collect::<StoreResult<_>>()?;
+    let now = ts::enc(req.now);
+    let mut out = Vec::with_capacity(waiting.len());
+    for dep in waiting {
+        let live: bool = match dep.owner_session_id {
+            Some(s) => {
+                sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM sessions
+                                     WHERE id = ? AND last_heartbeat_at >= ?)",
+                )
+                .bind(s.to_string())
+                .bind(ts::enc(rule.live_since))
+                .fetch_one(&mut *conn)
+                .await?
+            }
+            None => false,
+        };
+        let row = if live {
+            sqlx::query(concat!(
+                "UPDATE tasks SET status = 'claimed', lease_expires_at = ?, ",
+                clear_block!(),
+                ", version = version + 1, updated_at = ?
+                 WHERE id = ? AND status = 'blocked' RETURNING ",
+                task_cols!()
+            ))
+            .bind(ts::enc(req.now + dep.lease_ttl.unwrap_or(rule.default_ttl)))
+            .bind(&now)
+            .bind(dep.id.to_string())
+            .fetch_optional(&mut *conn)
+            .await?
+        } else {
+            sqlx::query(concat!(
+                "UPDATE tasks SET status = 'open', owner_session_id = NULL, owner_agent_id = NULL,
+                        lease_expires_at = NULL, plan_state = 'none', ",
+                clear_block!(),
+                ", version = version + 1, updated_at = ?
+                 WHERE id = ? AND status = 'blocked' RETURNING ",
+                task_cols!()
+            ))
+            .bind(&now)
+            .bind(dep.id.to_string())
+            .fetch_optional(&mut *conn)
+            .await?
+        };
+        let Some(row) = row else { continue };
+        let task = task_from(&row)?;
+        let (event, note) = unblocked_records(&task, done, !live, req.event.actor, req.now);
+        record_event(conn, &task, &event, req.token).await?;
+        insert_message(conn, &note, req.token).await?;
+        out.push(Unblocked { task, note });
+    }
+    Ok(out)
 }
 
 /// An FTS5 query matching every whitespace-separated word of `query` as a literal phrase, so
@@ -1533,7 +1667,34 @@ impl Store for SqliteStore {
                     .join(",")
             )
         });
+        let block = req.block.clone().unwrap_or_default();
+        let set_waiting = block.waiting_on.is_some();
+        let waiting = block.waiting_on.as_ref();
         let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        if let Some(target) = waiting.and_then(|w| w.task())
+            && !wait_allowed(&mut tx, req.task, target).await?
+        {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        // The values an update replaces, read under the write lock.
+        let mut event = req.event.clone();
+        if block.record_previous {
+            let previous =
+                sqlx::query(concat!("SELECT ", task_cols!(), " FROM tasks WHERE id = ?"))
+                    .bind(req.task.to_string())
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .as_ref()
+                    .map(task_from)
+                    .transpose()?
+                    .and_then(|t| t.block);
+            event.payload = Some(block_previous_payload(
+                event.payload.as_ref(),
+                previous.as_ref(),
+            ));
+        }
+        let to = req.to.map(|s| s.as_str());
         let updated = sqlx::query(concat!(
             "UPDATE tasks
                 SET status = COALESCE(?, status),
@@ -1546,6 +1707,19 @@ impl Store for SqliteStore {
                                    ELSE NULL END,
                     acked_at = CASE WHEN COALESCE(?, status) = 'done' THEN acked_at
                                     ELSE NULL END,
+                    block_reason = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
+                                        ELSE COALESCE(?, block_reason) END,
+                    blocked_at = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
+                                      WHEN status <> 'blocked' THEN ?
+                                      ELSE blocked_at END,
+                    waiting_kind = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
+                                        WHEN ? THEN ? ELSE waiting_kind END,
+                    waiting_task_id = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
+                                           WHEN ? THEN ? ELSE waiting_task_id END,
+                    waiting_text = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
+                                        WHEN ? THEN ? ELSE waiting_text END,
+                    unblock_text = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
+                                        ELSE COALESCE(?, unblock_text) END,
                     version = version + 1, updated_at = ?
               WHERE id = ?
                 AND instr(?, ',' || status || ',') > 0
@@ -1568,6 +1742,21 @@ impl Store for SqliteStore {
         .bind(ts::enc(req.now))
         .bind(req.to.map(|s| s.as_str()))
         .bind(req.to.map(|s| s.as_str()))
+        .bind(to)
+        .bind(&block.reason)
+        .bind(to)
+        .bind(ts::enc(req.now))
+        .bind(to)
+        .bind(set_waiting)
+        .bind(waiting.map(|w| w.kind()))
+        .bind(to)
+        .bind(set_waiting)
+        .bind(waiting.and_then(|w| w.task()).map(|t| t.to_string()))
+        .bind(to)
+        .bind(set_waiting)
+        .bind(waiting.and_then(|w| w.text()))
+        .bind(to)
+        .bind(&block.unblock)
         .bind(ts::enc(req.now))
         .bind(req.task.to_string())
         .bind(from)
@@ -1586,7 +1775,7 @@ impl Store for SqliteStore {
             tx.commit().await?;
             return Ok(None);
         };
-        let children_complete = record_event(&mut tx, &task, &req.event, req.token).await?;
+        let children_complete = record_event(&mut tx, &task, &event, req.token).await?;
         if req.archive_plans {
             sqlx::query(
                 "UPDATE message_recipients
@@ -1604,10 +1793,17 @@ impl Store for SqliteStore {
         if let Some(message) = &req.message {
             insert_message(&mut tx, message, req.token).await?;
         }
+        let unblocked = match req.unblock {
+            Some(rule) if req.to == Some(TaskStatus::Done) && task.status == TaskStatus::Done => {
+                unblock_waiting(&mut tx, &task, req, rule).await?
+            }
+            _ => Vec::new(),
+        };
         tx.commit().await?;
         Ok(Some(Transitioned {
             task,
             children_complete,
+            unblocked,
         }))
     }
 

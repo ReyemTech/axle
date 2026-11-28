@@ -17,11 +17,11 @@ use serde_json::{Value, json};
 use super::{AxleMcp, Labels, ToolError, project_view, render, timestamp};
 use crate::domain::{
     Address, Agent, Eligibility, Importance, MessageId, Project, ProjectId, Session, SessionId,
-    TaskId, TaskStatus,
+    TaskId, TaskStatus, WaitingOn,
 };
 use crate::service::identity::Resolved;
 use crate::service::messages::{InboxFilter, NewMessage, check_body, check_subject};
-use crate::service::tasks::{Caller, ClaimOutcome, Completion, NewTask};
+use crate::service::tasks::{BlockInput, Caller, ClaimOutcome, Completion, NewTask, UNBLOCK_MAX};
 use crate::store::{DoneFilter, TaskFilter};
 
 /// Page size for inbox and search results when none is asked for, and the most allowed.
@@ -246,14 +246,33 @@ pub enum UpdateStatusParam {
     Review,
 }
 
+/// What a blocked task waits on: exactly one of the three.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WaitingOnParam {
+    /// `true`: waits on the human (shown to them as "Blocked on you").
+    pub human: Option<bool>,
+    /// Waits on this task (id); when it is done, yours is unblocked automatically.
+    pub task: Option<String>,
+    /// Waits on something outside Axle, in words (at most 500 characters).
+    pub external: Option<String>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TaskUpdateParams {
     /// Task id.
     pub id: String,
     /// `blocked` (needs `reason`) or `review` (work done, awaiting the coordinator / human).
+    /// `blocked` on a task you already hold blocked updates its reason, `waiting_on` and/or
+    /// `unblock`.
     pub status: Option<UpdateStatusParam>,
     /// Why it is blocked, or a note for review.
     pub reason: Option<String>,
+    /// With `status: blocked`: what it waits on, `{"human": true}`, `{"task": "<id>"}` or
+    /// `{"external": "<text>"}`.
+    pub waiting_on: Option<WaitingOnParam>,
+    /// With `status: blocked`: what would unblock it (at most 500 characters).
+    pub unblock: Option<String>,
     /// New title (creator or owner only).
     pub title: Option<String>,
     /// New body (creator or owner only).
@@ -445,9 +464,12 @@ impl AxleMcp {
     }
 
     #[tool(description = described!(
-        "Set a task you own to `blocked` (with a reason) or `review`, edit its title or body \
-         (creator or owner), and/or add participating projects to a top-level task \
-         (`add_projects`; creator or owner)."
+        "Set a task you own to `blocked` (with a reason, and optionally `waiting_on` and \
+         `unblock`: what it waits on and what would unblock it) or `review`, edit its title or \
+         body (creator or owner), and/or add participating projects to a top-level task \
+         (`add_projects`; creator or owner). `blocked` on a task you hold blocked updates its \
+         reason, `waiting_on` or `unblock`. A task waiting on another task is unblocked when \
+         that task is done."
     ))]
     async fn task_update(
         &self,
@@ -1006,6 +1028,24 @@ impl AxleMcp {
                 "`reason` goes with `status`; pass `status: blocked` or `status: review`",
             ));
         }
+        let blocking = matches!(p.status, Some(UpdateStatusParam::Blocked));
+        if (p.waiting_on.is_some() || p.unblock.is_some()) && !blocking {
+            return Err(ToolError::invalid(
+                "`waiting_on` and `unblock` go with `status: blocked`",
+            ));
+        }
+        let waiting_on = match p.waiting_on {
+            Some(w) => Some(waiting_on(w)?),
+            None => None,
+        };
+        if p.unblock
+            .as_deref()
+            .is_some_and(|u| u.trim().chars().count() > UNBLOCK_MAX)
+        {
+            return Err(ToolError::invalid(
+                "`unblock` is at most 500 characters: say briefly what would unblock the task",
+            ));
+        }
         if p.title.as_deref().is_some_and(|t| t.trim().is_empty()) {
             return Err(ToolError::invalid("a task needs a title"));
         }
@@ -1019,14 +1059,20 @@ impl AxleMcp {
         if let Some(reason) = &reason {
             check_body(reason).map_err(ToolError::from)?;
         }
-        if matches!(p.status, Some(UpdateStatusParam::Blocked)) && reason.is_none() {
-            return Err(ToolError::invalid("a reason is required to block a task"));
-        }
         let mut task = match p.status {
+            // A first block needs a reason; the service says so (an update may omit it).
             Some(UpdateStatusParam::Blocked) => Some(
                 self.state
                     .tasks
-                    .block(me, id, reason.as_deref().unwrap_or_default())
+                    .block_with(
+                        me,
+                        id,
+                        BlockInput {
+                            reason,
+                            waiting_on,
+                            unblock: p.unblock,
+                        },
+                    )
                     .await?,
             ),
             Some(UpdateStatusParam::Review) => {
@@ -1218,4 +1264,24 @@ fn page(limit: Option<u32>) -> u32 {
 
 fn non_blank(s: Option<String>) -> Option<String> {
     s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// `waiting_on` as the service takes it: exactly one of `human: true`, `task`, `external`.
+fn waiting_on(w: WaitingOnParam) -> Result<WaitingOn, ToolError> {
+    const SHAPE: &str = "`waiting_on` takes exactly one of {\"human\": true}, \
+                         {\"task\": \"<id>\"} or {\"external\": \"<text>\"}";
+    match (w.human, w.task, w.external) {
+        (Some(true), None, None) => Ok(WaitingOn::Human),
+        (None, Some(t), None) => Ok(WaitingOn::Task(parse_id("waiting_on task", &t)?)),
+        (None, None, Some(text)) => match non_blank(Some(text)) {
+            Some(text) if text.chars().count() > UNBLOCK_MAX => Err(ToolError::invalid(
+                "`waiting_on.external` is at most 500 characters",
+            )),
+            Some(text) => Ok(WaitingOn::External(text)),
+            None => Err(ToolError::invalid(
+                "`waiting_on.external` needs some text: what does the task wait on?",
+            )),
+        },
+        _ => Err(ToolError::invalid(SHAPE)),
+    }
 }

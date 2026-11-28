@@ -274,6 +274,22 @@ pub struct CardView {
     /// The running lease of a claimed task.
     pub lease: Option<LeaseView>,
     pub progress: Option<ProgressView>,
+    /// A blocked task's reason: its first line, cut short (agent-written text).
+    pub blocked_line: Option<String>,
+    /// A blocked task waits on the human.
+    pub blocked_on_you: bool,
+}
+
+/// Characters of a blocked task's reason shown on its card.
+const BLOCKED_LINE: usize = 90;
+
+/// The first non-blank line of `reason`, cut to `BLOCKED_LINE` characters.
+pub(super) fn first_line(reason: &str) -> Option<String> {
+    let line = reason.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(match line.char_indices().nth(BLOCKED_LINE) {
+        Some((cut, _)) => format!("{}…", line[..cut].trim_end()),
+        None => line.to_string(),
+    })
 }
 
 /// A running lease: seconds left out of its full length, and the same in words.
@@ -440,6 +456,11 @@ async fn card(labels: &mut Labels<'_>, ctx: CardCtx, task: &Task) -> StoreResult
         parent,
         lease: lease_view(ctx.now, ctx.lease_ttl, task),
         progress,
+        blocked_line: task.block.as_ref().and_then(|b| first_line(&b.reason)),
+        blocked_on_you: task
+            .block
+            .as_ref()
+            .is_some_and(|b| b.waiting_on == Some(crate::domain::WaitingOn::Human)),
     })
 }
 

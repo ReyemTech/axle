@@ -1164,3 +1164,110 @@ store_matrix!(
         }
     }
 );
+
+store_matrix!(
+    task_update_blocks_with_waiting_on_and_unblock,
+    |store: Arc<dyn Store>| async move {
+        let server = start(store).await;
+        let a = server.agent("mac", "claude-code").await;
+        let b = server.agent("linux", "codex").await;
+        let schema = ok(&b, "task_create", json!({"title": "schema", "body": "b"})).await;
+        let sid = schema["id"].as_str().unwrap();
+        ok(&b, "task_claim", json!({"id": sid})).await;
+        let api = ok(&a, "task_create", json!({"title": "api", "body": "b"})).await;
+        let id = api["id"].as_str().unwrap();
+        ok(&a, "task_claim", json!({"id": id})).await;
+        let before = ok(&a, "task_get", json!({"id": id})).await;
+
+        // Malformed input is refused before anything is written.
+        for args in [
+            json!({"id": id, "status": "blocked", "waiting_on": {"human": true}}),
+            json!({"id": id, "status": "blocked", "reason": "r", "waiting_on": {}}),
+            json!({"id": id, "status": "blocked", "reason": "r",
+               "waiting_on": {"human": true, "task": sid}}),
+            json!({"id": id, "status": "blocked", "reason": "r", "waiting_on": {"human": false}}),
+            json!({"id": id, "status": "blocked", "reason": "r", "waiting_on": {"task": "nope"}}),
+            json!({"id": id, "status": "blocked", "reason": "r", "waiting_on": {"external": " "}}),
+            json!({"id": id, "status": "blocked", "reason": "r", "waiting_on": {"task": id}}),
+            json!({"id": id, "status": "blocked", "reason": "r", "unblock": "u".repeat(501)}),
+            json!({"id": id, "status": "review", "unblock": "x"}),
+            json!({"id": id, "title": "t", "waiting_on": {"human": true}}),
+        ] {
+            let (is_error, text) = call(&a, "task_update", args.clone()).await;
+            assert!(is_error, "{args}: {text}");
+            let after = ok(&a, "task_get", json!({"id": id})).await;
+            assert_eq!(
+                after, before,
+                "task changed after a rejected update: {args}"
+            );
+        }
+        let (_, text) = call(
+            &a,
+            "task_update",
+            json!({"id": id, "status": "blocked", "reason": "r", "waiting_on": {"task": id}}),
+        )
+        .await;
+        assert!(text.contains("cannot wait on itself"), "{text}");
+
+        let blocked = ok(
+            &a,
+            "task_update",
+            json!({"id": id, "status": "blocked", "reason": "needs the schema",
+               "waiting_on": {"task": sid}, "unblock": "schema merged"}),
+        )
+        .await;
+        assert_eq!(blocked["status"], "blocked");
+        assert_eq!(blocked["blocked"]["waiting_on"]["task"], sid);
+        let reason = blocked["blocked"]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("needs the schema") && reason.contains(WRAP_TAIL),
+            "{reason}"
+        );
+        assert!(
+            blocked["blocked"]["unblock"]
+                .as_str()
+                .unwrap()
+                .contains("schema merged")
+        );
+
+        // The schema task waiting on the api task would close a loop.
+        let (is_error, text) = call(
+            &b,
+            "task_update",
+            json!({"id": sid, "status": "blocked", "reason": "r", "waiting_on": {"task": id}}),
+        )
+        .await;
+        assert!(is_error && text.contains("cycle"), "{text}");
+
+        // Updating while blocked is not a status-change error.
+        let updated = ok(
+            &a,
+            "task_update",
+            json!({"id": id, "status": "blocked", "unblock": "schema merged and deployed"}),
+        )
+        .await;
+        assert_eq!(updated["status"], "blocked");
+        assert!(
+            updated["blocked"]["unblock"]
+                .as_str()
+                .unwrap()
+                .contains("deployed")
+        );
+        let detail = ok(&a, "task_get", json!({"id": id})).await;
+        let kinds: Vec<&str> = detail["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap())
+            .collect();
+        assert!(kinds.contains(&"block_updated"), "{kinds:?}");
+
+        // Finishing the schema unblocks the api task.
+        ok(&b, "task_complete", json!({"id": sid, "summary": "done"})).await;
+        let after = ok(&a, "task_get", json!({"id": id})).await;
+        assert_eq!(after["task"]["status"], "claimed", "{after}");
+        assert!(after["task"].get("blocked").is_none(), "{after}");
+        a.cancel().await.unwrap();
+        b.cancel().await.unwrap();
+    }
+);
