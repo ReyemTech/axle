@@ -47,6 +47,22 @@
       {% else if n.need.key() == "review" %}
         <a class="button-like" href="{{ n.href }}">Review the work</a>
       {% else %}
+        {% if let Some(r) = n.reply %}{% if let Some(mid) = n.message_id %}
+        <form class="stack quick-form" method="post" action="/ui/messages">
+          <input type="hidden" name="csrf" value="{{ token }}">
+          <input type="hidden" name="back" value="{{ back }}">
+          <input type="hidden" name="to_kind" value="{{ r.to_kind }}">
+          <input type="hidden" name="to" value="{{ r.to }}">
+          <input type="hidden" name="reply_to" value="{{ mid }}">
+          <input type="hidden" name="subject" value="{{ r.subject }}">
+          <div class="quick-replies" role="group" aria-labelledby="quick-label-{{ mid }}">
+            <span id="quick-label-{{ mid }}" class="quick-label">Quick reply:</span>
+            {% for o in n.options %}<button type="submit" class="secondary quick-reply" name="option" value="{{ o }}">{{ o }}</button>{% endfor %}
+          </div>
+          <label for="quick-note-{{ mid }}">Add a note <span class="muted">(optional, sent below the answer)</span></label>
+          <textarea id="quick-note-{{ mid }}" name="body" rows="2"></textarea>
+        </form>
+        {% endif %}{% endif %}
         <a class="button-like" href="{{ n.href }}">Open and reply</a>
         {% if let Some(mid) = n.message_id %}
         <form method="post" action="/ui/inbox/{{ mid }}/dismiss">

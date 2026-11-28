@@ -13,7 +13,7 @@ use super::task_page::{MessageView, message_view};
 use super::views::{
     Labels, ProjectOption, Pulse, UiError, UiResult, html, project_options, pulse_counts,
 };
-use crate::domain::{Actor, Address, MessageId};
+use crate::domain::{Actor, Address, Message, MessageId};
 use crate::http::AppState;
 use crate::service::messages::InboxFilter;
 use crate::service::tasks::Caller;
@@ -224,25 +224,14 @@ pub async fn inbox(
                 .await?
                 .first()
                 .map(|r| r.state());
-            let reply = match (m.task_id, m.from) {
-                (Some(t), _) => Some(ReplyTarget {
-                    to_kind: "task",
-                    to: t.to_string(),
-                    label: v.task.as_ref().map_or_else(
-                        || "the thread".into(),
-                        |(_, title)| format!("thread: {title}"),
-                    ),
-                    subject: String::new(),
-                }),
-                (None, Actor::Agent(agent, _)) => Some(ReplyTarget {
-                    to_kind: "agent",
-                    to: agent.to_string(),
-                    label: v.from.clone(),
-                    subject: reply_subject(m.subject.as_deref()),
-                }),
-                // The human's own message: no one to reply to.
-                (None, Actor::Human) => None,
-            };
+            let reply = reply_target(m).map(|mut r| {
+                r.label = match (m.task_id, &v.task) {
+                    (Some(_), Some((_, title))) => format!("thread: {title}"),
+                    (Some(_), None) => "the thread".into(),
+                    (None, _) => v.from.clone(),
+                };
+                r
+            });
             (Some(v), reply, m.to == Address::Human)
         }
         None => (None, None, false),
@@ -279,6 +268,27 @@ pub async fn inbox(
         projects: project_options(&labels, None),
         agents,
     })
+}
+
+/// Where the human's reply to `m` goes: its task thread, else its sending agent (with an
+/// empty `label` for the caller to fill). `None` for the human's own messages.
+pub(super) fn reply_target(m: &Message) -> Option<ReplyTarget> {
+    match (m.task_id, m.from) {
+        (Some(t), _) => Some(ReplyTarget {
+            to_kind: "task",
+            to: t.to_string(),
+            label: String::new(),
+            subject: String::new(),
+        }),
+        (None, Actor::Agent(agent, _)) => Some(ReplyTarget {
+            to_kind: "agent",
+            to: agent.to_string(),
+            label: String::new(),
+            subject: reply_subject(m.subject.as_deref()),
+        }),
+        // The human's own message: no one to reply to.
+        (None, Actor::Human) => None,
+    }
 }
 
 /// `Re: <subject>` (not doubled).

@@ -3156,6 +3156,47 @@ fn hidden_values(page: &Page, css: &str) -> Vec<String> {
         .collect()
 }
 
+// ---------------------------------------------------------------- quick replies
+
+const HOSTILE: &str = "<script>alert(1)</script>";
+
+/// An urgent question from `from` to the human offering `options`.
+async fn question(
+    app: &App,
+    from: &Resolved,
+    subject: &str,
+    options: &[&str],
+) -> axle::domain::Message {
+    let options: Vec<String> = options.iter().map(|o| o.to_string()).collect();
+    app.state
+        .messages
+        .send_with_options(
+            &Actor::Agent(from.agent.id, from.session.id),
+            NewMessage {
+                to: Address::Human,
+                subject: Some(subject.into()),
+                body: "which way?".into(),
+                importance: Importance::Urgent,
+                reply_to: None,
+            },
+            &options,
+        )
+        .await
+        .unwrap()
+}
+
+/// Bodies of the mail waiting for `agent`.
+async fn agent_bodies(app: &App, agent: &Resolved) -> Vec<String> {
+    app.state
+        .messages
+        .inbox(agent, axle::service::messages::InboxFilter::default())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| i.message.body)
+        .collect()
+}
+
 #[tokio::test]
 async fn history_lists_every_done_task_paged() {
     let app = app().await;
@@ -3590,4 +3631,156 @@ async fn markdown_renders_in_plan_thread_inbox_and_needs_you() {
         "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
          connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
     );
+}
+
+#[tokio::test]
+async fn quick_replies_render_as_escaped_labelled_buttons() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let q = question(&app, &infra, "Deploy?", &["Yes", HOSTILE]).await;
+    let plain = urgent_to_human(&app, &infra, "No options").await;
+
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    assert!(!board.body.contains(HOSTILE), "option text is escaped");
+    assert!(board.body.contains("&#60;script&#62;"), "{}", board.body);
+    let card = format!(".need-card:has(input[name=reply_to][value='{}'])", q.id);
+    assert_eq!(
+        select_texts(&board, &format!("{card} .quick-label")),
+        ["Quick reply:"]
+    );
+    assert_eq!(
+        select_texts(&board, &format!("{card} button.quick-reply")),
+        ["Yes", HOSTILE]
+    );
+    assert_eq!(
+        select_texts(&board, &format!("{card} textarea[name=body]")).len(),
+        1,
+        "a free-text note sits under the buttons"
+    );
+    // A card without options keeps its plain actions only.
+    assert_eq!(select_texts(&board, "button.quick-reply").len(), 2);
+    assert_eq!(
+        select_texts(
+            &board,
+            ".need-card[data-need=reply] button:not(.quick-reply)"
+        ),
+        ["Dismiss", "Dismiss"]
+    );
+
+    let reader = app
+        .get(&format!("/ui/inbox?m={}", q.id), Some(&cookie))
+        .await;
+    assert!(!reader.body.contains(HOSTILE));
+    assert_eq!(
+        select_texts(&reader, "form.reply .quick-label"),
+        ["Quick reply:"]
+    );
+    assert_eq!(
+        select_texts(&reader, "form.reply button.quick-reply"),
+        ["Yes", HOSTILE]
+    );
+    // Buttons send without the typed text being required; the text box stays.
+    assert_eq!(
+        select_texts(&reader, "form.reply button.quick-reply[formnovalidate]").len(),
+        2
+    );
+    assert_eq!(
+        select_texts(&reader, "form.reply textarea#reply-body").len(),
+        1
+    );
+    let none = app
+        .get(&format!("/ui/inbox?m={}", plain.id), Some(&cookie))
+        .await;
+    assert!(select_texts(&none, ".quick-replies").is_empty());
+}
+
+#[tokio::test]
+async fn clicking_a_quick_reply_replies_and_archives() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let first = question(&app, &infra, "Deploy?", &["Yes", "No"]).await;
+    let second = question(&app, &infra, "Rollback?", &["Roll back", "Hold"]).await;
+    let csrf = csrf_for(&app, &cookie).await;
+    let to = infra.agent.id.to_string();
+    let reply = |id: &str, option: &str, body: &str, back: &str| {
+        form(
+            &csrf,
+            &[
+                ("to_kind", "agent"),
+                ("to", &to),
+                ("reply_to", id),
+                ("subject", "Re: x"),
+                ("option", option),
+                ("body", body),
+                ("back", back),
+            ],
+        )
+    };
+
+    // CSRF is required.
+    let first_id = first.id.to_string();
+    let refused = app
+        .post_form(
+            "/ui/messages",
+            Some(&cookie),
+            &serde_urlencoded::to_string([
+                ("to_kind", "agent"),
+                ("to", to.as_str()),
+                ("reply_to", first_id.as_str()),
+                ("option", "Yes"),
+            ])
+            .unwrap(),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    assert!(agent_bodies(&app, &infra).await.is_empty());
+
+    // The option alone is the reply, threaded and archiving the human's copy; the card's
+    // form goes back to its page.
+    let page = app
+        .post_form(
+            "/ui/messages",
+            Some(&cookie),
+            &reply(&first_id, "Yes", "", "/ui/board"),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    assert_eq!(page.location.as_deref(), Some("/ui/board#needs-you"));
+    let mail = app
+        .state
+        .messages
+        .inbox(&infra, axle::service::messages::InboxFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(mail.len(), 1);
+    assert_eq!(mail[0].message.body, "Yes");
+    assert_eq!(mail[0].message.reply_to, Some(first.id));
+    assert!(mail[0].message.options.is_empty());
+    assert!(app.state.store.message_receipts(&[first.id]).await.unwrap()[0].replied);
+    assert_eq!(need_titles(&app, &cookie).await.0, ["Rollback?"]);
+
+    // Typed text follows the option after a blank line; from the reader it returns there.
+    let page = app
+        .post_form(
+            "/ui/messages",
+            Some(&cookie),
+            &reply(&second.id.to_string(), "Hold", "  until 5pm  ", ""),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    assert_eq!(page.location, Some(format!("/ui/inbox?m={}", second.id)));
+    assert_eq!(
+        agent_bodies(&app, &infra).await,
+        ["Yes", "Hold\n\n  until 5pm  "]
+    );
+    assert!(need_titles(&app, &cookie).await.0.is_empty());
+    let left = app
+        .state
+        .messages
+        .human_inbox(axle::service::messages::InboxFilter::default())
+        .await
+        .unwrap();
+    assert!(left.is_empty(), "both questions are archived for the human");
 }
