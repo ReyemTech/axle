@@ -114,6 +114,23 @@ impl RawDb {
         }
     }
 
+    /// The single `COUNT(*)` value of `sql` (inline literals only).
+    #[allow(dead_code)]
+    pub async fn count(&self, sql: &str) -> i64 {
+        let sql = sqlx::AssertSqlSafe(sql.to_string());
+        match self {
+            RawDb::Sqlite(pool) => sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(pool)
+                .await
+                .expect("raw sqlite count"),
+            #[cfg(feature = "pg-tests")]
+            RawDb::Postgres(pool) => sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(pool)
+                .await
+                .expect("raw postgres count"),
+        }
+    }
+
     pub async fn close(&self) {
         match self {
             RawDb::Sqlite(pool) => pool.close().await,

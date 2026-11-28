@@ -14,11 +14,12 @@ use axle::domain::{
 use axle::domain::{
     DeliverySignal, PrLinkedBy, Project, SessionId, SignalKind, SignalOutcome, SignalSource,
 };
+use axle::service::delivery::{DeliveryError, DeliveryService};
 use axle::service::identity::{IdentityInput, IdentityService, Resolved};
-use axle::service::tasks::{Caller, NewTask, TaskService};
+use axle::service::tasks::{Caller, Completion, NewTask, TaskError, TaskService};
 use axle::store::{
     CompleteRequest, DoneFilter, LeaseUpdate, LinkOutcome, LinkPrRequest, NewTaskPr, SignalInsert,
-    StageMove, StageMoved, Store, TaskFilter, TransitionRequest,
+    StageMove, StageMoved, Store, StoreError, TaskFilter, TransitionRequest,
 };
 use time::macros::datetime;
 use uuid::Uuid;
@@ -1801,4 +1802,415 @@ store_matrix!(signal_dedupe, |store: Arc<dyn Store>| async move {
             SignalInsert::Inserted
         );
     }
+});
+
+// ---- DeliveryService ----
+
+/// `Fx` plus a `DeliveryService` over the same store (its clock reads `T1`).
+struct Dx {
+    fx: Fx,
+    svc: DeliveryService,
+}
+
+fn pr_url(n: i64) -> String {
+    format!("https://github.com/reyemtech/axle/pull/{n}")
+}
+
+impl Dx {
+    async fn new(store: Arc<dyn Store>) -> Self {
+        let svc = DeliveryService::new(store.clone(), Arc::new(TestClock::new(T1)));
+        Dx {
+            fx: Fx::new(store).await,
+            svc,
+        }
+    }
+
+    async fn agent(&self, host: &str) -> Resolved {
+        IdentityService::resolve(
+            &*self.fx.store,
+            &TestClock::new(T0),
+            IdentityInput {
+                project_key: Some(PROJECT.into()),
+                host: host.into(),
+                harness: "claude-code".into(),
+                session: SessionId::new(),
+                token: common::token(&*self.fx.store).await,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn stages(&self, stages: &[DeliveryStage]) {
+        self.svc
+            .set_stages(&self.fx.project, stages.to_vec())
+            .await
+            .unwrap();
+    }
+
+    /// The owner completes a claimed task whose `links` hold PR `n`.
+    async fn delivering(&self, title: &str, n: i64) -> Task {
+        let task = self.fx.claimed(title, None).await;
+        self.fx
+            .svc
+            .complete(
+                &self.fx.owner,
+                task.id,
+                Completion {
+                    summary: "shipped".into(),
+                    links: vec![pr_url(n)],
+                    ..Completion::default()
+                },
+            )
+            .await
+            .unwrap()
+    }
+}
+
+store_matrix!(agent_link_permissions, |store: Arc<dyn Store>| async move {
+    let dx = Dx::new(store).await;
+    let other = dx.agent("other-host").await;
+    let stranger = dx.agent("stranger-host").await;
+    // Created by the owner agent, then released and claimed by `other`.
+    let task = dx.fx.claimed("work", None).await;
+    dx.fx.svc.force_release(task.id).await.unwrap();
+    dx.fx.svc.claim(&other, task.id).await.unwrap();
+
+    // A third agent may not report it; the creator and the owner may.
+    let err = dx
+        .svc
+        .link_pr(Caller::Agent(&stranger), task.id, &pr_url(7))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DeliveryError::NotAllowed), "{err}");
+    assert_eq!(
+        err.to_string(),
+        "only the task's owner or creator can report its PR"
+    );
+    let linked = dx
+        .svc
+        .link_pr(Caller::Agent(&dx.fx.owner), task.id, &pr_url(7))
+        .await
+        .unwrap();
+    assert_eq!(linked.delivery_stage, Some(DeliveryStage::InPr));
+    dx.svc
+        .link_pr(Caller::Agent(&other), task.id, &pr_url(8))
+        .await
+        .unwrap();
+    let pr = dx.fx.store.task_pr(task.id).await.unwrap().unwrap();
+    assert_eq!(pr.number, Some(8));
+    assert_eq!(pr.linked_by, PrLinkedBy::Agent);
+
+    // The human may link any task.
+    let human = dx.fx.claimed("other work", None).await;
+    dx.svc
+        .link_pr(Caller::Human, human.id, &pr_url(9))
+        .await
+        .unwrap();
+    assert_eq!(
+        dx.fx
+            .store
+            .task_pr(human.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .linked_by,
+        PrLinkedBy::Human
+    );
+
+    // A done task is closed.
+    let finished = dx.fx.claimed("finished", None).await;
+    dx.fx.complete(finished.id, T1).await;
+    let err = dx
+        .svc
+        .link_pr(Caller::Agent(&dx.fx.owner), finished.id, &pr_url(7))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DeliveryError::Task(TaskError::Closed(TaskStatus::Done))
+        ),
+        "{err}"
+    );
+});
+
+store_matrix_raw!(
+    link_error_messages,
+    |store: Arc<dyn Store>, raw: common::RawDb| async move {
+        let dx = Dx::new(store).await;
+        let me = Caller::Agent(&dx.fx.owner);
+        let first = dx.fx.claimed("first", None).await;
+        let second = dx.fx.claimed("second", None).await;
+
+        let err = dx
+            .svc
+            .link_pr(me, first.id, "https://github.com/other/repo/pull/1")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "pr must be a pull request in github.com/reyemtech/axle"
+        );
+
+        dx.svc.link_pr(me, first.id, &pr_url(7)).await.unwrap();
+        let err = dx.svc.link_pr(me, second.id, &pr_url(7)).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("PR #7 is already linked to task {}", first.id)
+        );
+
+        set_stage(&raw, first.id, DeliveryStage::Merged).await;
+        let err = dx.svc.link_pr(me, first.id, &pr_url(8)).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "this task was already merged via #7; open a new task for follow-up work"
+        );
+
+        assert_eq!(
+            DeliveryError::Delivering.to_string(),
+            "this task is delivering; use Mark done or Force release"
+        );
+        assert_eq!(
+            DeliveryError::NoNextStage.to_string(),
+            "this task is already at its last delivery stage"
+        );
+        assert_eq!(
+            DeliveryError::NotDelivering.to_string(),
+            "this task is not delivering"
+        );
+        assert_eq!(
+            DeliveryError::TakenBy {
+                number: None,
+                task: first.id
+            }
+            .to_string(),
+            format!("this PR is already linked to task {}", first.id)
+        );
+    }
+);
+
+store_matrix_raw!(
+    advance_moves_one_column,
+    |store: Arc<dyn Store>, raw: common::RawDb| async move {
+        let dx = Dx::new(store).await;
+        dx.stages(&[DeliveryStage::Deployed, DeliveryStage::InPr])
+            .await;
+        let task = dx.delivering("ship", 7).await;
+        assert_eq!(task.status, TaskStatus::Delivering);
+        assert_eq!(task.delivery_stage, Some(DeliveryStage::InPr));
+
+        let done = dx.svc.advance(task.id).await.unwrap();
+        assert_eq!(done.status, TaskStatus::Done);
+        assert_eq!(done.delivery_stage, Some(DeliveryStage::Deployed));
+        assert_eq!(done.done_at, Some(T1));
+        let stages = dx.fx.store.task_stages(task.id).await.unwrap();
+        let reached: Vec<_> = stages.iter().map(|s| (s.stage, s.implied)).collect();
+        assert_eq!(
+            reached,
+            vec![
+                (DeliveryStage::InPr, false),
+                (DeliveryStage::Merged, true),
+                (DeliveryStage::Released, true),
+                (DeliveryStage::Deployed, false),
+            ]
+        );
+        assert_eq!(
+            raw.count(
+                "SELECT COUNT(*) FROM delivery_signals
+                 WHERE source = 'human' AND kind = 'deployed' AND outcome = 'applied'
+                   AND matched = 1"
+            )
+            .await,
+            1
+        );
+        assert!(
+            dx.fx
+                .kinds(task.id)
+                .await
+                .contains(&TaskEventKind::Delivered)
+        );
+
+        // A done task is not delivering.
+        let err = dx.svc.advance(task.id).await.unwrap_err();
+        assert!(matches!(err, DeliveryError::NotDelivering), "{err}");
+        let err = dx.svc.mark_done(task.id).await.unwrap_err();
+        assert!(matches!(err, DeliveryError::NotDelivering), "{err}");
+    }
+);
+
+store_matrix_raw!(
+    advance_at_waiting_goes_to_first,
+    |store: Arc<dyn Store>, raw: common::RawDb| async move {
+        let dx = Dx::new(store).await;
+        dx.stages(&[DeliveryStage::Released]).await;
+        let task = dx.delivering("ship", 7).await;
+        assert_eq!(task.status, TaskStatus::Delivering);
+        let view = dx.svc.view(&task).await.unwrap().expect("has stages");
+        assert_eq!(view.column, Some((DeliveryStage::Released, true)));
+        assert_eq!(view.pr.map(|p| p.number), Some(Some(7)));
+
+        let done = dx.svc.advance(task.id).await.unwrap();
+        assert_eq!(done.status, TaskStatus::Done);
+        let stages = dx.fx.store.task_stages(task.id).await.unwrap();
+        let merged = stages.iter().find(|s| s.stage == DeliveryStage::Merged);
+        assert!(merged.is_some_and(|s| s.implied));
+        assert_eq!(
+            raw.count("SELECT COUNT(*) FROM delivery_signals WHERE kind = 'released'")
+                .await,
+            1
+        );
+    }
+);
+
+store_matrix_raw!(
+    no_next_stage_and_mark_done,
+    |store: Arc<dyn Store>, raw: common::RawDb| async move {
+        let dx = Dx::new(store).await;
+        dx.stages(&[DeliveryStage::InPr, DeliveryStage::Merged])
+            .await;
+        // A delivering task already past every enabled stage has nowhere to advance to.
+        let stuck = dx.delivering("stuck", 7).await;
+        set_stage(&raw, stuck.id, DeliveryStage::Deployed).await;
+        let err = dx.svc.advance(stuck.id).await.unwrap_err();
+        assert!(matches!(err, DeliveryError::NoNextStage), "{err}");
+
+        // The human may mark it done, skipping the stages.
+        let done = dx.svc.mark_done(stuck.id).await.unwrap();
+        assert_eq!(done.status, TaskStatus::Done);
+        assert_eq!(done.done_at, Some(T1));
+
+        // An open task is not delivering.
+        let open = dx.fx.claimed("open", None).await;
+        let err = dx.svc.mark_done(open.id).await.unwrap_err();
+        assert!(matches!(err, DeliveryError::NotDelivering), "{err}");
+    }
+);
+
+store_matrix!(force_release_keeps_pr, |store: Arc<dyn Store>| async move {
+    let dx = Dx::new(store).await;
+    dx.stages(&[DeliveryStage::InPr, DeliveryStage::Merged])
+        .await;
+    let task = dx.delivering("ship", 7).await;
+    assert_eq!(task.status, TaskStatus::Delivering);
+
+    // The PR cannot be unlinked while delivering.
+    let err = dx.svc.unlink_pr(task.id).await.unwrap_err();
+    assert!(matches!(err, DeliveryError::Delivering), "{err}");
+
+    let released = dx.fx.svc.force_release(task.id).await.unwrap();
+    assert_eq!(released.status, TaskStatus::Open);
+    assert_eq!(released.delivery_stage, Some(DeliveryStage::InPr));
+    assert!(dx.fx.store.task_pr(task.id).await.unwrap().is_some());
+
+    // A delivering task may also be cancelled.
+    let other = dx.delivering("other", 9).await;
+    assert_eq!(other.status, TaskStatus::Delivering);
+    let cancelled = dx.fx.svc.cancel(Caller::Human, other.id).await.unwrap();
+    assert_eq!(cancelled.status, TaskStatus::Cancelled);
+});
+
+store_matrix!(complete_reads_links, |store: Arc<dyn Store>| async move {
+    let dx = Dx::new(store).await;
+    dx.stages(&[DeliveryStage::InPr, DeliveryStage::Merged])
+        .await;
+    let task = dx.fx.claimed("ship", None).await;
+    let done = dx
+        .fx
+        .svc
+        .complete(
+            &dx.fx.owner,
+            task.id,
+            Completion {
+                summary: "shipped".into(),
+                // Only the third is a PR of this project's repo.
+                links: vec![
+                    "https://example.com/notes".into(),
+                    "https://github.com/other/repo/pull/1".into(),
+                    "https://github.com/reyemtech/axle/pull/7".into(),
+                ],
+                ..Completion::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(done.status, TaskStatus::Delivering);
+    assert_eq!(done.done_at, None);
+    let pr = dx.fx.store.task_pr(task.id).await.unwrap().unwrap();
+    assert_eq!(pr.number, Some(7));
+    assert_eq!(pr.linked_by, PrLinkedBy::CompleteLinks);
+
+    // Without stages a completion is a plain done, as before.
+    let plain = dx.fx.claimed("plain", None).await;
+    dx.stages(&[]).await;
+    let done = dx
+        .fx
+        .svc
+        .complete(&dx.fx.owner, plain.id, Completion::default())
+        .await
+        .unwrap();
+    assert_eq!(done.status, TaskStatus::Done);
+});
+
+store_matrix!(
+    set_stages_unknown_project,
+    |store: Arc<dyn Store>| async move {
+        let svc = DeliveryService::new(store, Arc::new(TestClock::new(T1)));
+        let ghost = Project {
+            id: axle::domain::ProjectId::new(),
+            key: "github.com/ghost/none".into(),
+            display_name: "ghost".into(),
+            created_at: T0,
+        };
+        let err = svc
+            .set_stages(&ghost, vec![DeliveryStage::InPr])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DeliveryError::Store(StoreError::NotFound("project"))),
+            "{err}"
+        );
+    }
+);
+
+store_matrix!(child_through_delivery_notifies_parent, |store: Arc<
+    dyn Store,
+>| async move {
+    let dx = Dx::new(store).await;
+    dx.stages(&[DeliveryStage::InPr, DeliveryStage::Merged])
+        .await;
+    let parent = dx.fx.claimed("parent", None).await;
+    let child = dx.fx.claimed("child", Some(parent.id)).await;
+    dx.fx
+        .svc
+        .complete(
+            &dx.fx.owner,
+            child.id,
+            Completion {
+                summary: "shipped".into(),
+                links: vec![pr_url(7)],
+                ..Completion::default()
+            },
+        )
+        .await
+        .unwrap();
+    // Finishing through delivery tells the parent's thread, as a plain done does.
+    dx.svc.advance(child.id).await.unwrap();
+    let subjects: Vec<_> = dx
+        .fx
+        .store
+        .task_thread(parent.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|m| m.subject)
+        .collect();
+    assert!(
+        subjects.contains(&"child task delivering".to_string()),
+        "{subjects:?}"
+    );
+    assert!(
+        subjects.contains(&"child task done".to_string()),
+        "{subjects:?}"
+    );
 });
