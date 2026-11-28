@@ -1004,6 +1004,9 @@ impl AxleMcp {
                     ClaimOutcome::Closed(status) => {
                         Err(ToolError::invalid(format!("the task is {status}")))
                     }
+                    ClaimOutcome::AwaitingApproval => Err(ToolError::invalid(
+                        "waiting for the human to approve this request",
+                    )),
                 }
             }
             (None, true) => {

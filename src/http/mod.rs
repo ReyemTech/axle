@@ -119,6 +119,9 @@ impl AppState {
     /// Builds the services over `store`, with message and task changes published on one bus.
     pub fn new(store: Arc<dyn Store>, clock: Arc<dyn Clock>, config: ServerConfig) -> Self {
         let bus = EventBus::new(store.clone(), clock.clone());
+        let wake = Arc::new(
+            WakeService::new(store.clone(), clock.clone(), &config).with_events(bus.clone()),
+        );
         Self {
             auth: Arc::new(AuthService::new(store.clone(), clock.clone())),
             messages: Arc::new(
@@ -126,16 +129,15 @@ impl AppState {
             ),
             tasks: Arc::new(
                 TaskService::from_config(store.clone(), clock.clone(), &config)
-                    .with_events(bus.clone()),
+                    .with_events(bus.clone())
+                    .with_wake(wake.clone()),
             ),
             enroll: Arc::new(EnrollService::new(
                 store.clone(),
                 clock.clone(),
                 bus.clone(),
             )),
-            wake: Arc::new(
-                WakeService::new(store.clone(), clock.clone(), &config).with_events(bus.clone()),
-            ),
+            wake,
             bus,
             shutdown: Shutdown::new(),
             rate_limit: Arc::new(RateLimiter::new(

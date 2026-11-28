@@ -331,8 +331,8 @@ Event kinds: `created`, `claimed`, `renewed`, `released`, `blocked`, `review`, `
 `cancelled`, `lease_expired_takeover`, `force_released`, `child_claimed`, `child_blocked`,
 `child_done`, `child_cancelled`, `children_complete`, `edited`, `plan_submitted`,
 `plan_approved`, `plan_changes_requested`, `projects_added`, `block_updated`, `unblocked`,
-`related`, `moved_under`, and Axle's wake-up notes `queued`, `routed`, `wake_sent`,
-`wake_failed`.
+`related`, `moved_under`, the work-request events `request_created`, `request_approved`,
+`request_declined`, and Axle's wake-up notes `queued`, `routed`, `wake_sent`, `wake_failed`.
 
 A blocked task also carries `blocked`: `reason`, `since`, `waiting_on` (`{"human": true}`,
 `{"task": "<id>"}`, `{"external": "<text>"}` or `null`) and `unblock`. The agent-written
@@ -377,6 +377,7 @@ Errors:
 - `already owned by <agent> (blocked, in review or with a plan awaiting approval: its lease does not expire)`
 - `you are not eligible for this task (harness, host or project)`
 - `task not found`, `the task is done`, `the task is cancelled`
+- `waiting for the human to approve this request` (a work request the human has not approved yet)
 - ``you have no home project, so there is no `next` task; claim one by id``
 - ``pass exactly one of `id` or `next: true` ``
 

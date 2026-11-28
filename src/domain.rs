@@ -643,6 +643,12 @@ pub enum TaskEventKind {
     /// The human acknowledged a done task. Only ever published as a live event; it is
     /// never written to a task's history.
     Acked,
+    /// Another agent asked for this work (the creation event of a work request).
+    RequestCreated,
+    /// The human approved the work request: it is open and sanctioned.
+    RequestApproved,
+    /// The human declined the work request: it is cancelled.
+    RequestDeclined,
 }
 
 text_enum!(TaskEventKind {
@@ -675,6 +681,9 @@ text_enum!(TaskEventKind {
     WakeSent => "wake_sent",
     WakeFailed => "wake_failed",
     Acked => "acked",
+    RequestCreated => "request_created",
+    RequestApproved => "request_approved",
+    RequestDeclined => "request_declined",
 });
 
 /// Where a done task stands with the human.
@@ -977,6 +986,14 @@ mod tests {
             TaskEventKind::LeaseExpiredTakeover.to_string(),
             "lease_expired_takeover"
         );
+        for (k, text) in [
+            (TaskEventKind::RequestCreated, "request_created"),
+            (TaskEventKind::RequestApproved, "request_approved"),
+            (TaskEventKind::RequestDeclined, "request_declined"),
+        ] {
+            assert_eq!(k.as_str(), text);
+            assert_eq!(text.parse::<TaskEventKind>().unwrap(), k);
+        }
         assert!("nope".parse::<TaskStatus>().is_err());
         for p in [
             PlanState::None,

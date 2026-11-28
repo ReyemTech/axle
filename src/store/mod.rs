@@ -293,6 +293,12 @@ pub trait Store: Send + Sync {
     ) -> StoreResult<Option<Task>>;
     /// Tasks with a dedupe key that `from` created at or after `since`.
     async fn count_requests_by(&self, from: AgentId, since: OffsetDateTime) -> StoreResult<u32>;
+    /// When the oldest of the tasks `count_requests_by(from, since)` counts was created.
+    async fn oldest_request_by(
+        &self,
+        from: AgentId,
+        since: OffsetDateTime,
+    ) -> StoreResult<Option<OffsetDateTime>>;
     /// Tasks in `project` still waiting for approval (status `requested`).
     async fn count_pending_requests(&self, project: ProjectId) -> StoreResult<u32>;
     // ---- wake-up: turn state, reservations and the queue ----

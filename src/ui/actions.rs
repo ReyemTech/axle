@@ -49,7 +49,8 @@ fn task_error(e: TaskError) -> UiError {
         | TaskError::NoPlanToReview(_)
         | TaskError::PlanChanged
         | TaskError::DuplicateOfDone
-        | TaskError::TooManyLinks(_)) => UiError::Conflict(capitalise(&e.to_string())),
+        | TaskError::TooManyLinks(_)
+        | TaskError::RequestChanged) => UiError::Conflict(capitalise(&e.to_string())),
         e @ (TaskError::SelfLink
         | TaskError::UnknownLinkTarget(_)
         | TaskError::DuplicateTwice
@@ -72,7 +73,8 @@ fn task_error(e: TaskError) -> UiError {
         | TaskError::InvalidLeaseTtl
         | TaskError::ChildExtraProjects
         | TaskError::ChildProjectMismatch
-        | TaskError::InvalidField { .. }) => UiError::Invalid(capitalise(&e.to_string())),
+        | TaskError::InvalidField { .. }
+        | TaskError::Guard(_)) => UiError::Invalid(capitalise(&e.to_string())),
     }
 }
 

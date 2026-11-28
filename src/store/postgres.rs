@@ -2082,6 +2082,22 @@ impl Store for PostgresStore {
         to_u32(n)
     }
 
+    async fn oldest_request_by(
+        &self,
+        from: AgentId,
+        since: OffsetDateTime,
+    ) -> StoreResult<Option<OffsetDateTime>> {
+        Ok(sqlx::query_scalar(
+            "SELECT MIN(created_at) FROM tasks
+              WHERE created_by_agent_id = $1 AND request_dedupe_key IS NOT NULL
+                AND created_at >= $2",
+        )
+        .bind(from.as_uuid())
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     async fn count_pending_requests(&self, project: ProjectId) -> StoreResult<u32> {
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tasks WHERE project_id = $1 AND status = 'requested'",

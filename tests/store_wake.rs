@@ -482,6 +482,56 @@ store_matrix!(
     }
 );
 
+store_matrix!(oldest_request_is_the_first_counted, |store: Arc<
+    dyn Store,
+>| async move {
+    let clock = TestClock::new(T0);
+    let a = agent(&store, &clock).await;
+    let project = a.project.as_ref().unwrap().id;
+    let since = T0 - Duration::hours(1);
+    assert_eq!(
+        store.oldest_request_by(a.agent.id, since).await.unwrap(),
+        None
+    );
+    request_by(&store, &a, project, "late", T0 + Duration::minutes(5)).await;
+    request_by(&store, &a, project, "early", T0 + Duration::seconds(90)).await;
+    // Plain tasks and other agents' requests are not counted.
+    insert(&store, &task_in(project, "plain", T0)).await;
+    let b = IdentityService::resolve(
+        &*store,
+        &clock,
+        IdentityInput {
+            project_key: Some(PROJECT.into()),
+            host: "other-host".into(),
+            harness: "claude-code".into(),
+            session: SessionId::new(),
+            token: common::token(&*store).await,
+        },
+    )
+    .await
+    .unwrap();
+    assert_ne!(b.agent.id, a.agent.id);
+    request_by(&store, &b, project, "theirs", T0).await;
+    assert_eq!(
+        store.oldest_request_by(a.agent.id, since).await.unwrap(),
+        Some(T0 + Duration::seconds(90))
+    );
+    assert_eq!(
+        store
+            .oldest_request_by(a.agent.id, T0 + Duration::minutes(2))
+            .await
+            .unwrap(),
+        Some(T0 + Duration::minutes(5))
+    );
+    assert_eq!(
+        store
+            .oldest_request_by(a.agent.id, T0 + Duration::minutes(6))
+            .await
+            .unwrap(),
+        None
+    );
+});
+
 store_matrix!(pending_requests_count_only_requested, |store: Arc<
     dyn Store,
 >| async move {

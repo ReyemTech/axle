@@ -2173,6 +2173,23 @@ impl Store for SqliteStore {
         to_u32(n)
     }
 
+    async fn oldest_request_by(
+        &self,
+        from: AgentId,
+        since: OffsetDateTime,
+    ) -> StoreResult<Option<OffsetDateTime>> {
+        let oldest: Option<String> = sqlx::query_scalar(
+            "SELECT MIN(created_at) FROM tasks
+              WHERE created_by_agent_id = ? AND request_dedupe_key IS NOT NULL
+                AND created_at >= ?",
+        )
+        .bind(from.to_string())
+        .bind(ts::enc(since))
+        .fetch_one(&self.pool)
+        .await?;
+        oldest.as_deref().map(ts::dec).transpose()
+    }
+
     async fn count_pending_requests(&self, project: ProjectId) -> StoreResult<u32> {
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tasks WHERE project_id = ? AND status = 'requested'",
