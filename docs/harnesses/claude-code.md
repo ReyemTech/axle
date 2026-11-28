@@ -112,8 +112,8 @@ Add to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
 Each hook (except `session-start`, which never waits on stdin) reads Claude Code's hook JSON
 on stdin and asks the server for the session's
 unread mail (and, where needed, the tasks it holds), with a 2-second timeout per request, a
-2.5-second budget for all of them, and a 4-second ceiling overall (Claude Code's hook
-timeout is 5 seconds).
+2.5-second budget for all of them, and a 4-second ceiling overall (registered with a 5-second
+hook timeout; `session-end`, which only reports usage within 1 second, gets 3 seconds).
 
 | Hook | What it does |
 |---|---|
@@ -148,7 +148,8 @@ text).
 ### Token usage
 
 The `stop` and `session-end` hooks report the session's token usage to the server, which
-prices it at API rates.
+prices it at API rates. An install made before token usage has no `SessionEnd` hook: re-run
+`axl install` to add it (until then only `stop` reports).
 
 - **What is read:** the transcript named by `transcript_path` in the hook input, plus the
   subagent transcripts next to it (`<transcript>/subagents/*.jsonl`). Only `assistant` lines

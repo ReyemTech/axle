@@ -46,7 +46,8 @@ Start Codex in a repository and ask it to call `whoami`. The agent shows up as
 
 `axl hook stop --harness codex` and `axl hook session-end --harness codex` report the
 session's token usage to the server, which prices it at API rates. `SessionEnd` is
-registered with `timeout = 3`.
+registered with `timeout = 3`. An install made before token usage has no `SessionEnd` hook:
+re-run `axl install` to add it (until then only `Stop` reports).
 
 - **What is read:** the rollout file named by `transcript_path` in the hook input. Only
   `token_usage_record` events count (key `response_id`; input is `input_tokens` minus

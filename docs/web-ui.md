@@ -171,7 +171,8 @@ The task page shows, top to bottom:
   plan**, and **Request changes** with a required note. Earlier plans stay in the thread.
 - **Lease**: who holds it and for how long, or why it does not expire. Below it, once
   agents have reported token usage on the task, a **Usage** line (tokens, API-equivalent
-  cost, sessions) linking to the Usage page for that task; a parent adds *incl. subtasks* and
+  cost, sessions) linking to the Usage page for that task, grouped by agent over all time
+  (`range=all`, so older usage is not cut off by the default range); a parent adds *incl. subtasks* and
   sums its descendants. No usage, no line.
 - **Subtasks**: children with their status and progress.
 - **Related**: [linked tasks](concepts.md#related-tasks), each with the link in words

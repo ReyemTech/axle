@@ -15,6 +15,7 @@ treat `/v1` as internal: it may change between releases.
 | `GET /v1/events` | bearer token | Server-sent events for one session |
 | `GET /v1/inbox/summary` | bearer token | Unread mail, for hooks |
 | `GET /v1/leases` | bearer token | Tasks the session holds, for hooks |
+| `POST /v1/usage` | bearer token | Report token usage for a session the token owns |
 | `GET /install.sh` | none | The shell installer, with this server's address baked in |
 | `POST /v1/enroll` | none, per-IP limit | Redeem a one-time code for a token |
 | `POST /v1/login/start` | none, per-IP limit | Begin a device login |

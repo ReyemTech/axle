@@ -21,7 +21,7 @@ flowchart TB
         MCP["/mcp<br/>Streamable HTTP MCP"]
         V1["/v1<br/>register, heartbeat, events, inbox"]
         UI["/ui<br/>askama + htmx, SSE"]
-        SVC["Services<br/>identity, tasks, messages, auth"]
+        SVC["Services<br/>identity, tasks, messages, auth, usage"]
         BUS["Event bus<br/>outbox + broadcast"]
         ST["Store trait"]
         MCP --> SVC
@@ -45,7 +45,7 @@ flowchart TB
 | CLI | `src/main.rs`, `src/cli/` | Subcommands `serve`, `bridge`, `hook`, `migrate`, `project`, `token`, and the onboarding set `install`, `uninstall`, `login`, `logout`, `status`, `service`. |
 | HTTP server | `src/http/` | axum router: probes, `/v1`, `/mcp`, `/ui`; bearer-token middleware and rate limit. |
 | MCP tools | `src/mcp/` | The 17 tools on rmcp, identity resolution per call, peer-data framing. |
-| Services | `src/service/` | Business rules shared by MCP, `/v1` and the UI: identity, tasks and leases, messages, tokens. |
+| Services | `src/service/` | Business rules shared by MCP, `/v1` and the UI: identity, tasks and leases, messages, tokens, token usage (ingest, totals, repricing). |
 | Store | `src/store/` | A `Store` trait with `sqlite.rs` and `postgres.rs` implementations and migrations in `migrations/`. |
 | Event bus | `src/events.rs` | Publishes changes after each commit. |
 | Web UI | `src/ui/`, `templates/`, `static/` | Server-rendered pages and fragments, embedded in the binary. |
