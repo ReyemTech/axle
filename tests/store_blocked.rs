@@ -643,3 +643,39 @@ store_matrix!(
         }
     }
 );
+
+// Siblings A and B share a parent and B waits on A. Completing A locks the parent and then
+// the waiter B; B's owner reclaiming B locks B and then the parent. Both at once must never
+// deadlock.
+store_matrix!(
+    completing_a_sibling_while_its_waiter_is_reclaimed,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let p = env.session("lead").await;
+        let a = env.session("mac").await;
+        let b = env.session("linux").await;
+        for i in 0..25 {
+            let parent = env.claimed(&p, &format!("parent {i}"), None).await;
+            let sib_a = env.claimed(&a, &format!("a {i}"), Some(&parent)).await;
+            let sib_b = env.claimed(&b, &format!("b {i}"), Some(&parent)).await;
+            env.wait(&b, &sib_b, WaitingOn::Task(sib_a.id))
+                .await
+                .unwrap();
+            let (svc, by) = (env.svc.clone(), a.clone());
+            let complete =
+                tokio::spawn(
+                    async move { svc.complete(&by, sib_a.id, Completion::default()).await },
+                );
+            let (svc, by) = (env.svc.clone(), b.clone());
+            let claim = tokio::spawn(async move { svc.claim(&by, sib_b.id).await });
+            complete.await.unwrap().expect("A completes");
+            match claim.await.unwrap() {
+                Ok(ClaimOutcome::Claimed(t)) => assert_eq!(t.status, TaskStatus::Claimed),
+                other => panic!("iteration {i}: {other:?}"),
+            }
+            let t = env.get(&sib_b).await;
+            assert_eq!(t.status, TaskStatus::Claimed, "iteration {i}");
+            assert_eq!(t.block, None, "iteration {i}");
+        }
+    }
+);

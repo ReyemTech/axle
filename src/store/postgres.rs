@@ -270,18 +270,44 @@ macro_rules! clear_block {
     };
 }
 
-/// The transaction-scoped advisory lock that serialises writes of waits on tasks with the
-/// `done` transitions that release them: without it, under READ COMMITTED, a task could start
-/// waiting on another that finished concurrently and never be unblocked. A transaction takes
-/// it before any task row lock (see `transition_task`), so it never deadlocks with them.
-const WAIT_LOCK: i64 = 0x6178_6c5f_7761_6974; // "axl_wait"
+/// The lock order for `tasks` rows on Postgres, as a transaction-scoped advisory lock.
+///
+/// **Rule:** a transaction that may lock more than one `tasks` row takes `TASK_LOCK` first,
+/// before any row lock. Those transactions are:
+/// - transitions and claims of a subtask (`record_event` locks the parent after the child);
+/// - transitions to `done` (they lock the tasks waiting on them, see `unblock_waiting`);
+/// - writes of a wait on a task (they must see every committed wait and `done`);
+/// - `claim_next_task`, heartbeat lease renewal and done-acks (multi-row statements).
+///
+/// Every other write locks at most one `tasks` row and, once it holds it, waits for no other
+/// `tasks` row, so it can never close a cycle; and the writers that lock several rows run one
+/// at a time, each acquiring the advisory lock while holding no row. So no two task writes
+/// deadlock, whatever rows they touch. SQLite needs none of this: a write transaction takes
+/// the database's single write lock up front (`BEGIN IMMEDIATE`).
+///
+/// The lock also keeps the wait rule sound: under READ COMMITTED, without it a task could
+/// start waiting on another that finished concurrently and never be unblocked.
+const TASK_LOCK: i64 = 0x6178_6c5f_7761_6974; // "axl_wait"
 
-async fn wait_lock(conn: &mut PgConnection) -> StoreResult<()> {
+async fn task_lock(conn: &mut PgConnection) -> StoreResult<()> {
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(WAIT_LOCK)
+        .bind(TASK_LOCK)
         .execute(&mut *conn)
         .await?;
     Ok(())
+}
+
+/// Whether `task` is a subtask (its writes lock its parent too). `parent_id` never changes
+/// after creation, so an unlocked read is exact.
+async fn is_subtask(conn: &mut PgConnection, task: TaskId) -> StoreResult<bool> {
+    Ok(
+        sqlx::query_scalar::<_, Option<Uuid>>("SELECT parent_id FROM tasks WHERE id = $1")
+            .bind(task.as_uuid())
+            .fetch_optional(&mut *conn)
+            .await?
+            .flatten()
+            .is_some(),
+    )
 }
 
 /// Whether `task` may wait on `target` (see `BlockWrite`): the target exists and is not
@@ -313,7 +339,7 @@ async fn wait_allowed(conn: &mut PgConnection, task: TaskId, target: TaskId) -> 
 }
 
 /// `done` just became done: applies `rule` to every blocked task waiting on it. The caller
-/// holds `WAIT_LOCK`, taken before its first row lock.
+/// holds `TASK_LOCK`, taken before its first row lock.
 async fn unblock_waiting(
     conn: &mut PgConnection,
     done: &Task,
@@ -1441,6 +1467,9 @@ impl Store for PostgresStore {
             return Ok(Vec::new());
         }
         let listed: Vec<uuid::Uuid> = ids.iter().map(|i| i.as_uuid()).collect();
+        let mut tx = self.pool.begin().await?;
+        // The lock order (see `TASK_LOCK`): one statement, many rows.
+        task_lock(&mut tx).await?;
         let rows: Vec<uuid::Uuid> = sqlx::query_scalar(
             "WITH RECURSIVE sub(id) AS (
                  SELECT id FROM tasks WHERE id = ANY($1) AND status = 'done'
@@ -1452,8 +1481,9 @@ impl Store for PostgresStore {
         )
         .bind(listed)
         .bind(now)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(rows.into_iter().map(TaskId::from).collect())
     }
 
@@ -1525,6 +1555,10 @@ impl Store for PostgresStore {
 
     async fn claim_task(&self, task: TaskId, req: &ClaimRequest) -> StoreResult<ClaimAttempt> {
         let mut tx = self.pool.begin().await?;
+        // The lock order (see `TASK_LOCK`): a subtask's claim locks its parent too.
+        if is_subtask(&mut tx, task).await? {
+            task_lock(&mut tx).await?;
+        }
         let attempt = claim_locked(&mut tx, task, req).await?;
         tx.commit().await?;
         Ok(attempt)
@@ -1537,6 +1571,8 @@ impl Store for PostgresStore {
     ) -> StoreResult<Option<Task>> {
         let c = &req.claimant;
         let mut tx = self.pool.begin().await?;
+        // The lock order (see `TASK_LOCK`): the row picked may be a subtask.
+        task_lock(&mut tx).await?;
         // Same reclaimable set as the claim guard minus same-agent takeover: open work and
         // abandoned (expired) claims. Rows another claimer has locked are skipped, and
         // `claim_locked` then applies the full guard to the row we locked.
@@ -1581,12 +1617,12 @@ impl Store for PostgresStore {
         let block = req.block.clone().unwrap_or_default();
         let waiting = block.waiting_on.as_ref();
         let finishing = req.unblock.is_some() && req.to == Some(TaskStatus::Done);
-        // Writes of waits on tasks and the `done` transitions that release them are serialised
-        // by `WAIT_LOCK`. It is always taken first, before any task row lock: a completion
-        // locks its row and its parent's, and blocking that parent on a task locks the parent
-        // after the wait lock, so the other order deadlocks.
-        if finishing || waiting.and_then(|w| w.task()).is_some() {
-            wait_lock(&mut tx).await?;
+        // The lock order (see `TASK_LOCK`): before any row lock.
+        if finishing
+            || waiting.and_then(|w| w.task()).is_some()
+            || is_subtask(&mut tx, req.task).await?
+        {
+            task_lock(&mut tx).await?;
         }
         // A decision on a named plan: lock the row first, then read the newest plan in a
         // statement of its own. Under READ COMMITTED a guard subquery inside the UPDATE would
@@ -1794,6 +1830,9 @@ impl Store for PostgresStore {
         now: OffsetDateTime,
         default_ttl: Duration,
     ) -> StoreResult<u64> {
+        let mut tx = self.pool.begin().await?;
+        // The lock order (see `TASK_LOCK`): one statement, all the session's leases.
+        task_lock(&mut tx).await?;
         let done = sqlx::query(
             "UPDATE tasks
                 SET lease_expires_at = $1
@@ -1804,8 +1843,9 @@ impl Store for PostgresStore {
         .bind(now)
         .bind(session.as_uuid())
         .bind(default_ttl.whole_seconds())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(done.rows_affected())
     }
 

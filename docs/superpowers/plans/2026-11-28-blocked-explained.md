@@ -22,7 +22,7 @@
 
 ## Review Focus
 
-1. **Postgres lock order:** `WAIT_LOCK` is taken before any task row lock, in the completion path and the block-on-task path. Test: `completing_a_child_while_its_parent_blocks_on_a_task`.
+1. **Postgres lock order:** every write that may lock more than one `tasks` row (subtask transitions and claims, `done`, waits on a task, `claim_next_task`, heartbeat renewal, done-acks) takes `TASK_LOCK` before any row lock. Tests: `completing_a_child_while_its_parent_blocks_on_a_task`, `completing_a_sibling_while_its_waiter_is_reclaimed`.
 2. **Races on the wait rule:** the store re-checks the rule inside the write, so the service's check cannot go stale. Test: `waits_that_could_never_end_are_refused` (raw store write).
 3. **`block_updated` previous values under concurrency.** Test: `concurrent_block_updates_record_what_they_replaced`.
 4. **Hostile reason text** on the card, panel and Needs you. Test: `hostile_block_text_is_escaped`.

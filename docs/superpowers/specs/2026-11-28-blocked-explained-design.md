@@ -20,7 +20,8 @@ task's own parent or ancestor (a parent finishes after its subtasks), or closing
 (a waits on b waits on a). A parent may wait on its own subtask. The store enforces the same
 rule inside the write (a guard miss); Postgres serialises waits on tasks and the `done`
 transitions that release them with a transaction-scoped advisory lock, so a task can never
-start waiting on one that finished concurrently.
+start waiting on one that finished concurrently. Every write that may lock more than one task
+row takes that lock before any row lock, which rules out deadlocks between them.
 
 **Auto-unblock.** In the same transaction that makes a task `done`, every blocked task with
 `waiting_kind = task` pointing at it leaves `blocked`. The rule mirrors how an agent
