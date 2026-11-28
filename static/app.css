@@ -560,10 +560,6 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
 .cards > :is(.show-more, .show-fewer) { justify-self: start; padding: 2px 4px; font-size: 13px; font-weight: 600; color: var(--text); text-underline-offset: 3px; }
 .cards > .show-fewer { font-weight: 400; color: var(--muted); }
 
-/* Compact cards: the same signals with tighter spacing (the stops, owner chips and subtask
-   list are not rendered). */
-.card[data-density="compact"] { gap: 3px; padding: 7px 10px; }
-.card[data-density="compact"] .progress { margin-top: 0; }
 
 .card {
   position: relative;
@@ -600,6 +596,66 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
 .owner, .agent-chip { font: 12px var(--mono); color: var(--text); }
 .presence { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 600; color: var(--ok); }
 .presence[data-presence="stale"] { color: var(--warn); }
+
+/* Compact cards: one 30px row per task. State with its word, the title cut to one line
+   (the full title in its tooltip), project on an all-projects board, holder, lease, then
+   only the attention chips and the subtask count. The title gives way first; when a narrow
+   column still cannot hold the signals, they wrap to a second line rather than being cut. */
+.card[data-density="compact"] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+  min-height: 30px;
+  padding: 4px 8px;
+  overflow-wrap: normal;
+  font-size: 12px;
+  line-height: 18px;
+  white-space: nowrap;
+  color: var(--muted);
+}
+.card[data-density="compact"] > * { flex: none; }
+.card[data-density="compact"] .state { gap: 4px; }
+.card[data-density="compact"] .card-title {
+  flex: 1 1 8ch;
+  min-width: 3ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 13px;
+  line-height: 18px;
+  text-wrap: nowrap;
+}
+.card[data-density="compact"] .project { flex: 0 1 auto; min-width: 3ch; max-width: 12ch; overflow: hidden; text-overflow: ellipsis; font-size: 11.5px; color: var(--muted); }
+.card[data-density="compact"] .project[data-line]::before { width: 6px; margin-right: 3px; }
+.card[data-density="compact"] .owner {
+  flex: 0 1 auto;
+  min-width: 4ch;
+  max-width: 14ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 11.5px;
+}
+.row-lease { font-size: 11.5px; }
+.row-lease .lease-left { font: 600 11.5px var(--mono); color: var(--text); }
+.chip, .row-lease:is([data-lease-state="low"], [data-lease-state="expired"]) {
+  padding: 0 5px;
+  border: 1px solid var(--warn);
+  border-radius: 3px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 16px;
+}
+.row-lease:is([data-lease-state="low"], [data-lease-state="expired"]) .lease-left { color: var(--warn); }
+.chip:is([data-chip="urgent"], [data-chip="blocked"]) { border-color: var(--danger); background: var(--danger-soft); color: var(--danger); }
+.card[data-density="compact"] .ratio { font: 600 11.5px var(--mono); }
+/* A compact Done row keeps its Ack beside it, outside the article the live feed replaces. */
+.cards:has(> .card[data-density="compact"]) { grid-template-columns: minmax(0, 1fr) auto; gap: 4px; }
+.cards:has(> .card[data-density="compact"]) > :not(form.ack) { grid-column: 1 / -1; }
+.cards:has(> .card[data-density="compact"]) > .card:has(+ form.ack) { grid-column: 1; }
+.cards:has(> .card[data-density="compact"]) > form.ack { grid-column: 2; align-self: center; margin: 0; }
+.cards > form.ack button.compact-ack { height: 24px; padding: 0 8px; font-size: 12px; }
 
 /* A track rule in the project's line colour; a claim lights it with an occupancy
    bar whose length is the lease left (--lease, 0..1, set by app.js). */
