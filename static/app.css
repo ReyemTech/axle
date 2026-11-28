@@ -882,6 +882,15 @@ label.check:has(input:disabled) { color: var(--muted); cursor: default; }
 .inline-form { display: flex; gap: 6px; align-items: center; flex: 1 1 240px; max-width: 420px; }
 .inline-form input { flex: 1; }
 
+/* ---------------------------------------------------------------- history */
+.history-bar { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin-bottom: 12px; }
+.history-bar .filter { flex: 1 1 320px; max-width: 560px; }
+.history-scope { margin: 0; font-size: 13px; }
+.ack-these { margin: 0 0 8px; }
+.ack-state { font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+.ack-state[data-ack="acked"], .ack-state[data-ack="auto-acked"] { color: var(--muted); }
+.history-next { margin: 12px 0 0; }
+
 /* ---------------------------------------------------------------- narrow screens */
 @media (max-width: 1100px) {
   .agent { grid-template-columns: 64px minmax(0, 1fr) minmax(0, 1fr) 70px; }

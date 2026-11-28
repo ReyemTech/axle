@@ -3123,3 +3123,240 @@ async fn cmd_enter_sends_message_forms() {
         );
     }
 }
+
+fn href_of(page: &Page, css: &str) -> String {
+    let sel = Selector::parse(css).unwrap();
+    page.html()
+        .select(&sel)
+        .next()
+        .unwrap_or_else(|| panic!("no element matches {css}"))
+        .value()
+        .attr("href")
+        .unwrap()
+        .to_string()
+}
+
+fn hidden_values(page: &Page, css: &str) -> Vec<String> {
+    let sel = Selector::parse(css).unwrap();
+    page.html()
+        .select(&sel)
+        .map(|e| e.value().attr("value").unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn history_lists_every_done_task_paged() {
+    let app = app().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let mut last = None;
+    for i in 0..=50 {
+        let t = app.task(&infra, &format!("t{i}"), None).await;
+        app.complete(&infra, t.id).await;
+        app.clock.advance(time::Duration::minutes(1));
+        last = Some(t);
+    }
+    // A subtask finishing last: History includes subtasks.
+    let parent = last.unwrap();
+    let child = app.task(&infra, "child", Some(parent.id)).await;
+    app.complete(&infra, child.id).await;
+    let cookie = app.login().await;
+
+    let p1 = app.get("/ui/history", Some(&cookie)).await;
+    assert_eq!(p1.status, StatusCode::OK);
+    let titles = select_texts(&p1, ".history-row .title");
+    assert_eq!(titles.len(), 50);
+    assert_eq!(titles[0], "child");
+    assert_eq!(titles[1], "t50");
+    let next = href_of(&p1, "a[rel=next]");
+    let p2 = app.get(&next, Some(&cookie)).await;
+    assert_eq!(p2.status, StatusCode::OK);
+    assert_eq!(select_texts(&p2, ".history-row .title"), ["t1", "t0"]);
+    assert!(select_texts(&p2, "a[rel=next]").is_empty());
+
+    let bad = app.get("/ui/history?after=nope", Some(&cookie)).await;
+    assert_eq!(bad.status, StatusCode::NOT_FOUND);
+    let unknown = app
+        .get(
+            &format!("/ui/history?after={}", TaskId::new()),
+            Some(&cookie),
+        )
+        .await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn history_shows_ack_state() {
+    let app = app().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let old = app.task(&infra, "old", None).await;
+    app.complete(&infra, old.id).await;
+    app.clock.advance(time::Duration::days(8));
+    let acked = app.task(&infra, "acked", None).await;
+    app.complete(&infra, acked.id).await;
+    app.state.tasks.ack_done(&[acked.id]).await.unwrap();
+    app.clock.advance(time::Duration::minutes(1));
+    let recent = app.task(&infra, "recent", None).await;
+    app.complete(&infra, recent.id).await;
+    let cookie = app.login().await;
+    let page = app.get("/ui/history", Some(&cookie)).await;
+    assert_eq!(
+        select_texts(&page, ".history-row .title"),
+        ["recent", "acked", "old"]
+    );
+    assert_eq!(
+        select_texts(&page, ".history-row .ack-state"),
+        ["unseen", "acked", "auto-acked"]
+    );
+    assert!(!page.text().contains("7 days"));
+}
+
+#[tokio::test]
+async fn history_filters_by_project_and_title() {
+    let app = app().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let web = app.agent("github.com/acme/web", "mac", "codex").await;
+    for (who, title) in [
+        (&infra, "infra work"),
+        (&web, "fix the flaky test"),
+        (&web, "100% sure_thing"),
+    ] {
+        let t = app.task(who, title, None).await;
+        app.complete(who, t.id).await;
+        app.clock.advance(time::Duration::minutes(1));
+    }
+    let cookie = app.login().await;
+    let titles = |p: &Page| select_texts(p, ".history-row .title");
+    let by_key = app
+        .get(&format!("/ui/history?project={INFRA}"), Some(&cookie))
+        .await;
+    assert_eq!(titles(&by_key), ["infra work"]);
+    let by_id = app
+        .get(
+            &format!("/ui/history?project={}", infra.agent.project_id.unwrap()),
+            Some(&cookie),
+        )
+        .await;
+    assert_eq!(titles(&by_id), ["infra work"]);
+    let by_title = app.get("/ui/history?q=FLAKY", Some(&cookie)).await;
+    assert_eq!(titles(&by_title), ["fix the flaky test"]);
+    let literal = app.get("/ui/history?q=%25+sure_", Some(&cookie)).await;
+    assert_eq!(titles(&literal), ["100% sure_thing"]);
+    let blank = app.get("/ui/history?q=+", Some(&cookie)).await;
+    assert_eq!(titles(&blank).len(), 3);
+    let missing = app.get("/ui/history?project=nope", Some(&cookie)).await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn history_next_link_keeps_filters() {
+    let app = app().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    for i in 0..51 {
+        let t = app.task(&infra, &format!("a&b {i}"), None).await;
+        app.complete(&infra, t.id).await;
+        app.clock.advance(time::Duration::minutes(1));
+    }
+    let cookie = app.login().await;
+    let pid = infra.agent.project_id.unwrap();
+    let page = app
+        .get(&format!("/ui/history?project={pid}&q=a%26b"), Some(&cookie))
+        .await;
+    let next = href_of(&page, "a[rel=next]");
+    assert!(next.starts_with("/ui/history?"), "{next}");
+    assert!(next.contains(&format!("project={pid}")), "{next}");
+    assert!(next.contains("q=a%26b"), "{next}");
+    assert!(next.contains("after="), "{next}");
+    let p2 = app.get(&next, Some(&cookie)).await;
+    assert_eq!(select_texts(&p2, ".history-row .title"), ["a&b 0"]);
+}
+
+#[tokio::test]
+async fn ack_these_clears_the_auto_acked_count() {
+    let app = app().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    for title in ["old one", "old two"] {
+        let t = app.task(&infra, title, None).await;
+        app.complete(&infra, t.id).await;
+    }
+    app.clock.advance(time::Duration::days(8));
+    let recent = app.task(&infra, "recent", None).await;
+    app.complete(&infra, recent.id).await;
+    let cookie = app.login().await;
+
+    let all = app.get("/ui/history", Some(&cookie)).await;
+    assert!(select_texts(&all, "form.ack-these").is_empty());
+
+    let page = app.get("/ui/history?unseen=auto", Some(&cookie)).await;
+    assert_eq!(select_texts(&page, ".history-row .title").len(), 2);
+    assert_eq!(select_texts(&page, "form.ack-these button"), ["Ack these"]);
+    let ids = hidden_values(&page, "form.ack-these input[name=id]");
+    assert_eq!(ids.len(), 2);
+    let back = hidden_values(&page, "form.ack-these input[name=back]");
+    assert_eq!(back, ["/ui/history?unseen=auto"]);
+    let csrf = csrf_of(&page);
+    let mut fields = vec![("csrf", csrf.as_str()), ("back", back[0].as_str())];
+    fields.extend(ids.iter().map(|i| ("id", i.as_str())));
+    let post = app
+        .post_form(
+            "/ui/done/ack",
+            Some(&cookie),
+            &serde_urlencoded::to_string(&fields).unwrap(),
+        )
+        .await;
+    assert_eq!(post.status, StatusCode::SEE_OTHER);
+    assert_eq!(post.location.as_deref(), Some("/ui/history?unseen=auto"));
+
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    assert!(select_texts(&board, ".auto-acked").is_empty());
+    assert_eq!(
+        select_texts(&board, ".column[data-status=done] .card-title"),
+        ["recent"]
+    );
+    let after = app.get("/ui/history?unseen=auto", Some(&cookie)).await;
+    assert!(select_texts(&after, ".history-row").is_empty());
+    assert!(select_texts(&after, "form.ack-these").is_empty());
+}
+
+#[tokio::test]
+async fn auto_unseen_honours_the_project_filter() {
+    let app = app().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let web = app.agent("github.com/acme/web", "mac", "codex").await;
+    for (who, title) in [(&infra, "infra old"), (&web, "web old")] {
+        let t = app.task(who, title, None).await;
+        app.complete(who, t.id).await;
+    }
+    app.clock.advance(time::Duration::days(8));
+    let cookie = app.login().await;
+    let pid = infra.agent.project_id.unwrap();
+    let page = app
+        .get(
+            &format!("/ui/history?unseen=auto&project={pid}"),
+            Some(&cookie),
+        )
+        .await;
+    assert_eq!(select_texts(&page, ".history-row .title"), ["infra old"]);
+    let back = hidden_values(&page, "form.ack-these input[name=back]");
+    assert_eq!(back, [format!("/ui/history?unseen=auto&project={pid}")]);
+}
+
+#[tokio::test]
+async fn history_is_in_the_nav_and_requires_login() {
+    let app = app().await;
+    let signed_out = app.get("/ui/history", None).await;
+    assert!(
+        signed_out
+            .location
+            .as_deref()
+            .unwrap()
+            .starts_with("/ui/login")
+    );
+    let cookie = app.login().await;
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    assert!(select_texts(&board, "nav.tabs a").contains(&"History".to_string()));
+    let history = app.get("/ui/history", Some(&cookie)).await;
+    assert_eq!(
+        select_texts(&history, "nav.tabs a[aria-current=page]"),
+        ["History"]
+    );
+}

@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}History{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1 class="page-title">History</h1>
+  <p class="muted">Every finished task, newest first. Acking hides a task from the board; it stays here.</p>
+</div>
+<div class="history-bar">
+  <form class="filter" method="get" action="/ui/history" role="search">
+    {% if auto %}<input type="hidden" name="unseen" value="auto">{% endif %}
+    <label for="history-project" class="visually-hidden">Project</label>
+    <select id="history-project" name="project">
+      <option value=""{% if filter.is_none() %} selected{% endif %}>All projects</option>
+      {% for p in projects %}<option value="{{ p.id }}" title="{{ p.key }}"{% if p.selected %} selected{% endif %}>{{ p.name }}</option>{% endfor %}
+    </select>
+    <label for="history-q" class="visually-hidden">Search titles</label>
+    <input id="history-q" class="search-field" type="search" name="q" value="{{ q }}" placeholder="Search titles">
+    <button type="submit" class="secondary">Show</button>
+  </form>
+  <p class="history-scope">{% if auto %}<a href="{{ all_href }}">Show all</a>{% else %}<a href="{{ auto_href }}">Show only auto-acked, unseen</a>{% endif %}</p>
+</div>
+{% if auto %}<p class="muted list-note">Auto-acked, unseen: finished long enough ago to have left the board before you acked them.</p>{% endif %}
+{% if rows.is_empty() %}
+<p class="empty">{% if auto %}No auto-acked, unseen tasks.{% else %}No finished tasks match.{% endif %}</p>
+{% else %}
+{% if auto %}{% if let Some(token) = csrf %}
+<form class="ack-these" method="post" action="/ui/done/ack">
+  <input type="hidden" name="csrf" value="{{ token }}">
+  <input type="hidden" name="back" value="{{ back }}">
+  {% for r in rows %}<input type="hidden" name="id" value="{{ r.id }}">{% endfor %}
+  <button type="submit" class="secondary">Ack these</button>
+</form>
+{% endif %}{% endif %}
+<ul class="rows">
+{% for r in rows %}
+  <li class="row history-row" id="task-{{ r.id }}" data-nav tabindex="-1">
+    <div class="row-main">
+      <a class="title row-title" href="/ui/tasks/{{ r.id }}">{{ r.title }}</a>
+      <span class="project" data-line="{{ r.project.line }}" title="{{ r.project.key }}">{{ r.project.name }}</span>
+      {% if let Some((pid, ptitle)) = r.parent %}<span class="muted">Subtask of <a href="/ui/tasks/{{ pid }}">{{ ptitle }}</a></span>{% endif %}
+      <span class="muted">done <time datetime="{{ r.done_at }}">{{ r.done_ago }}</time></span>
+    </div>
+    <span class="ack-state" data-ack="{{ r.state }}">{{ r.state }}</span>
+  </li>
+{% endfor %}
+</ul>
+{% if let Some(n) = next %}<p class="history-next"><a rel="next" href="{{ n }}">Older</a></p>{% endif %}
+{% endif %}
+{% endblock %}

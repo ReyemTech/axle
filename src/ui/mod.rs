@@ -12,6 +12,7 @@
 pub mod actions;
 pub mod admin;
 pub mod connect;
+pub mod history;
 pub mod inbox;
 pub mod needs;
 pub mod task_page;
@@ -156,6 +157,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/ui/pulse", get(views::pulse))
         .route("/ui/board", get(views::board))
         .route("/ui/board/columns", get(views::board_columns))
+        .route("/ui/history", get(history::history))
         .route("/ui/tasks", post(actions::create_task))
         .route("/ui/tasks/{id}", get(task_page::task_page))
         .route("/ui/tasks/{id}/children", get(views::children))

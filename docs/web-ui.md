@@ -10,7 +10,7 @@ none.
 
 ## The top bar
 
-Every page shares a bar with the sections (**Overview**, **Board**, **Inbox**, **Projects**,
+Every page shares a bar with the sections (**Overview**, **Board**, **History**, **Inbox**, **Projects**,
 **Tokens**), a **Filter this page** box, and live counts: sessions **live**, tasks
 **blocked**, and items that **need you**. The last links to the Needs you strip.
 
@@ -30,7 +30,7 @@ chips above the columns.
 The done column holds finished top-level tasks you have not seen, newest first, at most 50.
 Its head reads "N unseen". **Ack** under a card hides that task from the board; **Ack all**
 hides exactly the cards shown. Acking changes nothing about the task: it stays done and
-stays in History (the **History** link). Work finished more than `AXL_DONE_AUTO_ACK_DAYS`
+stays in [History](#history). Work finished more than `AXL_DONE_AUTO_ACK_DAYS`
 days ago (default 7) leaves the column by itself; a muted line, "N auto-acked, unseen",
 links to the History list of those tasks. Acking is a human action: agents cannot ack.
 
@@ -62,6 +62,22 @@ first — I approve before work starts**, ticked by default. See
 [the plan gate](concepts.md#the-plan-gate).
 
 <img src="images/new-task-form.webp" width="1440" alt="The New task form on the board: lead project select, Also involves checkboxes for other projects, title, details and a ticked Plan first checkbox, above the task columns.">
+
+## History
+
+**History** lists every finished task, subtasks included, newest first, 50 to a page;
+**Older** loads the next page. Each row shows the title, project, the parent for a subtask,
+when it finished, and its state in words:
+
+- **unseen**: finished recently and not acked yet; it is on the board.
+- **acked**: you acked it.
+- **auto-acked**: it finished more than `AXL_DONE_AUTO_ACK_DAYS` days ago without an ack, so
+  it left the board by itself.
+
+Filter by project, or search titles (case-insensitive, `%` and `_` match literally), then
+press **Show**. **Show only auto-acked, unseen** lists the tasks behind the board's
+"N auto-acked, unseen" line, respecting the project filter. There, **Ack these** acks exactly
+the rows on the page (up to 50) and returns to the same list.
 
 ## Needs you
 
