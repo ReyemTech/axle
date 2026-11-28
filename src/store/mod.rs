@@ -12,9 +12,11 @@ use async_trait::async_trait;
 use time::{Duration, OffsetDateTime};
 
 use crate::config::Backend;
-use crate::delivery::stages::{ChildState, CompletionTarget, completion_target};
+use crate::delivery::stages::{
+    ChildState, CompletionTarget, completion_target, last_enabled, parent_stage,
+};
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, Enrollment, EnrollmentId, EnrollmentKind, Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState, Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, WaitingOn, DeliveryStage, ProjectDelivery,
+    Actor, Address, Agent, AgentId, BlockDetail, Enrollment, EnrollmentId, EnrollmentKind, Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState, Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, WaitingOn, DeliveryStage, ProjectDelivery, PrLinkedBy, TaskPr, TaskStageRow,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -180,13 +182,53 @@ pub trait Store: Send + Sync {
     /// project with `completion_target(d.stages, …)`: a task whose target is `Done` becomes
     /// `done` (`done_at = updated_at = d.updated_at`, `version` bumped) with a `delivered`
     /// event (actor the human, note `delivered_note(&d.stages)`, `token` recorded). Done tasks
-    /// are never reopened. Parents are not recomputed here. Returns the tasks moved, as
-    /// updated.
+    /// are never reopened. The parent rule then runs for the parents of moved tasks (as after
+    /// any child change). Returns the tasks moved, as updated: those the stages finished and
+    /// the parents the parent rule moved.
     async fn set_project_delivery(
         &self,
         d: &ProjectDelivery,
         token: Option<TokenId>,
     ) -> StoreResult<Vec<Task>>;
+
+    // ---- delivery: PR links and completion ----
+
+    /// Links `req.pr` to `req.task` in one transaction (the task row is locked first). Refused
+    /// (`Closed`) for a `done` / `cancelled` task. The task's own PR again is `Unchanged`;
+    /// with a different PR linked, `replace = false` gives `HasLink`, and a task whose
+    /// `delivery_stage` reached `merged` gives `AlreadyMerged` (the linked PR's number). A PR
+    /// whose `(repo, number)` or `url` belongs to another task gives `TakenBy`. On link:
+    /// replaces any previous row, sets `delivery_stage = max(current, in_pr)`, records
+    /// `task_stages(in_pr)` if absent, bumps `version` / `updated_at = now`, and appends
+    /// `pr_linked` (payload `url`) or `pr_relinked` (payload `url`, `previous_url`).
+    async fn link_pr(&self, req: &LinkPrRequest) -> StoreResult<LinkOutcome>;
+    /// Removes the task's PR link, guarded: the task is not `done` / `cancelled` /
+    /// `delivering` and its stage is before `merged`. Sets `delivery_stage = NULL`, bumps
+    /// `version`, appends `pr_unlinked` (payload `previous_url`). Returns the removed link;
+    /// `None` when there was none or the guard did not match.
+    async fn unlink_pr(
+        &self,
+        task: TaskId,
+        actor: Actor,
+        token: Option<TokenId>,
+        now: OffsetDateTime,
+    ) -> StoreResult<Option<TaskPr>>;
+    /// The task's PR link.
+    async fn task_pr(&self, task: TaskId) -> StoreResult<Option<TaskPr>>;
+    /// The PR links of the listed tasks (tasks without one are left out), by task id.
+    async fn task_prs(&self, tasks: &[TaskId]) -> StoreResult<Vec<TaskPr>>;
+    /// The stages a task reached, in stage order.
+    async fn task_stages(&self, task: TaskId) -> StoreResult<Vec<TaskStageRow>>;
+    /// `task_complete`'s write: the guarded transition of `req.transition` (its `from`,
+    /// `owner`, plan, lease and message fields; its `to` is replaced by the target) and, in
+    /// the same transaction: links `req.link` (`complete_links`) when the task has no PR and
+    /// the PR is not taken (skipped silently otherwise), then decides with
+    /// `completion_target` from the project's stages, the PR, the task's stage and its
+    /// children. `done` sets `done_at`; `delivering` leaves it null and sets `delivery_stage`
+    /// to the target stage. The `done` event is appended either way; for `delivering` its
+    /// payload gains `"delivering": "<stage>"`. `None` (nothing written, the link included)
+    /// when the guard did not match.
+    async fn complete_task(&self, req: &CompleteRequest) -> StoreResult<Option<Completed>>;
 
     // ---- agents ----
 
@@ -810,6 +852,226 @@ pub fn projects_added_payload(added: &[ProjectId]) -> serde_json::Value {
     })
 }
 
+/// A PR to link to a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTaskPr {
+    /// `owner/name`.
+    pub repo: String,
+    /// `None` for a link-only PR (a host Axle cannot read).
+    pub number: Option<i64>,
+    pub url: String,
+    pub linked_by: PrLinkedBy,
+}
+
+/// A request to link a PR (see `Store::link_pr`).
+#[derive(Debug, Clone)]
+pub struct LinkPrRequest {
+    pub task: TaskId,
+    pub pr: NewTaskPr,
+    pub actor: Actor,
+    pub token: Option<TokenId>,
+    pub now: OffsetDateTime,
+    /// `false` for the fallback match: links only when the task has no PR.
+    pub replace: bool,
+}
+
+/// What `link_pr` did.
+// Outcomes carry whole rows by design and are short-lived values, so boxing would only add
+// noise (as for `ClaimOutcome`).
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkOutcome {
+    Linked(Task),
+    Relinked {
+        task: Task,
+        previous: TaskPr,
+    },
+    /// The task already has this PR.
+    Unchanged(Task),
+    /// The PR belongs to this other task.
+    TakenBy(TaskId),
+    /// The task reached `merged` (via the PR numbered `number`); new work needs a new task.
+    AlreadyMerged {
+        number: Option<i64>,
+    },
+    /// `replace = false` and the task has another PR.
+    HasLink,
+    Closed(TaskStatus),
+    NotFound,
+}
+
+/// `task_complete`'s write (see `Store::complete_task`).
+#[derive(Debug, Clone)]
+pub struct CompleteRequest {
+    pub transition: TransitionRequest,
+    /// A PR from the completion's links, linked when the task has none.
+    pub link: Option<NewTaskPr>,
+}
+
+/// A completion that applied, and where it sent the task.
+#[derive(Debug, Clone)]
+pub struct Completed {
+    pub transitioned: Transitioned,
+    pub target: CompletionTarget,
+}
+
+/// The `pr_linked` (or, replacing `previous`, `pr_relinked`) event of a link.
+pub(crate) fn pr_linked_event(
+    task: TaskId,
+    url: &str,
+    previous: Option<&TaskPr>,
+    actor: Actor,
+    at: OffsetDateTime,
+) -> TaskEvent {
+    let (kind, payload) = match previous {
+        None => (TaskEventKind::PrLinked, serde_json::json!({ "url": url })),
+        Some(p) => (
+            TaskEventKind::PrRelinked,
+            serde_json::json!({ "url": url, "previous_url": p.url }),
+        ),
+    };
+    TaskEvent {
+        id: uuid::Uuid::now_v7(),
+        task_id: task,
+        at,
+        actor,
+        kind,
+        note: None,
+        payload: Some(payload),
+    }
+}
+
+/// The `pr_unlinked` event, keeping the removed URL.
+pub(crate) fn pr_unlinked_event(
+    task: TaskId,
+    previous: &TaskPr,
+    actor: Actor,
+    at: OffsetDateTime,
+) -> TaskEvent {
+    TaskEvent {
+        id: uuid::Uuid::now_v7(),
+        task_id: task,
+        at,
+        actor,
+        kind: TaskEventKind::PrUnlinked,
+        note: None,
+        payload: Some(serde_json::json!({ "previous_url": previous.url })),
+    }
+}
+
+/// Whether `existing` is the PR `new` names (same URL, or same repo and number).
+pub(crate) fn same_pr(existing: &TaskPr, new: &NewTaskPr) -> bool {
+    existing.url == new.url
+        || (new.number.is_some() && existing.repo == new.repo && existing.number == new.number)
+}
+
+/// The completion's `done` event; completing into `delivering` adds `"delivering"` to it.
+pub(crate) fn completion_event(event: &TaskEvent, target: CompletionTarget) -> TaskEvent {
+    let mut event = event.clone();
+    if let CompletionTarget::Delivering(stage) = target {
+        let mut payload = match event.payload.take() {
+            Some(serde_json::Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        payload.insert("delivering".into(), stage.as_str().into());
+        event.payload = Some(payload.into());
+    }
+    event
+}
+
+/// What the parent rule reads about a `delivering` parent (under its row lock).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParentState {
+    /// `tasks.delivery_stage`: the stage the parent shows (the minimum).
+    pub stage: Option<DeliveryStage>,
+    pub has_pr: bool,
+    /// The furthest stage the parent's own PR reached (its `task_stages` rows): the
+    /// parent's `delivery_stage` is the derived minimum, so it cannot hold this.
+    pub own: Option<DeliveryStage>,
+}
+
+/// Where the parent rule moves a `delivering` parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParentMove {
+    /// Forward to this stage (the minimum over its own PR and its delivering children).
+    Stage(DeliveryStage),
+    /// Every non-cancelled child is `done` and its own PR (if any) reached the last stage.
+    Done,
+}
+
+/// The parent rule, shared by both stores and run after every change of a child whose
+/// parent is `delivering`. Moves are forward only; `None` when nothing changes.
+pub(crate) fn recompute_parent(
+    stages: &[DeliveryStage],
+    parent: &ParentState,
+    children: &[ChildState],
+) -> Option<ParentMove> {
+    let own = parent.has_pr.then(|| {
+        parent
+            .own
+            .map_or(DeliveryStage::InPr, |s| s.max(DeliveryStage::InPr))
+    });
+    let children_done = children
+        .iter()
+        .all(|c| matches!(c.status, TaskStatus::Done | TaskStatus::Cancelled));
+    let own_done = match (own, last_enabled(stages)) {
+        (Some(own), Some(last)) => own >= last,
+        _ => true,
+    };
+    if children_done && own_done {
+        return Some(ParentMove::Done);
+    }
+    let target = parent_stage(own, children)?;
+    (Some(target) > parent.stage).then_some(ParentMove::Stage(target))
+}
+
+/// The event the parent rule records on a parent it moved.
+pub(crate) fn parent_move_event(
+    parent: TaskId,
+    change: ParentMove,
+    source: &TaskEvent,
+) -> TaskEvent {
+    let (kind, note, payload) = match change {
+        ParentMove::Stage(stage) => (
+            TaskEventKind::StageReached,
+            None,
+            Some(serde_json::json!({ "stage": stage.as_str() })),
+        ),
+        ParentMove::Done => (
+            TaskEventKind::Delivered,
+            Some("every child task is done".to_string()),
+            None,
+        ),
+    };
+    TaskEvent {
+        id: uuid::Uuid::now_v7(),
+        task_id: parent,
+        at: source.at,
+        actor: source.actor,
+        kind,
+        note,
+        payload,
+    }
+}
+
+/// What one step of the parent rule did to a child's parent (both stores' `parent_step`).
+#[derive(Debug, Clone)]
+pub(crate) enum ParentStep {
+    Unchanged,
+    /// The last open child closed: `children_complete` was recorded on the parent, and a
+    /// `claimed` parent moved to `review` (the row as updated, if it moved).
+    ChildrenComplete(Option<Task>),
+    /// The rule moved a `delivering` parent (as updated) and this event records it; it has
+    /// not been appended yet, so the caller appends it and continues with the grandparent.
+    Moved(Task, TaskEvent),
+}
+
+/// Adds `task` to the tasks a write moved, replacing an earlier entry for the same task.
+pub(crate) fn push_moved(moved: &mut Vec<Task>, task: Task) {
+    moved.retain(|t| t.id != task.id);
+    moved.push(task);
+}
+
 /// A transition that applied.
 #[derive(Debug, Clone)]
 pub struct Transitioned {
@@ -978,7 +1240,7 @@ pub fn child_event(child: &Task, parent: TaskId, source: &TaskEvent) -> Option<T
     let kind = match source.kind {
         TaskEventKind::Claimed | TaskEventKind::LeaseExpiredTakeover => TaskEventKind::ChildClaimed,
         TaskEventKind::Blocked => TaskEventKind::ChildBlocked,
-        TaskEventKind::Done => TaskEventKind::ChildDone,
+        TaskEventKind::Done | TaskEventKind::Delivered => TaskEventKind::ChildDone,
         TaskEventKind::Cancelled => TaskEventKind::ChildCancelled,
         _ => return None,
     };
@@ -996,9 +1258,13 @@ pub fn child_event(child: &Task, parent: TaskId, source: &TaskEvent) -> Option<T
     })
 }
 
-/// Whether a child event can be the one that finishes the last open child.
+/// Whether a child event can be the one that finishes the last open child (a `done` event
+/// may also have sent the child to `delivering`, which still counts as open).
 pub fn closes_child(source: &TaskEvent) -> bool {
-    matches!(source.kind, TaskEventKind::Done | TaskEventKind::Cancelled)
+    matches!(
+        source.kind,
+        TaskEventKind::Done | TaskEventKind::Cancelled | TaskEventKind::Delivered
+    )
 }
 
 /// The event recorded on a parent whose children are all `done` / `cancelled`.
