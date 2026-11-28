@@ -204,10 +204,13 @@ pub fn remove_token(dir: &AxlDir) -> Result<bool, ClientError> {
 
 /// Writes `<path>.tmp` with mode 0600, then renames it over `path`.
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    // A name of its own per write (process id and a per-process counter), so concurrent hooks
+    // writing the same status.json or cursor never share, delete or rename each other's file.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.{seq}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
-    let _ = std::fs::remove_file(&tmp);
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -225,4 +228,47 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_private;
+
+    /// Concurrent hooks write the same status.json or cursor: every write lands whole and none
+    /// fails, because each one writes its own temporary file before the rename.
+    #[test]
+    fn concurrent_private_writes_do_not_race() {
+        let dir = std::env::temp_dir().join(format!("axl-wp-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("status.json");
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let body = format!("writer{i} ").repeat(4096);
+                    for _ in 0..25 {
+                        write_private(&path, body.as_bytes()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("a write failed");
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let first = text.split(' ').next().unwrap().to_string();
+        assert_eq!(text, format!("{first} ").repeat(4096), "a torn write");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "temporary files left behind"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
