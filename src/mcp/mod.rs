@@ -29,8 +29,8 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::domain::{
-    Actor, Address, AgentId, Message, Project, ProjectId, SessionId, Task, TaskEventKind, TaskId,
-    TokenId,
+    Actor, Address, AgentId, BlockDetail, Message, Project, ProjectId, SessionId, Task,
+    TaskEventKind, TaskId, TokenId, WaitingOn,
 };
 use crate::http::{AppState, AuthToken};
 use crate::service::identity::{IdentityError, IdentityInput, IdentityService, Resolved};
@@ -506,7 +506,7 @@ impl<'a> Labels<'a> {
             Some(a) => Some(self.agent(a).await?),
             None => None,
         };
-        Ok(json!({
+        let mut v = json!({
             "id": t.id,
             "title": self.task_title(t).await?,
             "status": t.status,
@@ -524,6 +524,34 @@ impl<'a> Labels<'a> {
             "created_by": self.actor(t.created_by).await?,
             "created_at": timestamp(t.created_at),
             "updated_at": timestamp(t.updated_at),
+        });
+        if let Some(b) = &t.block {
+            v["blocked"] = self.block(t, b).await?;
+        }
+        Ok(v)
+    }
+
+    /// A blocked task's detail; the agent-written texts are framed as the owner's.
+    async fn block(&mut self, t: &Task, b: &BlockDetail) -> Result<Value, ToolError> {
+        let author = match (t.owner_agent_id, t.owner_session_id) {
+            (Some(a), Some(s)) => Actor::Agent(a, s),
+            _ => t.created_by,
+        };
+        let waiting_on = match &b.waiting_on {
+            Some(WaitingOn::External(text)) => {
+                json!({ "external": self.wrap(author, Some(t.project_id), text).await? })
+            }
+            Some(w) => w.to_json(),
+            None => Value::Null,
+        };
+        Ok(json!({
+            "reason": self.wrap(author, Some(t.project_id), &b.reason).await?,
+            "since": b.since.map(timestamp),
+            "waiting_on": waiting_on,
+            "unblock": match &b.unblock {
+                Some(u) => Some(self.wrap(author, Some(t.project_id), u).await?),
+                None => None,
+            },
         }))
     }
 

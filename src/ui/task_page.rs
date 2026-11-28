@@ -17,6 +17,7 @@ use super::views::{
 };
 use crate::domain::{
     Actor, Message, MessageId, PlanState, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus,
+    WaitingOn,
 };
 use crate::http::AppState;
 use crate::service::tasks::plan_words;
@@ -173,6 +174,70 @@ impl PlanView {
     }
 }
 
+/// The Blocked panel: why, who and since when, what it waits on and what would unblock it.
+pub struct BlockedView {
+    /// Agent-written (`None`: blocked before reasons were kept, and none was found).
+    pub reason: Option<String>,
+    pub by: Option<String>,
+    pub since: Option<Stamp>,
+    /// `none`, `human`, `task` or `external`.
+    pub waiting_kind: &'static str,
+    /// For `task`: the awaited task's id, title and live status.
+    pub waiting_task: Option<WaitingTask>,
+    /// For `external`: agent-written.
+    pub waiting_text: Option<String>,
+    /// Agent-written.
+    pub unblock: Option<String>,
+}
+
+pub struct WaitingTask {
+    pub id: String,
+    pub title: String,
+    pub status: &'static str,
+    /// `cancelled`: it will never unblock this task.
+    pub cancelled: bool,
+}
+
+impl BlockedView {
+    /// The reason as safe HTML from its markdown (see [`super::markdown`]).
+    pub fn reason_html(&self) -> Option<String> {
+        self.reason
+            .as_deref()
+            .map(|r| super::markdown::render(r, Some("blocked")))
+    }
+}
+
+async fn blocked_view(
+    store: &dyn crate::store::Store,
+    now: OffsetDateTime,
+    task: &Task,
+    owner: Option<&str>,
+) -> StoreResult<Option<BlockedView>> {
+    if task.status != TaskStatus::Blocked {
+        return Ok(None);
+    }
+    let block = task.block.as_ref();
+    let waiting = block.and_then(|b| b.waiting_on.as_ref());
+    let waiting_task = match waiting.and_then(WaitingOn::task) {
+        Some(id) => store.get_task(id).await?.map(|w| WaitingTask {
+            id: w.id.to_string(),
+            title: w.title,
+            status: w.status.as_str(),
+            cancelled: w.status == TaskStatus::Cancelled,
+        }),
+        None => None,
+    };
+    Ok(Some(BlockedView {
+        reason: block.map(|b| b.reason.clone()),
+        by: owner.map(str::to_string),
+        since: block.and_then(|b| b.since).map(|t| Stamp::new(now, t)),
+        waiting_kind: waiting.map_or("none", WaitingOn::kind),
+        waiting_task,
+        waiting_text: waiting.and_then(WaitingOn::text).map(str::to_string),
+        unblock: block.and_then(|b| b.unblock.clone()),
+    }))
+}
+
 pub struct TaskView {
     pub id: String,
     pub title: String,
@@ -228,6 +293,7 @@ struct TaskPage {
     plan: Option<PlanView>,
     /// A decision was refused because the plan changed.
     plan_changed: bool,
+    blocked: Option<BlockedView>,
     /// Projects that can still be added.
     addable: Vec<ProjectOption>,
     /// Projects a subtask may be created in.
@@ -351,6 +417,7 @@ pub async fn task_page(
     let extra = store.task_projects(id).await?;
     let (aspect, label) = state_mark(&task);
     let open = !matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled);
+    let blocked = blocked_view(store, now, &task, owner.as_deref()).await?;
     let view = TaskView {
         id: task.id.to_string(),
         title: task.title.clone(),
@@ -512,6 +579,7 @@ pub async fn task_page(
         child_projects,
         plan,
         plan_changed: q.plan_changed.is_some(),
+        blocked,
         addable,
     })
 }

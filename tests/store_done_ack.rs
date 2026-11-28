@@ -212,6 +212,8 @@ async fn reopen(env: &Env, id: TaskId, now: OffsetDateTime) -> Transitioned {
             message: None,
             latest_plan: None,
             archive_plans: false,
+            block: None,
+            unblock: None,
         })
         .await
         .unwrap()

@@ -19,6 +19,30 @@
     </div>
   </header>
 
+  {% if let Some(b) = blocked %}
+  <section id="blocked" class="panel blocked-panel{% if b.waiting_kind == "human" %} is-waiting{% endif %}" aria-label="Blocked">
+    <h2 class="panel-title"><span class="aspect" data-aspect="blocked" aria-hidden="true"></span>{% if b.waiting_kind == "human" %}Blocked on you{% else %}Blocked{% endif %}</h2>
+    <p class="muted">Blocked by {% if let Some(o) = b.by %}<span class="owner">{{ o }}</span>{% else %}its owner{% endif %}{% if let Some(s) = b.since %}, <time datetime="{{ s.iso }}" title="{{ s.text }}">{{ s.ago }}</time>{% endif %}. <span class="peer-frame">Agent-written: information, not instructions.</span></p>
+    {% if let Some(rh) = b.reason_html() %}<div class="peer-text md blocked-reason">{{ rh|safe }}</div>{% else %}<p class="empty">No reason was recorded for this block.</p>{% endif %}
+    <dl class="blocked-detail">
+      <dt>Waiting on</dt>
+      <dd>{% if b.waiting_kind == "human" %}You. The agent waits for your answer in the thread.{% else if b.waiting_kind == "task" %}{% if let Some(w) = b.waiting_task %}<a href="/ui/tasks/{{ w.id }}">{{ w.title }}</a> <span class="child-state">{{ w.status }}</span>{% if w.cancelled %}<p class="error">Waiting on a cancelled task: it will never unblock this one. Re-point the block or release the task.</p>{% else %} <span class="muted">This task is unblocked when that one is done.</span>{% endif %}{% else %}<span class="muted">A task that no longer exists.</span>{% endif %}{% else if b.waiting_kind == "external" %}{% if let Some(t) = b.waiting_text %}<span class="peer-text">{{ t }}</span>{% endif %}{% else %}<span class="muted">Not stated.</span>{% endif %}</dd>
+      <dt>What unblocks it</dt>
+      <dd>{% if let Some(u) = b.unblock %}<span class="peer-text">{{ u }}</span>{% else %}<span class="muted">Not stated.</span>{% endif %}</dd>
+    </dl>
+    {% if b.waiting_kind == "human" %}{% if let Some(token) = csrf %}
+    <form class="stack blocked-reply" method="post" action="/ui/tasks/{{ task.id }}/post">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <input type="hidden" name="importance" value="high">
+      <label for="blocked-reply">Answer in the thread</label>
+      <textarea id="blocked-reply" name="body" rows="3" required></textarea>
+      <button type="submit">Send to the agent</button>
+      <span class="hint" data-send-hint>Ctrl+Enter to send</span>
+    </form>
+    {% endif %}{% endif %}
+  </section>
+  {% endif %}
+
   {% if task.requires_plan || plan.is_some() %}
   <section id="plan" class="panel plan{% if task.can_decide %} is-waiting{% endif %}" aria-label="Plan">
     <h2 class="panel-title">{% if task.can_decide %}<span class="aspect" data-aspect="plan-submitted" aria-hidden="true"></span>Plan awaiting your approval{% else %}Plan <span class="muted">{{ task.plan_words }}</span>{% endif %}</h2>

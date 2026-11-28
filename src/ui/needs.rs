@@ -4,6 +4,8 @@
 //! A card is one of:
 //! - a plan awaiting approval (a `planning` task whose plan is `submitted`), with Approve and
 //!   Request changes inline;
+//! - a task blocked waiting on the human ("Blocked on you"), with what would unblock it and a
+//!   reply box that posts into the task's thread;
 //! - a task in `review` (awaiting the coordinator or the human), whoever created it;
 //! - an unarchived human-due message of high or urgent importance (plans excluded: they have
 //!   their own card), read with a peek that marks nothing delivered.
@@ -18,7 +20,7 @@ use time::format_description::well_known::Rfc3339;
 use super::SessionCtx;
 use super::inbox::{ReplyTarget, reply_target};
 use super::views::{Labels, ProjectLabel, UiResult, html};
-use crate::domain::{Actor, Message, MessageKind, PlanState, Task, TaskId, TaskStatus};
+use crate::domain::{Actor, Message, MessageKind, PlanState, Task, TaskId, TaskStatus, WaitingOn};
 use crate::http::AppState;
 use crate::store::{StoreResult, TaskFilter};
 
@@ -31,6 +33,7 @@ const PREVIEW: usize = 280;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Need {
     ApprovePlan,
+    BlockedOnYou,
     Review,
     Reply,
 }
@@ -39,6 +42,7 @@ impl Need {
     pub fn key(&self) -> &'static str {
         match self {
             Need::ApprovePlan => "plan",
+            Need::BlockedOnYou => "blocked",
             Need::Review => "review",
             Need::Reply => "reply",
         }
@@ -47,6 +51,7 @@ impl Need {
     pub fn label(&self) -> &'static str {
         match self {
             Need::ApprovePlan => "Approve plan",
+            Need::BlockedOnYou => "Blocked on you",
             Need::Review => "Review",
             Need::Reply => "Reply",
         }
@@ -82,6 +87,8 @@ pub struct NeedCard {
     /// a reply goes.
     pub options: Vec<String>,
     pub reply: Option<ReplyTarget>,
+    /// For "Blocked on you" cards: the task whose thread the reply box posts to.
+    pub reply_task: Option<String>,
 }
 
 /// "42s", "12m", "3h", "2d".
@@ -114,7 +121,8 @@ pub async fn latest_plan(state: &AppState, task: TaskId) -> StoreResult<Option<M
         .find(|m| m.kind == MessageKind::Plan))
 }
 
-/// Every card, plans first, then reviews, then messages; each group oldest first.
+/// Every card, plans first, then tasks blocked on the human, then reviews, then messages;
+/// each group oldest first.
 pub(super) async fn needs_you(
     state: &AppState,
     labels: &mut Labels<'_>,
@@ -168,8 +176,11 @@ pub(super) async fn needs_you(
             importance: "high",
             options: Vec::new(),
             reply: None,
+            reply_task: None,
         });
     }
+
+    cards.extend(blocked_on_you(state, labels, now).await?);
 
     let mut reviews: Vec<Task> = state
         .store
@@ -202,6 +213,7 @@ pub(super) async fn needs_you(
             importance: "high",
             options: Vec::new(),
             reply: None,
+            reply_task: None,
         });
     }
 
@@ -244,6 +256,68 @@ pub(super) async fn needs_you(
                 reply_target(&m)
             },
             options: m.options,
+            reply_task: None,
+        });
+    }
+    Ok(cards)
+}
+
+/// "Blocked on you" cards: blocked tasks waiting on the human, longest-blocked first. The
+/// preview is what would unblock the task (else why it is blocked); the card's reply box posts
+/// into the task's thread.
+async fn blocked_on_you(
+    state: &AppState,
+    labels: &mut Labels<'_>,
+    now: OffsetDateTime,
+) -> StoreResult<Vec<NeedCard>> {
+    let mut blocked: Vec<(Task, OffsetDateTime)> = state
+        .store
+        .list_tasks(&TaskFilter {
+            status: Some(TaskStatus::Blocked),
+            ..TaskFilter::default()
+        })
+        .await?
+        .into_iter()
+        .filter_map(|t| {
+            let b = t.block.as_ref()?;
+            if b.waiting_on != Some(WaitingOn::Human) {
+                return None;
+            }
+            let at = b.since.unwrap_or(t.updated_at);
+            Some((t, at))
+        })
+        .collect();
+    blocked.sort_by_key(|(_, at)| *at);
+    let mut cards = Vec::with_capacity(blocked.len());
+    for (t, at) in blocked {
+        let agent = match t.owner_agent_id {
+            Some(a) => Some(labels.agent_label(a).await?),
+            None => None,
+        };
+        let block = t.block.as_ref().expect("filtered on its block");
+        let preview = match &block.unblock {
+            Some(u) => format!("Needs: {}", clip(u)),
+            None => clip(&block.reason),
+        };
+        cards.push(NeedCard {
+            need: Need::BlockedOnYou,
+            aspect: "blocked",
+            title: t.title.clone(),
+            href: format!("/ui/tasks/{}#blocked", t.id),
+            project: Some(labels.project(t.project_id)),
+            agent,
+            task_title: None,
+            preview: Some(preview),
+            plan_html: None,
+            waited: waited(now, at),
+            since: at.format(&Rfc3339).unwrap_or_default(),
+            task_id: None,
+            plan_id: None,
+            message_id: None,
+            importance: "high",
+            options: Vec::new(),
+            reply: None,
+            reply_task: Some(t.id.to_string()),
         });
     }
     Ok(cards)

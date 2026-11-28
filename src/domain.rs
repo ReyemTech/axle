@@ -317,6 +317,82 @@ pub struct Task {
     /// Claiming moves it to `planning`; work starts once the human approves the plan.
     pub requires_plan: bool,
     pub plan_state: PlanState,
+    /// Why a `blocked` task is blocked and what would unblock it; `None` in any other status
+    /// (and for a task blocked before the detail was recorded, if its history has no reason).
+    pub block: Option<BlockDetail>,
+}
+
+/// What a blocked task waits on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitingOn {
+    /// The human: the task is a "Blocked on you" card in the UI's Needs you.
+    Human,
+    /// Another task: when it is `done`, this one is unblocked automatically.
+    Task(TaskId),
+    /// Something outside Axle, in words.
+    External(String),
+}
+
+impl WaitingOn {
+    /// The stored `waiting_kind`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            WaitingOn::Human => "human",
+            WaitingOn::Task(_) => "task",
+            WaitingOn::External(_) => "external",
+        }
+    }
+
+    /// The stored `waiting_task_id`.
+    pub fn task(&self) -> Option<TaskId> {
+        match self {
+            WaitingOn::Task(t) => Some(*t),
+            _ => None,
+        }
+    }
+
+    /// The stored `waiting_text`.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            WaitingOn::External(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Inverse of `kind` / `task` / `text`; `None` for no or unknown kind.
+    pub fn from_columns(
+        kind: Option<&str>,
+        task: Option<TaskId>,
+        text: Option<String>,
+    ) -> Option<WaitingOn> {
+        match (kind?, task) {
+            ("human", _) => Some(WaitingOn::Human),
+            ("task", Some(t)) => Some(WaitingOn::Task(t)),
+            ("external", _) => Some(WaitingOn::External(text.unwrap_or_default())),
+            _ => None,
+        }
+    }
+
+    /// As JSON for tools and history: `{"human": true}`, `{"task": id}`, `{"external": text}`.
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            WaitingOn::Human => serde_json::json!({ "human": true }),
+            WaitingOn::Task(t) => serde_json::json!({ "task": t.to_string() }),
+            WaitingOn::External(text) => serde_json::json!({ "external": text }),
+        }
+    }
+}
+
+/// The current block of a `blocked` task (its history keeps every earlier one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockDetail {
+    /// Agent-written: why it is blocked.
+    pub reason: String,
+    /// When it entered `blocked` (an update keeps this).
+    pub since: Option<OffsetDateTime>,
+    pub waiting_on: Option<WaitingOn>,
+    /// Agent-written: what would unblock it.
+    pub unblock: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -346,6 +422,11 @@ pub enum TaskEventKind {
     PlanChangesRequested,
     /// Participating projects were added to a parent task (listed in the payload).
     ProjectsAdded,
+    /// The owner changed a blocked task's reason, what it waits on or what unblocks it (the
+    /// previous values are in the payload).
+    BlockUpdated,
+    /// The task this one waited on is done, so it left `blocked` on its own.
+    Unblocked,
     /// The human acknowledged a done task. Only ever published as a live event; it is
     /// never written to a task's history.
     Acked,
@@ -372,6 +453,8 @@ text_enum!(TaskEventKind {
     PlanApproved => "plan_approved",
     PlanChangesRequested => "plan_changes_requested",
     ProjectsAdded => "projects_added",
+    BlockUpdated => "block_updated",
+    Unblocked => "unblocked",
     Acked => "acked",
 });
 
@@ -570,6 +653,7 @@ mod tests {
             version: 1,
             requires_plan: false,
             plan_state: PlanState::None,
+            block: None,
         };
         let done = |at| task(TaskStatus::Done, Some(at), None);
         assert_eq!(ack_state(&done(now - n), now, n), Some(AckState::Unseen));

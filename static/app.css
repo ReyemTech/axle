@@ -846,6 +846,18 @@ label.check:has(input:disabled) { color: var(--muted); cursor: default; }
 .plan-actions { display: flex; flex-wrap: wrap; gap: 12px 16px; align-items: start; margin-top: 10px; }
 .plan-actions > form:first-child button { height: 34px; }
 .plan-changes { flex: 1 1 260px; }
+/* The Blocked panel: a blocked task says why, what it waits on and what unblocks it. */
+.blocked-panel { background: var(--danger-soft); border: 1px solid var(--danger-border); }
+.blocked-panel .panel-title { color: var(--danger); align-items: center; }
+.blocked-panel.is-waiting { border: 2px solid var(--sig-red); }
+.blocked-reason { margin: 8px 0 4px; padding: 10px 12px; background: var(--card); border: 1px solid var(--card-border); border-radius: 3px; }
+.blocked-detail { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 14px; margin: 8px 0 0; font-size: 13px; }
+.blocked-detail dt { font-weight: 600; color: var(--muted); }
+.blocked-detail dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.blocked-detail dd .error { margin: 4px 0 0; }
+.blocked-reply { margin-top: 10px; max-width: 520px; }
+.card-blocked { font-size: 12.5px; color: var(--text); overflow-wrap: anywhere; }
+.card-blocked-label { font-weight: 600; color: var(--danger); }
 .msg-kind { font-size: 12px; font-weight: 600; color: var(--warn); text-transform: uppercase; letter-spacing: .05em; }
 .msg-kind[data-kind="system"] { color: var(--muted); }
 

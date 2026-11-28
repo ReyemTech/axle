@@ -14,8 +14,8 @@ use time::{Duration, OffsetDateTime};
 use crate::config::Backend;
 use crate::domain::{
     Actor, Address, Agent, AgentId, Enrollment, EnrollmentId, EnrollmentKind, Importance,
-    InboxItem, Message, MessageId, PlanState, Project, ProjectId, Session, SessionId, Task,
-    TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId, TokenInfo,
+    InboxItem, Message, MessageId, MessageKind, PlanState, Project, ProjectId, Session, SessionId,
+    Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId, TokenInfo, WaitingOn,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -524,6 +524,96 @@ pub struct TransitionRequest {
     /// Archives (acks for the human) the task's existing plan messages, before `message` is
     /// written: a superseded or decided plan no longer waits on anyone.
     pub archive_plans: bool,
+    /// The block detail to write when the task is (or stays) `blocked`; `None` keeps it.
+    /// Whenever the resulting status is not `blocked`, the detail is cleared regardless.
+    pub block: Option<BlockWrite>,
+    /// When the transition makes the task `done`: unblocks, in the same transaction, every
+    /// `blocked` task waiting on it (see `UnblockRule`). `None` leaves them alone.
+    pub unblock: Option<UnblockRule>,
+}
+
+/// Block detail written by a transition. Each `None` keeps the stored value (on entering
+/// `blocked` the stored values are already empty). `blocked_at` is set on entering `blocked`.
+///
+/// A `WaitingOn::Task(t)` is guarded in the store: the write applies only while `t` exists,
+/// is not `done` / `cancelled`, is not the task itself or one of its ancestors, and does not
+/// (through the tasks it waits on) wait on this task. A guard miss writes nothing.
+#[derive(Debug, Clone, Default)]
+pub struct BlockWrite {
+    pub reason: Option<String>,
+    pub waiting_on: Option<WaitingOn>,
+    pub unblock: Option<String>,
+}
+
+/// How a finished task unblocks the tasks waiting on it: a dependent whose owner session's
+/// last heartbeat is at or after `live_since` goes back to `claimed` with a fresh lease
+/// (`now` + its own TTL, else `default_ttl`); otherwise it goes back to `open` with no owner,
+/// as a release would. Either way its block detail is cleared, an `unblocked` event is
+/// appended and a system note posted in its thread (`unblocked_note`).
+#[derive(Debug, Clone, Copy)]
+pub struct UnblockRule {
+    pub live_since: OffsetDateTime,
+    pub default_ttl: Duration,
+}
+
+/// A task a finished task unblocked, with the note posted in its thread.
+#[derive(Debug, Clone)]
+pub struct Unblocked {
+    pub task: Task,
+    pub note: Message,
+}
+
+/// The system note an unblocked task gets in its thread.
+pub fn unblocked_note(done: &Task, reopened: bool) -> String {
+    let base = format!("unblocked: \"{}\" ({}) is done", done.title, done.id);
+    if reopened {
+        format!(
+            "{base}. The owner's session has ended, so the task is open again for any \
+             eligible agent."
+        )
+    } else {
+        format!("{base}. The task is claimed by its owner again, with a fresh lease.")
+    }
+}
+
+/// The `unblocked` event and thread note for `dependent`, which waited on `done`. The note is
+/// written by the server (no sending agent), so the owner's inbox shows it even when the owner
+/// also finished `done`.
+pub fn unblocked_records(
+    dependent: &Task,
+    done: &Task,
+    reopened: bool,
+    actor: Actor,
+    now: OffsetDateTime,
+) -> (TaskEvent, Message) {
+    let text = unblocked_note(done, reopened);
+    let event = TaskEvent {
+        id: uuid::Uuid::now_v7(),
+        task_id: dependent.id,
+        at: now,
+        actor,
+        kind: TaskEventKind::Unblocked,
+        note: Some(text.clone()),
+        payload: Some(serde_json::json!({
+            "waiting_task_id": done.id.to_string(),
+            "reopened": reopened,
+        })),
+    };
+    let note = Message {
+        id: MessageId::new(),
+        project_id: Some(dependent.project_id),
+        from: Actor::Human,
+        to: Address::Task(dependent.id),
+        subject: Some("unblocked".into()),
+        body: text,
+        importance: Importance::Normal,
+        task_id: Some(dependent.id),
+        reply_to: None,
+        created_at: now,
+        kind: MessageKind::System,
+        options: Vec::new(),
+    };
+    (event, note)
 }
 
 /// A request to append participating projects to a task (see `Store::add_task_projects`).
@@ -570,6 +660,8 @@ pub struct Transitioned {
     /// Whether this transition closed its parent's last open child, so the store recorded
     /// `children_complete` on the parent (and moved a `claimed` parent to `review`).
     pub children_complete: bool,
+    /// Tasks this transition unblocked (it made the task `done`; see `UnblockRule`).
+    pub unblocked: Vec<Unblocked>,
 }
 
 #[derive(Debug, Clone, Default)]

@@ -12,15 +12,31 @@ use crate::clock::Clock;
 use crate::config::ServerConfig;
 use crate::domain::{
     Actor, Address, AgentId, Eligibility, Importance, Message, MessageId, MessageKind, PlanState,
-    ProjectId, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId,
+    ProjectId, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId, WaitingOn,
 };
 use crate::events::{Event, EventBus};
 use crate::service::identity::{IdentityError, NAME_MAX, Resolved, check_label};
 use crate::service::messages::{MessageError, SUBJECT_MAX, check_body, check_subject};
 use crate::store::{
-    AddProjectsRequest, ClaimRequest, Claimant, EditRequest, LeaseUpdate, Store, StoreError,
-    TaskFilter, TransitionRequest, Transitioned, claim_event,
+    AddProjectsRequest, BlockWrite, ClaimRequest, Claimant, EditRequest, LeaseUpdate, Store,
+    StoreError, TaskFilter, TransitionRequest, Transitioned, UnblockRule, claim_event,
 };
+
+/// Most characters in a block's "what unblocks it" and in an external `waiting_on`.
+pub const UNBLOCK_MAX: usize = 500;
+/// Most links followed when checking a wait (ancestors, or tasks waiting on tasks).
+const MAX_CHAIN: usize = 1000;
+
+/// What `TaskService::block_with` writes. On a task already blocked, each `None` keeps the
+/// current value.
+#[derive(Debug, Clone, Default)]
+pub struct BlockInput {
+    /// Why the task is blocked (required to block; optional on an update).
+    pub reason: Option<String>,
+    pub waiting_on: Option<WaitingOn>,
+    /// What would unblock it (at most `UNBLOCK_MAX` characters).
+    pub unblock: Option<String>,
+}
 
 /// Who is calling a task operation that agents and the human may both perform.
 #[derive(Debug, Clone, Copy)]
@@ -162,6 +178,27 @@ pub enum TaskError {
     Closed(TaskStatus),
     #[error("a reason is required to block a task")]
     ReasonRequired,
+    #[error(
+        "the task is already blocked: pass a new `reason`, `waiting_on` and/or `unblock` to \
+         update it"
+    )]
+    NothingToUpdate,
+    #[error("a task cannot wait on itself")]
+    WaitOnSelf,
+    #[error("the task to wait on does not exist")]
+    WaitTargetNotFound,
+    #[error("cannot wait on a {0} task: it will never unblock this one")]
+    WaitOnClosed(TaskStatus),
+    #[error(
+        "a subtask cannot wait on its own parent or ancestor: the parent finishes after its \
+         subtasks, so neither would ever move"
+    )]
+    WaitOnAncestor,
+    #[error(
+        "waiting on task {0} would make a cycle: it already waits (directly or through other \
+         tasks) on this one"
+    )]
+    WaitCycle(TaskId),
     #[error("a task lease TTL must be at least one second")]
     InvalidLeaseTtl,
     /// An eligibility harness or host outside the label charset or length.
@@ -375,6 +412,7 @@ impl TaskService {
             version: 0,
             requires_plan: new.requires_plan,
             plan_state: PlanState::None,
+            block: None,
         };
         let event = self.event(task.id, by.actor(), TaskEventKind::Created, None, None);
         let first = Message {
@@ -681,30 +719,203 @@ impl TaskService {
         .await
     }
 
-    /// `claimed → blocked`. The owner keeps the task and its lease stops expiring.
+    /// `claimed → blocked` with only a reason (see `block_with`).
     pub async fn block(
         &self,
         caller: &Resolved,
         id: TaskId,
         reason: &str,
     ) -> Result<Task, TaskError> {
-        let reason = reason.trim();
-        if reason.is_empty() {
-            return Err(TaskError::ReasonRequired);
-        }
-        self.owner_transition(
+        self.block_with(
             caller,
             id,
-            &[TaskStatus::Claimed],
-            TaskStatus::Blocked,
-            Some(TaskStatus::Blocked),
-            LeaseUpdate::Clear,
-            false,
-            TaskEventKind::Blocked,
-            Some(reason.to_string()),
-            None,
+            BlockInput {
+                reason: Some(reason.to_string()),
+                ..BlockInput::default()
+            },
         )
         .await
+    }
+
+    /// `claimed → blocked`: the owner keeps the task and its lease stops expiring. A reason is
+    /// required; what it waits on and what would unblock it are optional. On a task the
+    /// caller already holds `blocked`, it updates the given fields instead (the others are
+    /// kept) and records a `block_updated` event with the previous values.
+    ///
+    /// Waiting on a task is refused when that task is done, cancelled, unknown, this task or
+    /// one of its ancestors, or (through the tasks it waits on) waits on this task. When the
+    /// awaited task becomes `done`, this one is unblocked automatically (`complete`).
+    pub async fn block_with(
+        &self,
+        caller: &Resolved,
+        id: TaskId,
+        input: BlockInput,
+    ) -> Result<Task, TaskError> {
+        let reason = input
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map(str::to_string);
+        if let Some(r) = &reason {
+            check_body(r)?;
+        }
+        let unblock = input
+            .unblock
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(str::to_string);
+        if unblock
+            .as_ref()
+            .is_some_and(|u| u.chars().count() > UNBLOCK_MAX)
+        {
+            return Err(TaskError::InvalidField {
+                field: "unblock",
+                reason: "at most 500 characters",
+            });
+        }
+        let waiting_on = match input.waiting_on {
+            Some(WaitingOn::External(text)) => {
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    return Err(TaskError::InvalidField {
+                        field: "waiting_on.external",
+                        reason: "describe what the task waits on",
+                    });
+                }
+                if text.chars().count() > UNBLOCK_MAX {
+                    return Err(TaskError::InvalidField {
+                        field: "waiting_on.external",
+                        reason: "at most 500 characters",
+                    });
+                }
+                Some(WaitingOn::External(text))
+            }
+            other => other,
+        };
+        if let Some(target) = waiting_on.as_ref().and_then(WaitingOn::task) {
+            self.check_wait(id, target).await?;
+        }
+        let current = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+        let updating = current.status == TaskStatus::Blocked;
+        if !updating && reason.is_none() {
+            return Err(TaskError::ReasonRequired);
+        }
+        if updating && reason.is_none() && waiting_on.is_none() && unblock.is_none() {
+            return Err(TaskError::NothingToUpdate);
+        }
+        let mut detail = serde_json::Map::new();
+        if let Some(w) = &waiting_on {
+            detail.insert("waiting_on".into(), w.to_json());
+        }
+        if let Some(u) = &unblock {
+            detail.insert("unblock".into(), u.clone().into());
+        }
+        if updating && let Some(previous) = &current.block {
+            detail.insert("previous_reason".into(), previous.reason.clone().into());
+            detail.insert(
+                "previous_waiting_on".into(),
+                previous
+                    .waiting_on
+                    .as_ref()
+                    .map_or(serde_json::Value::Null, WaitingOn::to_json),
+            );
+            detail.insert(
+                "previous_unblock".into(),
+                previous
+                    .unblock
+                    .clone()
+                    .map_or(serde_json::Value::Null, Into::into),
+            );
+        }
+        let (from, to, kind): (&[TaskStatus], _, _) = if updating {
+            (&[TaskStatus::Blocked], None, TaskEventKind::BlockUpdated)
+        } else {
+            (
+                &[TaskStatus::Claimed],
+                Some(TaskStatus::Blocked),
+                TaskEventKind::Blocked,
+            )
+        };
+        let result = self
+            .guarded(
+                caller,
+                id,
+                Guarded {
+                    from,
+                    target: TaskStatus::Blocked,
+                    to,
+                    lease: if updating {
+                        LeaseUpdate::Keep
+                    } else {
+                        LeaseUpdate::Clear
+                    },
+                    note: reason.clone(),
+                    payload: (!detail.is_empty()).then(|| detail.into()),
+                    block: Some(BlockWrite {
+                        reason,
+                        waiting_on: waiting_on.clone(),
+                        unblock,
+                    }),
+                    ..Guarded::new(kind)
+                },
+            )
+            .await;
+        match result {
+            // The store's guard also misses when the awaited task closed or a wait cycle
+            // appeared after the check above: say which.
+            Err(e) => {
+                if let Some(target) = waiting_on.as_ref().and_then(WaitingOn::task) {
+                    self.check_wait(id, target).await?;
+                }
+                Err(e)
+            }
+            ok => ok,
+        }
+    }
+
+    /// Why `task` may not wait on `target`, if it may not (the store enforces the same rule).
+    async fn check_wait(&self, task: TaskId, target: TaskId) -> Result<(), TaskError> {
+        if task == target {
+            return Err(TaskError::WaitOnSelf);
+        }
+        let waited = self
+            .store
+            .get_task(target)
+            .await?
+            .ok_or(TaskError::WaitTargetNotFound)?;
+        if matches!(waited.status, TaskStatus::Done | TaskStatus::Cancelled) {
+            return Err(TaskError::WaitOnClosed(waited.status));
+        }
+        // Ancestors of `task`: a child waiting on its parent would never be unblocked.
+        let mut cursor = self.store.get_task(task).await?.and_then(|t| t.parent_id);
+        for _ in 0..MAX_CHAIN {
+            let Some(p) = cursor else { break };
+            if p == target {
+                return Err(TaskError::WaitOnAncestor);
+            }
+            cursor = self.store.get_task(p).await?.and_then(|t| t.parent_id);
+        }
+        // The tasks `target` waits on, transitively.
+        let mut next = Some(waited);
+        for _ in 0..MAX_CHAIN {
+            let Some(t) = next else { break };
+            let Some(on) = t
+                .block
+                .as_ref()
+                .filter(|_| t.status == TaskStatus::Blocked)
+                .and_then(|b| b.waiting_on.as_ref())
+                .and_then(WaitingOn::task)
+            else {
+                break;
+            };
+            if on == task {
+                return Err(TaskError::WaitCycle(target));
+            }
+            next = self.store.get_task(on).await?;
+        }
+        Ok(())
     }
 
     /// `claimed | blocked → review`: work done, awaiting the coordinator or the human.
@@ -934,9 +1145,15 @@ impl TaskService {
         let Transitioned {
             task,
             children_complete,
+            unblocked,
         } = done;
         let children_complete = *children_complete;
         self.changed(task, event.kind).await;
+        // Wake-up (later) wakes the owner of an unblocked task from these events.
+        for u in unblocked {
+            self.changed(&u.task, TaskEventKind::Unblocked).await;
+            self.message_created(&u.note).await;
+        }
         let Some(parent_id) = task.parent_id else {
             return;
         };
@@ -1136,6 +1353,8 @@ impl TaskService {
                 message: g.message.clone(),
                 latest_plan: None,
                 archive_plans: g.archive_plans,
+                block: g.block.clone(),
+                unblock: (g.to == Some(TaskStatus::Done)).then(|| self.unblock_rule()),
             };
             if let Some(done) = self.store.transition_task(&req).await? {
                 if g.kind != TaskEventKind::Renewed {
@@ -1229,6 +1448,8 @@ impl TaskService {
                 message: Some(message.clone()),
                 latest_plan: Some(plan),
                 archive_plans: true,
+                block: None,
+                unblock: None,
             };
             if let Some(done) = self.store.transition_task(&req).await? {
                 self.after_transition(&done, &req.event, None).await;
@@ -1256,6 +1477,15 @@ impl TaskService {
             .rev()
             .find(|m| m.kind == MessageKind::Plan)
             .map(|m| m.id))
+    }
+
+    /// How a finished task unblocks its dependents: like the task's owner reclaiming it while
+    /// its session is live, else like a release.
+    fn unblock_rule(&self) -> UnblockRule {
+        UnblockRule {
+            live_since: self.clock.now() - self.presence_stale,
+            default_ttl: self.lease_ttl,
+        }
     }
 
     async fn message_created(&self, message: &Message) {
@@ -1296,6 +1526,8 @@ impl TaskService {
             message: None,
             latest_plan: None,
             archive_plans: false,
+            block: None,
+            unblock: None,
         };
         match self.store.transition_task(&req).await? {
             Some(done) => {
@@ -1347,6 +1579,7 @@ struct Guarded<'a> {
     plan_to: Option<PlanState>,
     message: Option<Message>,
     archive_plans: bool,
+    block: Option<BlockWrite>,
 }
 
 impl Guarded<'_> {
@@ -1364,6 +1597,7 @@ impl Guarded<'_> {
             plan_to: None,
             message: None,
             archive_plans: false,
+            block: None,
         }
     }
 }

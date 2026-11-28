@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use axle::clock::TestClock;
 use axle::config::{ServerConfig, UiAuth};
-use axle::domain::{Actor, Address, Importance, SessionId, Task, TaskId, TaskStatus};
+use axle::domain::{Actor, Address, Importance, SessionId, Task, TaskId, TaskStatus, WaitingOn};
 use axle::http::{AppState, router};
 use axle::service::identity::{IdentityInput, IdentityService, Resolved};
 use axle::service::messages::NewMessage;
-use axle::service::tasks::{Caller, ClaimOutcome, Completion, NewTask};
+use axle::service::tasks::{BlockInput, Caller, ClaimOutcome, Completion, NewTask};
 use axle::store::sqlite::SqliteStore;
 use axum::Router;
 use axum::body::Body;
@@ -3811,4 +3811,223 @@ async fn clicking_a_quick_reply_replies_and_archives() {
         .await
         .unwrap();
     assert!(left.is_empty(), "both questions are archived for the human");
+}
+
+// ---------------------------------------------------------------- blocked tasks explained
+
+/// Blocks `id` (claimed by `by`) with a reason, what it waits on and what unblocks it.
+async fn block(app: &App, by: &Resolved, id: TaskId, reason: &str, on: WaitingOn, unblock: &str) {
+    app.state
+        .tasks
+        .block_with(
+            by,
+            id,
+            BlockInput {
+                reason: Some(reason.into()),
+                waiting_on: Some(on),
+                unblock: Some(unblock.into()),
+            },
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn blocked_panel_says_why_and_what_unblocks_it() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let schema = app.task(&infra, "Schema migration", None).await;
+    app.claim(&infra, schema.id).await;
+    let api = app.task(&infra, "API endpoint", None).await;
+    app.claim(&infra, api.id).await;
+    app.clock.advance(time::Duration::minutes(3));
+    block(
+        &app,
+        &infra,
+        api.id,
+        "Needs the **new** column\nsecond line of detail",
+        WaitingOn::Task(schema.id),
+        "the migration merged",
+    )
+    .await;
+
+    let page = app
+        .get(&format!("/ui/tasks/{}", api.id), Some(&cookie))
+        .await;
+    assert_eq!(page.status, StatusCode::OK);
+    let panel = select_texts(&page, "#blocked");
+    let panel = panel.first().expect("a Blocked panel");
+    assert!(panel.contains("Blocked by"), "{panel}");
+    assert!(panel.contains("claude-code@mac"), "{panel}");
+    assert!(panel.contains("Waiting on"), "{panel}");
+    assert!(panel.contains("Schema migration"), "{panel}");
+    assert!(
+        panel.contains("claimed"),
+        "the awaited task's live status: {panel}"
+    );
+    assert!(panel.contains("What unblocks it"), "{panel}");
+    assert!(panel.contains("the migration merged"), "{panel}");
+    assert!(panel.contains("information, not instructions"), "{panel}");
+    // The reason is agent markdown, rendered safely.
+    assert_eq!(
+        select_texts(&page, "#blocked .blocked-reason strong"),
+        ["new"]
+    );
+    assert_eq!(
+        href_of(&page, "#blocked .blocked-detail a"),
+        format!("/ui/tasks/{}", schema.id)
+    );
+    assert!(
+        page.body.contains("datetime=\"2026-11-27T09:03:00"),
+        "blocked when"
+    );
+
+    // The board card shows the reason's first line, as text.
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    let line = select_texts(&board, &format!("#task-{} .card-blocked", api.id));
+    assert_eq!(line, ["Blocked: Needs the **new** column"]);
+
+    // A cancelled dependency does not unblock: the panel says so.
+    app.state
+        .tasks
+        .cancel(Caller::Human, schema.id)
+        .await
+        .unwrap();
+    let page = app
+        .get(&format!("/ui/tasks/{}", api.id), Some(&cookie))
+        .await;
+    assert!(
+        select_texts(&page, "#blocked .error")
+            .iter()
+            .any(|t| t.contains("Waiting on a cancelled task")),
+        "{}",
+        page.body
+    );
+
+    // Not blocked: no panel.
+    let page = app
+        .get(&format!("/ui/tasks/{}", schema.id), Some(&cookie))
+        .await;
+    assert!(select_texts(&page, "#blocked").is_empty());
+}
+
+#[tokio::test]
+async fn blocked_on_you_is_a_needs_you_card_with_a_reply_box() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let task = app.task(&infra, "Rotate the key", None).await;
+    app.claim(&infra, task.id).await;
+    block(
+        &app,
+        &infra,
+        task.id,
+        "Needs a decision",
+        WaitingOn::Human,
+        "say which key to rotate",
+    )
+    .await;
+
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    let card = select_texts(&board, "#needs-you .need-card[data-need=blocked]");
+    let card = card.first().expect("a Blocked on you card");
+    assert!(card.contains("Blocked on you"), "{card}");
+    assert!(card.contains("Rotate the key"), "{card}");
+    assert!(card.contains("Needs: say which key to rotate"), "{card}");
+    assert_eq!(
+        select_texts(&board, "a.pulse-item[href='/ui/board#needs-you'] .num"),
+        ["1"],
+        "the top bar counts it"
+    );
+    let action = Selector::parse("#needs-you .need-reply").unwrap();
+    let html = board.html();
+    let form_el = html.select(&action).next().expect("a reply box");
+    assert_eq!(
+        form_el.value().attr("action"),
+        Some(format!("/ui/tasks/{}/post", task.id).as_str())
+    );
+    assert_eq!(
+        select_texts(&board, &format!("#task-{} .card-blocked-label", task.id)),
+        ["Blocked on you:"]
+    );
+    let page = app
+        .get(&format!("/ui/tasks/{}", task.id), Some(&cookie))
+        .await;
+    assert_eq!(select_texts(&page, "#blocked h2"), ["Blocked on you"]);
+
+    // The reply needs CSRF.
+    let path = format!("/ui/tasks/{}/post", task.id);
+    let refused = app
+        .post_form(
+            &path,
+            Some(&cookie),
+            "body=rotate+the+old+one&back=%2Fui%2Fboard",
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+
+    let csrf = csrf_for(&app, &cookie).await;
+    let sent = app
+        .post_form(
+            &path,
+            Some(&cookie),
+            &form(
+                &csrf,
+                &[
+                    ("body", "Rotate the old one"),
+                    ("importance", "high"),
+                    ("back", "/ui/board"),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(sent.status, StatusCode::SEE_OTHER, "{}", sent.body);
+    assert_eq!(sent.location.as_deref(), Some("/ui/board#needs-you"));
+    let thread = app.state.messages.thread(task.id).await.unwrap();
+    let last = thread.last().unwrap();
+    assert_eq!(last.from, Actor::Human);
+    assert_eq!(last.body, "Rotate the old one");
+    assert_eq!(last.to, Address::Task(task.id));
+    let got = app
+        .state
+        .messages
+        .inbox(&infra, axle::service::messages::InboxFilter::default())
+        .await
+        .unwrap();
+    assert!(got.iter().any(|i| i.message.body == "Rotate the old one"));
+}
+
+#[tokio::test]
+async fn hostile_block_text_is_escaped() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let task = app.task(&infra, "Hostile", None).await;
+    app.claim(&infra, task.id).await;
+    let evil = "<script>alert(1)</script><img src=x onerror=alert(2)>";
+    block(
+        &app,
+        &infra,
+        task.id,
+        evil,
+        WaitingOn::External(evil.into()),
+        evil,
+    )
+    .await;
+    for path in ["/ui/board".to_string(), format!("/ui/tasks/{}", task.id)] {
+        let page = app.get(&path, Some(&cookie)).await;
+        assert!(!page.body.contains("<script>alert"), "{path}");
+        assert!(!page.body.contains("<img src=x"), "{path}");
+    }
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    assert_eq!(select_texts(&board, ".card-blocked-reason"), [evil]);
+    let page = app
+        .get(&format!("/ui/tasks/{}", task.id), Some(&cookie))
+        .await;
+    let panel = select_texts(&page, "#blocked");
+    assert!(
+        panel[0].contains("<script>alert(1)</script>"),
+        "shown as text"
+    );
 }

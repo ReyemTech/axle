@@ -49,6 +49,12 @@ fn task_error(e: TaskError) -> UiError {
         | TaskError::NoPlanToReview(_)
         | TaskError::PlanChanged) => UiError::Conflict(capitalise(&e.to_string())),
         e @ (TaskError::ReasonRequired
+        | TaskError::NothingToUpdate
+        | TaskError::WaitOnSelf
+        | TaskError::WaitTargetNotFound
+        | TaskError::WaitOnClosed(_)
+        | TaskError::WaitOnAncestor
+        | TaskError::WaitCycle(_)
         | TaskError::EmptyPlan
         | TaskError::NoteRequired
         | TaskError::UnknownProject
@@ -282,6 +288,10 @@ pub struct PostForm {
     subject: String,
     #[serde(default)]
     importance: String,
+    /// The page to return to: the board or the overview (a "Blocked on you" reply), else the
+    /// task page.
+    #[serde(default)]
+    back: String,
 }
 
 /// Posts into the task's thread as the human.
@@ -309,7 +319,7 @@ pub async fn post_to_thread(
         )
         .await
         .map_err(message_error)?;
-    Ok(see_other(&format!("/ui/tasks/{id}")))
+    Ok(see_other(&back_to(&form.back, id)))
 }
 
 pub async fn force_release(

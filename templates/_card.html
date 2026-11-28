@@ -1,6 +1,7 @@
 <article class="card" id="task-{{ card.id }}" data-status="{{ card.status }}" data-line="{{ card.project.line }}" data-nav tabindex="-1"
          sse-swap="task-{{ card.id }}" hx-swap="outerHTML">
   <h3 class="card-title"><a class="card-link" href="/ui/tasks/{{ card.id }}">{{ card.title }}</a></h3>
+  {% if let Some(r) = card.blocked_line %}<p class="card-blocked"><span class="card-blocked-label">{% if card.blocked_on_you %}Blocked on you:{% else %}Blocked:{% endif %}</span> <span class="card-blocked-reason" title="Agent-written">{{ r }}</span></p>{% endif %}
   {% if let Some((pid, ptitle)) = card.parent %}<p class="card-parent">Subtask of <a href="/ui/tasks/{{ pid }}">{{ ptitle }}</a></p>{% endif %}
   <div class="card-meta">
     <span class="state" data-status="{{ card.status }}" data-aspect="{{ card.aspect }}"><span class="aspect" data-aspect="{{ card.aspect }}" aria-hidden="true"></span><span class="status">{{ card.label }}</span></span>
