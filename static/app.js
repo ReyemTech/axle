@@ -108,6 +108,12 @@
     document.querySelectorAll("[data-nav]").forEach(function (el) {
       el.hidden = q !== "" && el.textContent.toLowerCase().indexOf(q) < 0;
     });
+    // Per-card Ack forms sit beside their card (outside the article so live swaps keep their
+    // CSRF token); they hide and show together with it.
+    document.querySelectorAll("form.ack[data-ack-for]").forEach(function (form) {
+      var card = document.getElementById("task-" + form.getAttribute("data-ack-for"));
+      form.hidden = !!card && card.hidden;
+    });
     updateBulkAck(q !== "");
   }
 
@@ -330,6 +336,8 @@
 
   document.addEventListener("htmx:afterSettle", afterSwap);
   document.addEventListener("htmx:sseMessage", afterSwap);
+  document.addEventListener("htmx:afterSwap", afterSwap);
+  document.addEventListener("htmx:oobAfterSwap", afterSwap);
 
   // Destructive forms ask first (`data-confirm` holds the question).
   document.addEventListener("submit", function (e) {

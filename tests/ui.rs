@@ -3424,6 +3424,32 @@ async fn history_bulk_ack_links_each_id_to_its_row() {
     }
 }
 
+#[tokio::test]
+async fn per_card_ack_forms_link_to_their_card_for_the_filter() {
+    let app = app().await;
+    let (_, cookie, _) = board_with_done(&app, &["a", "b"]).await;
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    let ids = hidden_values(&board, "form.ack-all input[name=id]");
+    assert_eq!(ids.len(), 2);
+    assert_eq!(select_texts(&board, "form.ack[data-ack-for]").len(), 2);
+    for id in &ids {
+        assert_eq!(
+            select_texts(&board, &format!("form.ack[data-ack-for=\"{id}\"]")).len(),
+            1
+        );
+        assert_eq!(select_texts(&board, &format!("article#task-{id}")).len(), 1);
+    }
+}
+
+#[test]
+fn app_js_hides_per_card_ack_with_its_card_and_reapplies_on_swap() {
+    let js = include_str!("../static/app.js");
+    assert!(js.contains("form.ack[data-ack-for]"));
+    assert!(js.contains("form.hidden = "));
+    assert!(js.contains("htmx:afterSwap"));
+    assert!(js.contains("htmx:oobAfterSwap"));
+}
+
 #[test]
 fn app_js_filters_bulk_ack_ids() {
     let js = include_str!("../static/app.js");

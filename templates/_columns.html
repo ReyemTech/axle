@@ -18,7 +18,7 @@
   <div class="cards">
   {% for card in col.cards %}{% include "_card.html" %}
   {% if col.status == "done" %}{% if let Some(token) = csrf %}
-  <form class="ack" method="post" action="/ui/tasks/{{ card.id }}/ack">
+  <form class="ack" data-ack-for="{{ card.id }}" method="post" action="/ui/tasks/{{ card.id }}/ack">
     <input type="hidden" name="csrf" value="{{ token }}">
     <input type="hidden" name="back" value="{{ ack_back }}">
     <button type="submit" class="secondary" aria-label="Ack {{ card.title }}">Ack</button>
