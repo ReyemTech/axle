@@ -1,6 +1,6 @@
 [package]
 name = "axle-mcp"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Axle (axl): self-hosted MCP server where coding agents on any machine message each other and claim tasks under renewable leases, with a live web UI"
 license = "Elastic-2.0"

@@ -7,6 +7,85 @@ include breaking changes.
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/ReyemTech/axle/compare/v0.1.2...v0.1.3) - 2026-11-28
+
+### Added
+
+- *(ui)* show a task's token usage on its page
+- *(ui)* Usage page with totals, breakdown and usage over time
+- *(cli)* axl status shows usage collection, billing and the last report
+- *(install)* register the SessionEnd hook for Claude Code and Codex
+- *(hook)* report token usage on Stop and SessionEnd
+- *(usage)* collect usage deltas from harness logs and report them
+- *(usage)* cursor files, billing detection and the [usage] config table
+- *(usage)* parse token usage from Codex rollouts
+- *(usage)* parse token usage from Claude Code transcripts
+- *(cli)* axl usage reprice recomputes stored costs
+- *(http)* accept token usage reports at POST /v1/usage
+- *(usage)* built-in API price table with an override file
+- *(store)* sum token usage by project, task, agent, harness, host, model and day
+- *(store)* record token usage and split it across held tasks
+- *(ui)* one-line compact cards
+- move a top-level task under a parent
+- related links between tasks; questions always in Needs you
+- *(install)* rules for PR links, review threads and follow-up subtasks
+- *(ui)* declutter the board: 12 per column with Show more, compact cards
+- blocked tasks say why and what unblocks them
+- *(ui)* show quick replies as buttons in the inbox and on Needs you cards
+- *(mcp)* let send_message offer the human 2-4 quick-reply options
+- *(ui)* render agent markdown safely in plans, threads and inbox
+- *(ui)* history page for finished tasks
+- *(ui)* done column shows unseen work with Ack and Ack all
+- *(mcp)* hide acked done tasks from task_list; add AXL_DONE_AUTO_ACK_DAYS
+- *(tasks)* ack done tasks and their done descendants
+- *(store)* query done tasks by ack window, title and done order
+- *(store)* record done_at and acked_at on tasks
+- *(ui)* Cmd+Enter or Ctrl+Enter sends the message
+- *(install)* write the Axle rules block into ~/.claude/CLAUDE.md for Claude Code
+- *(http)* add read-only GET /v1/leases listing a session's held tasks
+- *(ui)* link project keys to their repository
+
+### Fixed
+
+- *(ui)* show no price or a lower bound when totals include unpriced models
+- *(usage)* hold a trailing Codex fallback record until the next run
+- *(usage)* count a Codex token_count only when the running total advances
+- *(store)* count a lease takeover as the new owner's holding
+- *(client)* give each private write its own temporary file
+- *(store)* merge a duplicate usage key only from the token that stored it
+- *(usage)* keep the off switch when a billing value or config.toml is bad
+- *(ui)* build the usage page's board filter with the new expand field
+- *(ui)* say no price on a task's usage line when the model is unpriced
+- *(usage)* report an unreadable transcript once per session
+- *(ui)* wrap compact signals instead of clipping them in narrow columns
+- *(tasks)* allow replacing a link at the limit and moving with a new wait
+- *(mcp)* check links and moves before task_update writes anything
+- *(store)* refuse a move that makes a task wait on its own ancestor
+- *(store)* serialize links and moves under TASK_LOCK; cancel a duplicate atomically
+- *(ui)* re-rank the board on urgent thread mail; density links keep the expansion
+- *(ui)* rank urgent thread mail first however much attention mail is older
+- *(store)* one lock order for completion, blocking and claims on Postgres
+- *(store)* record a block update's previous values under the write lock
+- *(store)* take the wait lock before any task row lock on Postgres
+- *(ui)* done ack polish from review
+- *(mcp)* frame quick-reply options as peer text
+- *(ui)* keep URL paren trimming linear in markdown
+- *(ui)* hide per-card Ack with its card when the filter hides it
+- *(ui)* bulk ack only submits cards the filter shows
+- *(store)* ack done descendants below non-done intermediates
+- *(ui)* ack copy, per-card labels, history filter link and ASCII-only back
+- *(store)* use the done index on SQLite, keep DoneNewest to done rows, ack pre-upgrade done tasks older than a week
+- *(hook)* frame held task titles, claim the nudge atomically, cache leases
+- *(hook)* always inject the Axle rules at session start and nudge once without a task
+
+### Other
+
+- *(codex)* say plainly the cache-write mapping is unverified and how to check it
+- *(hook)* say a slow usage report can delay the Stop block within its budget
+- Merge pull request #23 from ReyemTech/feat/compact-one-line
+- *(store)* renumber blocked_detail migration to 0006
+- *(store)* renumber message_options migration to 0005
+
 ## [0.1.2](https://github.com/ReyemTech/axle/compare/v0.1.1...v0.1.2) - 2026-11-28
 
 ### Added
