@@ -2,7 +2,7 @@
 
 Spec: `docs/superpowers/specs/2026-11-28-related-links-design.md`.
 
-1. Migration `0009_related_links` (SQLite and Postgres): `task_links` with the pair index.
+1. Migration `0007_related_links` (SQLite and Postgres): `task_links` with the pair index.
 2. Domain: `LinkKind` (with `label`), `TaskLink`, event kinds `related` and `moved_under`.
 3. Store: `relate_tasks`, `task_links`, `move_task` on both backends; `human_attention`
    includes messages with options. `store_matrix!` tests: symmetric read, replace, removal,

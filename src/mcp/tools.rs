@@ -21,7 +21,9 @@ use crate::domain::{
 };
 use crate::service::identity::Resolved;
 use crate::service::messages::{InboxFilter, NewMessage, check_body, check_subject};
-use crate::service::tasks::{BlockInput, Caller, ClaimOutcome, Completion, NewTask, UNBLOCK_MAX};
+use crate::service::tasks::{
+    BlockInput, Caller, ClaimOutcome, Completion, MoveContext, NewTask, UNBLOCK_MAX,
+};
 use crate::store::{DoneFilter, TaskFilter};
 
 /// Page size for inbox and search results when none is asked for, and the most allowed.
@@ -1139,6 +1141,27 @@ impl AxleMcp {
         let reason = non_blank(p.reason);
         if let Some(reason) = &reason {
             check_body(reason).map_err(ToolError::from)?;
+        }
+        // Links and the move are checked as far as they can be without a lock, so a request
+        // they would refuse changes nothing (the status and edit below run first).
+        if !related.is_empty() || !unrelate.is_empty() {
+            self.state
+                .tasks
+                .check_relate(Caller::Agent(me), id, &related, &unrelate)
+                .await?;
+        }
+        if let Some(parent) = parent {
+            let ctx = MoveContext {
+                adds_projects: !projects.is_empty(),
+                pending_wait: match &waiting_on {
+                    Some(WaitingOn::Task(t)) => Some(*t),
+                    _ => None,
+                },
+            };
+            self.state
+                .tasks
+                .check_move(Caller::Agent(me), id, parent, &ctx)
+                .await?;
         }
         let mut task = match p.status {
             // A first block needs a reason; the service says so (an update may omit it).

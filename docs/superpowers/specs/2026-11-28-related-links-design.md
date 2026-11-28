@@ -63,5 +63,4 @@ question) or dismisses them.
 
 ## Migration
 
-`0009_related_links` in both stores. The number skips 0006-0008, which parallel PRs use;
-renumber at merge.
+`0007_related_links` in both stores (main has 0001-0006).

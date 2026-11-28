@@ -1454,3 +1454,83 @@ store_matrix!(
         }
     }
 );
+
+store_matrix!(
+    a_refused_relationship_leaves_the_whole_update_unwritten,
+    |store: Arc<dyn Store>| async move {
+        let server = start(store).await;
+        let creator = server.agent("mac", "claude-code").await;
+        let id = |v: Value| v["id"].as_str().unwrap().to_string();
+        let t = id(ok(
+            &creator,
+            "task_create",
+            json!({"title": "Before", "body": "old"}),
+        )
+        .await);
+        let a = id(ok(&creator, "task_create", json!({"title": "A", "body": ""})).await);
+        let b = id(ok(&creator, "task_create", json!({"title": "B", "body": ""})).await);
+        let parent = id(ok(
+            &creator,
+            "task_create",
+            json!({"title": "Parent", "body": ""}),
+        )
+        .await);
+        let child = id(ok(
+            &creator,
+            "task_create",
+            json!({"title": "Child", "body": "", "parent": t}),
+        )
+        .await);
+        let refused = [
+            (
+                json!({"id": t, "title": "After", "body": "new",
+                       "related": [{"id": a, "kind": "duplicate"}, {"id": b, "kind": "duplicate"}]}),
+                "one task only",
+            ),
+            (
+                json!({"id": t, "title": "After",
+                       "related": [{"id": uuid::Uuid::now_v7().to_string(), "kind": "relates"}]}),
+                "not found",
+            ),
+            (json!({"id": t, "title": "After", "parent": child}), "cycle"),
+            (
+                json!({"id": t, "title": "After", "add_projects": ["github.com/acme/web-app"],
+                       "parent": parent}),
+                "one project",
+            ),
+        ];
+        // The project named above must exist for the last case to reach the move check.
+        let session = uuid::Uuid::now_v7().to_string();
+        let web = server
+            .connect(&[
+                ("x-axl-project", "github.com/acme/web-app"),
+                ("x-axl-host", "mac"),
+                ("x-axl-harness", "claude-code"),
+                ("x-axl-session", &session),
+            ])
+            .await;
+        ok(&web, "whoami", json!({})).await;
+        for (args, want) in refused {
+            let (is_error, text) = call(&creator, "task_update", args.clone()).await;
+            assert!(is_error && text.contains(want), "{args}: {text}");
+            let detail = ok(&creator, "task_get", json!({"id": t})).await;
+            let title = detail["task"]["title"].as_str().unwrap();
+            assert!(
+                title.contains("Before"),
+                "{args}: the title changed: {title}"
+            );
+            assert!(detail["related"].as_array().unwrap().is_empty(), "{args}");
+            assert!(
+                !detail["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["kind"] == "edited" || e["kind"] == "projects_added"),
+                "{args}: {detail}"
+            );
+        }
+        for cl in [creator, web] {
+            cl.cancel().await.unwrap();
+        }
+    }
+);

@@ -322,6 +322,71 @@ pub fn plan_words(state: PlanState) -> &'static str {
     }
 }
 
+/// The caller's other writes in the same request, for `TaskService::check_move`.
+#[derive(Debug, Clone, Default)]
+pub struct MoveContext {
+    /// The request also adds participating projects (a task with them cannot be a child).
+    pub adds_projects: bool,
+    /// The request also blocks the task waiting on this task.
+    pub pending_wait: Option<TaskId>,
+}
+
+/// A target named twice keeps its last kind; removals are deduplicated. Returns the additions,
+/// the removals and the duplicate targets, refusing self-links, more than `MAX_LINKS`
+/// additions and more than one duplicate target.
+#[allow(clippy::type_complexity)]
+fn normalize_links(
+    id: TaskId,
+    add: &[(TaskId, LinkKind)],
+    remove: &[TaskId],
+) -> Result<(Vec<(TaskId, LinkKind)>, Vec<TaskId>, Vec<TaskId>), TaskError> {
+    let mut adds: Vec<(TaskId, LinkKind)> = Vec::with_capacity(add.len());
+    for (target, kind) in add {
+        if *target == id {
+            return Err(TaskError::SelfLink);
+        }
+        adds.retain(|(t, _)| t != target);
+        adds.push((*target, *kind));
+    }
+    if adds.len() > MAX_LINKS as usize {
+        return Err(TaskError::TooManyLinks(id));
+    }
+    let duplicates: Vec<TaskId> = adds
+        .iter()
+        .filter(|(_, k)| *k == LinkKind::Duplicate)
+        .map(|(t, _)| *t)
+        .collect();
+    if duplicates.len() > 1 {
+        return Err(TaskError::DuplicateTwice);
+    }
+    let mut removes: Vec<TaskId> = Vec::with_capacity(remove.len());
+    for r in remove {
+        if !removes.contains(r) {
+            removes.push(*r);
+        }
+    }
+    Ok((adds, removes, duplicates))
+}
+
+/// The edit rule, read without a lock: the human, the creating agent, or the session holding
+/// the task (`planning`, `claimed`, `blocked` or `review`).
+fn may_change(by: Caller<'_>, task: &Task) -> bool {
+    match by {
+        Caller::Human => true,
+        Caller::Agent(r) => {
+            matches!(task.created_by, Actor::Agent(a, _) if a == r.agent.id)
+                || (task.owner_session_id == Some(r.session.id)
+                    && matches!(
+                        task.status,
+                        TaskStatus::Planning
+                            | TaskStatus::Claimed
+                            | TaskStatus::Blocked
+                            | TaskStatus::Review
+                    ))
+        }
+    }
+}
+
 /// The statuses a task can be cancelled from.
 const CANCELLABLE: [TaskStatus; 5] = [
     TaskStatus::Open,
@@ -1065,32 +1130,7 @@ impl TaskService {
         add: &[(TaskId, LinkKind)],
         remove: &[TaskId],
     ) -> Result<Task, TaskError> {
-        let mut adds: Vec<(TaskId, LinkKind)> = Vec::with_capacity(add.len());
-        for (target, kind) in add {
-            if *target == id {
-                return Err(TaskError::SelfLink);
-            }
-            // A target named twice keeps its last kind.
-            adds.retain(|(t, _)| t != target);
-            adds.push((*target, *kind));
-        }
-        if adds.len() > MAX_LINKS as usize {
-            return Err(TaskError::TooManyLinks(id));
-        }
-        let duplicates: Vec<TaskId> = adds
-            .iter()
-            .filter(|(_, k)| *k == LinkKind::Duplicate)
-            .map(|(t, _)| *t)
-            .collect();
-        if duplicates.len() > 1 {
-            return Err(TaskError::DuplicateTwice);
-        }
-        let mut removes: Vec<TaskId> = Vec::with_capacity(remove.len());
-        for r in remove {
-            if !removes.contains(r) {
-                removes.push(*r);
-            }
-        }
+        let (adds, removes, duplicates) = normalize_links(id, add, remove)?;
         let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
         if !duplicates.is_empty() && task.status == TaskStatus::Done {
             return Err(TaskError::DuplicateOfDone);
@@ -1241,16 +1281,38 @@ impl TaskService {
             Moved::Refused => {}
         }
         // Explain the refusal from a fresh read.
+        self.check_move(by, id, parent, &MoveContext::default())
+            .await?;
+        Err(TaskError::NotOwner)
+    }
+
+    /// Checks everything about a move that needs no lock, refusing it the way `move_under`
+    /// would, so a caller combining it with other writes can refuse before writing anything.
+    /// `ctx` describes the caller's other writes in the same request. The store re-checks all
+    /// of it under its lock.
+    pub async fn check_move(
+        &self,
+        by: Caller<'_>,
+        id: TaskId,
+        parent: TaskId,
+        ctx: &MoveContext,
+    ) -> Result<(), TaskError> {
+        if id == parent {
+            return Err(TaskError::OwnParent);
+        }
         let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
         let p = self
             .store
             .get_task(parent)
             .await?
             .ok_or(TaskError::UnknownParent)?;
+        if !may_change(by, &task) {
+            return Err(TaskError::NotOwner);
+        }
         if task.parent_id.is_some() {
             return Err(TaskError::AlreadyAChild);
         }
-        if !self.store.task_projects(id).await?.is_empty() {
+        if ctx.adds_projects || !self.store.task_projects(id).await?.is_empty() {
             return Err(TaskError::ChildExtraProjects);
         }
         match p.status {
@@ -1260,13 +1322,15 @@ impl TaskService {
             }
             _ => {}
         }
-        // Bounded, so a corrupt hierarchy cannot hang the explanation.
+        // The parent and its ancestors, bounded so a corrupt hierarchy cannot hang this.
+        let mut above = vec![parent];
         let mut up = p.parent_id;
         for _ in 0..MAX_CHAIN {
             let Some(a) = up else { break };
             if a == id {
                 return Err(TaskError::ParentIsDescendant);
             }
+            above.push(a);
             up = self.store.get_task(a).await?.and_then(|t| t.parent_id);
         }
         if p.project_id != task.project_id
@@ -1278,7 +1342,92 @@ impl TaskService {
         {
             return Err(TaskError::ChildProjectMismatch);
         }
-        Err(TaskError::NotOwner)
+        // No task of the moved subtree may wait on one of its new ancestors, counting a wait
+        // the same request is about to set on the task itself.
+        if let Some(target) = ctx.pending_wait
+            && above.contains(&target)
+        {
+            return Err(TaskError::MoveMakesAncestorWait {
+                task: id,
+                title: task.title.clone(),
+            });
+        }
+        let mut subtree = vec![task];
+        let mut i = 0;
+        while i < subtree.len() && subtree.len() <= MAX_CHAIN {
+            let t = &subtree[i];
+            if let Some(WaitingOn::Task(target)) =
+                t.block.as_ref().and_then(|b| b.waiting_on.as_ref())
+                && t.status == TaskStatus::Blocked
+                && above.contains(target)
+            {
+                return Err(TaskError::MoveMakesAncestorWait {
+                    task: t.id,
+                    title: t.title.clone(),
+                });
+            }
+            let kids = self
+                .store
+                .list_tasks(&TaskFilter {
+                    parent: Some(t.id),
+                    ..TaskFilter::default()
+                })
+                .await?;
+            subtree.extend(kids);
+            i += 1;
+        }
+        Ok(())
+    }
+
+    /// Checks everything about a link change that needs no lock, refusing it the way `relate`
+    /// would (bad input, permission, a done duplicate, a missing target, the link limit), so a
+    /// caller combining it with other writes can refuse before writing anything. The store
+    /// re-checks all of it under its lock.
+    pub async fn check_relate(
+        &self,
+        by: Caller<'_>,
+        id: TaskId,
+        add: &[(TaskId, LinkKind)],
+        remove: &[TaskId],
+    ) -> Result<(), TaskError> {
+        let (adds, removes, duplicates) = normalize_links(id, add, remove)?;
+        let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+        if !may_change(by, &task) {
+            return Err(TaskError::NotOwner);
+        }
+        if !duplicates.is_empty() && task.status == TaskStatus::Done {
+            return Err(TaskError::DuplicateOfDone);
+        }
+        let links = self.store.task_links(id).await?;
+        let other = |l: &TaskLink| {
+            if l.task_id == id {
+                l.target_id
+            } else {
+                l.task_id
+            }
+        };
+        let mut mine: Vec<TaskId> = links
+            .iter()
+            .map(other)
+            .filter(|t| !removes.contains(t))
+            .collect();
+        for (target, _) in &adds {
+            if self.store.get_task(*target).await?.is_none() {
+                return Err(TaskError::UnknownLinkTarget(*target));
+            }
+            if mine.contains(target) {
+                continue;
+            }
+            mine.push(*target);
+            let theirs = self.store.task_links(*target).await?.len();
+            if theirs >= MAX_LINKS as usize {
+                return Err(TaskError::TooManyLinks(*target));
+            }
+        }
+        if mine.len() > MAX_LINKS as usize {
+            return Err(TaskError::TooManyLinks(id));
+        }
+        Ok(())
     }
 
     /// Every link of task `id`, oldest first, with the task at the other end.
