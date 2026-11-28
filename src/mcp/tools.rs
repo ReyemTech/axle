@@ -16,8 +16,8 @@ use serde_json::{Value, json};
 
 use super::{AxleMcp, Labels, ToolError, project_view, render, timestamp};
 use crate::domain::{
-    Address, Agent, Eligibility, Importance, LinkKind, MessageId, Project, ProjectId, Session,
-    SessionId, TaskId, TaskStatus, WaitingOn,
+    Address, Agent, DeliveryStage, Eligibility, Importance, LinkKind, MessageId, Project,
+    ProjectId, Session, SessionId, Task, TaskId, TaskStatus, WaitingOn, short_id,
 };
 use crate::service::identity::Resolved;
 use crate::service::messages::{InboxFilter, NewMessage, check_body, check_subject};
@@ -184,6 +184,7 @@ pub enum StatusParam {
     Claimed,
     Blocked,
     Review,
+    Delivering,
     Done,
     Cancelled,
 }
@@ -196,6 +197,7 @@ impl From<StatusParam> for TaskStatus {
             StatusParam::Claimed => TaskStatus::Claimed,
             StatusParam::Blocked => TaskStatus::Blocked,
             StatusParam::Review => TaskStatus::Review,
+            StatusParam::Delivering => TaskStatus::Delivering,
             StatusParam::Done => TaskStatus::Done,
             StatusParam::Cancelled => TaskStatus::Cancelled,
         }
@@ -291,6 +293,9 @@ pub struct TaskUpdateParams {
     /// Move this top-level task under this parent task (id; creator or owner only). The
     /// parent must be open for subtasks and in the task's project or one it spans.
     pub parent: Option<String>,
+    /// URL of the pull request you opened for this task (creator or owner). Report it as
+    /// soon as it exists; reporting another PR replaces the link until the task is merged.
+    pub pr: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -514,7 +519,8 @@ impl AxleMcp {
          links; creator or owner), and/or move a top-level task under a parent (`parent`; \
          creator or owner). `blocked` on a task you hold blocked updates its reason, \
          `waiting_on` or `unblock`. A task waiting on another task is unblocked when that task \
-         is done."
+         is done. Report the pull request you opened for it with `pr` (its URL; creator \
+         or owner)."
     ))]
     async fn task_update(
         &self,
@@ -822,6 +828,39 @@ impl AxleMcp {
         Ok(json!({ "messages": out }))
     }
 
+    /// A task without its body, plus its short id and delivery state.
+    async fn summary(&self, labels: &mut Labels<'_>, t: &Task) -> ToolResult {
+        let mut v = labels.task_summary(t).await?;
+        self.add_delivery(&mut v, t).await?;
+        Ok(v)
+    }
+
+    /// A task with its body, plus its short id and delivery state.
+    async fn full(&self, labels: &mut Labels<'_>, t: &Task) -> ToolResult {
+        let mut v = labels.task(t).await?;
+        self.add_delivery(&mut v, t).await?;
+        Ok(v)
+    }
+
+    /// `short_id` and `delivery`. The PR's title is third-party text and is left out.
+    async fn add_delivery(&self, v: &mut Value, t: &Task) -> Result<(), ToolError> {
+        v["short_id"] = json!(short_id(t.id));
+        v["delivery"] = match self.state.delivery.view(t).await? {
+            None => Value::Null,
+            Some(d) => json!({
+                "stage": d.stage,
+                "stages_enabled": d.stages_enabled,
+                "pr": d.pr.map(|pr| json!({
+                    "url": pr.url,
+                    "number": pr.number,
+                    "state": pr.state,
+                    "ci": pr.ci_state,
+                })),
+            }),
+        };
+        Ok(())
+    }
+
     async fn task_create_impl(&self, me: &Resolved, p: TaskCreateParams) -> ToolResult {
         let parent = p
             .parent
@@ -882,7 +921,7 @@ impl AxleMcp {
                 self.state.tasks.create(Caller::Agent(me), new).await?
             }
         };
-        self.labels().task(&task).await
+        self.full(&mut self.labels(), &task).await
     }
 
     async fn task_list_impl(&self, p: TaskListParams) -> ToolResult {
@@ -923,7 +962,7 @@ impl AxleMcp {
         let mut labels = self.labels();
         let mut out = Vec::with_capacity(tasks.len());
         for t in &tasks {
-            out.push(labels.task_summary(t).await?);
+            out.push(self.summary(&mut labels, t).await?);
         }
         Ok(json!({ "tasks": out, "next": next }))
     }
@@ -936,7 +975,7 @@ impl AxleMcp {
         let project = Some(detail.task.project_id);
         let mut children = vec![];
         for c in &detail.children {
-            children.push(labels.task_summary(c).await?);
+            children.push(self.summary(&mut labels, c).await?);
         }
         let mut events = vec![];
         for e in &detail.events {
@@ -967,7 +1006,7 @@ impl AxleMcp {
             }));
         }
         Ok(json!({
-            "task": labels.task(&detail.task).await?,
+            "task": self.full(&mut labels, &detail.task).await?,
             "progress": { "done": detail.progress.done, "total": detail.progress.total },
             "children": children,
             "related": related,
@@ -983,7 +1022,7 @@ impl AxleMcp {
                 let id: TaskId = parse_id("task", id)?;
                 match self.state.tasks.claim(me, id).await? {
                     ClaimOutcome::Claimed(task) => {
-                        with_plan_step(labels.task_summary(&task).await?, &task)
+                        with_claim_step(self.summary(&mut labels, &task).await?, &task)
                     }
                     ClaimOutcome::AlreadyOwned { by, until } => {
                         let by = labels.agent(by).await?;
@@ -1013,7 +1052,7 @@ impl AxleMcp {
                     ));
                 };
                 match self.state.tasks.claim_next(me, home.id).await? {
-                    Some(task) => with_plan_step(labels.task_summary(&task).await?, &task),
+                    Some(task) => with_claim_step(self.summary(&mut labels, &task).await?, &task),
                     None => Ok(json!({
                         "task": null,
                         "note": format!("no open task you are eligible for in {}", home.key),
@@ -1071,10 +1110,11 @@ impl AxleMcp {
             && related.is_empty()
             && unrelate.is_empty()
             && parent.is_none()
+            && p.pr.is_none()
         {
             return Err(ToolError::invalid(
                 "nothing to update: pass `status`, `title`, `body`, `add_projects`, `related`, \
-                 `unrelate` and/or `parent`",
+                 `unrelate`, `parent` and/or `pr`",
             ));
         }
         if parent == Some(id) {
@@ -1143,7 +1183,7 @@ impl AxleMcp {
             check_body(reason).map_err(ToolError::from)?;
         }
         // Links and the move are checked as far as they can be without a lock, so a request
-        // they would refuse changes nothing (the status and edit below run first).
+        // they would refuse changes nothing (the PR link, status and edit below run first).
         if !related.is_empty() || !unrelate.is_empty() {
             self.state
                 .tasks
@@ -1167,8 +1207,19 @@ impl AxleMcp {
                 .check_move(Caller::Agent(me), id, parent, &ctx)
                 .await?;
         }
-        let mut task = match p.status {
-            // A first block needs a reason; the service says so (an update may omit it).
+        // The PR link is the one write with refusals the checks above cannot predict (wrong
+        // repo, taken by another task, already merged), so it is the first write: a refusal
+        // leaves the task untouched.
+        let mut task = match &p.pr {
+            Some(url) => Some(
+                self.state
+                    .delivery
+                    .link_pr(Caller::Agent(me), id, url)
+                    .await?,
+            ),
+            None => None,
+        };
+        task = match p.status {
             Some(UpdateStatusParam::Blocked) => Some(
                 self.state
                     .tasks
@@ -1186,7 +1237,7 @@ impl AxleMcp {
             Some(UpdateStatusParam::Review) => {
                 Some(self.state.tasks.to_review(me, id, reason).await?)
             }
-            None => None,
+            None => task,
         };
         if p.title.is_some() || p.body.is_some() {
             task = Some(self.state.tasks.edit(me, id, p.title, p.body).await?);
@@ -1216,13 +1267,13 @@ impl AxleMcp {
             );
         }
         let task = task.expect("at least one update ran");
-        self.labels().task_summary(&task).await
+        self.summary(&mut self.labels(), &task).await
     }
 
     async fn task_propose_plan_impl(&self, me: &Resolved, p: TaskProposePlanParams) -> ToolResult {
         let id: TaskId = parse_id("task", &p.id)?;
         let (task, plan) = self.state.tasks.propose_plan(me, id, p.plan).await?;
-        let mut v = self.labels().task_summary(&task).await?;
+        let mut v = self.summary(&mut self.labels(), &task).await?;
         v["plan_message"] = json!(plan.id);
         v["next_step"] = json!(
             "Wait for the human's decision; it arrives as a message. Do not start the work until \
@@ -1233,7 +1284,7 @@ impl AxleMcp {
 
     async fn task_renew_impl(&self, me: &Resolved, p: TaskIdParams) -> ToolResult {
         let task = self.state.tasks.renew(me, parse_id("task", &p.id)?).await?;
-        self.labels().task_summary(&task).await
+        self.summary(&mut self.labels(), &task).await
     }
 
     async fn task_release_impl(&self, me: &Resolved, p: TaskReleaseParams) -> ToolResult {
@@ -1242,7 +1293,7 @@ impl AxleMcp {
             .tasks
             .release(me, parse_id("task", &p.id)?, non_blank(p.note))
             .await?;
-        self.labels().task_summary(&task).await
+        self.summary(&mut self.labels(), &task).await
     }
 
     async fn task_complete_impl(&self, me: &Resolved, p: TaskCompleteParams) -> ToolResult {
@@ -1263,7 +1314,27 @@ impl AxleMcp {
                 },
             )
             .await?;
-        self.labels().task_summary(&task).await
+        let mut v = self.summary(&mut self.labels(), &task).await?;
+        if task.status == TaskStatus::Delivering {
+            let project = self
+                .state
+                .store
+                .get_project(task.project_id)
+                .await?
+                .ok_or_else(|| ToolError::internal("task without a project"))?;
+            let last = self
+                .state
+                .delivery
+                .settings(&project)
+                .await?
+                .last_stage()
+                .map_or("its last stage", DeliveryStage::label);
+            v["next_step"] = json!(format!(
+                "Delivery is tracked by Axle; this task moves to done when it reaches {last}. \
+                 Nothing more to do."
+            ));
+        }
+        Ok(v)
     }
 
     // ------------------------------------------------------------ name resolution
@@ -1347,6 +1418,13 @@ impl AxleMcp {
             Address::Human
         })
     }
+}
+
+/// A claimed task's summary with the branch hint (its short id) and, in `planning`, the plan
+/// step.
+fn with_claim_step(mut v: Value, task: &crate::domain::Task) -> ToolResult {
+    v["branch_hint"] = json!(short_id(task.id));
+    with_plan_step(v, task)
 }
 
 /// A claimed `planning` task tells the agent what the plan gate expects of it.

@@ -330,7 +330,7 @@ data: {"id":"01a21e49-812d-71b1-a958-8ed6820c5bc3","to":{"kind":"project","id":"
 | Event | Data | Sent to the session when |
 |---|---|---|
 | `MessageCreated` | `id`, `to` (`kind` and `id`), `project_id` | The message is addressed to it: its session, its agent, its home project, or a task its agent owns or created. Never for its agent's own messages. |
-| `TaskChanged` | `id`, `project_id`, `status`, `kind` (the history event kind) | The task is in its home project, spans its home project, or its agent owns or created it. |
+| `TaskChanged` | `id`, `project_id`, `status`, `kind` (the history event kind; delivery adds `pr_linked`, `pr_relinked`, `pr_unlinked`, `ci_changed` (reserved; emitted once the GitHub source ships), `stage_reached` and `delivered`, see [delivery](delivery.md#history)) | The task is in its home project, spans its home project, or its agent owns or created it. |
 | `Lagged` | the number of dropped events | The subscriber fell behind. Re-read the inbox and tasks. |
 
 The stream sends keep-alive comments and ends when the server shuts down. There is no

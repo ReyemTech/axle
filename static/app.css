@@ -153,6 +153,19 @@ kbd {
   background: var(--sig-green);
 }
 :is(.aspect[data-aspect="open"], .station[data-status="open"]) { border-color: var(--text); }
+/* Delivering: a solid dot inside an outer ring (block cleared, train still moving). Always
+   beside the stage word; the ring keeps it apart from done's plain solid. */
+.aspect[data-aspect="delivering"] {
+  border-color: var(--sig-green);
+  background: radial-gradient(circle, var(--sig-green) 0 38%, transparent 42%);
+  box-shadow: 0 0 0 1.5px var(--card), 0 0 0 3px var(--sig-green);
+  margin: 0 3px;
+}
+.card-chips { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; margin-top: 6px; font-size: 12px; }
+.short-id, .pr-chip { font: 12px var(--mono); color: var(--muted); }
+.pr-chip { color: var(--accent); }
+.stage-word, .waiting-for { font-size: 12px; font-weight: 600; }
+.waiting-for { color: var(--muted); font-weight: 400; }
 /* Planning: a dashed ring, the block reserved but not yet occupied. Awaiting you: the same
    dashed ring in amber with a centre, like review (finished thinking, waiting on a check). */
 :is(.aspect[data-aspect="planning"], .station[data-status="planning"]) {
@@ -541,7 +554,9 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
   background: var(--text);
 }
 .column h2 { font-size: 12.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
+.column .sep { margin: 0 4px; color: var(--muted); font-weight: 700; }
 .column .count { margin-left: auto; font-size: 13px; font-weight: 600; color: var(--muted); }
+.column[data-stage] .count { margin-left: 0; }
 /* Waiting work reads from across the desk; an empty column stays quiet. */
 .column:is([data-status="blocked"], [data-status="review"]):has(.card) > header .aspect { width: 14px; height: 14px; }
 .column:is([data-status="blocked"], [data-status="review"]):has(.card) .count { font-size: 18px; font-weight: 700; }
@@ -1116,3 +1131,7 @@ label.check:has(input:disabled) { color: var(--muted); cursor: default; }
 @media (prefers-reduced-motion: reduce) {
   button:active { transform: none; }
 }
+.stage-rows { list-style: none; margin: 0 0 10px; padding: 0; }
+.stage-row { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; padding: 3px 0; }
+.stage-label { font-weight: 600; min-width: 5.5em; }
+.stage-row[data-state="waiting"] .stage-state { color: var(--muted); }

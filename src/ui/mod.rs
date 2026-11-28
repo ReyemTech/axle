@@ -169,6 +169,10 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/ui/tasks/{id}/post", post(actions::post_to_thread))
         .route("/ui/tasks/{id}/force-release", post(actions::force_release))
         .route("/ui/tasks/{id}/cancel", post(actions::cancel))
+        .route("/ui/tasks/{id}/pr", post(actions::link_pr))
+        .route("/ui/tasks/{id}/pr/unlink", post(actions::unlink_pr))
+        .route("/ui/tasks/{id}/advance", post(actions::advance_stage))
+        .route("/ui/tasks/{id}/mark-done", post(actions::mark_done))
         .route("/ui/tasks/{id}/ack", post(actions::ack_task))
         .route("/ui/done/ack", post(actions::ack_done))
         .route("/ui/tasks/{id}/plan/approve", post(actions::approve_plan))
@@ -190,6 +194,10 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/ui/messages", post(actions::send_message))
         .route("/ui/projects", get(admin::projects))
         .route("/ui/projects/{id}/rename", post(actions::rename_project))
+        .route(
+            "/ui/projects/{id}/delivery",
+            post(actions::set_project_delivery),
+        )
         .route("/ui/tokens", get(admin::tokens))
         .route("/ui/tokens/{id}/revoke", post(actions::revoke_token))
         .route("/ui/tokens/connect", post(connect::connect_machine))

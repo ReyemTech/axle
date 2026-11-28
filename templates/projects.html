@@ -23,6 +23,20 @@
       <input id="name-{{ p.id }}" name="display_name" value="{{ p.name }}" maxlength="{{ max }}" required>
       <button type="submit" class="secondary">Rename</button>
     </form>
+    <details class="delivery-stages">
+      <summary>Delivery stages</summary>
+      <form class="stack" method="post" action="/ui/projects/{{ p.id }}/delivery">
+        <input type="hidden" name="csrf" value="{{ token }}">
+        <fieldset class="checks">
+          <legend>Stages after a PR</legend>
+          {% for s in p.stages %}
+          <label class="check" for="stage-{{ p.id }}-{{ s.value }}"><input id="stage-{{ p.id }}-{{ s.value }}" type="checkbox" name="stage" value="{{ s.value }}"{% if s.on %} checked{% endif %}>{{ s.label }}</label>
+          {% endfor %}
+          <p class="hint muted">Tasks with a PR move through these after the agent completes them. Done means the last one ticked.</p>
+        </fieldset>
+        <button type="submit" class="secondary">Save stages</button>
+      </form>
+    </details>
     {% endif %}
   </li>
 {% endfor %}

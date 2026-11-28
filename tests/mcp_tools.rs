@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use axle::clock::TestClock;
 use axle::config::ServerConfig;
+use axle::domain::{DeliveryStage, TaskEventKind, TaskId};
 use axle::http::{AppState, router};
 use axle::store::Store;
 use axum::http::{HeaderName, HeaderValue};
@@ -31,6 +32,8 @@ struct Server {
     token: String,
     clock: Arc<TestClock>,
     tasks: Arc<axle::service::tasks::TaskService>,
+    delivery: Arc<axle::service::delivery::DeliveryService>,
+    store: Arc<dyn Store>,
 }
 
 type Client = RunningService<RoleClient, ClientConfig>;
@@ -43,9 +46,10 @@ async fn start(store: Arc<dyn Store>) -> Server {
         _ => None,
     })
     .unwrap();
-    let state = AppState::new(store, clock.clone(), config);
+    let state = AppState::new(store.clone(), clock.clone(), config);
     let token = state.auth.create("test").await.unwrap().1;
     let tasks = state.tasks.clone();
+    let delivery = state.delivery.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
     tokio::spawn(axum::serve(listener, router(state)).into_future());
@@ -54,6 +58,8 @@ async fn start(store: Arc<dyn Store>) -> Server {
         token,
         clock,
         tasks,
+        delivery,
+        store,
     }
 }
 
@@ -92,9 +98,13 @@ impl Server {
 
     /// A client for agent `(PROJECT, host, harness)` with its own session.
     async fn agent(&self, host: &str, harness: &str) -> Client {
+        self.agent_in(PROJECT, host, harness).await
+    }
+
+    async fn agent_in(&self, project: &str, host: &str, harness: &str) -> Client {
         let session = uuid::Uuid::now_v7().to_string();
         self.connect(&[
-            ("x-axl-project", PROJECT),
+            ("x-axl-project", project),
             ("x-axl-host", host),
             ("x-axl-harness", harness),
             ("x-axl-session", &session),
@@ -1598,3 +1608,241 @@ store_matrix!(up_front_checks_see_the_rest_of_the_request, |store: Arc<
     assert!(is_error && text.contains("own ancestor"), "{text}");
     creator.cancel().await.unwrap();
 });
+
+const WEB: &str = "github.com/acme/web-app";
+
+/// A client in `WEB` after enabling `stages` for that project.
+async fn delivering_agent(server: &Server, stages: &[DeliveryStage]) -> Client {
+    let client = server.agent_in(WEB, "mac", "claude-code").await;
+    ok(&client, "whoami", json!({})).await;
+    let project = server
+        .store
+        .get_project_by_key(WEB)
+        .await
+        .unwrap()
+        .expect("the agent's first call created the project");
+    server
+        .delivery
+        .set_stages(&project, stages.to_vec())
+        .await
+        .unwrap();
+    client
+}
+
+async fn claimed_task(client: &Client) -> Value {
+    let task = ok(
+        client,
+        "task_create",
+        json!({"title": "Rate limit", "body": "Add it."}),
+    )
+    .await;
+    ok(client, "task_claim", json!({"id": task["id"]})).await
+}
+
+store_matrix!(
+    task_update_pr_validation,
+    |store: Arc<dyn Store>| async move {
+        let server = start(store).await;
+        let client = delivering_agent(&server, &[DeliveryStage::InPr, DeliveryStage::Merged]).await;
+        let task = claimed_task(&client).await;
+        let id = task["id"].clone();
+
+        let (is_error, text) = call(
+            &client,
+            "task_update",
+            json!({"id": id, "pr": "https://github.com/other/repo/pull/3"}),
+        )
+        .await;
+        assert!(is_error);
+        assert_eq!(text, "pr must be a pull request in github.com/acme/web-app");
+
+        let updated = ok(
+            &client,
+            "task_update",
+            json!({"id": id, "pr": "https://github.com/acme/web-app/pull/12"}),
+        )
+        .await;
+        assert_eq!(updated["delivery"]["pr"]["number"], 12);
+        assert_eq!(
+            updated["delivery"]["pr"]["url"],
+            "https://github.com/acme/web-app/pull/12"
+        );
+        assert!(updated["delivery"]["pr"].get("title").is_none());
+
+        // pr together with another field applies both.
+        let both = ok(
+            &client,
+            "task_update",
+            json!({"id": id, "title": "Rate limit v2", "pr": "https://github.com/acme/web-app/pull/13"}),
+        )
+        .await;
+        assert_eq!(both["delivery"]["pr"]["number"], 13);
+        assert!(both["title"].as_str().unwrap().contains("Rate limit v2"));
+        client.cancel().await.unwrap();
+    }
+);
+
+store_matrix!(task_update_bad_pr_changes_nothing, |store: Arc<
+    dyn Store,
+>| async move {
+    let server = start(store).await;
+    let client = delivering_agent(&server, &[DeliveryStage::InPr]).await;
+    let task = claimed_task(&client).await;
+    let (is_error, text) = call(
+        &client,
+        "task_update",
+        json!({"id": task["id"], "status": "review", "title": "Changed",
+                   "pr": "https://github.com/other/repo/pull/3"}),
+    )
+    .await;
+    assert!(is_error);
+    assert_eq!(text, "pr must be a pull request in github.com/acme/web-app");
+    let got = ok(&client, "task_get", json!({"id": task["id"]})).await;
+    assert_eq!(got["task"]["status"], "claimed");
+    assert!(
+        got["task"]["title"]
+            .as_str()
+            .unwrap()
+            .contains("Rate limit")
+    );
+    client.cancel().await.unwrap();
+});
+
+store_matrix!(
+    task_complete_next_step,
+    |store: Arc<dyn Store>| async move {
+        let server = start(store).await;
+        let client = delivering_agent(&server, &[DeliveryStage::InPr, DeliveryStage::Merged]).await;
+        let task = claimed_task(&client).await;
+        ok(
+            &client,
+            "task_update",
+            json!({"id": task["id"], "pr": "https://github.com/acme/web-app/pull/12"}),
+        )
+        .await;
+        let done = ok(
+            &client,
+            "task_complete",
+            json!({"id": task["id"], "summary": "Shipped."}),
+        )
+        .await;
+        assert_eq!(done["status"], "delivering");
+        assert_eq!(
+            done["next_step"],
+            "Delivery is tracked by Axle; this task moves to done when it reaches Merged. \
+             Nothing more to do."
+        );
+        client.cancel().await.unwrap();
+    }
+);
+
+store_matrix!(task_object_shape, |store: Arc<dyn Store>| async move {
+    let server = start(store).await;
+    let client = server.agent("mac", "claude-code").await;
+    let task = claimed_task(&client).await;
+    let id = task["id"].as_str().unwrap();
+    assert_eq!(task["short_id"], format!("axl-{}", &id[id.len() - 8..]));
+    assert!(task["delivery"].is_null());
+
+    let done = ok(
+        &client,
+        "task_complete",
+        json!({"id": id, "summary": "Done."}),
+    )
+    .await;
+    assert_eq!(done["status"], "done");
+    assert!(done.get("next_step").is_none());
+    client.cancel().await.unwrap();
+});
+
+store_matrix!(stageless_project_has_no_delivery, |store: Arc<
+    dyn Store,
+>| async move {
+    let server = start(store).await;
+    let client = server.agent_in(WEB, "mac", "claude-code").await;
+
+    // An explicit link still applies offline, but `delivery` stays null without stages.
+    let task = claimed_task(&client).await;
+    let updated = ok(
+        &client,
+        "task_update",
+        json!({"id": task["id"], "pr": "https://github.com/acme/web-app/pull/12"}),
+    )
+    .await;
+    assert!(updated["delivery"].is_null(), "{updated}");
+    let id: TaskId = task["id"].as_str().unwrap().parse().unwrap();
+    assert!(server.store.task_pr(id).await.unwrap().is_some());
+
+    // `task_complete` does not link from `links`: the result is exactly as without stages.
+    let other = claimed_task(&client).await;
+    let done = ok(
+        &client,
+        "task_complete",
+        json!({"id": other["id"], "summary": "Done.",
+               "links": ["https://github.com/acme/web-app/pull/13"]}),
+    )
+    .await;
+    assert_eq!(done["status"], "done");
+    assert!(done["delivery"].is_null());
+    assert!(done.get("next_step").is_none());
+    let other: TaskId = other["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(server.store.task_pr(other).await.unwrap(), None);
+    let events = server.store.task_events(other).await.unwrap();
+    assert!(!events.iter().any(|e| e.kind == TaskEventKind::PrLinked));
+    client.cancel().await.unwrap();
+});
+
+store_matrix!(task_claim_short_id, |store: Arc<dyn Store>| async move {
+    let server = start(store).await;
+    let client = server.agent("mac", "claude-code").await;
+    let task = claimed_task(&client).await;
+    assert!(task["short_id"].as_str().unwrap().starts_with("axl-"));
+    assert_eq!(task["branch_hint"], task["short_id"]);
+    client.cancel().await.unwrap();
+});
+
+store_matrix!(task_list_delivering, |store: Arc<dyn Store>| async move {
+    let server = start(store).await;
+    let client = delivering_agent(&server, &[DeliveryStage::InPr, DeliveryStage::Merged]).await;
+    let task = claimed_task(&client).await;
+    ok(
+        &client,
+        "task_update",
+        json!({"id": task["id"], "pr": "https://github.com/acme/web-app/pull/12"}),
+    )
+    .await;
+    ok(
+        &client,
+        "task_complete",
+        json!({"id": task["id"], "summary": "Shipped."}),
+    )
+    .await;
+    let listed = ok(&client, "task_list", json!({"status": "delivering"})).await;
+    let tasks = listed["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["id"], task["id"]);
+    assert_eq!(tasks[0]["delivery"]["stage"], "in_pr");
+    let open = ok(&client, "task_list", json!({"status": "open"})).await;
+    assert!(open["tasks"].as_array().unwrap().is_empty());
+    client.cancel().await.unwrap();
+});
+
+store_matrix!(tool_count_unchanged, |store: Arc<dyn Store>| async move {
+    let server = start(store).await;
+    let client = server.agent("mac", "claude-code").await;
+    assert_eq!(client.list_all_tools().await.unwrap().len(), 17);
+    client.cancel().await.unwrap();
+});
+
+#[test]
+fn instructions_mention_pr_report() {
+    let rule = "report it at once with `task_update { id, pr: \"<url>\" }`";
+    assert!(axle::mcp::INSTRUCTIONS.contains(rule));
+    assert!(axle::install::INSTRUCTIONS.contains(rule));
+    let skill = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/harness/claude-code/empty/after/.axl/integrations/claude-code/skills/axle/SKILL.md"),
+    )
+    .unwrap();
+    assert!(skill.contains(rule));
+}

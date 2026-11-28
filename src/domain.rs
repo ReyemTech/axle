@@ -171,6 +171,9 @@ pub enum TaskStatus {
     Claimed,
     Blocked,
     Review,
+    /// Finished by its agent, waiting on the world (merge, release, deploy); the column
+    /// comes from `delivery_stage`. Only delivery signals and the human move it.
+    Delivering,
     Done,
     Cancelled,
 }
@@ -181,6 +184,7 @@ text_enum!(TaskStatus {
     Claimed => "claimed",
     Blocked => "blocked",
     Review => "review",
+    Delivering => "delivering",
     Done => "done",
     Cancelled => "cancelled",
 });
@@ -337,6 +341,8 @@ pub struct Task {
     /// Why a `blocked` task is blocked and what would unblock it; `None` in any other status
     /// (and for a task blocked before the detail was recorded, if its history has no reason).
     pub block: Option<BlockDetail>,
+    /// The furthest delivery stage reached; `None` until `in_pr` is reached.
+    pub delivery_stage: Option<DeliveryStage>,
 }
 
 /// What a blocked task waits on.
@@ -412,6 +418,293 @@ pub struct BlockDetail {
     pub unblock: Option<String>,
 }
 
+/// A step on the way from "agent finished" to "live", in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryStage {
+    InPr,
+    Merged,
+    Released,
+    Deployed,
+}
+
+text_enum!(DeliveryStage {
+    InPr => "in_pr",
+    Merged => "merged",
+    Released => "released",
+    Deployed => "deployed",
+});
+
+impl DeliveryStage {
+    pub const ALL: [DeliveryStage; 4] = [
+        DeliveryStage::InPr,
+        DeliveryStage::Merged,
+        DeliveryStage::Released,
+        DeliveryStage::Deployed,
+    ];
+
+    /// Position in the chain, 1 (`in_pr`) to 4 (`deployed`).
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::InPr => 1,
+            Self::Merged => 2,
+            Self::Released => 3,
+            Self::Deployed => 4,
+        }
+    }
+
+    /// The board label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::InPr => "In PR",
+            Self::Merged => "Merged",
+            Self::Released => "Released",
+            Self::Deployed => "Deployed",
+        }
+    }
+}
+
+/// How a task came to have its PR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrLinkedBy {
+    Agent,
+    Human,
+    BranchMatch,
+    TitleMatch,
+    CompleteLinks,
+}
+
+text_enum!(PrLinkedBy {
+    Agent => "agent",
+    Human => "human",
+    BranchMatch => "branch_match",
+    TitleMatch => "title_match",
+    CompleteLinks => "complete_links",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrState {
+    Open,
+    Closed,
+    Merged,
+}
+
+text_enum!(PrState {
+    Open => "open",
+    Closed => "closed",
+    Merged => "merged",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiState {
+    None,
+    Pending,
+    Passing,
+    Failing,
+}
+
+text_enum!(CiState {
+    None => "none",
+    Pending => "pending",
+    Passing => "passing",
+    Failing => "failing",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseSource {
+    GithubReleases,
+    GithubTags,
+    Generic,
+    None,
+}
+
+text_enum!(ReleaseSource {
+    GithubReleases => "github_releases",
+    GithubTags => "github_tags",
+    Generic => "generic",
+    None => "none",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploySource {
+    GithubDeployments,
+    Generic,
+    None,
+}
+
+text_enum!(DeploySource {
+    GithubDeployments => "github_deployments",
+    Generic => "generic",
+    None => "none",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalKind {
+    Pr,
+    Ci,
+    Merged,
+    Released,
+    Deployed,
+}
+
+text_enum!(SignalKind {
+    Pr => "pr",
+    Ci => "ci",
+    Merged => "merged",
+    Released => "released",
+    Deployed => "deployed",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalSource {
+    Github,
+    Cli,
+    Webhook,
+    Human,
+}
+
+text_enum!(SignalSource {
+    Github => "github",
+    Cli => "cli",
+    Webhook => "webhook",
+    Human => "human",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalOutcome {
+    Applied,
+    Unmatched,
+    Duplicate,
+    Refused,
+}
+
+text_enum!(SignalOutcome {
+    Applied => "applied",
+    Unmatched => "unmatched",
+    Duplicate => "duplicate",
+    Refused => "refused",
+});
+
+/// A project's delivery settings. No stored row means no stages (today's behaviour).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectDelivery {
+    pub project_id: ProjectId,
+    /// A subset of the stages in stage order; empty means off.
+    pub stages: Vec<DeliveryStage>,
+    /// `owner/name`, when the project key names a repository.
+    pub repo: Option<String>,
+    pub github_enabled: bool,
+    pub release_source: ReleaseSource,
+    /// Optional tag prefix glob (`v*`, `web-v*`) scoping tags and releases.
+    pub tag_pattern: Option<String>,
+    pub deploy_source: DeploySource,
+    pub required_environment: String,
+    pub updated_at: OffsetDateTime,
+}
+
+impl ProjectDelivery {
+    /// The settings a project has before anyone configures it: no stages, and the sources
+    /// that fit its key (GitHub for `github.com` keys, generic otherwise).
+    pub fn defaults(project: &Project, now: OffsetDateTime) -> Self {
+        let github = crate::delivery::links::is_github_key(&project.key);
+        ProjectDelivery {
+            project_id: project.id,
+            stages: Vec::new(),
+            repo: crate::delivery::links::repo_of_key(&project.key).map(|r| r.to_string()),
+            github_enabled: github,
+            release_source: if github {
+                ReleaseSource::GithubReleases
+            } else {
+                ReleaseSource::Generic
+            },
+            tag_pattern: None,
+            deploy_source: if github {
+                DeploySource::GithubDeployments
+            } else {
+                DeploySource::Generic
+            },
+            required_environment: "production".to_string(),
+            updated_at: now,
+        }
+    }
+
+    /// The final enabled stage, where a task becomes `done`.
+    pub fn last_stage(&self) -> Option<DeliveryStage> {
+        self.stages.iter().copied().max()
+    }
+}
+
+/// The PR a task ships in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskPr {
+    pub task_id: TaskId,
+    pub project_id: ProjectId,
+    /// `owner/name`.
+    pub repo: String,
+    /// `None` for a PR on a host Axle cannot read (stored as a link only).
+    pub number: Option<i64>,
+    pub url: String,
+    pub linked_by: PrLinkedBy,
+    pub head_ref: Option<String>,
+    pub base_ref: Option<String>,
+    pub head_sha: Option<String>,
+    /// Third-party text, capped at 200 characters.
+    pub title: Option<String>,
+    pub state: PrState,
+    pub merged_at: Option<OffsetDateTime>,
+    pub merge_commit_sha: Option<String>,
+    pub ci_state: CiState,
+    /// Up to 5 failing check names.
+    pub ci_failing: Vec<String>,
+    pub checked_at: Option<OffsetDateTime>,
+}
+
+/// When a task reached a stage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskStageRow {
+    pub task_id: TaskId,
+    pub stage: DeliveryStage,
+    pub reached_at: OffsetDateTime,
+    /// Passed over rather than observed (a later signal arrived first).
+    pub implied: bool,
+    pub signal_id: Option<Uuid>,
+    /// `version`, `environment` and `url` when known.
+    pub detail: Option<serde_json::Value>,
+}
+
+/// One entry of the append-only delivery log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliverySignal {
+    pub id: Uuid,
+    pub project_id: ProjectId,
+    pub kind: SignalKind,
+    pub source: SignalSource,
+    pub version: Option<String>,
+    pub sha: Option<String>,
+    pub environment: Option<String>,
+    pub url: Option<String>,
+    pub delivery_id: Option<String>,
+    pub outcome: SignalOutcome,
+    /// How many tasks the signal moved.
+    pub matched: u32,
+    pub received_at: OffsetDateTime,
+}
+
+/// The short id agents put in branch names: `axl-` plus the last 8 hex digits of the task
+/// UUID (the leading digits of a UUIDv7 are a timestamp shared within a minute).
+pub fn short_id(id: TaskId) -> String {
+    let hex = id.to_string().to_lowercase();
+    format!("axl-{}", &hex[hex.len() - 8..])
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskEventKind {
@@ -451,6 +744,17 @@ pub enum TaskEventKind {
     /// The human acknowledged a done task. Only ever published as a live event; it is
     /// never written to a task's history.
     Acked,
+    /// A PR was linked to the task (reported by the agent, matched, or set by the human).
+    PrLinked,
+    /// A different PR replaced the linked one (the previous is in the payload).
+    PrRelinked,
+    PrUnlinked,
+    /// The linked PR's CI state changed.
+    CiChanged,
+    /// The task reached a delivery stage.
+    StageReached,
+    /// The task reached the last enabled stage and became done.
+    Delivered,
 }
 
 text_enum!(TaskEventKind {
@@ -479,6 +783,12 @@ text_enum!(TaskEventKind {
     Related => "related",
     MovedUnder => "moved_under",
     Acked => "acked",
+    PrLinked => "pr_linked",
+    PrRelinked => "pr_relinked",
+    PrUnlinked => "pr_unlinked",
+    CiChanged => "ci_changed",
+    StageReached => "stage_reached",
+    Delivered => "delivered",
 });
 
 /// Where a done task stands with the human.
@@ -718,6 +1028,7 @@ mod tests {
             requires_plan: false,
             plan_state: PlanState::None,
             block: None,
+            delivery_stage: None,
         };
         let done = |at| task(TaskStatus::Done, Some(at), None);
         assert_eq!(ack_state(&done(now - n), now, n), Some(AckState::Unseen));

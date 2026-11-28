@@ -15,9 +15,10 @@ use time::{Duration, OffsetDateTime};
 
 use super::SessionCtx;
 use super::needs::{NeedCard, needs_you};
+use crate::delivery::stages::column as stage_column;
 use crate::domain::{
-    Actor, Address, Agent, AgentId, Importance, PlanState, Project, ProjectId, Task, TaskId,
-    TaskStatus,
+    Actor, Address, Agent, AgentId, DeliveryStage, Importance, PlanState, Project, ProjectId, Task,
+    TaskId, TaskStatus, short_id,
 };
 use crate::events::Event;
 use crate::http::AppState;
@@ -289,6 +290,14 @@ pub struct CardView {
     pub urgent: bool,
     /// Whether a compact card names its project (not when the board shows one project).
     pub show_project: bool,
+    /// `axl-` and the last eight hex digits of the id.
+    pub short_id: String,
+    /// The linked PR, when it has a number (a link-only PR has none to show).
+    pub pr: Option<PrChip>,
+    /// The stage word of a delivering task, shown beside its aspect.
+    pub stage: Option<&'static str>,
+    /// The stage a delivering task has not reached yet, for "waiting for Released".
+    pub waiting_for: Option<&'static str>,
 }
 
 /// Characters of a blocked task's reason in a compact card's tooltip.
@@ -344,6 +353,12 @@ pub(super) fn first_line(reason: &str) -> Option<String> {
     })
 }
 
+/// A card's PR chip: `PR #123`, linking to the pull request.
+pub struct PrChip {
+    pub number: i64,
+    pub url: String,
+}
+
 /// A running lease: seconds left out of its full length, and the same in words.
 /// The page counts `left` down between renders.
 pub struct LeaseView {
@@ -368,6 +383,7 @@ pub fn state_mark(task: &Task) -> (&'static str, &'static str) {
     match (task.status, task.plan_state) {
         (TaskStatus::Planning, PlanState::Submitted) => ("plan-submitted", "plan awaiting you"),
         (TaskStatus::Planning, PlanState::ChangesRequested) => ("planning", "plan in revision"),
+        (TaskStatus::Delivering, _) => ("delivering", "delivering"),
         (status, _) => (status.as_str(), status.as_str()),
     }
 }
@@ -516,6 +532,10 @@ async fn card(labels: &mut Labels<'_>, ctx: CardCtx, task: &Task) -> StoreResult
         compact: false,
         urgent: false,
         show_project: true,
+        short_id: short_id(task.id),
+        pr: None,
+        stage: None,
+        waiting_for: None,
     })
 }
 
@@ -626,6 +646,10 @@ pub async fn set_density(
 
 pub struct ColumnView {
     pub status: &'static str,
+    /// `Some` for a delivery stage column (`in_pr`, `merged`, ...).
+    pub stage: Option<&'static str>,
+    /// What the column says when it holds no cards.
+    pub empty_text: &'static str,
     pub label: &'static str,
     pub cards: Vec<CardView>,
     /// Every task in the column, shown or not (the header's count).
@@ -869,7 +893,15 @@ async fn columns(
         .into_iter()
         .collect();
     let mut out = Vec::with_capacity(COLUMNS.len());
+    let stages = StageBoard::load(state, project).await?;
     for (status, label) in COLUMNS {
+        if status == TaskStatus::Done {
+            out.extend(
+                stages
+                    .columns(labels, ctx, compact, &urgent, project.is_none())
+                    .await?,
+            );
+        }
         let mut done = None;
         let mut tasks: Vec<Task> = if status == TaskStatus::Done {
             let unseen = TaskFilter {
@@ -932,12 +964,16 @@ async fn columns(
             );
             tasks.sort_by_key(|t| (t.created_at, t.id));
         }
-        let tasks: Vec<Task> = tasks
+        let mut tasks: Vec<Task> = tasks
             .into_iter()
             .filter(|t| {
                 t.parent_id.is_none() || matches!(status, TaskStatus::Blocked | TaskStatus::Review)
             })
             .collect();
+        if status == TaskStatus::Review {
+            // A delivering task with no stage column to sit in must never be invisible.
+            tasks.extend(stages.stranded.iter().cloned());
+        }
         let mut cards = Vec::with_capacity(tasks.len());
         for t in &tasks {
             let mut c = card(labels, ctx, t).await?;
@@ -946,6 +982,7 @@ async fn columns(
             c.show_project = project.is_none();
             cards.push(c);
         }
+        stages.decorate(&mut cards).await?;
         let total = cards.len();
         let key = status.as_str();
         let (mut more, mut fewer, mut expanded) = (None, None, false);
@@ -983,6 +1020,16 @@ async fn columns(
         }
         out.push(ColumnView {
             status: key,
+            stage: None,
+            empty_text: match status {
+                TaskStatus::Open => "No open work. New tasks land here.",
+                TaskStatus::Claimed => {
+                    "No block occupied. Claimed tasks show here with their lease."
+                }
+                TaskStatus::Blocked => "Nothing blocked.",
+                TaskStatus::Review => "Nothing awaiting review.",
+                _ => "Nothing unseen. Finished work stays here until you ack it or it auto-acks.",
+            },
             label,
             cards,
             total,
@@ -993,6 +1040,178 @@ async fn columns(
         });
     }
     Ok(out)
+}
+
+/// The delivery decoration of a single live card, as the board gives it: PR chip, and for a
+/// delivering task its stage word and "waiting for".
+async fn decorate_one(state: &AppState, card: &mut CardView, task: &Task) -> StoreResult<()> {
+    if let Some(pr) = state.store.task_pr(task.id).await?
+        && let Some(number) = pr.number
+    {
+        card.pr = Some(PrChip {
+            number,
+            url: pr.url,
+        });
+    }
+    if task.status == TaskStatus::Delivering {
+        let enabled = state
+            .store
+            .get_project_delivery(task.project_id)
+            .await?
+            .map(|d| d.stages)
+            .unwrap_or_default();
+        if let Some((stage, waiting)) = stage_column(&enabled, task.delivery_stage) {
+            card.stage = Some(stage.label());
+            card.waiting_for = waiting.then(|| stage.label());
+        }
+    }
+    Ok(())
+}
+
+/// The empty sentence of a stage column: what it is waiting for next.
+fn stage_empty_text(stage: DeliveryStage) -> &'static str {
+    match stage {
+        DeliveryStage::InPr => "Nothing waiting for merge",
+        DeliveryStage::Merged => "Nothing waiting for release",
+        DeliveryStage::Released | DeliveryStage::Deployed => "Nothing waiting for deploy",
+    }
+}
+
+/// The delivery side of the board: which stage columns exist, and which `delivering` task
+/// sits in which. A task is placed by its own project's stages (`column`). On a board
+/// filtered to another project it spans, that column may be missing: the task then sits in
+/// the board's nearest stage column below it, keeping its own stage word, or in Review.
+struct StageBoard {
+    store: std::sync::Arc<dyn Store>,
+    /// The stage columns, in stage order: the project's enabled stages, or the union.
+    stages: Vec<DeliveryStage>,
+    /// Delivering tasks per stage column: the column, the task's own stage column, the task,
+    /// and whether it is "waiting for" its own stage.
+    placed: Vec<(DeliveryStage, DeliveryStage, Task, bool)>,
+    /// Delivering tasks with no stage column on this board: their project has no enabled
+    /// stage (should not happen), or the board shows none at or below theirs.
+    stranded: Vec<Task>,
+}
+
+impl StageBoard {
+    async fn load(state: &AppState, project: Option<ProjectId>) -> StoreResult<Self> {
+        let enabled: HashMap<ProjectId, Vec<DeliveryStage>> = state
+            .store
+            .list_project_delivery()
+            .await?
+            .into_iter()
+            .map(|d| (d.project_id, d.stages))
+            .collect();
+        let mut stages: Vec<DeliveryStage> = enabled
+            .iter()
+            .filter(|(id, _)| project.is_none_or(|p| p == **id))
+            .flat_map(|(_, s)| s.iter().copied())
+            .collect();
+        stages.sort();
+        stages.dedup();
+        let delivering = state
+            .store
+            .list_tasks(&TaskFilter {
+                project,
+                status: Some(TaskStatus::Delivering),
+                ..TaskFilter::default()
+            })
+            .await?;
+        let ids: HashSet<TaskId> = delivering.iter().map(|t| t.id).collect();
+        let mut placed = Vec::new();
+        let mut stranded = Vec::new();
+        for t in delivering {
+            // A parent that follows its children shows once.
+            if t.parent_id.is_some_and(|p| ids.contains(&p)) {
+                continue;
+            }
+            let own = enabled.get(&t.project_id).map_or(&[][..], Vec::as_slice);
+            let shown = stage_column(own, t.delivery_stage).and_then(|(stage, waiting)| {
+                let column = stages.iter().copied().rfind(|s| *s <= stage)?;
+                Some((column, stage, waiting))
+            });
+            match shown {
+                Some((column, stage, waiting)) => placed.push((column, stage, t, waiting)),
+                None => stranded.push(t),
+            }
+        }
+        Ok(Self {
+            store: state.store.clone(),
+            stages,
+            placed,
+            stranded,
+        })
+    }
+
+    /// One column per stage, uncapped (`compact`, `urgent` and `show_project` as on the
+    /// status columns).
+    async fn columns(
+        &self,
+        labels: &mut Labels<'_>,
+        ctx: CardCtx,
+        compact: bool,
+        urgent: &HashSet<TaskId>,
+        show_project: bool,
+    ) -> StoreResult<Vec<ColumnView>> {
+        let mut out = Vec::with_capacity(self.stages.len());
+        for stage in &self.stages {
+            let mut cards = Vec::new();
+            for (column, own, t, waiting) in &self.placed {
+                if column == stage {
+                    let mut c = card(labels, ctx, t).await?;
+                    c.stage = Some(own.label());
+                    c.waiting_for = waiting.then(|| own.label());
+                    c.compact = compact;
+                    c.urgent = urgent.contains(&t.id);
+                    c.show_project = show_project;
+                    cards.push(c);
+                }
+            }
+            self.decorate(&mut cards).await?;
+            out.push(ColumnView {
+                status: "delivering",
+                stage: Some(stage.as_str()),
+                empty_text: stage_empty_text(*stage),
+                label: stage.label(),
+                total: cards.len(),
+                cards,
+                expanded: false,
+                more: None,
+                fewer: None,
+                done: None,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Adds the PR chip to every card, with one batch lookup.
+    async fn decorate(&self, cards: &mut [CardView]) -> StoreResult<()> {
+        let ids: Vec<TaskId> = cards.iter().filter_map(|c| c.id.parse().ok()).collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let prs: HashMap<TaskId, _> = self
+            .store
+            .task_prs(&ids)
+            .await?
+            .into_iter()
+            .map(|p| (p.task_id, p))
+            .collect();
+        for c in cards {
+            let Ok(id) = c.id.parse::<TaskId>() else {
+                continue;
+            };
+            if let Some(pr) = prs.get(&id)
+                && let Some(number) = pr.number
+            {
+                c.pr = Some(PrChip {
+                    number,
+                    url: pr.url.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 pub async fn board(
@@ -1410,7 +1629,8 @@ async fn task_frames(state: &AppState, event: &Event) -> UiResult<Frames> {
         frames.push(("board".into(), PING.into()));
     }
     let mut labels = Labels::load(&*state.store).await?;
-    let card = card(&mut labels, CardCtx::of(state), &root).await?;
+    let mut card = card(&mut labels, CardCtx::of(state), &root).await?;
+    decorate_one(state, &mut card, &root).await?;
     // SSE data must be one line per `data:` field; HTML does not care about the newlines.
     let html = CardFragment { card }.render()?.replace(['\r', '\n'], " ");
     frames.push((format!("task-{}", root.id), html));

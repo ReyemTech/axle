@@ -2,6 +2,7 @@
 //! UTC RFC3339 text (see `ts`), so both compare correctly in SQL.
 
 use std::str::FromStr;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -10,21 +11,26 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 use time::{Duration as TimeDuration, OffsetDateTime};
 
 use super::{
-    AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate,
-    MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome, Priced, Pricer,
-    ProjectsAdded, Recipient, RelateRequest, Related, RepriceRow, Store, StoreError, StoreResult,
-    StoredUsage, TaskFilter, TaskOrder, TaskScope, TransitionRequest, Transitioned, UnblockRule,
-    Unblocked, UsageBatch, UsageCounts, UsageFilter, UsageGroup, UsageRow, UsageWritten,
-    block_previous_payload, child_event, children_complete_event, claim_event, closes_child,
-    edit_payload, enrollment_token_label, like_pattern, options_from, options_to,
-    projects_added_note, projects_added_payload, related_payload, send_time_recipient,
-    unblocked_records,
+    AddProjectsRequest, ClaimAttempt, ClaimRequest, CompleteRequest, Completed, DeliveringRow,
+    EditRequest, InboxFilter, LeaseUpdate, LinkOutcome, LinkPrRequest, MessageReceipt, MoveRequest,
+    Moved, NewEnrollment, NewTaskPr, NewToken, ParentMove, ParentState, ParentStep, PollOutcome,
+    Priced, Pricer, ProjectsAdded, Recipient, RelateRequest, Related, RepriceRow, SignalInsert,
+    StageMove, StageMoved, StagesApplied, Store, StoreError, StoreResult, StoredUsage, TaskFilter,
+    TaskOrder, TaskScope, TransitionRequest, Transitioned, UnblockRule, Unblocked, UsageBatch,
+    UsageCounts, UsageFilter, UsageGroup, UsageRow, UsageWritten, block_previous_payload,
+    child_event, children_complete_event, claim_event, closes_child, completion_event,
+    edit_payload, enrollment_token_label, finished_by, like_pattern, link_refusal,
+    marked_done_event, move_delivers, options_from, options_to, parent_move_event, pr_linked_event,
+    pr_unlinked_event, projects_added_note, projects_added_payload, push_moved, recompute_parent,
+    related_payload, send_time_recipient, stage_delivered_event, stage_reached_event,
+    stages_delivered_event, stages_from_json, stages_to_json, unblocked_records,
 };
+use crate::delivery::stages::{ChildState, CompletionTarget, STAGE_RANK_SQL, completion_target};
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId,
-    EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId, Session,
-    SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo,
-    UsageId, WaitingOn,
+    Actor, Address, Agent, AgentId, BlockDetail, DeliverySignal, DeliveryStage, Eligibility,
+    Enrollment, EnrollmentId, EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project,
+    ProjectDelivery, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId,
+    TaskLink, TaskPr, TaskStageRow, TaskStatus, TokenId, TokenInfo, UsageId, WaitingOn,
 };
 
 /// The columns `enrollment_from` reads (a macro so queries can `concat!` it statically).
@@ -174,6 +180,10 @@ fn task_from(row: &SqliteRow) -> StoreResult<Task> {
         requires_plan: row.try_get("requires_plan")?,
         plan_state: parse_text(row.try_get("plan_state")?)?,
         block: block_from(row)?,
+        delivery_stage: row
+            .try_get::<Option<String>, _>("delivery_stage")?
+            .map(|s| parse_text(&s))
+            .transpose()?,
     })
 }
 
@@ -194,6 +204,35 @@ fn block_from(row: &SqliteRow) -> StoreResult<Option<BlockDetail>> {
     }))
 }
 
+/// The columns `delivery_from` reads.
+macro_rules! delivery_cols {
+    () => {
+        "project_id, stages, repo, github_enabled, release_source, tag_pattern, deploy_source,
+         required_environment, updated_at"
+    };
+}
+
+fn delivery_from(row: &SqliteRow) -> StoreResult<ProjectDelivery> {
+    Ok(ProjectDelivery {
+        project_id: uuid_of(row.try_get("project_id")?)?,
+        stages: stages_from_json(row.try_get("stages")?)?,
+        repo: row.try_get("repo")?,
+        github_enabled: row.try_get("github_enabled")?,
+        release_source: parse_text(row.try_get("release_source")?)?,
+        tag_pattern: row.try_get("tag_pattern")?,
+        deploy_source: parse_text(row.try_get("deploy_source")?)?,
+        required_environment: row.try_get("required_environment")?,
+        updated_at: ts::dec(row.try_get("updated_at")?)?,
+    })
+}
+
+/// A row's `delivery_stage`.
+fn opt_stage(row: &SqliteRow) -> StoreResult<Option<DeliveryStage>> {
+    row.try_get::<Option<&str>, _>("delivery_stage")?
+        .map(parse_text)
+        .transpose()
+}
+
 fn event_from(row: &SqliteRow) -> StoreResult<TaskEvent> {
     let payload: Option<&str> = row.try_get("payload")?;
     Ok(TaskEvent {
@@ -211,6 +250,25 @@ fn event_from(row: &SqliteRow) -> StoreResult<TaskEvent> {
             .transpose()
             .map_err(|e| StoreError::Corrupt(format!("event payload: {e}")))?,
     })
+}
+
+/// Task columns as a literal, so queries stay static SQL.
+macro_rules! task_cols {
+    () => {
+        "id, project_id, parent_id, title, body, status, owner_session_id, owner_agent_id,
+         lease_expires_at, lease_epoch, lease_ttl_secs, eligible_harness, eligible_host,
+         created_by_agent_id, created_by_session_id, created_at, updated_at, version,
+         requires_plan, plan_state, done_at, acked_at, block_reason, blocked_at, waiting_kind,
+         waiting_task_id, waiting_text, unblock_text, delivery_stage"
+    };
+}
+
+/// `SET` assignments that empty a task's block detail (a literal, so queries stay static).
+macro_rules! clear_block {
+    () => {
+        "block_reason = NULL, blocked_at = NULL, waiting_kind = NULL, waiting_task_id = NULL,
+         waiting_text = NULL, unblock_text = NULL"
+    };
 }
 
 async fn insert_event(
@@ -239,25 +297,82 @@ async fn insert_event(
     Ok(())
 }
 
-/// Appends `event` to the task's history and, when it belongs to a child, bubbles it into the
-/// parent's thread; the last child closing moves a `claimed` parent to `review`. Runs inside
-/// the write transaction of the child's state change.
+/// Appends `event` to the task's history, then runs the parent rule up the tree (see
+/// `parent_step`). Runs inside the write transaction of the task's change. Returns the task
+/// on which this change recorded `children_complete` (it closed that task's last open
+/// child): the parent, or an ancestor the parent rule finished its way up to.
 async fn record_event(
     conn: &mut SqliteConnection,
     task: &Task,
     event: &TaskEvent,
     token: Option<TokenId>,
-) -> StoreResult<bool> {
+) -> StoreResult<Option<TaskId>> {
+    record_event_into(conn, task, event, token, &mut Vec::new()).await
+}
+
+/// `record_event`, adding to `moved` every ancestor the parent rule changed. A parent the
+/// rule moved records its own event, which runs the rule for the grandparent in turn.
+async fn record_event_into(
+    conn: &mut SqliteConnection,
+    task: &Task,
+    event: &TaskEvent,
+    token: Option<TokenId>,
+    moved: &mut Vec<Task>,
+) -> StoreResult<Option<TaskId>> {
     insert_event(conn, event, token).await?;
-    let Some(parent) = task.parent_id else {
-        return Ok(false);
+    let (mut child, mut source) = (task.clone(), event.clone());
+    while let Some(parent) = child.parent_id {
+        match parent_step(conn, &child, parent, &source, token).await? {
+            ParentStep::Unchanged => break,
+            ParentStep::ChildrenComplete(updated) => {
+                if let Some(p) = updated {
+                    push_moved(moved, p);
+                }
+                return Ok(Some(parent));
+            }
+            ParentStep::Moved(p, ev) => {
+                insert_event(conn, &ev, token).await?;
+                push_moved(moved, p.clone());
+                (child, source) = (p, ev);
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The parent rule for one change (`source`) of `child`: bubbles the event into the parent's
+/// thread; a `delivering` parent then follows its children (`recompute_parent`: forward to
+/// the minimum stage, or `done`); otherwise the last child closing records
+/// `children_complete` and moves a `claimed` parent to `review`. Under the write lock.
+async fn parent_step(
+    conn: &mut SqliteConnection,
+    child: &Task,
+    parent: TaskId,
+    source: &TaskEvent,
+    token: Option<TokenId>,
+) -> StoreResult<ParentStep> {
+    let Some(row) =
+        sqlx::query("SELECT status, delivery_stage, project_id FROM tasks WHERE id = ?")
+            .bind(parent.to_string())
+            .fetch_optional(&mut *conn)
+            .await?
+    else {
+        return Ok(ParentStep::Unchanged);
     };
-    let Some(bubbled) = child_event(task, parent, event) else {
-        return Ok(false);
-    };
-    insert_event(conn, &bubbled, token).await?;
-    if !closes_child(event) {
-        return Ok(false);
+    if let Some(bubbled) = child_event(child, parent, source) {
+        insert_event(conn, &bubbled, token).await?;
+    }
+    let status: TaskStatus = parse_text(row.try_get("status")?)?;
+    if status == TaskStatus::Delivering {
+        let project = uuid_of(row.try_get("project_id")?)?;
+        let moved = follow_children(conn, parent, project, opt_stage(&row)?, source).await?;
+        return Ok(match moved {
+            Some((p, ev)) => ParentStep::Moved(p, ev),
+            None => ParentStep::Unchanged,
+        });
+    }
+    if !closes_child(source) {
+        return Ok(ParentStep::Unchanged);
     }
     let open: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM tasks WHERE parent_id = ? AND status NOT IN ('done', 'cancelled')",
@@ -266,30 +381,479 @@ async fn record_event(
     .fetch_one(&mut *conn)
     .await?;
     if open > 0 {
-        return Ok(false);
+        return Ok(ParentStep::Unchanged);
     }
-    let status: Option<String> = sqlx::query_scalar("SELECT status FROM tasks WHERE id = ?")
+    let updated = match status {
+        // Never a `done` row, so `done_at` / `acked_at` need no handling here.
+        TaskStatus::Claimed => sqlx::query(concat!(
+            "UPDATE tasks SET status = 'review', lease_expires_at = NULL,
+                    version = version + 1, updated_at = ?
+              WHERE id = ?
+              RETURNING ",
+            task_cols!()
+        ))
+        .bind(ts::enc(source.at))
         .bind(parent.to_string())
         .fetch_optional(&mut *conn)
-        .await?;
-    match status.as_deref() {
-        // Never a `done` row, so `done_at` / `acked_at` need no handling here.
-        Some("claimed") => {
-            sqlx::query(
-                "UPDATE tasks SET status = 'review', lease_expires_at = NULL,
-                        version = version + 1, updated_at = ?
-                  WHERE id = ?",
-            )
-            .bind(ts::enc(event.at))
+        .await?
+        .as_ref()
+        .map(task_from)
+        .transpose()?,
+        TaskStatus::Open | TaskStatus::Planning | TaskStatus::Blocked | TaskStatus::Review => None,
+        _ => return Ok(ParentStep::Unchanged),
+    };
+    insert_event(conn, &children_complete_event(parent, source), token).await?;
+    Ok(ParentStep::ChildrenComplete(updated))
+}
+
+/// `recompute_parent` applied to the `delivering` task `parent` (shown at `stage`), for the
+/// change `source`: the row as moved and the event recording the move (not yet appended),
+/// or `None` when it stays. The own stage is read from `task_stages` (see `ParentState`).
+async fn follow_children(
+    conn: &mut SqliteConnection,
+    parent: TaskId,
+    project: ProjectId,
+    stage: Option<DeliveryStage>,
+    source: &TaskEvent,
+) -> StoreResult<Option<(Task, TaskEvent)>> {
+    let has_pr = pr_of(conn, parent).await?.is_some();
+    let state = ParentState {
+        stage,
+        has_pr,
+        own: own_stage(conn, parent).await?,
+    };
+    let stages = project_stages(conn, project).await?;
+    let children = child_states(conn, parent).await?;
+    let Some(change) = recompute_parent(&stages, &state, &children) else {
+        return Ok(None);
+    };
+    let query = match change {
+        ParentMove::Done => sqlx::query(concat!(
+            "UPDATE tasks
+                SET status = 'done', done_at = ?1, version = version + 1, updated_at = ?1
+              WHERE id = ?2 AND status = 'delivering'
+              RETURNING ",
+            task_cols!()
+        ))
+        .bind(ts::enc(source.at))
+        .bind(parent.to_string()),
+        ParentMove::Stage(stage) => sqlx::query(PARENT_STAGE_SQL.as_str())
+            .bind(ts::enc(source.at))
             .bind(parent.to_string())
+            .bind(stage.as_str())
+            .bind(i64::from(stage.rank())),
+    };
+    let updated = query
+        .fetch_optional(&mut *conn)
+        .await?
+        .as_ref()
+        .map(task_from)
+        .transpose()?;
+    Ok(updated.map(|p| (p, parent_move_event(parent, change, source))))
+}
+
+/// The parent rule's forward-only stage move. Binds: at, id, stage, stage rank.
+static PARENT_STAGE_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "UPDATE tasks SET delivery_stage = ?3, version = version + 1, updated_at = ?1
+          WHERE id = ?2 AND status = 'delivering' AND {STAGE_RANK_SQL} < ?4
+          RETURNING {}",
+        task_cols!()
+    )
+});
+
+/// `unlink_pr`'s guarded clear. Binds: at, id.
+/// A project's `delivering` tasks, deepest first (most ancestors), then by `(created_at,
+/// id)`: children always come before their parents. Binds: project.
+const DELIVERING_LEAF_FIRST_SQL: &str = "WITH RECURSIVE chain(id, up, depth) AS (
+         SELECT id, parent_id, 0 FROM tasks WHERE project_id = ?1 AND status = 'delivering'
+         UNION ALL
+         SELECT c.id, t.parent_id, c.depth + 1 FROM chain c JOIN tasks t ON t.id = c.up)
+     SELECT c.id FROM chain c JOIN tasks t ON t.id = c.id
+      GROUP BY c.id, t.created_at
+      ORDER BY MAX(c.depth) DESC, t.created_at, c.id";
+
+/// The task's own stage (its `task_stages`) must be before `merged`.
+const UNLINK_SQL: &str = concat!(
+    "UPDATE tasks SET delivery_stage = NULL, version = version + 1, updated_at = ?1
+      WHERE id = ?2 AND status NOT IN ('done', 'cancelled', 'delivering')
+        AND NOT EXISTS (SELECT 1 FROM task_stages s
+                         WHERE s.task_id = tasks.id
+                           AND s.stage IN ('merged', 'released', 'deployed'))
+        AND EXISTS (SELECT 1 FROM task_prs p WHERE p.task_id = tasks.id)
+      RETURNING ",
+    task_cols!()
+);
+
+/// The furthest stage the task's own PR reached (its `task_stages` rows).
+async fn own_stage(
+    conn: &mut SqliteConnection,
+    task: TaskId,
+) -> StoreResult<Option<DeliveryStage>> {
+    let rows: Vec<String> = sqlx::query_scalar("SELECT stage FROM task_stages WHERE task_id = ?")
+        .bind(task.to_string())
+        .fetch_all(&mut *conn)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|s| parse_text::<DeliveryStage>(s))
+        .collect::<StoreResult<Vec<_>>>()?
+        .into_iter()
+        .max())
+}
+
+/// The project's enabled stages (none without a settings row).
+async fn project_stages(
+    conn: &mut SqliteConnection,
+    project: ProjectId,
+) -> StoreResult<Vec<DeliveryStage>> {
+    let stages: Option<String> =
+        sqlx::query_scalar("SELECT stages FROM project_delivery WHERE project_id = ?")
+            .bind(project.to_string())
+            .fetch_optional(&mut *conn)
+            .await?;
+    stages.map_or(Ok(Vec::new()), |s| stages_from_json(&s))
+}
+
+/// What the parent rule needs of each child of `parent`.
+async fn child_states(conn: &mut SqliteConnection, parent: TaskId) -> StoreResult<Vec<ChildState>> {
+    sqlx::query("SELECT status, delivery_stage FROM tasks WHERE parent_id = ?")
+        .bind(parent.to_string())
+        .fetch_all(&mut *conn)
+        .await?
+        .iter()
+        .map(|c| {
+            Ok(ChildState {
+                status: parse_text(c.try_get("status")?)?,
+                stage: opt_stage(c)?,
+            })
+        })
+        .collect()
+}
+
+/// The `task_prs` columns `pr_from` reads.
+macro_rules! pr_cols {
+    () => {
+        "task_id, project_id, repo, number, url, linked_by, head_ref, base_ref, head_sha, title,
+         state, merged_at, merge_commit_sha, ci_state, ci_failing, checked_at"
+    };
+}
+
+fn pr_from(row: &SqliteRow) -> StoreResult<TaskPr> {
+    let opt_ts = |col: &str| -> StoreResult<Option<OffsetDateTime>> {
+        row.try_get::<Option<&str>, _>(col)?
+            .map(ts::dec)
+            .transpose()
+    };
+    Ok(TaskPr {
+        task_id: uuid_of(row.try_get("task_id")?)?,
+        project_id: uuid_of(row.try_get("project_id")?)?,
+        repo: row.try_get("repo")?,
+        number: row.try_get("number")?,
+        url: row.try_get("url")?,
+        linked_by: parse_text(row.try_get("linked_by")?)?,
+        head_ref: row.try_get("head_ref")?,
+        base_ref: row.try_get("base_ref")?,
+        head_sha: row.try_get("head_sha")?,
+        title: row.try_get("title")?,
+        state: parse_text(row.try_get("state")?)?,
+        merged_at: opt_ts("merged_at")?,
+        merge_commit_sha: row.try_get("merge_commit_sha")?,
+        ci_state: parse_text(row.try_get("ci_state")?)?,
+        ci_failing: serde_json::from_str(row.try_get("ci_failing")?)
+            .map_err(|e| StoreError::Corrupt(format!("ci_failing: {e}")))?,
+        checked_at: opt_ts("checked_at")?,
+    })
+}
+
+async fn pr_of(conn: &mut SqliteConnection, task: TaskId) -> StoreResult<Option<TaskPr>> {
+    sqlx::query(concat!(
+        "SELECT ",
+        pr_cols!(),
+        " FROM task_prs WHERE task_id = ?"
+    ))
+    .bind(task.to_string())
+    .fetch_optional(&mut *conn)
+    .await?
+    .as_ref()
+    .map(pr_from)
+    .transpose()
+}
+
+/// The other task that holds `pr` (by URL, or by repo and number).
+async fn pr_owner(
+    conn: &mut SqliteConnection,
+    pr: &NewTaskPr,
+    except: TaskId,
+) -> StoreResult<Option<TaskId>> {
+    let owner: Option<String> = sqlx::query_scalar(
+        "SELECT task_id FROM task_prs
+          WHERE task_id <> ?1 AND (url = ?2 OR (repo = ?3 AND number = ?4))
+          LIMIT 1",
+    )
+    .bind(except.to_string())
+    .bind(&pr.url)
+    .bind(&pr.repo)
+    .bind(pr.number)
+    .fetch_optional(&mut *conn)
+    .await?;
+    owner.as_deref().map(uuid_of).transpose()
+}
+
+/// Inserts the task's PR row unless the PR (or a row for the task) already exists; whether
+/// it was inserted.
+async fn insert_pr(conn: &mut SqliteConnection, task: &Task, pr: &NewTaskPr) -> StoreResult<bool> {
+    let done = sqlx::query(
+        "INSERT INTO task_prs (task_id, project_id, repo, number, url, linked_by)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(task.id.to_string())
+    .bind(task.project_id.to_string())
+    .bind(&pr.repo)
+    .bind(pr.number)
+    .bind(&pr.url)
+    .bind(pr.linked_by.as_str())
+    .execute(&mut *conn)
+    .await?;
+    Ok(done.rows_affected() == 1)
+}
+
+/// Records that the task reached `stage` at `at`, once.
+async fn insert_stage(
+    conn: &mut SqliteConnection,
+    task: TaskId,
+    stage: DeliveryStage,
+    at: OffsetDateTime,
+) -> StoreResult<()> {
+    sqlx::query(
+        "INSERT INTO task_stages (task_id, stage, reached_at) VALUES (?, ?, ?)
+         ON CONFLICT (task_id, stage) DO NOTHING",
+    )
+    .bind(task.to_string())
+    .bind(stage.as_str())
+    .bind(ts::enc(at))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+async fn task_locked(conn: &mut SqliteConnection, id: TaskId) -> StoreResult<Option<Task>> {
+    sqlx::query(concat!("SELECT ", task_cols!(), " FROM tasks WHERE id = ?"))
+        .bind(id.to_string())
+        .fetch_optional(&mut *conn)
+        .await?
+        .as_ref()
+        .map(task_from)
+        .transpose()
+}
+
+/// `link_pr` inside its write transaction; the caller commits only `Linked` / `Relinked`.
+async fn link_locked(conn: &mut SqliteConnection, req: &LinkPrRequest) -> StoreResult<LinkOutcome> {
+    let Some(task) = task_locked(conn, req.task).await? else {
+        return Ok(LinkOutcome::NotFound);
+    };
+    let existing = pr_of(conn, task.id).await?;
+    let own = own_stage(conn, task.id).await?;
+    if let Some(refused) = link_refusal(&task, existing.as_ref(), own, req) {
+        return Ok(refused);
+    }
+    if let Some(owner) = pr_owner(conn, &req.pr, task.id).await? {
+        return Ok(LinkOutcome::TakenBy(owner));
+    }
+    if existing.is_some() {
+        sqlx::query("DELETE FROM task_prs WHERE task_id = ?")
+            .bind(task.id.to_string())
             .execute(&mut *conn)
             .await?;
-        }
-        Some("open" | "planning" | "blocked" | "review") => {}
-        _ => return Ok(false),
     }
-    insert_event(conn, &children_complete_event(parent, event), token).await?;
-    Ok(true)
+    if !insert_pr(conn, &task, &req.pr).await? {
+        return Err(StoreError::Corrupt(format!("PR {} conflicts", req.pr.url)));
+    }
+    let updated = sqlx::query(concat!(
+        "UPDATE tasks SET delivery_stage = COALESCE(delivery_stage, 'in_pr'),
+                version = version + 1, updated_at = ?
+          WHERE id = ?
+          RETURNING ",
+        task_cols!()
+    ))
+    .bind(ts::enc(req.now))
+    .bind(task.id.to_string())
+    .fetch_one(&mut *conn)
+    .await?;
+    let mut updated = task_from(&updated)?;
+    insert_stage(conn, task.id, DeliveryStage::InPr, req.now).await?;
+    let event = pr_linked_event(task.id, &req.pr.url, existing.as_ref(), req.actor, req.now);
+    record_event(conn, &updated, &event, req.token).await?;
+    if updated.status == TaskStatus::Delivering {
+        // A delivering parent now also follows its own PR (forward only).
+        let moved = follow_children(
+            conn,
+            task.id,
+            task.project_id,
+            updated.delivery_stage,
+            &event,
+        )
+        .await?;
+        if let Some((p, ev)) = moved {
+            record_event(conn, &p, &ev, req.token).await?;
+            updated = p;
+        }
+    }
+    Ok(match existing {
+        None => LinkOutcome::Linked(updated),
+        Some(previous) => LinkOutcome::Relinked {
+            task: updated,
+            previous,
+        },
+    })
+}
+
+/// `advance_stage`'s forward-only move of a task the parent rule does not drive: writes the
+/// stage and, when `deliver` (a delivering leaf at the last stage), finishes the task.
+/// Binds: at, id, stage, stage rank, deliver.
+static ADVANCE_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "UPDATE tasks
+            SET delivery_stage = ?3,
+                status = CASE WHEN ?5 AND status = 'delivering' THEN 'done' ELSE status END,
+                done_at = CASE WHEN ?5 AND status = 'delivering' THEN ?1 ELSE done_at END,
+                version = version + 1, updated_at = ?1
+          WHERE id = ?2 AND status NOT IN ('done', 'cancelled') AND {STAGE_RANK_SQL} < ?4
+          RETURNING {}",
+        task_cols!()
+    )
+});
+
+/// Records a stage of `m` on its task, once: `m.to` with the signal and detail, or an implied
+/// stage (signal only).
+async fn insert_moved_stage(
+    conn: &mut SqliteConnection,
+    m: &StageMove,
+    stage: DeliveryStage,
+) -> StoreResult<()> {
+    let implied = stage != m.to;
+    sqlx::query(
+        "INSERT INTO task_stages (task_id, stage, reached_at, implied, signal_id, detail)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (task_id, stage) DO NOTHING",
+    )
+    .bind(m.task.to_string())
+    .bind(stage.as_str())
+    .bind(ts::enc(m.now))
+    .bind(implied)
+    .bind(m.signal_id.map(|s| s.to_string()))
+    .bind(if implied {
+        None
+    } else {
+        m.detail.as_ref().map(|d| d.to_string())
+    })
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// `advance_stage` inside its write transaction; the caller commits only `Some`.
+async fn advance_locked(
+    conn: &mut SqliteConnection,
+    m: &StageMove,
+) -> StoreResult<Option<StageMoved>> {
+    let Some(task) = task_locked(conn, m.task).await? else {
+        return Ok(None);
+    };
+    // Forward only, against the task's own stage (see `ParentState`).
+    if matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled)
+        || own_stage(conn, task.id).await? >= Some(m.to)
+    {
+        return Ok(None);
+    }
+    let has_children = !child_states(conn, task.id).await?.is_empty();
+    // A delivering parent shows its derived minimum; the parent rule moves it below.
+    let parent_rule = task.status == TaskStatus::Delivering && has_children;
+    let updated = if parent_rule {
+        sqlx::query(concat!(
+            "UPDATE tasks SET version = version + 1, updated_at = ?1
+              WHERE id = ?2 AND status = 'delivering'
+              RETURNING ",
+            task_cols!()
+        ))
+        .bind(ts::enc(m.now))
+        .bind(task.id.to_string())
+        .fetch_optional(&mut *conn)
+        .await?
+    } else {
+        let stages = project_stages(conn, task.project_id).await?;
+        sqlx::query(ADVANCE_SQL.as_str())
+            .bind(ts::enc(m.now))
+            .bind(task.id.to_string())
+            .bind(m.to.as_str())
+            .bind(i64::from(m.to.rank()))
+            .bind(move_delivers(&stages, task.status, has_children, m.to))
+            .fetch_optional(&mut *conn)
+            .await?
+    };
+    let Some(mut updated) = updated.as_ref().map(task_from).transpose()? else {
+        return Ok(None);
+    };
+    for &stage in &m.implied {
+        insert_moved_stage(conn, m, stage).await?;
+    }
+    insert_moved_stage(conn, m, m.to).await?;
+    let reached = stage_reached_event(m);
+    let delivered = updated.status == TaskStatus::Done;
+    let mut moved = Vec::new();
+    let mut children_complete = if delivered {
+        insert_event(conn, &reached, m.token).await?;
+        record_event_into(
+            conn,
+            &updated,
+            &stage_delivered_event(m),
+            m.token,
+            &mut moved,
+        )
+        .await?
+    } else {
+        record_event_into(conn, &updated, &reached, m.token, &mut moved).await?
+    };
+    if parent_rule {
+        let own = follow_children(
+            conn,
+            task.id,
+            task.project_id,
+            updated.delivery_stage,
+            &reached,
+        )
+        .await?;
+        if let Some((p, ev)) = own {
+            let closed = record_event_into(conn, &p, &ev, m.token, &mut moved).await?;
+            children_complete = children_complete.or(closed);
+            updated = p;
+        }
+    }
+    let mut finished = vec![updated.clone()];
+    finished.extend(moved.into_iter().filter(|t| t.id != updated.id));
+    let unblocked = unblock_done(conn, &finished, m.now, m.actor, m.token, m.unblock).await?;
+    Ok(Some(StageMoved {
+        delivered: updated.status == TaskStatus::Done,
+        children_complete,
+        task: updated,
+        unblocked,
+    }))
+}
+
+fn stage_row_from(row: &SqliteRow) -> StoreResult<TaskStageRow> {
+    let detail: Option<&str> = row.try_get("detail")?;
+    Ok(TaskStageRow {
+        task_id: uuid_of(row.try_get("task_id")?)?,
+        stage: parse_text(row.try_get("stage")?)?,
+        reached_at: ts::dec(row.try_get("reached_at")?)?,
+        implied: row.try_get("implied")?,
+        signal_id: opt_uuid(row, "signal_id")?,
+        detail: detail
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| StoreError::Corrupt(format!("stage detail: {e}")))?,
+    })
 }
 
 /// The `WHERE` shared by `list_tasks` and `count_tasks` (everything but the `after` cursor).
@@ -309,25 +873,6 @@ macro_rules! task_where {
                         AND ((?6 = 'unseen' AND done_at >= ?7)
                              OR (?6 = 'auto' AND done_at < ?7))))
                AND (?8 IS NULL OR title LIKE ?8 ESCAPE '\\')"
-    };
-}
-
-/// Task columns as a literal, so queries stay static SQL.
-macro_rules! task_cols {
-    () => {
-        "id, project_id, parent_id, title, body, status, owner_session_id, owner_agent_id,
-         lease_expires_at, lease_epoch, lease_ttl_secs, eligible_harness, eligible_host,
-         created_by_agent_id, created_by_session_id, created_at, updated_at, version,
-         requires_plan, plan_state, done_at, acked_at, block_reason, blocked_at, waiting_kind,
-         waiting_task_id, waiting_text, unblock_text"
-    };
-}
-
-/// `SET` assignments that empty a task's block detail (a literal, so queries stay static).
-macro_rules! clear_block {
-    () => {
-        "block_reason = NULL, blocked_at = NULL, waiting_kind = NULL, waiting_task_id = NULL,
-         waiting_text = NULL, unblock_text = NULL"
     };
 }
 
@@ -687,7 +1232,9 @@ async fn wait_allowed(
 async fn unblock_waiting(
     conn: &mut SqliteConnection,
     done: &Task,
-    req: &TransitionRequest,
+    now: OffsetDateTime,
+    actor: Actor,
+    token: Option<TokenId>,
     rule: UnblockRule,
 ) -> StoreResult<Vec<Unblocked>> {
     let waiting: Vec<Task> = sqlx::query(concat!(
@@ -703,7 +1250,7 @@ async fn unblock_waiting(
     .iter()
     .map(task_from)
     .collect::<StoreResult<_>>()?;
-    let now = ts::enc(req.now);
+    let at = ts::enc(now);
     let mut out = Vec::with_capacity(waiting.len());
     for dep in waiting {
         let live: bool = match dep.owner_session_id {
@@ -727,8 +1274,8 @@ async fn unblock_waiting(
                  WHERE id = ? AND status = 'blocked' RETURNING ",
                 task_cols!()
             ))
-            .bind(ts::enc(req.now + dep.lease_ttl.unwrap_or(rule.default_ttl)))
-            .bind(&now)
+            .bind(ts::enc(now + dep.lease_ttl.unwrap_or(rule.default_ttl)))
+            .bind(&at)
             .bind(dep.id.to_string())
             .fetch_optional(&mut *conn)
             .await?
@@ -741,17 +1288,37 @@ async fn unblock_waiting(
                  WHERE id = ? AND status = 'blocked' RETURNING ",
                 task_cols!()
             ))
-            .bind(&now)
+            .bind(&at)
             .bind(dep.id.to_string())
             .fetch_optional(&mut *conn)
             .await?
         };
         let Some(row) = row else { continue };
         let task = task_from(&row)?;
-        let (event, note) = unblocked_records(&task, done, !live, req.event.actor, req.now);
-        record_event(conn, &task, &event, req.token).await?;
-        insert_message(conn, &note, req.token).await?;
+        let (event, note) = unblocked_records(&task, done, !live, actor, now);
+        record_event(conn, &task, &event, token).await?;
+        insert_message(conn, &note, token).await?;
         out.push(Unblocked { task, note });
+    }
+    Ok(out)
+}
+
+/// Applies `rule` (when given) to the waiting tasks of each task in `tasks` that is `done`:
+/// the tasks one write made `done` (the task itself, the `delivering` parents it finished).
+async fn unblock_done(
+    conn: &mut SqliteConnection,
+    tasks: &[Task],
+    now: OffsetDateTime,
+    actor: Actor,
+    token: Option<TokenId>,
+    rule: Option<UnblockRule>,
+) -> StoreResult<Vec<Unblocked>> {
+    let Some(rule) = rule else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for done in tasks.iter().filter(|t| t.status == TaskStatus::Done) {
+        out.extend(unblock_waiting(&mut *conn, done, now, actor, token, rule).await?);
     }
     Ok(out)
 }
@@ -862,6 +1429,7 @@ fn enrollment_from(row: &SqliteRow) -> StoreResult<Enrollment> {
 async fn transition_in(
     conn: &mut SqliteConnection,
     req: &TransitionRequest,
+    stage: Option<DeliveryStage>,
 ) -> StoreResult<Option<Transitioned>> {
     let from = format!(
         ",{},",
@@ -937,6 +1505,7 @@ async fn transition_in(
                                     WHEN ? THEN ? ELSE waiting_text END,
                 unblock_text = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
                                     ELSE COALESCE(?, unblock_text) END,
+                delivery_stage = COALESCE(?, delivery_stage),
                 version = version + 1, updated_at = ?
           WHERE id = ?
             AND instr(?, ',' || status || ',') > 0
@@ -974,6 +1543,7 @@ async fn transition_in(
     .bind(waiting.and_then(|w| w.text()))
     .bind(to)
     .bind(&block.unblock)
+    .bind(stage.map(|st| st.as_str()))
     .bind(ts::enc(req.now))
     .bind(req.task.to_string())
     .bind(from)
@@ -991,7 +1561,8 @@ async fn transition_in(
     let Some(task) = updated else {
         return Ok(None);
     };
-    let children_complete = record_event(conn, &task, &event, req.token).await?;
+    let mut moved = Vec::new();
+    let children_complete = record_event_into(conn, &task, &event, req.token, &mut moved).await?;
     if req.archive_plans {
         sqlx::query(
             "UPDATE message_recipients
@@ -1009,12 +1580,22 @@ async fn transition_in(
     if let Some(message) = &req.message {
         insert_message(conn, message, req.token).await?;
     }
-    let unblocked = match req.unblock {
-        Some(rule) if req.to == Some(TaskStatus::Done) && task.status == TaskStatus::Done => {
-            unblock_waiting(conn, &task, req, rule).await?
-        }
-        _ => Vec::new(),
-    };
+    // The task itself only when this transition finished it; then any `delivering` ancestor
+    // the parent rule finished.
+    let mut finished = Vec::new();
+    if req.to == Some(TaskStatus::Done) && task.status == TaskStatus::Done {
+        finished.push(task.clone());
+    }
+    finished.extend(moved);
+    let unblocked = unblock_done(
+        conn,
+        &finished,
+        req.now,
+        req.event.actor,
+        req.token,
+        req.unblock,
+    )
+    .await?;
     Ok(Some(Transitioned {
         task,
         children_complete,
@@ -1329,6 +1910,336 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn get_project_delivery(
+        &self,
+        project: ProjectId,
+    ) -> StoreResult<Option<ProjectDelivery>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            delivery_cols!(),
+            " FROM project_delivery WHERE project_id = ?"
+        ))
+        .bind(project.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(delivery_from)
+        .transpose()
+    }
+
+    async fn list_project_delivery(&self) -> StoreResult<Vec<ProjectDelivery>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            delivery_cols!(),
+            " FROM project_delivery ORDER BY project_id"
+        ))
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(delivery_from)
+        .collect()
+    }
+
+    async fn set_project_delivery(
+        &self,
+        d: &ProjectDelivery,
+        token: Option<TokenId>,
+        unblock: Option<UnblockRule>,
+    ) -> StoreResult<StagesApplied> {
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        sqlx::query(
+            "INSERT INTO project_delivery
+                 (project_id, stages, repo, github_enabled, release_source, tag_pattern,
+                  deploy_source, required_environment, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (project_id) DO UPDATE
+                SET stages = excluded.stages, repo = excluded.repo,
+                    github_enabled = excluded.github_enabled,
+                    release_source = excluded.release_source,
+                    tag_pattern = excluded.tag_pattern,
+                    deploy_source = excluded.deploy_source,
+                    required_environment = excluded.required_environment,
+                    updated_at = excluded.updated_at",
+        )
+        .bind(d.project_id.to_string())
+        .bind(stages_to_json(&d.stages))
+        .bind(&d.repo)
+        .bind(d.github_enabled)
+        .bind(d.release_source.as_str())
+        .bind(&d.tag_pattern)
+        .bind(d.deploy_source.as_str())
+        .bind(&d.required_environment)
+        .bind(ts::enc(d.updated_at))
+        .execute(&mut *tx)
+        .await?;
+
+        // Children before parents (the same order as the Postgres store, which locks in it).
+        let delivering: Vec<String> = sqlx::query_scalar(DELIVERING_LEAF_FIRST_SQL)
+            .bind(d.project_id.to_string())
+            .fetch_all(&mut *tx)
+            .await?;
+        let (mut moved, mut finished) = (Vec::new(), Vec::new());
+        for id in &delivering {
+            let id: TaskId = uuid_of(id)?;
+            let state = DeliveringRow {
+                task: id,
+                stage: own_stage(&mut tx, id).await?,
+                has_pr: pr_of(&mut tx, id).await?.is_some(),
+                children: child_states(&mut tx, id).await?,
+            };
+            if !finished_by(&d.stages, &state) {
+                continue;
+            }
+            let done = sqlx::query(concat!(
+                "UPDATE tasks
+                    SET status = 'done', done_at = ?1, version = version + 1, updated_at = ?1
+                  WHERE id = ?2 AND status = 'delivering'
+                  RETURNING ",
+                task_cols!()
+            ))
+            .bind(ts::enc(d.updated_at))
+            .bind(state.task.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .as_ref()
+            .map(task_from)
+            .transpose()?;
+            if let Some(task) = done {
+                let event = stages_delivered_event(task.id, d);
+                push_moved(&mut moved, task.clone());
+                let closed = record_event_into(&mut tx, &task, &event, token, &mut moved).await?;
+                finished.push((task, closed));
+            }
+        }
+        let unblocked =
+            unblock_done(&mut tx, &moved, d.updated_at, Actor::Human, token, unblock).await?;
+        tx.commit().await?;
+        Ok(StagesApplied {
+            moved,
+            finished,
+            unblocked,
+        })
+    }
+
+    async fn link_pr(&self, req: &LinkPrRequest) -> StoreResult<LinkOutcome> {
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let outcome = link_locked(&mut tx, req).await?;
+        if matches!(
+            outcome,
+            LinkOutcome::Linked(_) | LinkOutcome::Relinked { .. }
+        ) {
+            tx.commit().await?;
+        } else {
+            tx.rollback().await?;
+        }
+        Ok(outcome)
+    }
+
+    async fn unlink_pr(
+        &self,
+        task: TaskId,
+        actor: Actor,
+        token: Option<TokenId>,
+        now: OffsetDateTime,
+    ) -> StoreResult<Option<TaskPr>> {
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let Some(previous) = pr_of(&mut tx, task).await? else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let updated = sqlx::query(UNLINK_SQL)
+            .bind(ts::enc(now))
+            .bind(task.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .as_ref()
+            .map(task_from)
+            .transpose()?;
+        let Some(updated) = updated else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        sqlx::query("DELETE FROM task_prs WHERE task_id = ?")
+            .bind(task.to_string())
+            .execute(&mut *tx)
+            .await?;
+        let event = pr_unlinked_event(task, &previous, actor, now);
+        record_event(&mut tx, &updated, &event, token).await?;
+        tx.commit().await?;
+        Ok(Some(previous))
+    }
+
+    async fn task_pr(&self, task: TaskId) -> StoreResult<Option<TaskPr>> {
+        let mut conn = self.pool.acquire().await?;
+        pr_of(&mut conn, task).await
+    }
+
+    async fn task_prs(&self, tasks: &[TaskId]) -> StoreResult<Vec<TaskPr>> {
+        let listed =
+            serde_json::to_string(&tasks.iter().map(|i| i.to_string()).collect::<Vec<_>>())
+                .expect("strings serialize");
+        sqlx::query(concat!(
+            "SELECT ",
+            pr_cols!(),
+            " FROM task_prs WHERE task_id IN (SELECT value FROM json_each(?)) ORDER BY task_id"
+        ))
+        .bind(listed)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(pr_from)
+        .collect()
+    }
+
+    async fn task_stages(&self, task: TaskId) -> StoreResult<Vec<TaskStageRow>> {
+        let mut rows = sqlx::query(
+            "SELECT task_id, stage, reached_at, implied, signal_id, detail
+               FROM task_stages WHERE task_id = ?",
+        )
+        .bind(task.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(stage_row_from)
+        .collect::<StoreResult<Vec<_>>>()?;
+        rows.sort_by_key(|r| r.stage);
+        Ok(rows)
+    }
+
+    async fn complete_task(&self, req: &CompleteRequest) -> StoreResult<Option<Completed>> {
+        let t = &req.transition;
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let Some(task) = task_locked(&mut tx, t.task).await? else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let stages = project_stages(&mut tx, task.project_id).await?;
+        let mut has_pr = pr_of(&mut tx, task.id).await?.is_some();
+        let mut linked = None;
+        // `links` is only linked in a project with stages; without, completion is as today.
+        if !has_pr
+            && !stages.is_empty()
+            && let Some(link) = &req.link
+        {
+            has_pr = insert_pr(&mut tx, &task, link).await?;
+            linked = has_pr.then_some(link);
+        }
+        // The task's own stage is its `task_stages` (see `ParentState`); a link made here
+        // reaches In PR.
+        let mut own = own_stage(&mut tx, task.id).await?;
+        if linked.is_some() {
+            own = own.max(Some(DeliveryStage::InPr));
+        }
+        let children = child_states(&mut tx, task.id).await?;
+        let target = completion_target(&stages, own, has_pr, &children);
+        let (to, stage) = match target {
+            CompletionTarget::Done => (TaskStatus::Done, linked.and(own)),
+            CompletionTarget::Delivering(s) => (TaskStatus::Delivering, Some(s)),
+        };
+        // The completion runs through the same guarded change as every transition (block
+        // detail cleared, waiting tasks unblocked when it lands on `done`).
+        let mut finish = t.clone();
+        finish.to = Some(to);
+        finish.event = completion_event(&t.event, target);
+        let Some(transitioned) = transition_in(&mut tx, &finish, stage).await? else {
+            // Nothing applies, the link included.
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        if let Some(link) = linked {
+            insert_stage(&mut tx, task.id, DeliveryStage::InPr, t.now).await?;
+            let event = pr_linked_event(task.id, &link.url, None, t.event.actor, t.now);
+            insert_event(&mut tx, &event, t.token).await?;
+        }
+        tx.commit().await?;
+        Ok(Some(Completed {
+            transitioned,
+            target,
+        }))
+    }
+
+    async fn advance_stage(&self, m: &StageMove) -> StoreResult<Option<StageMoved>> {
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let moved = advance_locked(&mut tx, m).await?;
+        if moved.is_some() {
+            tx.commit().await?;
+        } else {
+            tx.rollback().await?;
+        }
+        Ok(moved)
+    }
+
+    async fn mark_delivered(
+        &self,
+        task: TaskId,
+        actor: Actor,
+        token: Option<TokenId>,
+        now: OffsetDateTime,
+        unblock: Option<UnblockRule>,
+    ) -> StoreResult<Option<Transitioned>> {
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let done = sqlx::query(concat!(
+            "UPDATE tasks
+                SET status = 'done', done_at = ?1, version = version + 1, updated_at = ?1
+              WHERE id = ?2 AND status = 'delivering'
+              RETURNING ",
+            task_cols!()
+        ))
+        .bind(ts::enc(now))
+        .bind(task.to_string())
+        .fetch_optional(&mut *tx)
+        .await?
+        .as_ref()
+        .map(task_from)
+        .transpose()?;
+        let Some(done) = done else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let event = marked_done_event(task, actor, now);
+        let mut moved = Vec::new();
+        let children_complete =
+            record_event_into(&mut tx, &done, &event, token, &mut moved).await?;
+        let mut finished = vec![done.clone()];
+        finished.extend(moved);
+        let unblocked = unblock_done(&mut tx, &finished, now, actor, token, unblock).await?;
+        tx.commit().await?;
+        Ok(Some(Transitioned {
+            task: done,
+            children_complete,
+            unblocked,
+        }))
+    }
+
+    async fn insert_signal(&self, s: &DeliverySignal) -> StoreResult<SignalInsert> {
+        let done = sqlx::query(
+            "INSERT INTO delivery_signals
+                 (id, project_id, kind, source, version, sha, environment, url, delivery_id,
+                  outcome, matched, received_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (project_id, delivery_id) WHERE delivery_id IS NOT NULL DO NOTHING",
+        )
+        .bind(s.id.to_string())
+        .bind(s.project_id.to_string())
+        .bind(s.kind.as_str())
+        .bind(s.source.as_str())
+        .bind(&s.version)
+        .bind(&s.sha)
+        .bind(&s.environment)
+        .bind(&s.url)
+        .bind(&s.delivery_id)
+        .bind(s.outcome.as_str())
+        .bind(i64::from(s.matched))
+        .bind(ts::enc(s.received_at))
+        .execute(&self.pool)
+        .await?;
+        Ok(if done.rows_affected() == 1 {
+            SignalInsert::Inserted
+        } else {
+            SignalInsert::Duplicate
+        })
+    }
+
     async fn upsert_agent(
         &self,
         project: Option<ProjectId>,
@@ -1518,8 +2429,8 @@ impl Store for SqliteStore {
                  (id, project_id, parent_id, title, body, status, owner_session_id,
                   owner_agent_id, lease_expires_at, lease_epoch, lease_ttl_secs,
                   eligible_harness, eligible_host, created_by_agent_id, created_by_session_id,
-                  token_id, created_at, updated_at, version, requires_plan, plan_state)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  token_id, created_at, updated_at, version, requires_plan, plan_state, delivery_stage)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(task.id.to_string())
         .bind(task.project_id.to_string())
@@ -1542,6 +2453,7 @@ impl Store for SqliteStore {
         .bind(task.version)
         .bind(task.requires_plan)
         .bind(task.plan_state.as_str())
+        .bind(task.delivery_stage.map(|s| s.as_str()))
         .execute(&mut *tx)
         .await?;
         for project in extra_projects {
@@ -1767,7 +2679,7 @@ impl Store for SqliteStore {
         }
         let cancelled = match &req.cancel {
             Some(cancel) if task.status != TaskStatus::Cancelled => {
-                let done = transition_in(&mut tx, cancel).await?.ok_or_else(|| {
+                let done = transition_in(&mut tx, cancel, None).await?.ok_or_else(|| {
                     StoreError::Corrupt(format!("task {} did not cancel under its lock", req.task))
                 })?;
                 task = done.task.clone();
@@ -2065,7 +2977,7 @@ impl Store for SqliteStore {
 
     async fn transition_task(&self, req: &TransitionRequest) -> StoreResult<Option<Transitioned>> {
         let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
-        let done = transition_in(&mut tx, req).await?;
+        let done = transition_in(&mut tx, req, None).await?;
         tx.commit().await?;
         Ok(done)
     }

@@ -43,6 +43,103 @@ macro_rules! store_matrix {
     };
 }
 
+/// `store_matrix_raw!(name, |store: Arc<dyn Store>, raw: common::RawDb| async move { ... })`:
+/// `store_matrix!` plus a raw connection to the same database, for setting up rows that no
+/// store method writes yet.
+#[allow(unused_macros)]
+macro_rules! store_matrix_raw {
+    ($name:ident, $body:expr) => {
+        mod $name {
+            #[allow(unused_imports)]
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn sqlite() {
+                let (store, file) = crate::common::sqlite_store().await;
+                let raw = crate::common::RawDb::sqlite(&file).await;
+                let outcome = crate::common::catch_body(($body)(store, raw.clone())).await;
+                raw.close().await;
+                crate::common::resume(outcome);
+            }
+
+            #[cfg(feature = "pg-tests")]
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn postgres() {
+                let (store, schema) = crate::common::pg_store().await;
+                let raw = crate::common::RawDb::Postgres(schema.pool().await);
+                let outcome = crate::common::catch_body(($body)(store, raw.clone())).await;
+                raw.close().await;
+                schema.drop().await;
+                crate::common::resume(outcome);
+            }
+        }
+    };
+}
+
+/// A raw pool on a test's database. `execute` takes SQL with inline literals only, which
+/// both backends accept unchanged (a quoted uuid is text on SQLite and casts on Postgres).
+#[derive(Clone)]
+pub enum RawDb {
+    Sqlite(sqlx::SqlitePool),
+    #[cfg(feature = "pg-tests")]
+    Postgres(sqlx::PgPool),
+}
+
+impl RawDb {
+    pub async fn sqlite(file: &TempDb) -> Self {
+        let url = format!("sqlite://{}", file.path().display());
+        RawDb::Sqlite(
+            sqlx::SqlitePool::connect(&url)
+                .await
+                .expect("raw sqlite pool"),
+        )
+    }
+
+    pub async fn execute(&self, sql: &str) {
+        let sql = sqlx::AssertSqlSafe(sql.to_string());
+        match self {
+            RawDb::Sqlite(pool) => {
+                sqlx::query(sql)
+                    .execute(pool)
+                    .await
+                    .expect("raw sqlite sql");
+            }
+            #[cfg(feature = "pg-tests")]
+            RawDb::Postgres(pool) => {
+                sqlx::query(sql)
+                    .execute(pool)
+                    .await
+                    .expect("raw postgres sql");
+            }
+        }
+    }
+
+    /// The single `COUNT(*)` value of `sql` (inline literals only).
+    #[allow(dead_code)]
+    pub async fn count(&self, sql: &str) -> i64 {
+        let sql = sqlx::AssertSqlSafe(sql.to_string());
+        match self {
+            RawDb::Sqlite(pool) => sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(pool)
+                .await
+                .expect("raw sqlite count"),
+            #[cfg(feature = "pg-tests")]
+            RawDb::Postgres(pool) => sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(pool)
+                .await
+                .expect("raw postgres count"),
+        }
+    }
+
+    pub async fn close(&self) {
+        match self {
+            RawDb::Sqlite(pool) => pool.close().await,
+            #[cfg(feature = "pg-tests")]
+            RawDb::Postgres(pool) => pool.close().await,
+        }
+    }
+}
+
 /// Runs a test body in its own task so a panic is caught rather than unwinding past cleanup.
 pub async fn catch_body<F>(body: F) -> Result<(), JoinError>
 where

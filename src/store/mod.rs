@@ -12,11 +12,15 @@ use async_trait::async_trait;
 use time::{Duration, OffsetDateTime};
 
 use crate::config::Backend;
+use crate::delivery::stages::{
+    ChildState, CompletionTarget, completion_target, last_enabled, parent_stage,
+};
 use crate::domain::{
-    Actor, Address, Agent, AgentId, Billing, BlockDetail, Enrollment, EnrollmentId, EnrollmentKind,
-    Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState, Project,
-    ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus,
-    TokenId, TokenInfo, UsageId, WaitingOn,
+    Actor, Address, Agent, AgentId, Billing, BlockDetail, DeliverySignal, DeliveryStage,
+    Enrollment, EnrollmentId, EnrollmentKind, Importance, InboxItem, LinkKind, Message, MessageId,
+    MessageKind, PlanState, PrLinkedBy, Project, ProjectDelivery, ProjectId, Session, SessionId,
+    Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskPr, TaskStageRow, TaskStatus, TokenId,
+    TokenInfo, UsageId, WaitingOn,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -168,6 +172,107 @@ pub trait Store: Send + Sync {
     async fn list_projects(&self) -> StoreResult<Vec<Project>>;
     /// Changes only the display name; `NotFound` if the project does not exist.
     async fn rename_project(&self, id: ProjectId, display_name: &str) -> StoreResult<()>;
+
+    // ---- delivery settings ----
+
+    /// The project's stored delivery settings; `None` when it has none (no stages).
+    async fn get_project_delivery(
+        &self,
+        project: ProjectId,
+    ) -> StoreResult<Option<ProjectDelivery>>;
+    /// Every stored delivery settings row, ordered by project id.
+    async fn list_project_delivery(&self) -> StoreResult<Vec<ProjectDelivery>>;
+    /// Upserts `d` and, in the same transaction, recomputes every `delivering` task of the
+    /// project with `completion_target(d.stages, …)`: a task whose target is `Done` becomes
+    /// `done` (`done_at = updated_at = d.updated_at`, `version` bumped) with a `delivered`
+    /// event (actor the human, note `delivered_note(&d.stages)`, `token` recorded). Done tasks
+    /// are never reopened. The parent rule then runs for the parents of moved tasks (as after
+    /// any child change). With `unblock`, every task that became `done` unblocks its waiting
+    /// tasks in the same transaction (see `UnblockRule`; actor the human). Returns the tasks
+    /// moved, as updated (those the stages finished and the parents the parent rule moved),
+    /// the tasks the stages finished themselves (with any `children_complete` each recorded)
+    /// and the tasks unblocked. A task with a child that is not `done` or `cancelled` is not
+    /// finished.
+    async fn set_project_delivery(
+        &self,
+        d: &ProjectDelivery,
+        token: Option<TokenId>,
+        unblock: Option<UnblockRule>,
+    ) -> StoreResult<StagesApplied>;
+
+    // ---- delivery: PR links and completion ----
+
+    /// Links `req.pr` to `req.task` in one transaction (the task row is locked first). Refused
+    /// (`Closed`) for a `done` / `cancelled` task. The task's own PR again is `Unchanged`;
+    /// with a different PR linked, `replace = false` gives `HasLink`, and a task whose
+    /// `delivery_stage` reached `merged` gives `AlreadyMerged` (the linked PR's number). A PR
+    /// whose `(repo, number)` or `url` belongs to another task gives `TakenBy`. On link:
+    /// replaces any previous row, sets `delivery_stage = max(current, in_pr)`, records
+    /// `task_stages(in_pr)` if absent, bumps `version` / `updated_at = now`, and appends
+    /// `pr_linked` (payload `url`) or `pr_relinked` (payload `url`, `previous_url`).
+    async fn link_pr(&self, req: &LinkPrRequest) -> StoreResult<LinkOutcome>;
+    /// Removes the task's PR link, guarded: the task is not `done` / `cancelled` /
+    /// `delivering` and its stage is before `merged`. Sets `delivery_stage = NULL`, bumps
+    /// `version`, appends `pr_unlinked` (payload `previous_url`). Returns the removed link;
+    /// `None` when there was none or the guard did not match.
+    async fn unlink_pr(
+        &self,
+        task: TaskId,
+        actor: Actor,
+        token: Option<TokenId>,
+        now: OffsetDateTime,
+    ) -> StoreResult<Option<TaskPr>>;
+    /// The task's PR link.
+    async fn task_pr(&self, task: TaskId) -> StoreResult<Option<TaskPr>>;
+    /// The PR links of the listed tasks (tasks without one are left out), by task id.
+    async fn task_prs(&self, tasks: &[TaskId]) -> StoreResult<Vec<TaskPr>>;
+    /// The stages a task reached, in stage order.
+    async fn task_stages(&self, task: TaskId) -> StoreResult<Vec<TaskStageRow>>;
+    /// `task_complete`'s write: the guarded transition of `req.transition` (its `from`,
+    /// `owner`, plan, lease and message fields; its `to` is replaced by the target) and, in
+    /// the same transaction: links `req.link` (`complete_links`) when the project has enabled
+    /// stages, the task has no PR and the PR is not taken (skipped silently otherwise; a
+    /// project without stages completes exactly as before delivery), then decides with
+    /// `completion_target` from the project's stages, the PR, the task's stage and its
+    /// children. `done` sets `done_at`; `delivering` leaves it null and sets `delivery_stage`
+    /// to the target stage. The `done` event is appended either way; for `delivering` its
+    /// payload gains `"delivering": "<stage>"`. `None` (nothing written, the link included)
+    /// when the guard did not match.
+    async fn complete_task(&self, req: &CompleteRequest) -> StoreResult<Option<Completed>>;
+
+    // ---- delivery: stage moves and signals ----
+
+    /// Moves `m.task` forward to `m.to`, in one transaction that locks the task row first. The
+    /// guard: the task is not `done` / `cancelled` and its own stage (its `task_stages`, see
+    /// `ParentState`) is before `m.to`, so two moves racing for one task have one winner. On
+    /// match: a task without children gets `delivery_stage = m.to` (the guarded
+    /// `UPDATE … WHERE <STAGE_RANK_SQL> < :rank`); a `delivering` task with children keeps
+    /// its derived minimum and is recomputed by the parent rule (forward only). Either bumps
+    /// `version` / `updated_at = m.now`, records `task_stages` rows for `m.to` (with
+    /// `signal_id` / `detail`) and for each of `m.implied` (`implied = true`), `ON CONFLICT DO
+    /// NOTHING`, and appends `stage_reached` (payload `stage`, `implied`). A `delivering` task
+    /// without children whose `m.to` reaches the project's last enabled stage becomes `done`
+    /// (`done_at = m.now`) with a `delivered` event (payload `stage`); a task in any other
+    /// status only records the stage (stages reached before completion). The parent rule
+    /// then runs up the tree. With `m.unblock`, every task the move made `done` (the task, a
+    /// parent the rule closed) unblocks its waiting tasks. `None` when the guard did not match
+    /// (or no such task).
+    async fn advance_stage(&self, m: &StageMove) -> StoreResult<Option<StageMoved>>;
+    /// The human's **Mark done**: guarded `delivering → done` (`done_at = updated_at = now`,
+    /// `version` bumped), a `delivered` event with note `marked done by the human`, then the
+    /// parent rule; with `unblock`, the task and any parent it closed unblock their waiting
+    /// tasks. `None` when the task is not `delivering`.
+    async fn mark_delivered(
+        &self,
+        task: TaskId,
+        actor: Actor,
+        token: Option<TokenId>,
+        now: OffsetDateTime,
+        unblock: Option<UnblockRule>,
+    ) -> StoreResult<Option<Transitioned>>;
+    /// Appends `s` to the delivery log. `Duplicate` (nothing written) when the project already
+    /// logged a signal with the same `delivery_id`; signals without one never collide.
+    async fn insert_signal(&self, s: &DeliverySignal) -> StoreResult<SignalInsert>;
 
     // ---- agents ----
 
@@ -729,7 +834,8 @@ pub struct TransitionRequest {
     /// Whenever the resulting status is not `blocked`, the detail is cleared regardless.
     pub block: Option<BlockWrite>,
     /// When the transition makes the task `done`: unblocks, in the same transaction, every
-    /// `blocked` task waiting on it (see `UnblockRule`). `None` leaves them alone.
+    /// `blocked` task waiting on it (see `UnblockRule`), and likewise for every `delivering`
+    /// ancestor the parent rule finished. `None` leaves them alone.
     pub unblock: Option<UnblockRule>,
 }
 
@@ -966,13 +1072,383 @@ pub fn projects_added_payload(added: &[ProjectId]) -> serde_json::Value {
     })
 }
 
+/// A PR to link to a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTaskPr {
+    /// `owner/name`.
+    pub repo: String,
+    /// `None` for a link-only PR (a host Axle cannot read).
+    pub number: Option<i64>,
+    pub url: String,
+    pub linked_by: PrLinkedBy,
+}
+
+/// A request to link a PR (see `Store::link_pr`).
+#[derive(Debug, Clone)]
+pub struct LinkPrRequest {
+    pub task: TaskId,
+    pub pr: NewTaskPr,
+    pub actor: Actor,
+    pub token: Option<TokenId>,
+    pub now: OffsetDateTime,
+    /// `false` for the fallback match: links only when the task has no PR.
+    pub replace: bool,
+}
+
+/// What `link_pr` did.
+// Outcomes carry whole rows by design and are short-lived values, so boxing would only add
+// noise (as for `ClaimOutcome`).
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkOutcome {
+    Linked(Task),
+    Relinked {
+        task: Task,
+        previous: TaskPr,
+    },
+    /// The task already has this PR.
+    Unchanged(Task),
+    /// The PR belongs to this other task.
+    TakenBy(TaskId),
+    /// The task reached `merged` (via the PR numbered `number`); new work needs a new task.
+    AlreadyMerged {
+        number: Option<i64>,
+    },
+    /// `replace = false` and the task has another PR.
+    HasLink,
+    Closed(TaskStatus),
+    NotFound,
+}
+
+/// `task_complete`'s write (see `Store::complete_task`).
+#[derive(Debug, Clone)]
+pub struct CompleteRequest {
+    pub transition: TransitionRequest,
+    /// A PR from the completion's links, linked when the task has none.
+    pub link: Option<NewTaskPr>,
+}
+
+/// A completion that applied, and where it sent the task.
+#[derive(Debug, Clone)]
+pub struct Completed {
+    pub transitioned: Transitioned,
+    pub target: CompletionTarget,
+}
+
+/// A forward stage move (see `Store::advance_stage`).
+#[derive(Debug, Clone)]
+pub struct StageMove {
+    pub task: TaskId,
+    pub to: DeliveryStage,
+    /// Stages passed over on the way (`implied_between`), recorded as `implied`.
+    pub implied: Vec<DeliveryStage>,
+    /// The signal that caused the move, if one did.
+    pub signal_id: Option<uuid::Uuid>,
+    /// `version`, `environment` and `url` when known, stored on the `m.to` row.
+    pub detail: Option<serde_json::Value>,
+    pub actor: Actor,
+    pub token: Option<TokenId>,
+    pub now: OffsetDateTime,
+    /// Unblocks the waiting tasks of every task the move made `done`; `None` leaves them.
+    pub unblock: Option<UnblockRule>,
+}
+
+/// What `set_project_delivery` changed.
+#[derive(Debug, Clone, Default)]
+pub struct StagesApplied {
+    /// The tasks moved to `done`, as updated, parents included.
+    pub moved: Vec<Task>,
+    /// The tasks the stages finished themselves (not through the parent rule), as updated,
+    /// each with the task on which finishing it recorded `children_complete` (see
+    /// `Transitioned::children_complete`).
+    pub finished: Vec<(Task, Option<TaskId>)>,
+    /// The tasks those unblocked.
+    pub unblocked: Vec<Unblocked>,
+}
+
+/// A stage move that applied.
+#[derive(Debug, Clone)]
+pub struct StageMoved {
+    /// The task as updated.
+    pub task: Task,
+    /// Whether the move finished the task (`delivering → done`).
+    pub delivered: bool,
+    /// The task on which the move recorded `children_complete` (it closed that task's last
+    /// open child): the parent, or an ancestor the parent rule finished its way up to.
+    pub children_complete: Option<TaskId>,
+    /// Tasks unblocked because the move made a task `done` (see `StageMove::unblock`).
+    pub unblocked: Vec<Unblocked>,
+}
+
+/// What `insert_signal` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalInsert {
+    Inserted,
+    /// The project already logged this `delivery_id`.
+    Duplicate,
+}
+
+/// The `stage_reached` event of a stage move.
+pub(crate) fn stage_reached_event(m: &StageMove) -> TaskEvent {
+    TaskEvent {
+        id: uuid::Uuid::now_v7(),
+        task_id: m.task,
+        at: m.now,
+        actor: m.actor,
+        kind: TaskEventKind::StageReached,
+        note: None,
+        payload: Some(serde_json::json!({
+            "stage": m.to.as_str(),
+            "implied": m.implied.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        })),
+    }
+}
+
+/// The `delivered` event of a stage move that reached the last enabled stage.
+pub(crate) fn stage_delivered_event(m: &StageMove) -> TaskEvent {
+    TaskEvent {
+        id: uuid::Uuid::now_v7(),
+        task_id: m.task,
+        at: m.now,
+        actor: m.actor,
+        kind: TaskEventKind::Delivered,
+        note: None,
+        payload: Some(serde_json::json!({ "stage": m.to.as_str() })),
+    }
+}
+
+/// The `delivered` event of the human's **Mark done**.
+pub(crate) fn marked_done_event(task: TaskId, actor: Actor, now: OffsetDateTime) -> TaskEvent {
+    TaskEvent {
+        id: uuid::Uuid::now_v7(),
+        task_id: task,
+        at: now,
+        actor,
+        kind: TaskEventKind::Delivered,
+        note: Some("marked done by the human".to_string()),
+        payload: None,
+    }
+}
+
+/// Whether a stage move to `to` finishes a task in `status` (`has_children`: the parent rule
+/// decides instead): a `delivering` leaf reaching the last enabled stage.
+pub(crate) fn move_delivers(
+    stages: &[DeliveryStage],
+    status: TaskStatus,
+    has_children: bool,
+    to: DeliveryStage,
+) -> bool {
+    status == TaskStatus::Delivering
+        && !has_children
+        && last_enabled(stages).is_some_and(|last| to >= last)
+}
+
+/// The `pr_linked` (or, replacing `previous`, `pr_relinked`) event of a link.
+pub(crate) fn pr_linked_event(
+    task: TaskId,
+    url: &str,
+    previous: Option<&TaskPr>,
+    actor: Actor,
+    at: OffsetDateTime,
+) -> TaskEvent {
+    let (kind, payload) = match previous {
+        None => (TaskEventKind::PrLinked, serde_json::json!({ "url": url })),
+        Some(p) => (
+            TaskEventKind::PrRelinked,
+            serde_json::json!({ "url": url, "previous_url": p.url }),
+        ),
+    };
+    TaskEvent {
+        id: uuid::Uuid::now_v7(),
+        task_id: task,
+        at,
+        actor,
+        kind,
+        note: None,
+        payload: Some(payload),
+    }
+}
+
+/// The `pr_unlinked` event, keeping the removed URL.
+pub(crate) fn pr_unlinked_event(
+    task: TaskId,
+    previous: &TaskPr,
+    actor: Actor,
+    at: OffsetDateTime,
+) -> TaskEvent {
+    TaskEvent {
+        id: uuid::Uuid::now_v7(),
+        task_id: task,
+        at,
+        actor,
+        kind: TaskEventKind::PrUnlinked,
+        note: None,
+        payload: Some(serde_json::json!({ "previous_url": previous.url })),
+    }
+}
+
+/// Whether `existing` is the PR `new` names (same URL, or same repo and number).
+pub(crate) fn same_pr(existing: &TaskPr, new: &NewTaskPr) -> bool {
+    existing.url == new.url
+        || (new.number.is_some() && existing.repo == new.repo && existing.number == new.number)
+}
+
+/// The completion's `done` event; completing into `delivering` adds `"delivering"` to it.
+pub(crate) fn completion_event(event: &TaskEvent, target: CompletionTarget) -> TaskEvent {
+    let mut event = event.clone();
+    if let CompletionTarget::Delivering(stage) = target {
+        let mut payload = match event.payload.take() {
+            Some(serde_json::Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        payload.insert("delivering".into(), stage.as_str().into());
+        event.payload = Some(payload.into());
+    }
+    event
+}
+
+/// Whether a `done` event is a completion into `delivering` (its payload names the stage).
+pub(crate) fn completes_into_delivering(event: &TaskEvent) -> bool {
+    event.kind == TaskEventKind::Done
+        && event
+            .payload
+            .as_ref()
+            .is_some_and(|p| p.get("delivering").is_some())
+}
+
+/// What the parent rule reads about a `delivering` parent (under its row lock).
+///
+/// **Own stage vs shown stage (binding rule).** A task's *own* furthest stage is always the
+/// greatest of its `task_stages` rows (for a task without children it equals
+/// `tasks.delivery_stage`). `tasks.delivery_stage` of a `delivering` parent holds the derived
+/// minimum the board shows, so it is never read as the parent's own stage. Every writer
+/// keeps this: a stage reached by the task's own PR (link, `advance_stage`) is a
+/// `task_stages` row, and on a `delivering` parent the move recomputes the parent
+/// (`recompute_parent`, forward only) instead of writing the PR's stage into
+/// `delivery_stage`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParentState {
+    /// `tasks.delivery_stage`: the stage the parent shows (the minimum).
+    pub stage: Option<DeliveryStage>,
+    pub has_pr: bool,
+    /// The furthest stage the parent's own PR reached (max of its `task_stages` rows).
+    pub own: Option<DeliveryStage>,
+}
+
+/// Why `link_pr` refuses before looking for another holder of the PR, if it does: the
+/// task's own stage is `own` (its `task_stages`), never a parent's derived `delivery_stage`.
+pub(crate) fn link_refusal(
+    task: &Task,
+    existing: Option<&TaskPr>,
+    own: Option<DeliveryStage>,
+    req: &LinkPrRequest,
+) -> Option<LinkOutcome> {
+    if matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled) {
+        return Some(LinkOutcome::Closed(task.status));
+    }
+    if let Some(e) = existing {
+        if same_pr(e, &req.pr) {
+            return Some(LinkOutcome::Unchanged(task.clone()));
+        }
+        if !req.replace {
+            return Some(LinkOutcome::HasLink);
+        }
+    }
+    (own >= Some(DeliveryStage::Merged)).then(|| LinkOutcome::AlreadyMerged {
+        number: existing.and_then(|e| e.number),
+    })
+}
+
+/// Where the parent rule moves a `delivering` parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParentMove {
+    /// Forward to this stage (the minimum over its own PR and its delivering children).
+    Stage(DeliveryStage),
+    /// Every non-cancelled child is `done` and its own PR (if any) reached the last stage.
+    Done,
+}
+
+/// The parent rule, shared by both stores and run after every change of a child whose
+/// parent is `delivering`. Moves are forward only; `None` when nothing changes.
+pub(crate) fn recompute_parent(
+    stages: &[DeliveryStage],
+    parent: &ParentState,
+    children: &[ChildState],
+) -> Option<ParentMove> {
+    let own = parent.has_pr.then(|| {
+        parent
+            .own
+            .map_or(DeliveryStage::InPr, |s| s.max(DeliveryStage::InPr))
+    });
+    let children_done = children
+        .iter()
+        .all(|c| matches!(c.status, TaskStatus::Done | TaskStatus::Cancelled));
+    let own_done = match (own, last_enabled(stages)) {
+        (Some(own), Some(last)) => own >= last,
+        _ => true,
+    };
+    if children_done && own_done {
+        return Some(ParentMove::Done);
+    }
+    let target = parent_stage(own, children)?;
+    (Some(target) > parent.stage).then_some(ParentMove::Stage(target))
+}
+
+/// The event the parent rule records on a parent it moved.
+pub(crate) fn parent_move_event(
+    parent: TaskId,
+    change: ParentMove,
+    source: &TaskEvent,
+) -> TaskEvent {
+    let (kind, note, payload) = match change {
+        ParentMove::Stage(stage) => (
+            TaskEventKind::StageReached,
+            None,
+            Some(serde_json::json!({ "stage": stage.as_str() })),
+        ),
+        ParentMove::Done => (
+            TaskEventKind::Delivered,
+            Some("every child task is done".to_string()),
+            None,
+        ),
+    };
+    TaskEvent {
+        id: uuid::Uuid::now_v7(),
+        task_id: parent,
+        at: source.at,
+        actor: source.actor,
+        kind,
+        note,
+        payload,
+    }
+}
+
+/// What one step of the parent rule did to a child's parent (both stores' `parent_step`).
+#[derive(Debug, Clone)]
+pub(crate) enum ParentStep {
+    Unchanged,
+    /// The last open child closed: `children_complete` was recorded on the parent, and a
+    /// `claimed` parent moved to `review` (the row as updated, if it moved).
+    ChildrenComplete(Option<Task>),
+    /// The rule moved a `delivering` parent (as updated) and this event records it; it has
+    /// not been appended yet, so the caller appends it and continues with the grandparent.
+    Moved(Task, TaskEvent),
+}
+
+/// Adds `task` to the tasks a write moved, replacing an earlier entry for the same task.
+pub(crate) fn push_moved(moved: &mut Vec<Task>, task: Task) {
+    moved.retain(|t| t.id != task.id);
+    moved.push(task);
+}
+
 /// A transition that applied.
 #[derive(Debug, Clone)]
 pub struct Transitioned {
     pub task: Task,
-    /// Whether this transition closed its parent's last open child, so the store recorded
-    /// `children_complete` on the parent (and moved a `claimed` parent to `review`).
-    pub children_complete: bool,
+    /// The task on which this transition recorded `children_complete` (it closed that
+    /// task's last open child, and a `claimed` one moved to `review`): the parent, or an
+    /// ancestor the parent rule finished its way up to.
+    pub children_complete: Option<TaskId>,
     /// Tasks this transition unblocked (it made the task `done`; see `UnblockRule`).
     pub unblocked: Vec<Unblocked>,
 }
@@ -1134,7 +1610,9 @@ pub fn child_event(child: &Task, parent: TaskId, source: &TaskEvent) -> Option<T
     let kind = match source.kind {
         TaskEventKind::Claimed | TaskEventKind::LeaseExpiredTakeover => TaskEventKind::ChildClaimed,
         TaskEventKind::Blocked => TaskEventKind::ChildBlocked,
-        TaskEventKind::Done => TaskEventKind::ChildDone,
+        // A completion into `delivering` is not done yet: its later `delivered` bubbles once.
+        TaskEventKind::Done if completes_into_delivering(source) => return None,
+        TaskEventKind::Done | TaskEventKind::Delivered => TaskEventKind::ChildDone,
         TaskEventKind::Cancelled => TaskEventKind::ChildCancelled,
         _ => return None,
     };
@@ -1152,9 +1630,13 @@ pub fn child_event(child: &Task, parent: TaskId, source: &TaskEvent) -> Option<T
     })
 }
 
-/// Whether a child event can be the one that finishes the last open child.
+/// Whether a child event can be the one that finishes the last open child (a `done` event
+/// may also have sent the child to `delivering`, which still counts as open).
 pub fn closes_child(source: &TaskEvent) -> bool {
-    matches!(source.kind, TaskEventKind::Done | TaskEventKind::Cancelled)
+    matches!(
+        source.kind,
+        TaskEventKind::Done | TaskEventKind::Cancelled | TaskEventKind::Delivered
+    )
 }
 
 /// The event recorded on a parent whose children are all `done` / `cancelled`.
@@ -1166,6 +1648,62 @@ pub fn children_complete_event(parent: TaskId, source: &TaskEvent) -> TaskEvent 
         actor: source.actor,
         kind: TaskEventKind::ChildrenComplete,
         note: Some("all child tasks are done or cancelled".to_string()),
+        payload: None,
+    }
+}
+
+/// The `project_delivery.stages` column: a JSON array of stage strings.
+pub fn stages_to_json(stages: &[DeliveryStage]) -> String {
+    serde_json::Value::from(stages.iter().map(|s| s.as_str()).collect::<Vec<_>>()).to_string()
+}
+
+/// Reads `project_delivery.stages` back.
+pub fn stages_from_json(text: &str) -> StoreResult<Vec<DeliveryStage>> {
+    let names: Vec<String> = serde_json::from_str(text)
+        .map_err(|e| StoreError::Corrupt(format!("delivery stages: {e}")))?;
+    names
+        .iter()
+        .map(|s| s.parse().map_err(StoreError::Corrupt))
+        .collect()
+}
+
+/// The history note of a task that a stage change finished.
+pub fn delivered_note(stages: &[DeliveryStage]) -> String {
+    match crate::delivery::stages::last_enabled(stages) {
+        None => "delivery stages turned off".to_string(),
+        Some(last) => format!("{} is now the last delivery stage", last.label()),
+    }
+}
+
+/// One delivering task as the settings recompute reads it (under the write lock).
+#[derive(Debug, Clone)]
+pub(crate) struct DeliveringRow {
+    pub task: TaskId,
+    /// The task's own furthest stage (its `task_stages`; see `ParentState`).
+    pub stage: Option<DeliveryStage>,
+    pub has_pr: bool,
+    pub children: Vec<ChildState>,
+}
+
+/// Whether new stages finish a delivering task. A task with a child that is not `done` or
+/// `cancelled` (one reopened by a force release, say) stays delivering, as under the parent
+/// rule (`recompute_parent`).
+pub(crate) fn finished_by(stages: &[DeliveryStage], row: &DeliveringRow) -> bool {
+    row.children
+        .iter()
+        .all(|c| matches!(c.status, TaskStatus::Done | TaskStatus::Cancelled))
+        && completion_target(stages, row.stage, row.has_pr, &row.children) == CompletionTarget::Done
+}
+
+/// The `delivered` event a stage change records on a task it finished (the human acts).
+pub(crate) fn stages_delivered_event(task: TaskId, d: &ProjectDelivery) -> TaskEvent {
+    TaskEvent {
+        id: uuid::Uuid::now_v7(),
+        task_id: task,
+        at: d.updated_at,
+        actor: Actor::Human,
+        kind: TaskEventKind::Delivered,
+        note: Some(delivered_note(&d.stages)),
         payload: None,
     }
 }

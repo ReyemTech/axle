@@ -10,7 +10,7 @@ use super::SessionCtx;
 use super::connect::{self, ConnectPanel, PendingRow};
 use super::task_page::Stamp;
 use super::views::{Pulse, UiError, UiResult, html, line_colours, pulse_counts};
-use crate::domain::DISPLAY_NAME_MAX;
+use crate::domain::{DISPLAY_NAME_MAX, DeliveryStage};
 use crate::http::AppState;
 
 /// `https://host/path` for a project key shaped `host[:port]/seg/seg…`, else `None`.
@@ -58,6 +58,14 @@ pub struct ProjectRow {
     /// The project's line colour (see `views::line_colours`).
     pub line: u8,
     pub created: Stamp,
+    /// The four delivery stages with whether each is ticked.
+    pub stages: Vec<StageBox>,
+}
+
+pub struct StageBox {
+    pub value: String,
+    pub label: &'static str,
+    pub on: bool,
 }
 
 #[derive(Template)]
@@ -79,17 +87,31 @@ pub async fn projects(
     let now = state.clock.now();
     let all = state.store.list_projects().await?;
     let lines = line_colours(&all);
-    let mut projects: Vec<ProjectRow> = all
-        .into_iter()
-        .map(|p| ProjectRow {
+    let mut projects: Vec<ProjectRow> = Vec::with_capacity(all.len());
+    for p in all {
+        let enabled = state
+            .delivery
+            .settings(&p)
+            .await
+            .map_err(|e| UiError::Internal(e.to_string()))?
+            .stages;
+        projects.push(ProjectRow {
             id: p.id.to_string(),
             line: lines.get(&p.id).copied().unwrap_or(0),
-            name: p.display_name,
+            name: p.display_name.clone(),
             repo_url: repo_url(&p.key),
-            key: p.key,
+            key: p.key.clone(),
             created: Stamp::new(now, p.created_at),
-        })
-        .collect();
+            stages: DeliveryStage::ALL
+                .iter()
+                .map(|s| StageBox {
+                    value: s.to_string(),
+                    label: s.label(),
+                    on: enabled.contains(s),
+                })
+                .collect(),
+        });
+    }
     projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.key.cmp(&b.key)));
     html(&ProjectsPage {
         logout: session.logout,

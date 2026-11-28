@@ -10,18 +10,20 @@ use uuid::Uuid;
 
 use crate::clock::Clock;
 use crate::config::ServerConfig;
+use crate::delivery::links::{PrUrl, parse_pr_url};
 use crate::domain::{
     Actor, Address, AgentId, Eligibility, Importance, LinkKind, Message, MessageId, MessageKind,
-    PlanState, ProjectId, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus,
-    TokenId, WaitingOn,
+    PlanState, PrLinkedBy, ProjectId, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink,
+    TaskStatus, TokenId, WaitingOn,
 };
-use crate::events::{Event, EventBus};
+use crate::events::EventBus;
+use crate::service::announce::Notifier;
 use crate::service::identity::{IdentityError, NAME_MAX, Resolved, check_label};
 use crate::service::messages::{MessageError, SUBJECT_MAX, check_body, check_subject};
 use crate::store::{
-    AddProjectsRequest, BlockWrite, ClaimRequest, Claimant, EditRequest, LeaseUpdate, MoveRequest,
-    Moved, RelateRequest, Related, Store, StoreError, TaskFilter, TransitionRequest, Transitioned,
-    UnblockRule, claim_event,
+    AddProjectsRequest, BlockWrite, ClaimRequest, Claimant, CompleteRequest, EditRequest,
+    LeaseUpdate, MoveRequest, Moved, NewTaskPr, RelateRequest, Related, Store, StoreError,
+    TaskFilter, TransitionRequest, Transitioned, UnblockRule, claim_event,
 };
 
 /// The most links one task may have (both directions count).
@@ -389,12 +391,13 @@ fn may_change(by: Caller<'_>, task: &Task) -> bool {
 }
 
 /// The statuses a task can be cancelled from.
-const CANCELLABLE: [TaskStatus; 5] = [
+const CANCELLABLE: [TaskStatus; 6] = [
     TaskStatus::Open,
     TaskStatus::Planning,
     TaskStatus::Claimed,
     TaskStatus::Blocked,
     TaskStatus::Review,
+    TaskStatus::Delivering,
 ];
 
 /// Every plan state but `Submitted`: the states in which a planning lease runs.
@@ -535,6 +538,7 @@ impl TaskService {
             requires_plan: new.requires_plan,
             plan_state: PlanState::None,
             block: None,
+            delivery_stage: None,
         };
         let event = self.event(task.id, by.actor(), TaskEventKind::Created, None, None);
         let first = Message {
@@ -1047,32 +1051,81 @@ impl TaskService {
         .await
     }
 
-    /// `claimed | review → done`. The owner is kept as the record of who did it.
+    /// `claimed | review → done`, or `→ delivering` when the project has delivery stages and
+    /// the task has a PR. The owner is kept as the record of who did it. In a project with
+    /// stages, the first of `links` that is a PR in the project's repo is linked first when
+    /// the task has none (the store decides under its lock; without stages nothing is linked).
     pub async fn complete(
         &self,
         caller: &Resolved,
         id: TaskId,
         done: Completion,
     ) -> Result<Task, TaskError> {
+        let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+        let link = match self.store.get_project(task.project_id).await? {
+            Some(project) => {
+                done.links
+                    .iter()
+                    .find_map(|raw| match parse_pr_url(raw, &project.key) {
+                        Ok(PrUrl::Github { repo, number, url }) => Some(NewTaskPr {
+                            repo: repo.to_string(),
+                            number: Some(i64::from(number)),
+                            url,
+                            linked_by: PrLinkedBy::CompleteLinks,
+                        }),
+                        _ => None,
+                    })
+            }
+            None => None,
+        };
         let payload = serde_json::json!({
             "summary": done.summary,
             "changed_files": done.changed_files,
             "tests": done.tests,
             "links": done.links,
         });
-        self.owner_transition(
-            caller,
-            id,
-            &[TaskStatus::Claimed, TaskStatus::Review],
-            TaskStatus::Done,
-            Some(TaskStatus::Done),
-            LeaseUpdate::Clear,
-            false,
-            TaskEventKind::Done,
-            Some(done.summary),
-            Some(payload),
-        )
-        .await
+        let from = [TaskStatus::Claimed, TaskStatus::Review];
+        for _ in 0..MAX_GUARD_RETRIES {
+            let req = CompleteRequest {
+                transition: TransitionRequest {
+                    task: id,
+                    from: from.to_vec(),
+                    to: Some(TaskStatus::Done),
+                    owner: Some(caller.session.id),
+                    lease: LeaseUpdate::Clear,
+                    clear_owner: false,
+                    now: self.clock.now(),
+                    token: Some(caller.session.token_id),
+                    event: self.event(
+                        id,
+                        actor_of(caller),
+                        TaskEventKind::Done,
+                        Some(done.summary.clone()),
+                        Some(payload.clone()),
+                    ),
+                    plan_from: None,
+                    plan_to: None,
+                    message: None,
+                    latest_plan: None,
+                    archive_plans: false,
+                    block: None,
+                    unblock: Some(self.unblock_rule()),
+                },
+                link: link.clone(),
+            };
+            if let Some(completed) = self.store.complete_task(&req).await? {
+                self.after_transition(
+                    &completed.transitioned,
+                    &req.transition.event,
+                    req.transition.token,
+                )
+                .await;
+                return Ok(completed.transitioned.task);
+            }
+            self.explain_miss(id, caller.session.id, &from, TaskStatus::Done, None)
+                .await?;
+        }
+        Err(TaskError::LeaseLost)
     }
 
     /// Changes the title and/or body (`None` keeps each). Allowed for the creating agent and
@@ -1490,6 +1543,7 @@ impl TaskService {
                 TaskStatus::Claimed,
                 TaskStatus::Blocked,
                 TaskStatus::Review,
+                TaskStatus::Delivering,
             ],
             TaskStatus::Open,
             true,
@@ -1563,133 +1617,36 @@ impl TaskService {
     // ---------------------------------------------------------------- internals
 
     async fn changed(&self, task: &Task, kind: TaskEventKind) {
-        if let Some(bus) = &self.events {
-            bus.emit(Event::TaskChanged {
-                id: task.id,
-                project_id: task.project_id,
-                status: task.status,
-                kind,
-            })
-            .await;
-        }
+        self.notifier().changed(task, kind).await;
     }
 
     /// After a committed transition: publishes the change and, for a child, tells the
-    /// coordinator (spec §8). A child that is blocked, done or cancelled posts a message into
-    /// the parent's thread (delivered to the parent's owner and creator), as does the closing
-    /// of the last open child (the store reports it wrote `children_complete`); the parent's
-    /// move to `review` that the store makes then is published too. The transition has already committed, so failures here are logged.
+    /// coordinator (see `Notifier::announce`).
     async fn after_transition(
         &self,
         done: &Transitioned,
         event: &TaskEvent,
         token: Option<TokenId>,
     ) {
-        let Transitioned {
-            task,
-            children_complete,
-            unblocked,
-        } = done;
-        let children_complete = *children_complete;
-        self.changed(task, event.kind).await;
         // Wake-up (later) wakes the owner of an unblocked task from these events.
-        for u in unblocked {
+        for u in &done.unblocked {
             self.changed(&u.task, TaskEventKind::Unblocked).await;
-            self.message_created(&u.note).await;
+            self.notifier().message_created(&u.note).await;
         }
-        let Some(parent_id) = task.parent_id else {
-            return;
-        };
-        if !matches!(
-            event.kind,
-            TaskEventKind::Blocked | TaskEventKind::Done | TaskEventKind::Cancelled
-        ) {
-            return;
-        }
-        let parent = match self.store.get_task(parent_id).await {
-            Ok(Some(p)) => p,
-            Ok(None) => return,
-            Err(e) => {
-                eprintln!("axl: failed to read parent task {parent_id}: {e}");
-                return;
-            }
-        };
-        let (status, detail) = match event.kind {
-            TaskEventKind::Blocked => ("blocked", event.note.as_deref()),
-            TaskEventKind::Done => ("done", event.note.as_deref()),
-            _ => ("cancelled", None),
-        };
-        let body = match detail.map(str::trim).filter(|d| !d.is_empty()) {
-            Some(d) => format!(
-                "Child task \"{}\" ({}) is {status}: {d}",
-                task.title, task.id
-            ),
-            None => format!("Child task \"{}\" ({}) is {status}.", task.title, task.id),
-        };
-        let importance = if event.kind == TaskEventKind::Blocked {
-            Importance::High
-        } else {
-            Importance::Normal
-        };
-        self.notify_parent(
-            &parent,
-            event.actor,
-            token,
-            &format!("child task {status}"),
-            body,
-            importance,
-        )
-        .await;
-        if !children_complete {
-            return;
-        }
-        if parent.status == TaskStatus::Review {
-            self.changed(&parent, TaskEventKind::ChildrenComplete).await;
-        }
-        let body = format!(
-            "All child tasks are done or cancelled; the parent task is {}.",
-            parent.status
-        );
-        self.notify_parent(
-            &parent,
-            event.actor,
-            token,
-            "child tasks complete",
-            body,
-            Importance::High,
-        )
-        .await;
+        self.notifier()
+            .announce(
+                &done.task,
+                event.kind,
+                event.note.as_deref(),
+                event.actor,
+                token,
+                done.children_complete,
+            )
+            .await;
     }
 
-    /// Posts an automatic message into the parent task's thread.
-    async fn notify_parent(
-        &self,
-        parent: &Task,
-        from: Actor,
-        token: Option<TokenId>,
-        subject: &str,
-        body: String,
-        importance: Importance,
-    ) {
-        let message = Message {
-            id: MessageId::new(),
-            project_id: Some(parent.project_id),
-            from,
-            to: Address::Task(parent.id),
-            subject: Some(subject.to_string()),
-            body,
-            importance,
-            task_id: Some(parent.id),
-            reply_to: None,
-            created_at: self.clock.now(),
-            kind: MessageKind::System,
-            options: Vec::new(),
-        };
-        if let Err(e) = self.store.insert_message(&message, token).await {
-            eprintln!("axl: failed to notify parent task {}: {e}", parent.id);
-            return;
-        }
-        self.message_created(&message).await;
+    fn notifier(&self) -> Notifier {
+        Notifier::new(self.store.clone(), self.clock.clone(), self.events.clone())
     }
 
     fn claim_request(&self, caller: &Resolved) -> ClaimRequest {
@@ -1797,7 +1754,8 @@ impl TaskService {
                 latest_plan: None,
                 archive_plans: g.archive_plans,
                 block: g.block.clone(),
-                unblock: (g.to == Some(TaskStatus::Done)).then(|| self.unblock_rule()),
+                // Always: a cancel can finish a `delivering` parent, which unblocks its waiters.
+                unblock: Some(self.unblock_rule()),
             };
             if let Some(done) = self.store.transition_task(&req).await? {
                 if g.kind != TaskEventKind::Renewed {
@@ -1805,31 +1763,46 @@ impl TaskService {
                 }
                 return Ok(done.task);
             }
-            let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
-            if !g.from.contains(&task.status) {
-                if task.status == TaskStatus::Planning {
-                    return Err(TaskError::PlanNotApproved(task.plan_state));
-                }
-                return Err(TaskError::InvalidTransition {
-                    from: task.status,
-                    to: g.target,
-                });
-            }
-            if task.owner_session_id != Some(session) {
-                return Err(if self.store.session_held_task(id, session).await? {
-                    TaskError::LeaseLost
-                } else {
-                    TaskError::NotOwner
-                });
-            }
-            if let Some(states) = g.plan_from
-                && !states.contains(&task.plan_state)
-            {
-                return Err(TaskError::PlanNotApproved(task.plan_state));
-            }
+            self.explain_miss(id, session, g.from, g.target, g.plan_from)
+                .await?;
             // The task changed between the guarded write and the re-read; try again.
         }
         Err(TaskError::LeaseLost)
+    }
+
+    /// Why an owner-guarded write matched nothing, from a re-read. `Ok(())` means the guard
+    /// should now pass (the task changed in between), so the caller may retry.
+    async fn explain_miss(
+        &self,
+        id: TaskId,
+        session: SessionId,
+        from: &[TaskStatus],
+        target: TaskStatus,
+        plan_from: Option<&[PlanState]>,
+    ) -> Result<(), TaskError> {
+        let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+        if !from.contains(&task.status) {
+            if task.status == TaskStatus::Planning {
+                return Err(TaskError::PlanNotApproved(task.plan_state));
+            }
+            return Err(TaskError::InvalidTransition {
+                from: task.status,
+                to: target,
+            });
+        }
+        if task.owner_session_id != Some(session) {
+            return Err(if self.store.session_held_task(id, session).await? {
+                TaskError::LeaseLost
+            } else {
+                TaskError::NotOwner
+            });
+        }
+        if let Some(states) = plan_from
+            && !states.contains(&task.plan_state)
+        {
+            return Err(TaskError::PlanNotApproved(task.plan_state));
+        }
+        Ok(())
     }
 
     /// The human's decision on a submitted plan: guarded on `planning` + `submitted` and on the
@@ -1932,14 +1905,7 @@ impl TaskService {
     }
 
     async fn message_created(&self, message: &Message) {
-        if let Some(bus) = &self.events {
-            bus.emit(Event::MessageCreated {
-                id: message.id,
-                to: message.to,
-                project_id: message.project_id,
-            })
-            .await;
-        }
+        self.notifier().message_created(message).await;
     }
 
     /// A transition with no ownership guard (authorisation is the caller's job). `noted` is
@@ -2009,7 +1975,8 @@ impl TaskService {
             latest_plan: None,
             archive_plans: false,
             block: None,
-            unblock: None,
+            // A cancel can finish a `delivering` parent, which unblocks its waiters.
+            unblock: Some(self.unblock_rule()),
         }
     }
 }

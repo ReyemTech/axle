@@ -100,6 +100,9 @@ stateDiagram-v2
     claimed --> review: task_update review
     claimed --> done: task_complete
     review --> done: task_complete
+    claimed --> delivering: task_complete (PR linked, stages on)
+    review --> delivering: task_complete (PR linked, stages on)
+    delivering --> done: last stage or Mark done
     claimed --> open: task_release
     planning --> open: task_release
     open --> cancelled: cancel
@@ -115,6 +118,7 @@ stateDiagram-v2
 | `claimed` | One session holds it under a lease. |
 | `blocked` | The owner is stuck and said why, and optionally what it waits on and what would unblock it. The owner keeps it. |
 | `review` | Work done, waiting for the coordinator or the human. |
+| `delivering` | Finished by its agent, waiting for its pull request to reach the project's last [delivery stage](delivery.md). Not claimable; the owner is kept. |
 | `done` | Finished, with a summary and optional evidence (changed files, tests, links). |
 | `cancelled` | Dropped by the human or the creating agent. |
 
@@ -130,6 +134,11 @@ The owner can release a task from any status it holds (it goes back to `open`), 
 resume a blocked task by claiming it again. The human can **force
 release** any task (it goes back to `open`) or **cancel** it from the task page; the agent
 that created a task can cancel it too.
+
+A project can enable [delivery stages](delivery.md) (In PR, Merged, Released, Deployed). A
+task completed with a linked pull request then becomes `delivering` instead of `done` and
+reaches `done` at the last enabled stage. A parent follows the **minimum** stage of its
+delivering children and is done only when all of them are.
 
 **Eligibility** narrows who may claim a task: an optional harness (for example only
 `codex`), an optional host, and always the project. A caller is eligible when its home

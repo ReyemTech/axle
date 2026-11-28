@@ -26,6 +26,7 @@ const SECRET: &str = "test-secret-0123456789";
 const INFRA: &str = "github.com/acme/platform-infra";
 
 struct App {
+    pool: sqlx::SqlitePool,
     state: AppState,
     clock: Arc<TestClock>,
     router: Router,
@@ -41,7 +42,7 @@ async fn app_with(configure: impl FnOnce(&mut ServerConfig)) -> App {
         .connect_with(opts.foreign_keys(true))
         .await
         .unwrap();
-    let store = Arc::new(SqliteStore::from_pool(pool).await.unwrap());
+    let store = Arc::new(SqliteStore::from_pool(pool.clone()).await.unwrap());
     let clock = Arc::new(TestClock::new(datetime!(2026-11-27 9:00 UTC)));
     let mut config = ServerConfig::from_lookup(|k| match k {
         "DATABASE_URL" => Some("sqlite::memory:".into()),
@@ -52,6 +53,7 @@ async fn app_with(configure: impl FnOnce(&mut ServerConfig)) -> App {
     configure(&mut config);
     let state = AppState::new(store, clock.clone(), config);
     App {
+        pool,
         router: router(state.clone()),
         state,
         clock,
@@ -4873,4 +4875,741 @@ async fn human_moves_a_task_under_a_parent() {
         )
         .await;
     assert_eq!(page.status, StatusCode::CONFLICT, "{}", page.body);
+}
+
+// ---------------------------------------------------------------- delivery stage columns
+
+mod stage_board {
+    use super::*;
+    use axle::domain::DeliveryStage::{self, Deployed, InPr, Merged, Released};
+
+    const WEB: &str = "github.com/acme/web";
+    const SHOP: &str = "github.com/acme/shop";
+
+    async fn set_stages(app: &App, agent: &Resolved, stages: &[DeliveryStage]) {
+        let project = app
+            .state
+            .store
+            .get_project(agent.agent.project_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        app.state
+            .delivery
+            .set_stages(&project, stages.to_vec())
+            .await
+            .unwrap();
+    }
+
+    /// A task with a linked PR, completed into `delivering`.
+    async fn delivering(app: &App, by: &Resolved, title: &str, pr: &str) -> Task {
+        let task = app.task(by, title, None).await;
+        app.claim(by, task.id).await;
+        app.state
+            .delivery
+            .link_pr(Caller::Agent(by), task.id, pr)
+            .await
+            .unwrap();
+        let done = app
+            .state
+            .tasks
+            .complete(
+                by,
+                task.id,
+                Completion {
+                    summary: "done".into(),
+                    ..Completion::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(done.status, TaskStatus::Delivering);
+        done
+    }
+
+    fn column_names(page: &Page) -> Vec<String> {
+        select_texts(page, ".column > header h2")
+    }
+
+    async fn two_projects() -> (App, String, Resolved, Resolved) {
+        let app = app().await;
+        let cookie = app.login().await;
+        let web = app.agent(WEB, "mac", "claude-code").await;
+        let shop = app.agent(SHOP, "mac", "claude-code").await;
+        set_stages(&app, &web, &[InPr, Merged]).await;
+        (app, cookie, web, shop)
+    }
+
+    #[tokio::test]
+    async fn stage_columns_per_project() {
+        let (app, cookie, web, shop) = two_projects().await;
+        set_stages(&app, &shop, &[Released]).await;
+        let web_id = web.agent.project_id.unwrap();
+
+        let filtered = app
+            .get(&format!("/ui/board?project={web_id}"), Some(&cookie))
+            .await;
+        assert_eq!(
+            column_names(&filtered),
+            [
+                "Open", "Claimed", "Blocked", "Review", "In PR", "Merged", "Done"
+            ]
+        );
+        let all = app.get("/ui/board", Some(&cookie)).await;
+        assert_eq!(
+            column_names(&all),
+            [
+                "Open", "Claimed", "Blocked", "Review", "In PR", "Merged", "Released", "Done"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_rows_keep_stage_and_pr_chips() {
+        let (app, cookie, web, _shop) = two_projects().await;
+        set_stages(&app, &web, &[InPr, Merged]).await;
+        delivering(&app, &web, "web work", "https://github.com/acme/web/pull/4").await;
+        let set = app
+            .get("/ui/board/density?set=compact", Some(&cookie))
+            .await;
+        let both = format!("{cookie}; {}", cookie_pair(&set.set_cookie.unwrap()));
+        let page = app.get("/ui/board", Some(&both)).await;
+        let row = "article.card[data-density=\"compact\"]";
+        assert_eq!(select_texts(&page, &format!("{row} .pr-chip")), ["PR #4"]);
+        assert_eq!(
+            select_texts(&page, &format!("{row} .stage-word")),
+            ["In PR"]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_sits_in_own_column() {
+        let (app, cookie, web, shop) = two_projects().await;
+        // The task reaches `in_pr` while the shop has it enabled, then the shop narrows to
+        // Released only.
+        set_stages(&app, &shop, &[InPr, Released]).await;
+        delivering(
+            &app,
+            &shop,
+            "shop work",
+            "https://github.com/acme/shop/pull/3",
+        )
+        .await;
+        set_stages(&app, &shop, &[Released]).await;
+        delivering(&app, &web, "web work", "https://github.com/acme/web/pull/4").await;
+
+        let page = app.get("/ui/board", Some(&cookie)).await;
+        let html = page.html();
+        let sections = Selector::parse("section.column").unwrap();
+        let titles = Selector::parse(".card-title").unwrap();
+        let in_column = |stage: &str| -> Vec<String> {
+            html.select(&sections)
+                .filter(|c| c.value().attr("data-stage") == Some(stage))
+                .flat_map(|c| {
+                    c.select(&titles)
+                        .map(|t| t.text().collect::<String>().trim().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        assert_eq!(in_column("in_pr"), ["web work"]);
+        assert_eq!(in_column("released"), ["shop work"]);
+        assert_eq!(
+            select_texts(&page, ".waiting-for"),
+            ["waiting for Released"]
+        );
+        for status in ["open", "claimed", "blocked", "review", "done"] {
+            let cards =
+                Selector::parse(&format!("section.column[data-status={status}] .card")).unwrap();
+            assert_eq!(html.select(&cards).count(), 0, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn spanning_task_sits_in_a_column_the_board_has() {
+        let (app, cookie, web, shop) = two_projects().await;
+        set_stages(&app, &web, &[InPr, Merged, Released, Deployed]).await;
+        set_stages(&app, &shop, &[Merged, Deployed]).await;
+        let shop_id = shop.agent.project_id.unwrap();
+        let early = delivering(&app, &web, "early", "https://github.com/acme/web/pull/4").await;
+        let late = delivering(&app, &web, "late", "https://github.com/acme/web/pull/5").await;
+        app.state.delivery.advance(late.id).await.unwrap();
+        app.state.delivery.advance(late.id).await.unwrap();
+        for t in [&early, &late] {
+            app.state
+                .tasks
+                .add_projects(Caller::Human, t.id, &[shop_id])
+                .await
+                .unwrap();
+        }
+
+        // The shop board has no In PR or Released column: a web task sits in the nearest
+        // shop stage at or below its own, keeping its own stage word, or else in Review.
+        let page = app
+            .get(&format!("/ui/board?project={shop_id}"), Some(&cookie))
+            .await;
+        let html = page.html();
+        let titles = Selector::parse(".card-title").unwrap();
+        let in_column = |attr: &str, value: &str| -> Vec<String> {
+            let sel = Selector::parse(&format!("section.column[{attr}={value}]")).unwrap();
+            html.select(&sel)
+                .flat_map(|c| {
+                    c.select(&titles)
+                        .map(|t| t.text().collect::<String>().trim().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        assert_eq!(in_column("data-stage", "merged"), ["late"]);
+        assert_eq!(in_column("data-status", "review"), ["early"]);
+        let words = select_texts(&page, ".state .stage-word");
+        assert!(words.contains(&"Released".to_string()), "{words:?}");
+    }
+
+    #[tokio::test]
+    async fn empty_stage_column_sentence() {
+        let (app, cookie, _web, _shop) = two_projects().await;
+        let page = app.get("/ui/board", Some(&cookie)).await;
+        let empties = select_texts(&page, "section.column[data-stage] .empty");
+        assert_eq!(
+            empties,
+            ["Nothing waiting for merge", "Nothing waiting for release"]
+        );
+    }
+
+    #[tokio::test]
+    async fn card_pr_chip_and_short_id() {
+        let (app, cookie, web, _shop) = two_projects().await;
+        delivering(
+            &app,
+            &web,
+            "web work",
+            "https://github.com/acme/web/pull/12",
+        )
+        .await;
+        let page = app.get("/ui/board", Some(&cookie)).await;
+        let html = page.html();
+        let link = Selector::parse("a[href=\"https://github.com/acme/web/pull/12\"]").unwrap();
+        let a = html.select(&link).next().expect("PR chip");
+        assert_eq!(a.text().collect::<String>(), "PR #12");
+        assert_eq!(a.value().attr("rel"), Some("noopener noreferrer"));
+        let ids = select_texts(&page, ".short-id");
+        assert!(ids.iter().any(|t| t.starts_with("axl-")), "{ids:?}");
+        assert_eq!(select_texts(&page, ".state .stage-word"), ["In PR"]);
+    }
+
+    #[tokio::test]
+    async fn stage_column_head_reads_label_dot_count() {
+        let (app, cookie, web, _shop) = two_projects().await;
+        delivering(
+            &app,
+            &web,
+            "web work",
+            "https://github.com/acme/web/pull/12",
+        )
+        .await;
+        let page = app.get("/ui/board", Some(&cookie)).await;
+        let html = page.html();
+        let head = Selector::parse("section.column[data-stage=in_pr] > header").unwrap();
+        let text: Vec<String> = html
+            .select(&head)
+            .next()
+            .unwrap()
+            .text()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .collect();
+        assert_eq!(text.join(" "), "In PR · 1");
+    }
+
+    #[tokio::test]
+    async fn stranded_delivering_task_sits_in_review() {
+        let app = app().await;
+        let cookie = app.login().await;
+        let web = app.agent(WEB, "mac", "claude-code").await;
+        let task = app.task(&web, "stranded", None).await;
+        // Stages are off, so no path produces this; force the row.
+        sqlx::query("UPDATE tasks SET status = 'delivering' WHERE id = ?")
+            .bind(task.id.to_string())
+            .execute(&app.pool)
+            .await
+            .unwrap();
+        let page = app.get("/ui/board", Some(&cookie)).await;
+        let html = page.html();
+        let sel =
+            Selector::parse("section.column[data-status=review] .card .state .status").unwrap();
+        let words: Vec<String> = html
+            .select(&sel)
+            .map(|e| e.text().collect::<String>())
+            .collect();
+        assert_eq!(words, ["delivering"]);
+    }
+
+    #[tokio::test]
+    async fn no_stages_board_unchanged() {
+        let app = app().await;
+        let cookie = app.login().await;
+        let web = app.agent(WEB, "mac", "claude-code").await;
+        app.task(&web, "plain", None).await;
+        let page = app.get("/ui/board", Some(&cookie)).await;
+        assert_eq!(
+            column_names(&page),
+            ["Open", "Claimed", "Blocked", "Review", "Done"]
+        );
+    }
+}
+
+// ---------------------------------------------------------------- task delivery panel
+
+mod delivery_panel {
+    use super::*;
+    use axle::domain::DeliveryStage::{self, InPr, Merged, Released};
+    use axle::store::StageMove;
+
+    const WEB: &str = "github.com/acme/web";
+    const PR: &str = "https://github.com/acme/web/pull/12";
+
+    async fn setup(stages: &[DeliveryStage]) -> (App, String, String, Resolved) {
+        let app = app().await;
+        let cookie = app.login().await;
+        let web = app.agent(WEB, "mac", "claude-code").await;
+        let project = app
+            .state
+            .store
+            .get_project(web.agent.project_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        app.state
+            .delivery
+            .set_stages(&project, stages.to_vec())
+            .await
+            .unwrap();
+        let csrf = csrf_for(&app, &cookie).await;
+        (app, cookie, csrf, web)
+    }
+
+    async fn delivering(app: &App, by: &Resolved) -> Task {
+        let task = app.task(by, "Ship it", None).await;
+        app.claim(by, task.id).await;
+        app.state
+            .delivery
+            .link_pr(Caller::Agent(by), task.id, PR)
+            .await
+            .unwrap();
+        app.state
+            .tasks
+            .complete(
+                by,
+                task.id,
+                Completion {
+                    summary: "done".into(),
+                    ..Completion::default()
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn move_to(app: &App, task: &Task, to: DeliveryStage, implied: Vec<DeliveryStage>) {
+        app.state
+            .store
+            .advance_stage(&StageMove {
+                task: task.id,
+                to,
+                implied,
+                signal_id: None,
+                detail: None,
+                actor: Actor::Human,
+                token: None,
+                now: app.state.clock.now(),
+                unblock: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    fn buttons(page: &Page) -> Vec<String> {
+        select_texts(page, ".delivery-panel button")
+    }
+
+    const PR_LINK: &str = ".delivery-panel a[href=\"https://github.com/acme/web/pull/12\"]";
+
+    #[tokio::test]
+    async fn delivery_panel_timeline() {
+        let (app, cookie, _csrf, web) = setup(&[InPr, Merged, Released]).await;
+        let task = delivering(&app, &web).await;
+        move_to(&app, &task, Released, vec![Merged]).await;
+        let page = app
+            .get(&format!("/ui/tasks/{}", task.id), Some(&cookie))
+            .await;
+        assert_eq!(
+            select_texts(&page, ".delivery-panel .short-id"),
+            [axle::domain::short_id(task.id)]
+        );
+        assert_eq!(
+            select_texts(&page, ".delivery-panel .stage-label"),
+            ["In PR", "Merged", "Released"]
+        );
+        assert_eq!(
+            select_texts(&page, ".delivery-panel .stage-state"),
+            ["reached", "implied", "reached"]
+        );
+        let notes = select_texts(&page, ".delivery-panel .stage-note");
+        assert!(
+            notes.iter().any(|n| n == "implied by Released"),
+            "{notes:?}"
+        );
+        assert_eq!(select_texts(&page, PR_LINK), ["PR #12"]);
+
+        // A stage not yet reached reads waiting.
+        let (app, cookie, _csrf, web) = setup(&[InPr, Merged]).await;
+        let task = delivering(&app, &web).await;
+        let page = app
+            .get(&format!("/ui/tasks/{}", task.id), Some(&cookie))
+            .await;
+        assert_eq!(
+            select_texts(&page, ".delivery-panel .stage-state"),
+            ["reached", "waiting"]
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_panel_shows_pr_without_in_pr_stage() {
+        // Only later stages enabled: no In PR row carries the link, so it shows on its own,
+        // once, on a delivering task and after it is done.
+        let (app, cookie, _csrf, web) = setup(&[Merged, Released]).await;
+        let task = delivering(&app, &web).await;
+        let path = format!("/ui/tasks/{}", task.id);
+        let page = app.get(&path, Some(&cookie)).await;
+        assert_eq!(
+            select_texts(&page, ".delivery-panel .stage-label"),
+            ["Merged", "Released"]
+        );
+        assert_eq!(select_texts(&page, PR_LINK), ["PR #12"]);
+        move_to(&app, &task, Released, vec![Merged]).await;
+        let page = app.get(&path, Some(&cookie)).await;
+        assert_eq!(
+            app.state
+                .store
+                .get_task(task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Done
+        );
+        assert_eq!(select_texts(&page, PR_LINK), ["PR #12"]);
+    }
+
+    #[tokio::test]
+    async fn link_pr_form() {
+        let (app, cookie, csrf, web) = setup(&[InPr, Merged]).await;
+        let task = app.task(&web, "Ship it", None).await;
+        app.claim(&web, task.id).await;
+        let path = format!("/ui/tasks/{}", task.id);
+
+        let page = app.get(&path, Some(&cookie)).await;
+        assert!(buttons(&page).contains(&"Link PR".to_string()));
+
+        // Without CSRF nothing happens.
+        let denied = app
+            .post_form(
+                &format!("{path}/pr"),
+                Some(&cookie),
+                &serde_urlencoded::to_string([("url", PR)]).unwrap(),
+            )
+            .await;
+        assert_eq!(denied.status, StatusCode::FORBIDDEN);
+        for action in ["pr/unlink", "advance", "mark-done"] {
+            let denied = app
+                .post_form(&format!("{path}/{action}"), Some(&cookie), "")
+                .await;
+            assert_eq!(denied.status, StatusCode::FORBIDDEN, "{action}");
+        }
+
+        // A bad URL shows the exact message in the panel.
+        let bad = app
+            .post_form(
+                &format!("{path}/pr"),
+                Some(&cookie),
+                &form(&csrf, &[("url", "https://github.com/other/repo/pull/3")]),
+            )
+            .await;
+        assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", bad.body);
+        assert_eq!(
+            select_texts(&bad, ".delivery-panel .error"),
+            ["pr must be a pull request in github.com/acme/web"]
+        );
+
+        let ok = app
+            .post_form(
+                &format!("{path}/pr"),
+                Some(&cookie),
+                &form(&csrf, &[("url", PR)]),
+            )
+            .await;
+        assert_eq!(ok.status, StatusCode::SEE_OTHER, "{}", ok.body);
+        assert_eq!(ok.location.as_deref(), Some(path.as_str()));
+        let page = app.get(&path, Some(&cookie)).await;
+        assert_eq!(select_texts(&page, PR_LINK), ["PR #12"]);
+        assert!(buttons(&page).contains(&"Unlink PR".to_string()));
+
+        // Unlink removes it again.
+        let un = app
+            .post_form(
+                &format!("{path}/pr/unlink"),
+                Some(&cookie),
+                &form(&csrf, &[]),
+            )
+            .await;
+        assert_eq!(un.status, StatusCode::SEE_OTHER, "{}", un.body);
+        assert!(app.state.store.task_pr(task.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn advance_and_mark_done_buttons() {
+        let (app, cookie, csrf, web) = setup(&[InPr, Merged, Released]).await;
+        let task = delivering(&app, &web).await;
+        let path = format!("/ui/tasks/{}", task.id);
+        let page = app.get(&path, Some(&cookie)).await;
+        let b = buttons(&page);
+        assert!(b.contains(&"Advance stage".to_string()), "{b:?}");
+        assert!(b.contains(&"Mark done".to_string()), "{b:?}");
+
+        let r = app
+            .post_form(&format!("{path}/advance"), Some(&cookie), &form(&csrf, &[]))
+            .await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+        let t = app.state.store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(t.delivery_stage, Some(Merged));
+        assert_eq!(t.status, TaskStatus::Delivering);
+
+        let r = app
+            .post_form(
+                &format!("{path}/mark-done"),
+                Some(&cookie),
+                &form(&csrf, &[]),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+        let t = app.state.store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Done);
+
+        // Done: neither button, and a repeat is refused in the panel.
+        let page = app.get(&path, Some(&cookie)).await;
+        let b = buttons(&page);
+        assert!(!b.contains(&"Advance stage".to_string()), "{b:?}");
+        assert!(!b.contains(&"Mark done".to_string()), "{b:?}");
+        let r = app
+            .post_form(
+                &format!("{path}/mark-done"),
+                Some(&cookie),
+                &form(&csrf, &[]),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CONFLICT);
+        assert_eq!(
+            select_texts(&r, ".delivery-panel .error"),
+            ["this task is not delivering"]
+        );
+    }
+
+    #[tokio::test]
+    async fn force_release_offered_while_delivering() {
+        let (app, cookie, csrf, web) = setup(&[InPr, Merged]).await;
+        let task = delivering(&app, &web).await;
+        let path = format!("/ui/tasks/{}", task.id);
+        let page = app.get(&path, Some(&cookie)).await;
+        assert_eq!(
+            select_texts(
+                &page,
+                &format!("form[action='{path}/force-release'] button")
+            ),
+            ["Force release"]
+        );
+
+        let r = app
+            .post_form(
+                &format!("{path}/force-release"),
+                Some(&cookie),
+                &form(&csrf, &[]),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+        let t = app.state.store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Open);
+    }
+
+    #[tokio::test]
+    async fn unlink_hidden_after_merge() {
+        let (app, cookie, _csrf, web) = setup(&[InPr, Merged]).await;
+        let unlink = "Unlink PR".to_string();
+
+        // Delivering: the store refuses an unlink, so the button is not offered.
+        let task = delivering(&app, &web).await;
+        let path = format!("/ui/tasks/{}", task.id);
+        let page = app.get(&path, Some(&cookie)).await;
+        assert!(!buttons(&page).contains(&unlink));
+
+        // Force release reopens it, keeping its stage: open, PR linked, stage In PR.
+        app.state.tasks.force_release(task.id).await.unwrap();
+        let t = app.state.store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Open);
+        assert_eq!(t.delivery_stage, Some(InPr));
+        let page = app.get(&path, Some(&cookie)).await;
+        assert!(buttons(&page).contains(&unlink), "positive control");
+
+        // The same open task once its stage is Merged: the store would refuse, so no button.
+        let (app, cookie, _csrf, web) = setup(&[InPr, Merged, Released]).await;
+        let task = delivering(&app, &web).await;
+        move_to(&app, &task, Merged, vec![]).await;
+        app.state.tasks.force_release(task.id).await.unwrap();
+        let t = app.state.store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Open);
+        assert_eq!(t.delivery_stage, Some(Merged));
+        let page = app
+            .get(&format!("/ui/tasks/{}", task.id), Some(&cookie))
+            .await;
+        assert!(!buttons(&page).contains(&unlink));
+    }
+}
+
+// ---------------------------------------------------------------- project delivery stages
+
+mod project_delivery {
+    use super::*;
+    use axle::domain::DeliveryStage::{self, InPr, Merged};
+
+    const WEB: &str = "github.com/acme/web";
+
+    async fn setup() -> (App, String, String, Resolved, String) {
+        let app = app().await;
+        let cookie = app.login().await;
+        let web = app.agent(WEB, "mac", "claude-code").await;
+        let project = web.agent.project_id.unwrap();
+        let csrf = csrf_for(&app, &cookie).await;
+        let path = format!("/ui/projects/{project}/delivery");
+        (app, cookie, csrf, web, path)
+    }
+
+    async fn stored(app: &App, web: &Resolved) -> Vec<DeliveryStage> {
+        let project = app
+            .state
+            .store
+            .get_project(web.agent.project_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        app.state.delivery.settings(&project).await.unwrap().stages
+    }
+
+    #[tokio::test]
+    async fn delivery_settings_save() {
+        let (app, cookie, csrf, web, path) = setup().await;
+        let page = app.get("/ui/projects", Some(&cookie)).await;
+        assert_eq!(
+            select_texts(&page, ".delivery-stages label"),
+            ["In PR", "Merged", "Released", "Deployed"]
+        );
+        assert!(page.text().contains(
+            "Tasks with a PR move through these after the agent completes them. Done means the last one ticked."
+        ));
+        assert_eq!(
+            select_texts(&page, ".delivery-stages button"),
+            ["Save stages"]
+        );
+
+        let body = format!("csrf={csrf}&stage=in_pr&stage=merged");
+        let r = app.post_form(&path, Some(&cookie), &body).await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+        assert_eq!(r.location.as_deref(), Some("/ui/projects"));
+        assert_eq!(stored(&app, &web).await, [InPr, Merged]);
+
+        let page = app.get("/ui/projects", Some(&cookie)).await;
+        let checked = Html::parse_document(&page.body)
+            .select(&Selector::parse(".delivery-stages input[checked]").unwrap())
+            .count();
+        assert_eq!(checked, 2);
+    }
+
+    #[tokio::test]
+    async fn delivery_settings_csrf() {
+        let (app, cookie, _csrf, web, path) = setup().await;
+        let r = app.post_form(&path, Some(&cookie), "stage=in_pr").await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN);
+        assert!(stored(&app, &web).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_stage_rejected() {
+        let (app, cookie, csrf, web, path) = setup().await;
+        let body = format!("csrf={csrf}&stage=in_pr&stage=shipped");
+        let r = app.post_form(&path, Some(&cookie), &body).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+        assert!(stored(&app, &web).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unticking_all_moves_delivering_to_done() {
+        let (app, cookie, csrf, web, path) = setup().await;
+        let project = app
+            .state
+            .store
+            .get_project(web.agent.project_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        app.state
+            .delivery
+            .set_stages(&project, vec![InPr, Merged])
+            .await
+            .unwrap();
+        let task = app.task(&web, "Ship it", None).await;
+        app.claim(&web, task.id).await;
+        app.state
+            .delivery
+            .link_pr(
+                Caller::Agent(&web),
+                task.id,
+                "https://github.com/acme/web/pull/12",
+            )
+            .await
+            .unwrap();
+        app.state
+            .tasks
+            .complete(
+                &web,
+                task.id,
+                Completion {
+                    summary: "done".into(),
+                    ..Completion::default()
+                },
+            )
+            .await
+            .unwrap();
+        let t = app.state.store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Delivering);
+
+        let r = app
+            .post_form(&path, Some(&cookie), &format!("csrf={csrf}"))
+            .await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+        assert!(stored(&app, &web).await.is_empty());
+        let t = app.state.store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Done);
+
+        let page = app
+            .get(&format!("/ui/tasks/{}", task.id), Some(&cookie))
+            .await;
+        assert!(
+            select_texts(&page, ".event-note")
+                .iter()
+                .any(|n| n.contains("delivery stages turned off")),
+            "{}",
+            page.body
+        );
+    }
 }

@@ -26,7 +26,16 @@ The board has five columns: **open**, **claimed** (which also holds `planning` t
 status glyph and label, the project, the holder and whether its session is live, and a
 lease bar. A blocked card shows the first line of its reason under the title ("Blocked:",
 or "Blocked on you:" when it waits on you). A parent task shows its subtasks as a row of stops. Filter by project with the
-chips above the columns.
+chips above the columns. Every card also shows its short id (`axl-…`) and, once a pull
+request is linked, a `PR #123` link.
+
+A project with delivery stages enabled adds one column per stage (**In PR**, **Merged**,
+**Released**, **Deployed**) between review and done. Filtered to one project, the board shows
+that project's stages; unfiltered, the union, and each task sits only in its own project's
+column. A task that spans the filtered project but belongs to another sits in the board's
+nearest stage column at or below its own, keeping its own stage word, or in **Review** when
+the board has none. A card in a stage it has not reached yet reads "waiting for Released". Without stages
+the board is unchanged.
 
 Open, claimed, blocked and review each show at most **12 cards**, the ones asking for
 attention first: urgent mail in the task's thread, a plan awaiting you, blocked (the task or
@@ -46,7 +55,8 @@ the chips that ask for attention: **urgent**, **plan awaiting you**, **blocked o
 for the start of the reason; a blocked task's status word carries the same tooltip),
 **N blocked** and **N review** for subtasks, the lease turning into a chip when under a fifth
 is left or it has expired, and "3/5" for a parent's subtasks done. A Done row keeps a small
-**Ack** button at its end.
+**Ack** button at its end. A delivering row also shows its stage word, "waiting for …" in a stage it
+has not reached, and its `PR #123` link.
 
 The done column holds finished top-level tasks you have not seen, newest first, at most 50.
 Its head reads "N unseen". **Ack** under a card hides that task from the board; **Ack all**
@@ -177,6 +187,11 @@ The task page shows, top to bottom:
   cost, sessions) linking to the Usage page for that task, grouped by agent over all time
   (`range=all`, so older usage is not cut off by the default range); a parent adds *incl. subtasks* and
   sums its descendants. No usage, no line.
+- **Delivery** (when the project has [stages](delivery.md) on, or a PR is linked): the
+  short id, the linked PR as a chip (on the In PR row, or above the stages when In PR is
+  off), and the stages with where the task is. **Link PR** takes
+  a pull request URL, **Unlink PR** removes it (not after a merge), **Advance stage** moves a
+  delivering task one stage forward and **Mark done** finishes it. These are human only.
 - **Subtasks**: children with their status and progress.
 - **Related**: [linked tasks](concepts.md#related-tasks), each with the link in words
   (*follow-up of*, *duplicated by*, …), the other task's project, title and status, and
@@ -195,8 +210,8 @@ list. One-line previews stay plain text.
 On the side:
 
 - **Post to the thread**, as you, with an importance.
-- **Take over**: **Force release** (back to `open`) and **Cancel task**. Both ask for
-  confirmation.
+- **Take over**: **Force release** (back to `open`, also offered while delivering) and
+  **Cancel task**. Both ask for confirmation.
 - **Projects**: the lead and participating projects, and **Add project** for a top-level
   task. Projects are never removed.
 - **Link a task**: pick what this task is (*related to*, *a follow-up of*, *a duplicate of*)
@@ -245,6 +260,11 @@ answers are written by the agent, so they are shown as plain text, never as mark
 
 Projects appear here on first contact. Rename a project's display name; the key stays the
 same and is shown on hover. A key that is a plain `host/path` links to its repository.
+
+Each project row has a **Delivery stages** disclosure with four checkboxes (**In PR**,
+**Merged**, **Released**, **Deployed**) and **Save stages**. Tasks with a PR move through the
+ticked stages after the agent completes them; done means the last one ticked. Unticking all
+turns stages off and finishes any task still delivering. See [Delivery stages](delivery.md).
 
 ## Tokens
 

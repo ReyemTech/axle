@@ -276,7 +276,7 @@ Flat. There are no shadows anywhere. Depth is tonal: ground, then the band (a da
 Quiet geometry. Cards, panels, columns, lists and the reader use a 6px radius; buttons and the segmented control 4px; form fields and the error bar 3px. State glyphs are 10px circles, except blocked and urgent which become a 1px-radius square, so shape carries state without colour. Track rules and line swatches are straight bars (2px track, 4px swatch, 8px lease occupancy bar). Dividers are 1px rules; nothing is rounded beyond 6px except the circular glyphs. The 1px `hairline` radius is used only on the blocked square glyph. The one literal `#000` in the stylesheet is the opaque stop of the phone project-filter fade mask (`mask-image`); it is an alpha mask, not a colour.
 
 ### Named Rules
-**The Shape Carries State Rule.** Ring is open, half-filled is claimed, square is blocked, ringed centre is review, solid is done or live, diagonal slash is cancelled, a dashed red ring is planning (block reserved, work not started) and a dashed amber ring with a centre is a plan awaiting the human. Do not reuse these shapes for non-state meaning.
+**The Shape Carries State Rule.** Ring is open, half-filled is claimed, square is blocked, ringed centre is review, solid is done or live, a solid dot inside an outer ring is delivering (block cleared, train still moving), diagonal slash is cancelled, a dashed red ring is planning (block reserved, work not started) and a dashed amber ring with a centre is a plan awaiting the human. Do not reuse these shapes for non-state meaning.
 
 ## Components
 
@@ -292,6 +292,7 @@ Quiet geometry. Cards, panels, columns, lists and the reader use a 6px radius; b
 ### Cards (task card)
 - **Corner / border:** 6px radius, 1px Card Border, Card fill, 10px 12px padding, 5px internal gap.
 - **Content order:** title link (600, persistent 1px Rule Strong underline offset 3px that turns to ink on card or link hover), optional "Subtask of ..." line, state + project row, owner row ("Held by" or "Done by" + mono agent id + live/stale), lease meter, subtask progress.
+- **Delivery chips:** a card shows its short id (`axl-` and eight hex digits, mono, muted) and, once a PR is linked, a mono `PR #123` link (`rel="noopener noreferrer"`). A delivering card's glyph always sits beside the stage word ("In PR"); a card parked in a stage it has not reached reads "waiting for Released". Later chips (CI, merged, release, deploy) follow the same mono-text pattern.
 - **State:** a blocked card is soft red with a red border. Hover darkens the border and the title underline.
 - **Selection:** j/k moves a 2px outline between `[data-nav]` cards.
 - **Compact density:** one 30px row (signals wrap to a second line rather than being clipped in a narrow column) (4px 8px padding, 12px meta, 13px title): state glyph + status word, the title on one line with an ellipsis and the full title as its tooltip, the project only on an all-projects board, the holder in mono (or "open"), "lease 12m left", then text chips (warn or danger soft fill, 1px border, 3px radius, 11.5px/600) for urgent, plan awaiting you, blocked on you, N blocked, N review and a low or expired lease, and the mono "done/total" count. The title shrinks first. A Done row's Ack sits beside it as a 24px secondary button.
@@ -306,6 +307,9 @@ On the task page, above the lease: the latest plan as peer text in a card-filled
 - **Band:** tinted wash, 6px radius, min-height 160px. Header is 40px with a 2px ink bottom rule, the column's aspect glyph, an uppercase label and a count at the right. The 2px head rules join into one continuous line across the board: each non-last head extends 8px into the gutter with a 2px by 10px vertical joint, so gutters read as junctions between blocks.
 - **Done head:** the count reads "N unseen" (not a bare number). Under the rule sit a labelled **Ack all** button and a **History** link; when work has auto-acked, a muted line "N auto-acked, unseen" links to it and is hidden at zero. Each done card has a labelled **Ack** button beneath it, outside the card.
 - **Waiting work shouts:** when the blocked or review column has cards, its glyph grows to 14px and its count to 18px bold in danger or warn. Empty columns stay quiet with a sentence of explanation.
+
+### Stage columns
+Projects with delivery stages add one column per enabled stage between Review and Done, in stage order (filtered to one project: its stages; all projects: the union, each task only in its own project's column). The head is the delivering glyph, the stage name, a middle dot and the count, set together on the left (`IN PR · 4`, uppercased by the label style). Empty stage columns say what they wait for: "Nothing waiting for merge", "Nothing waiting for release", "Nothing waiting for deploy". A project without stages shows today's five columns.
 
 ### Lease meter
 A project-coloured 2px track with an 8px occupancy bar whose length is time left on the lease (red; amber when under a fifth remains; zero when expired), beside text "lease" plus mono time left. JS decrements it between server renders.

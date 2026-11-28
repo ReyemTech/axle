@@ -17,8 +17,8 @@ use super::views::{
     lease_view, project_options, pulse_counts, state_mark,
 };
 use crate::domain::{
-    Actor, Message, MessageId, PlanState, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus,
-    WaitingOn,
+    Actor, DeliveryStage, Message, MessageId, PlanState, Task, TaskEvent, TaskEventKind, TaskId,
+    TaskStatus, WaitingOn, short_id,
 };
 use crate::http::AppState;
 use crate::service::tasks::plan_words;
@@ -333,9 +333,112 @@ async fn usage_line(state: &AppState, id: TaskId) -> StoreResult<Option<UsageLin
     }))
 }
 
+/// One enabled stage on the Delivery panel's timeline.
+pub struct StageRow {
+    pub label: &'static str,
+    /// `reached`, `implied` or `waiting`.
+    pub state: &'static str,
+    pub at: Option<Stamp>,
+    /// "implied by <later stage>" for an implied row.
+    pub note: Option<String>,
+    /// The PR link, on the In PR row.
+    pub pr: Option<PrLink>,
+}
+
+pub struct PrLink {
+    pub url: String,
+    pub text: String,
+}
+
+/// The Delivery panel: the short id, the timeline and the actions that apply now.
+pub struct DeliveryPanel {
+    pub short_id: String,
+    pub rows: Vec<StageRow>,
+    /// The PR link shown on its own: set when no In PR row carries it (no stages, or a
+    /// project whose enabled stages leave In PR out).
+    pub pr: Option<PrLink>,
+    pub can_link: bool,
+    pub can_unlink: bool,
+    /// The task is `delivering`: Advance stage and Mark done apply.
+    pub can_move: bool,
+    /// Why the last action was refused.
+    pub error: Option<String>,
+}
+
+fn pr_link(pr: &crate::domain::TaskPr) -> PrLink {
+    PrLink {
+        url: pr.url.clone(),
+        text: pr
+            .number
+            .map_or_else(|| pr.url.clone(), |n| format!("PR #{n}")),
+    }
+}
+
+async fn delivery_panel(
+    state: &AppState,
+    task: &Task,
+    now: OffsetDateTime,
+    error: Option<String>,
+) -> UiResult<DeliveryPanel> {
+    let view = state
+        .delivery
+        .view(task)
+        .await
+        .map_err(|e| UiError::Internal(e.to_string()))?;
+    let (enabled, pr, timeline) = match view {
+        Some(v) => (v.stages_enabled, v.pr, v.timeline),
+        // No stages: the panel still shows a PR linked by hand (`task_update` / Link PR).
+        None => (Vec::new(), state.store.task_pr(task.id).await?, Vec::new()),
+    };
+    let rows = enabled
+        .iter()
+        .map(|stage| {
+            let row = timeline.iter().find(|r| r.stage == *stage);
+            let state = match row {
+                Some(r) if r.implied => "implied",
+                Some(_) => "reached",
+                None => "waiting",
+            };
+            let note = row.filter(|r| r.implied).and_then(|r| {
+                timeline
+                    .iter()
+                    .filter(|t| !t.implied && t.stage > r.stage)
+                    .min_by_key(|t| t.stage)
+                    .map(|t| format!("implied by {}", t.stage.label()))
+            });
+            StageRow {
+                label: stage.label(),
+                state,
+                at: row.map(|r| Stamp::new(now, r.reached_at)),
+                note,
+                pr: pr
+                    .as_ref()
+                    .filter(|_| *stage == DeliveryStage::InPr)
+                    .map(pr_link),
+            }
+        })
+        .collect();
+    let open = !matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled);
+    let delivering = task.status == TaskStatus::Delivering;
+    let merged = task.delivery_stage >= Some(DeliveryStage::Merged);
+    Ok(DeliveryPanel {
+        short_id: short_id(task.id),
+        rows,
+        can_unlink: pr.is_some() && open && !delivering && !merged,
+        pr: pr
+            .as_ref()
+            .filter(|_| !enabled.contains(&DeliveryStage::InPr))
+            .map(pr_link),
+        can_link: open,
+        can_move: delivering,
+        error,
+    })
+}
+
 #[derive(Template)]
 #[template(path = "task.html")]
 struct TaskPage {
+    delivery: DeliveryPanel,
     csrf: Option<String>,
     logout: bool,
     /// The top bar's counts (`None` when signed out).
@@ -367,7 +470,7 @@ struct TaskPage {
     child_projects: Vec<ProjectOption>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct TaskQuery {
     /// History cursor: show events older than this event id.
     #[serde(default)]
@@ -415,6 +518,9 @@ fn lease_text(now: OffsetDateTime, task: &Task, owner: Option<&str>) -> String {
             "Held by {owner}; the lease does not expire while {}.",
             task.status
         ),
+        TaskStatus::Delivering => {
+            format!("Finished by {owner}; the lease does not expire while delivery is tracked.")
+        }
         TaskStatus::Done => format!("Finished by {owner}."),
         TaskStatus::Cancelled => "Cancelled.".into(),
     }
@@ -447,6 +553,17 @@ pub async fn task_page(
     Query(q): Query<TaskQuery>,
 ) -> UiResult<Response> {
     let id: TaskId = id.parse().map_err(|_| UiError::NotFound("No such task."))?;
+    render_task_page(&state, session, id, q, None).await
+}
+
+/// The task page, with `error` (a refused delivery action) shown in the Delivery panel.
+pub(super) async fn render_task_page(
+    state: &AppState,
+    session: SessionCtx,
+    id: TaskId,
+    q: TaskQuery,
+    error: Option<String>,
+) -> UiResult<Response> {
     let store = &*state.store;
     let task = store
         .get_task(id)
@@ -507,10 +624,14 @@ pub async fn task_page(
         eligibility,
         can_release: matches!(
             task.status,
-            TaskStatus::Planning | TaskStatus::Claimed | TaskStatus::Blocked | TaskStatus::Review
+            TaskStatus::Planning
+                | TaskStatus::Claimed
+                | TaskStatus::Blocked
+                | TaskStatus::Review
+                | TaskStatus::Delivering
         ),
         can_cancel: !matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled),
-        usage: usage_line(&state, id).await?,
+        usage: usage_line(state, id).await?,
     };
 
     // The newest page of the thread (one extra tells whether an earlier page exists),
@@ -604,7 +725,7 @@ pub async fn task_page(
         })
         .collect();
 
-    let plan = match latest_plan(&state, id).await? {
+    let plan = match latest_plan(state, id).await? {
         Some(m) => Some(PlanView {
             id: m.id.to_string(),
             from: labels.actor_label(m.from).await?,
@@ -650,10 +771,11 @@ pub async fn task_page(
     };
 
     html(&TaskPage {
+        delivery: delivery_panel(state, &task, now, error).await?,
         refresh,
         logout: session.logout,
         csrf: Some(session.csrf),
-        pulse: Some(pulse_counts(&state).await?),
+        pulse: Some(pulse_counts(state).await?),
         nav: "board",
         task: view,
         thread,
