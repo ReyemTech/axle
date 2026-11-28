@@ -214,6 +214,8 @@ async fn reopen(env: &Env, id: TaskId, now: OffsetDateTime) -> Transitioned {
             archive_plans: false,
             block: None,
             unblock: None,
+            version: None,
+            sanctioned: None,
         })
         .await
         .unwrap()

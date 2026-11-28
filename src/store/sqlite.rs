@@ -10,19 +10,10 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 use time::{Duration as TimeDuration, OffsetDateTime};
 
 use super::{
-    AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate,
-    MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome, ProjectsAdded,
-    Recipient, RelateRequest, Related, Store, StoreError, StoreResult, TaskFilter, TaskOrder,
-    TransitionRequest, Transitioned, UnblockRule, Unblocked, block_previous_payload, child_event,
-    children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label,
-    like_pattern, options_from, options_to, projects_added_note, projects_added_payload,
-    related_payload, send_time_recipient, unblocked_records,
+    AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate, MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, RelateRequest, Related, Store, StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, UnblockRule, Unblocked, block_previous_payload, child_event, children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label, like_pattern, options_from, options_to, projects_added_note, projects_added_payload, related_payload, send_time_recipient, unblocked_records, AttemptQuery, to_u32,
 };
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId,
-    EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId, Session,
-    SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo,
-    WaitingOn,
+    Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId, EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, WaitingOn, ProjectWakeSettings, ServerSettings, WakeAttempt,
 };
 
 /// The columns `enrollment_from` reads (a macro so queries can `concat!` it statically).
@@ -947,6 +938,7 @@ async fn transition_in(
         "UPDATE tasks
             SET status = COALESCE(?, status),
                 plan_state = COALESCE(?, plan_state),
+                sanctioned = COALESCE(?, sanctioned),
                 lease_expires_at = CASE WHEN ? THEN lease_expires_at ELSE ? END,
                 owner_session_id = CASE WHEN ? THEN NULL ELSE owner_session_id END,
                 owner_agent_id = CASE WHEN ? THEN NULL ELSE owner_agent_id END,
@@ -977,11 +969,13 @@ async fn transition_in(
                  OR ? = (SELECT p.id FROM messages p
                           WHERE p.task_id = tasks.id AND p.kind = 'plan'
                           ORDER BY p.seq DESC LIMIT 1))
+            AND (? IS NULL OR version = ?)
           RETURNING ",
         task_cols!()
     ))
     .bind(req.to.map(|s| s.as_str()))
     .bind(req.plan_to.map(|s| s.as_str()))
+    .bind(req.sanctioned)
     .bind(keep_lease)
     .bind(lease)
     .bind(req.clear_owner)
@@ -1014,6 +1008,8 @@ async fn transition_in(
     .bind(&owner)
     .bind(req.latest_plan.map(|m| m.to_string()))
     .bind(req.latest_plan.map(|m| m.to_string()))
+    .bind(req.version)
+    .bind(req.version)
     .fetch_optional(&mut *conn)
     .await?
     .as_ref()
@@ -1939,6 +1935,210 @@ impl Store for SqliteStore {
             .as_ref()
             .map(task_from)
             .transpose()
+    }
+
+    async fn wake_settings(&self, project: ProjectId) -> StoreResult<ProjectWakeSettings> {
+        let row = sqlx::query(
+            "SELECT auto_start, headless_enabled, headless_harness, max_concurrent_runs,
+                    daily_run_cap, max_run_minutes, max_budget_usd
+               FROM project_wake_settings WHERE project_id = ?",
+        )
+        .bind(project.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(ProjectWakeSettings::defaults(project));
+        };
+        Ok(ProjectWakeSettings {
+            project_id: project,
+            auto_start: row.try_get("auto_start")?,
+            headless_enabled: row.try_get("headless_enabled")?,
+            headless_harness: row.try_get("headless_harness")?,
+            max_concurrent_runs: to_u32(row.try_get("max_concurrent_runs")?)?,
+            daily_run_cap: to_u32(row.try_get("daily_run_cap")?)?,
+            max_run_minutes: to_u32(row.try_get("max_run_minutes")?)?,
+            max_budget_usd: row.try_get("max_budget_usd")?,
+        })
+    }
+
+    async fn put_wake_settings(
+        &self,
+        s: &ProjectWakeSettings,
+        now: OffsetDateTime,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO project_wake_settings
+                 (project_id, auto_start, headless_enabled, headless_harness,
+                  max_concurrent_runs, daily_run_cap, max_run_minutes, max_budget_usd,
+                  updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (project_id) DO UPDATE SET
+                 auto_start = excluded.auto_start,
+                 headless_enabled = excluded.headless_enabled,
+                 headless_harness = excluded.headless_harness,
+                 max_concurrent_runs = excluded.max_concurrent_runs,
+                 daily_run_cap = excluded.daily_run_cap,
+                 max_run_minutes = excluded.max_run_minutes,
+                 max_budget_usd = excluded.max_budget_usd,
+                 updated_at = excluded.updated_at",
+        )
+        .bind(s.project_id.to_string())
+        .bind(s.auto_start)
+        .bind(s.headless_enabled)
+        .bind(&s.headless_harness)
+        .bind(i64::from(s.max_concurrent_runs))
+        .bind(i64::from(s.daily_run_cap))
+        .bind(i64::from(s.max_run_minutes))
+        .bind(s.max_budget_usd)
+        .bind(ts::enc(now))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn server_settings(&self) -> StoreResult<ServerSettings> {
+        let row =
+            sqlx::query("SELECT wake_paused, headless_paused FROM server_settings WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(row) = row else {
+            return Ok(ServerSettings::default());
+        };
+        Ok(ServerSettings {
+            wake_paused: row.try_get("wake_paused")?,
+            headless_paused: row.try_get("headless_paused")?,
+        })
+    }
+
+    async fn put_server_settings(
+        &self,
+        s: &ServerSettings,
+        now: OffsetDateTime,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO server_settings (id, wake_paused, headless_paused, updated_at)
+             VALUES (1, ?, ?, ?)
+             ON CONFLICT (id) DO UPDATE SET
+                 wake_paused = excluded.wake_paused,
+                 headless_paused = excluded.headless_paused,
+                 updated_at = excluded.updated_at",
+        )
+        .bind(s.wake_paused)
+        .bind(s.headless_paused)
+        .bind(ts::enc(now))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_wake_attempt(&self, a: &WakeAttempt) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO wake_attempts
+                 (id, kind, trigger, task_id, session_id, from_agent_id, runner_id, run_id,
+                  outcome, detail, pr_url, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(a.id.to_string())
+        .bind(a.kind.as_str())
+        .bind(a.trigger.as_str())
+        .bind(a.task_id.map(|t| t.to_string()))
+        .bind(a.session_id.map(|s| s.to_string()))
+        .bind(a.from_agent_id.map(|g| g.to_string()))
+        .bind(a.runner_id.map(|r| r.to_string()))
+        .bind(a.run_id.map(|r| r.to_string()))
+        .bind(a.outcome.as_str())
+        .bind(&a.detail)
+        .bind(&a.pr_url)
+        .bind(ts::enc(a.at))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn count_wake_attempts(&self, q: &AttemptQuery) -> StoreResult<u32> {
+        let triggers = q.triggers.as_ref().map(|list| {
+            format!(
+                ",{},",
+                list.iter()
+                    .map(|t| t.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        });
+        let session = q.session.map(|s| s.to_string());
+        let task = q.task.map(|t| t.to_string());
+        let from_agent = q.from_agent.map(|a| a.to_string());
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM wake_attempts
+              WHERE kind = ? AND outcome = ? AND created_at >= ?
+                AND (? IS NULL OR session_id = ?)
+                AND (? IS NULL OR task_id = ?)
+                AND (? IS NULL OR from_agent_id = ?)
+                AND (? IS NULL OR instr(?, ',' || trigger || ',') > 0)",
+        )
+        .bind(q.kind.as_str())
+        .bind(q.outcome.as_str())
+        .bind(ts::enc(q.since))
+        .bind(&session)
+        .bind(&session)
+        .bind(&task)
+        .bind(&task)
+        .bind(&from_agent)
+        .bind(&from_agent)
+        .bind(&triggers)
+        .bind(&triggers)
+        .fetch_one(&self.pool)
+        .await?;
+        to_u32(n)
+    }
+
+    async fn find_request(
+        &self,
+        from: AgentId,
+        project: ProjectId,
+        dedupe_key: &str,
+        since: OffsetDateTime,
+    ) -> StoreResult<Option<Task>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            task_cols!(),
+            " FROM tasks
+               WHERE created_by_agent_id = ? AND project_id = ? AND request_dedupe_key = ?
+                 AND created_at >= ?
+               ORDER BY created_at DESC, id DESC LIMIT 1"
+        ))
+        .bind(from.to_string())
+        .bind(project.to_string())
+        .bind(dedupe_key)
+        .bind(ts::enc(since))
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(task_from)
+        .transpose()
+    }
+
+    async fn count_requests_by(&self, from: AgentId, since: OffsetDateTime) -> StoreResult<u32> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks
+              WHERE created_by_agent_id = ? AND request_dedupe_key IS NOT NULL
+                AND created_at >= ?",
+        )
+        .bind(from.to_string())
+        .bind(ts::enc(since))
+        .fetch_one(&self.pool)
+        .await?;
+        to_u32(n)
+    }
+
+    async fn count_pending_requests(&self, project: ProjectId) -> StoreResult<u32> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE project_id = ? AND status = 'requested'",
+        )
+        .bind(project.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        to_u32(n)
     }
 
     async fn task_projects(&self, id: TaskId) -> StoreResult<Vec<ProjectId>> {

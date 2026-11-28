@@ -6,11 +6,14 @@ use std::sync::Arc;
 
 use axle::clock::{Clock, TestClock};
 use axle::domain::{
-    Actor, Address, Eligibility, Importance, Message, MessageId, MessageKind, PlanState, ProjectId,
-    SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TurnState, WakeChannel,
+    Actor, Address, AgentId, Eligibility, Importance, Message, MessageId, MessageKind, PlanState,
+    ProjectId, ProjectWakeSettings, ServerSettings, SessionId, Task, TaskEvent, TaskEventKind,
+    TaskId, TaskStatus, TurnState, WakeAttempt, WakeChannel, WakeKind, WakeOutcome, WakeTrigger,
 };
 use axle::service::identity::{IdentityInput, IdentityService, Resolved};
-use axle::store::{ClaimRequest, Claimant, Store, TaskFilter};
+use axle::store::{
+    AttemptQuery, ClaimRequest, Claimant, LeaseUpdate, Store, TaskFilter, TransitionRequest,
+};
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
@@ -203,6 +206,332 @@ store_matrix!(new_session_has_unknown_turn_and_no_channel, |store: Arc<
     assert_eq!(s.run_id, None);
     let _ = clock.now();
 });
+
+store_matrix!(wake_settings_default_then_upsert, |store: Arc<
+    dyn Store,
+>| async move {
+    let clock = TestClock::new(T0);
+    let a = agent(&store, &clock).await;
+    let project = a.project.as_ref().unwrap().id;
+    assert_eq!(
+        store.wake_settings(project).await.unwrap(),
+        ProjectWakeSettings::defaults(project)
+    );
+    let mut s = ProjectWakeSettings::defaults(project);
+    s.auto_start = true;
+    s.headless_enabled = true;
+    s.headless_harness = Some("claude-code".into());
+    s.max_concurrent_runs = 2;
+    s.daily_run_cap = 9;
+    s.max_run_minutes = 45;
+    s.max_budget_usd = Some(2.5);
+    store.put_wake_settings(&s, T0).await.unwrap();
+    assert_eq!(store.wake_settings(project).await.unwrap(), s);
+    s.auto_start = false;
+    s.max_budget_usd = None;
+    store
+        .put_wake_settings(&s, T0 + Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(store.wake_settings(project).await.unwrap(), s);
+});
+
+store_matrix!(server_settings_default_then_upsert, |store: Arc<
+    dyn Store,
+>| async move {
+    assert_eq!(
+        store.server_settings().await.unwrap(),
+        ServerSettings::default()
+    );
+    let s = ServerSettings {
+        wake_paused: true,
+        headless_paused: false,
+    };
+    store.put_server_settings(&s, T0).await.unwrap();
+    assert_eq!(store.server_settings().await.unwrap(), s);
+    let s = ServerSettings {
+        wake_paused: false,
+        headless_paused: true,
+    };
+    store
+        .put_server_settings(&s, T0 + Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(store.server_settings().await.unwrap(), s);
+});
+
+fn attempt(
+    session: SessionId,
+    trigger: WakeTrigger,
+    outcome: WakeOutcome,
+    at: OffsetDateTime,
+) -> WakeAttempt {
+    WakeAttempt {
+        id: uuid::Uuid::now_v7(),
+        kind: WakeKind::Wake,
+        trigger,
+        task_id: None,
+        session_id: Some(session),
+        from_agent_id: None,
+        runner_id: None,
+        run_id: None,
+        outcome,
+        detail: None,
+        pr_url: None,
+        at,
+    }
+}
+
+store_matrix!(attempt_counts_filter_by_window_and_trigger, |store: Arc<
+    dyn Store,
+>| async move {
+    let clock = TestClock::new(T0);
+    let a = agent(&store, &clock).await;
+    let session = a.session.id;
+    for (trigger, at) in [
+        (WakeTrigger::HumanPost, T0),
+        (WakeTrigger::HumanPost, T0 + Duration::minutes(59)),
+        (WakeTrigger::PeerPost, T0 + Duration::minutes(59)),
+    ] {
+        let mut row = attempt(session, trigger, WakeOutcome::Sent, at);
+        if trigger == WakeTrigger::PeerPost {
+            row.from_agent_id = Some(a.agent.id);
+        }
+        store.insert_wake_attempt(&row).await.unwrap();
+    }
+    // Not `sent`, and another kind: neither counts.
+    store
+        .insert_wake_attempt(&attempt(
+            session,
+            WakeTrigger::HumanPost,
+            WakeOutcome::Failed,
+            T0 + Duration::minutes(59),
+        ))
+        .await
+        .unwrap();
+    let mut headless = attempt(
+        session,
+        WakeTrigger::HumanPost,
+        WakeOutcome::Sent,
+        T0 + Duration::minutes(59),
+    );
+    headless.kind = WakeKind::Headless;
+    store.insert_wake_attempt(&headless).await.unwrap();
+
+    let q = AttemptQuery {
+        kind: WakeKind::Wake,
+        outcome: WakeOutcome::Sent,
+        session: Some(session),
+        task: None,
+        from_agent: None,
+        triggers: None,
+        since: T0,
+    };
+    assert_eq!(store.count_wake_attempts(&q).await.unwrap(), 3);
+    let since_930 = AttemptQuery {
+        since: T0 + Duration::minutes(30),
+        ..q.clone()
+    };
+    assert_eq!(store.count_wake_attempts(&since_930).await.unwrap(), 2);
+    let peer_only = AttemptQuery {
+        triggers: Some(vec![WakeTrigger::PeerPost]),
+        since: T0 + Duration::minutes(30),
+        ..q.clone()
+    };
+    assert_eq!(store.count_wake_attempts(&peer_only).await.unwrap(), 1);
+    let by_agent = AttemptQuery {
+        from_agent: Some(a.agent.id),
+        ..q.clone()
+    };
+    assert_eq!(store.count_wake_attempts(&by_agent).await.unwrap(), 1);
+    let other_session = AttemptQuery {
+        session: Some(SessionId::new()),
+        ..q
+    };
+    assert_eq!(store.count_wake_attempts(&other_session).await.unwrap(), 0);
+});
+
+/// A request created by `by` in `project` at `at`.
+async fn request_by(
+    store: &Arc<dyn Store>,
+    by: &Resolved,
+    project: ProjectId,
+    key: &str,
+    at: OffsetDateTime,
+) -> Task {
+    let mut t = task_in(project, key, at);
+    t.status = TaskStatus::Requested;
+    t.created_by = Actor::Agent(by.agent.id, by.session.id);
+    t.request_depth = 1;
+    t.request_dedupe_key = Some(key.into());
+    insert(store, &t).await;
+    t
+}
+
+fn transition(id: TaskId, version: Option<i64>, sanctioned: Option<bool>) -> TransitionRequest {
+    TransitionRequest {
+        task: id,
+        from: vec![TaskStatus::Requested],
+        to: Some(TaskStatus::Open),
+        owner: None,
+        lease: LeaseUpdate::Clear,
+        clear_owner: false,
+        now: T0 + Duration::minutes(1),
+        token: None,
+        event: TaskEvent {
+            id: uuid::Uuid::now_v7(),
+            task_id: id,
+            at: T0 + Duration::minutes(1),
+            actor: Actor::Human,
+            kind: TaskEventKind::Released,
+            note: None,
+            payload: None,
+        },
+        plan_from: None,
+        plan_to: None,
+        message: None,
+        latest_plan: None,
+        archive_plans: false,
+        version,
+        sanctioned,
+    }
+}
+
+/// Approves `id` (requested to open) through the store.
+async fn approve(store: &Arc<dyn Store>, id: TaskId) {
+    let done = store
+        .transition_task(&transition(id, None, None))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(done.task.status, TaskStatus::Open);
+}
+
+store_matrix!(
+    find_request_within_window,
+    |store: Arc<dyn Store>| async move {
+        let clock = TestClock::new(T0);
+        let a = agent(&store, &clock).await;
+        let project = a.project.as_ref().unwrap().id;
+        let t = request_by(&store, &a, project, "k", T0).await;
+        let window = Duration::minutes(10);
+        // Looked up 9m59s later, the window reaches back to before the request.
+        let found = store
+            .find_request(
+                a.agent.id,
+                project,
+                "k",
+                T0 + Duration::seconds(599) - window,
+            )
+            .await
+            .unwrap();
+        assert_eq!(found.map(|f| f.id), Some(t.id));
+        // At +10m the window starts after the request was created.
+        assert!(
+            store
+                .find_request(a.agent.id, project, "k", T0 + Duration::seconds(1))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Wrong key, wrong project and wrong requester never match.
+        assert!(
+            store
+                .find_request(a.agent.id, project, "other", T0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .find_request(a.agent.id, ProjectId::new(), "k", T0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .find_request(AgentId::new(), project, "k", T0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Any status counts: an approved (open) request is still found.
+        approve(&store, t.id).await;
+        assert!(
+            store
+                .find_request(a.agent.id, project, "k", T0)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .count_requests_by(a.agent.id, T0 - Duration::hours(1))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .count_requests_by(a.agent.id, T0 + Duration::minutes(1))
+                .await
+                .unwrap(),
+            0
+        );
+    }
+);
+
+store_matrix!(pending_requests_count_only_requested, |store: Arc<
+    dyn Store,
+>| async move {
+    let clock = TestClock::new(T0);
+    let a = agent(&store, &clock).await;
+    let project = a.project.as_ref().unwrap().id;
+    assert_eq!(store.count_pending_requests(project).await.unwrap(), 0);
+    let first = request_by(&store, &a, project, "one", T0).await;
+    request_by(&store, &a, project, "two", T0).await;
+    insert(&store, &task_in(project, "plain open", T0)).await;
+    assert_eq!(store.count_pending_requests(project).await.unwrap(), 2);
+    assert_eq!(
+        store
+            .count_pending_requests(ProjectId::new())
+            .await
+            .unwrap(),
+        0
+    );
+    approve(&store, first.id).await;
+    assert_eq!(store.count_pending_requests(project).await.unwrap(), 1);
+});
+
+store_matrix!(
+    transition_guarded_by_version,
+    |store: Arc<dyn Store>| async move {
+        let clock = TestClock::new(T0);
+        let a = agent(&store, &clock).await;
+        let project = a.project.as_ref().unwrap().id;
+        let t = request_by(&store, &a, project, "k", T0).await;
+        assert!(!t.sanctioned);
+
+        let stale = store
+            .transition_task(&transition(t.id, Some(t.version + 5), Some(true)))
+            .await
+            .unwrap();
+        assert!(stale.is_none());
+        let unchanged = store.get_task(t.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.status, TaskStatus::Requested);
+        assert!(!unchanged.sanctioned);
+
+        let applied = store
+            .transition_task(&transition(t.id, Some(t.version), Some(true)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.task.status, TaskStatus::Open);
+        assert!(applied.task.sanctioned);
+        assert_eq!(applied.task.version, t.version + 1);
+    }
+);
 
 /// Copies migrations 0001..=0004 of `backend` into a fresh directory.
 fn old_migrations(backend: &str) -> std::path::PathBuf {

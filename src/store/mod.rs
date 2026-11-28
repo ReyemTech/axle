@@ -13,10 +13,7 @@ use time::{Duration, OffsetDateTime};
 
 use crate::config::Backend;
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, Enrollment, EnrollmentId, EnrollmentKind,
-    Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState, Project,
-    ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus,
-    TokenId, TokenInfo, WaitingOn,
+    Actor, Address, Agent, AgentId, BlockDetail, Enrollment, EnrollmentId, EnrollmentKind, Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState, Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, WaitingOn, ProjectWakeSettings, ServerSettings, WakeAttempt, WakeKind, WakeOutcome, WakeTrigger,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +30,11 @@ pub enum StoreError {
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
+
+/// A stored count or limit as `u32`.
+fn to_u32(n: i64) -> StoreResult<u32> {
+    u32::try_from(n).map_err(|_| StoreError::Corrupt(format!("{n} out of range")))
+}
 
 /// A new enrollment row; `secret_hash` / `user_code_hash` are SHA-256 hex of the secrets.
 #[derive(Debug, Clone)]
@@ -254,6 +256,38 @@ pub trait Store: Send + Sync {
     /// Every link of `task`, whichever way it points, oldest first.
     async fn task_links(&self, task: TaskId) -> StoreResult<Vec<TaskLink>>;
     async fn get_task(&self, id: TaskId) -> StoreResult<Option<Task>>;
+
+    // ---- wake-up: requests, settings and the wake log ----
+
+    /// The project's wake settings; the defaults when it has no row.
+    async fn wake_settings(&self, project: ProjectId) -> StoreResult<ProjectWakeSettings>;
+    /// Inserts or replaces the project's wake settings row.
+    async fn put_wake_settings(
+        &self,
+        s: &ProjectWakeSettings,
+        now: OffsetDateTime,
+    ) -> StoreResult<()>;
+    /// The server-wide switches; both off when never set.
+    async fn server_settings(&self) -> StoreResult<ServerSettings>;
+    async fn put_server_settings(&self, s: &ServerSettings, now: OffsetDateTime)
+    -> StoreResult<()>;
+    /// Appends one row to the wake log.
+    async fn insert_wake_attempt(&self, a: &WakeAttempt) -> StoreResult<()>;
+    /// How many wake-log rows match `q`.
+    async fn count_wake_attempts(&self, q: &AttemptQuery) -> StoreResult<u32>;
+    /// The newest task in `project` with this dedupe key that `from` created at or after
+    /// `since`, whatever its status.
+    async fn find_request(
+        &self,
+        from: AgentId,
+        project: ProjectId,
+        dedupe_key: &str,
+        since: OffsetDateTime,
+    ) -> StoreResult<Option<Task>>;
+    /// Tasks with a dedupe key that `from` created at or after `since`.
+    async fn count_requests_by(&self, from: AgentId, since: OffsetDateTime) -> StoreResult<u32>;
+    /// Tasks in `project` still waiting for approval (status `requested`).
+    async fn count_pending_requests(&self, project: ProjectId) -> StoreResult<u32>;
     /// The extra participating projects listed for `id` (not its home project).
     async fn task_projects(&self, id: TaskId) -> StoreResult<Vec<ProjectId>>;
     /// Tasks matching every set filter field, in `filter.order` (oldest first by default). `project` also matches tasks
@@ -556,6 +590,10 @@ pub struct TransitionRequest {
     /// When the transition makes the task `done`: unblocks, in the same transaction, every
     /// `blocked` task waiting on it (see `UnblockRule`). `None` leaves them alone.
     pub unblock: Option<UnblockRule>,
+    /// Required version: applies only while the task's `version` equals this.
+    pub version: Option<i64>,
+    /// `None` keeps `sanctioned`.
+    pub sanctioned: Option<bool>,
 }
 
 /// Block detail written by a transition. Each `None` keeps the stored value (on entering
@@ -672,6 +710,19 @@ pub fn unblocked_records(
         options: Vec::new(),
     };
     (event, note)
+}
+
+/// Which wake-log rows `Store::count_wake_attempts` counts: `kind` and `outcome` always, and
+/// every set field, from `since` (inclusive) on.
+#[derive(Debug, Clone)]
+pub struct AttemptQuery {
+    pub kind: WakeKind,
+    pub outcome: WakeOutcome,
+    pub session: Option<SessionId>,
+    pub task: Option<TaskId>,
+    pub from_agent: Option<AgentId>,
+    pub triggers: Option<Vec<WakeTrigger>>,
+    pub since: OffsetDateTime,
 }
 
 /// A request to append participating projects to a task (see `Store::add_task_projects`).

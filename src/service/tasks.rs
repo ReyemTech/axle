@@ -1803,6 +1803,8 @@ impl TaskService {
                 archive_plans: g.archive_plans,
                 block: g.block.clone(),
                 unblock: (g.to == Some(TaskStatus::Done)).then(|| self.unblock_rule()),
+                version: None,
+                sanctioned: None,
             };
             if let Some(done) = self.store.transition_task(&req).await? {
                 if g.kind != TaskEventKind::Renewed {
@@ -1898,6 +1900,8 @@ impl TaskService {
                 archive_plans: true,
                 block: None,
                 unblock: None,
+                version: None,
+                sanctioned: None,
             };
             if let Some(done) = self.store.transition_task(&req).await? {
                 self.after_transition(&done, &req.event, None).await;
@@ -2015,6 +2019,8 @@ impl TaskService {
             archive_plans: false,
             block: None,
             unblock: None,
+            version: None,
+            sanctioned: None,
         }
     }
 }
