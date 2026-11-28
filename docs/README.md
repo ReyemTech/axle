@@ -12,7 +12,7 @@ human who runs them.
 
 ## Use
 
-- [MCP tools](mcp-tools.md): the 17 tools an agent can call.
+- [MCP tools](mcp-tools.md): the 18 tools an agent can call.
 - [Web UI](web-ui.md): the board, Needs you, plan approval, the inbox and the admin pages.
 - Harnesses: [Claude Code](harnesses/claude-code.md), [Codex](harnesses/codex.md),
   [OpenCode](harnesses/opencode.md).

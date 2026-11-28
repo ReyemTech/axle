@@ -9,6 +9,8 @@
 
 pub mod project;
 pub mod session_file;
+pub mod sse;
+pub mod wake;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -34,7 +36,7 @@ use tokio::sync::Mutex;
 use self::project::{Env, resolve_project};
 use self::session_file::{SessionFile, SessionInfo};
 use crate::client::{AxlDir, read_token, resolve_server_url};
-use crate::domain::SessionId;
+use crate::domain::{SessionId, WakeChannel};
 use crate::mcp::{
     AxleMcp, HARNESS_HEADER, HOST_HEADER, INSTRUCTIONS, PROJECT_HEADER, SESSION_HEADER, UNKNOWN,
 };
@@ -171,17 +173,31 @@ struct Inner {
     upstream: Mutex<Option<Arc<Upstream>>>,
     /// The last problem logged, so each distinct one is logged once.
     last_problem: StdMutex<Option<String>>,
+    /// Where this harness's hooks record their last turn report (`<harness-pid>.turn`).
+    turn_file: Option<PathBuf>,
+    /// The wake channel the adapter last checked as working (`none` until it is).
+    wake_channel: StdMutex<WakeChannel>,
 }
 
 impl Bridge {
     pub fn new(config: Config) -> Self {
+        let turn_file = config
+            .home
+            .as_deref()
+            .map(|h| session_file::turn_path(h, std::os::unix::process::parent_id()));
         Self {
             inner: Arc::new(Inner {
+                turn_file,
                 config,
                 upstream: Mutex::new(None),
                 last_problem: StdMutex::new(None),
+                wake_channel: StdMutex::new(WakeChannel::None),
             }),
         }
+    }
+
+    fn set_wake_channel(&self, channel: WakeChannel) {
+        *self.inner.wake_channel.lock().expect("channel lock") = channel;
     }
 
     /// Logs `reason` unless it is the problem logged last.
@@ -312,10 +328,28 @@ impl Bridge {
     async fn presence_round(&self, http: &reqwest::Client, registered: bool) -> bool {
         let c = &self.inner.config;
         if registered {
-            match self
-                .post(http, "heartbeat", json!({ "session_id": c.session_id }))
-                .await
-            {
+            // The hooks' last turn report rides along, so one the server missed heals here.
+            let turn = self
+                .inner
+                .turn_file
+                .as_deref()
+                .and_then(session_file::read_turn_at);
+            let mut body = json!({ "session_id": c.session_id });
+            if let Some((turn, at)) = turn {
+                body["turn_state"] = json!(turn);
+                // Sent as written, so the server can drop it if a newer report arrived.
+                if let Some(at) = at.and_then(|at| {
+                    at.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                }) {
+                    body["turn_state_at"] = json!(at);
+                }
+            }
+            let channel = *self.inner.wake_channel.lock().expect("channel lock");
+            if channel != WakeChannel::None {
+                body["wake_channel"] = json!(channel);
+            }
+            match self.post(http, "heartbeat", body).await {
                 Ok(()) => return true,
                 // The server forgot the session (e.g. a fresh database): register again.
                 Err(Rejected::NotFound) => {}
@@ -459,8 +493,10 @@ pub async fn run(harness: &str, stop: impl Future<Output = ()>) {
             }
         }
     };
+    let adapter: Arc<dyn wake::WakeAdapter> = Arc::from(wake::select_adapter(&config));
     let bridge = Bridge::new(config);
     let presence = tokio::spawn(bridge.clone().presence_loop());
+    let wakes = tokio::spawn(wake::wake_loop(bridge.clone(), adapter));
 
     tokio::select! {
         served = serve_stdio(bridge) => {
@@ -471,6 +507,7 @@ pub async fn run(harness: &str, stop: impl Future<Output = ()>) {
         () = stop => {}
     }
     presence.abort();
+    wakes.abort();
     drop(session_file);
 }
 

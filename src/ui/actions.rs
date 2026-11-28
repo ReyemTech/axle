@@ -9,8 +9,10 @@ use serde::Deserialize;
 
 use super::views::{UiError, UiResult};
 use crate::domain::{
-    Actor, Address, Importance, LinkKind, MessageId, ProjectId, TaskId, TokenId, clean_display_name,
+    Actor, Address, Importance, LinkKind, Message, MessageId, MessageKind, ProjectId, TaskId,
+    TokenId, WakeTrigger, clean_display_name,
 };
+use crate::events::Event;
 use crate::http::AppState;
 use crate::service::auth::AuthError;
 use crate::service::messages::{MessageError, NewMessage};
@@ -49,7 +51,8 @@ fn task_error(e: TaskError) -> UiError {
         | TaskError::NoPlanToReview(_)
         | TaskError::PlanChanged
         | TaskError::DuplicateOfDone
-        | TaskError::TooManyLinks(_)) => UiError::Conflict(capitalise(&e.to_string())),
+        | TaskError::TooManyLinks(_)
+        | TaskError::RequestChanged) => UiError::Conflict(capitalise(&e.to_string())),
         e @ (TaskError::SelfLink
         | TaskError::UnknownLinkTarget(_)
         | TaskError::DuplicateTwice
@@ -72,7 +75,8 @@ fn task_error(e: TaskError) -> UiError {
         | TaskError::InvalidLeaseTtl
         | TaskError::ChildExtraProjects
         | TaskError::ChildProjectMismatch
-        | TaskError::InvalidField { .. }) => UiError::Invalid(capitalise(&e.to_string())),
+        | TaskError::InvalidField { .. }
+        | TaskError::Guard(_)) => UiError::Invalid(capitalise(&e.to_string())),
     }
 }
 
@@ -123,13 +127,14 @@ fn subject(raw: &str) -> Option<String> {
 // ---------------------------------------------------------------- tasks
 
 /// The new-task form: `project` (the lead), repeated `also` (other participating projects,
-/// top-level tasks only), `plan_first` (a ticked checkbox sends `on`), `title`, `body` and
-/// `parent`. Parsed by hand because a checkbox list repeats its field name.
+/// top-level tasks only), `plan_first` and `start_now` (a ticked checkbox sends `on`; an
+/// unticked one sends nothing), `title`, `body` and `parent`. Parsed by hand because a checkbox list repeats its field name.
 #[derive(Default)]
 struct CreateTaskForm {
     project: String,
     also: Vec<String>,
     plan_first: bool,
+    start_now: bool,
     title: String,
     body: String,
     parent: String,
@@ -145,6 +150,7 @@ impl CreateTaskForm {
                 "project" => form.project = v,
                 "also" => form.also.push(v),
                 "plan_first" => form.plan_first = v == "on",
+                "start_now" => form.start_now = v == "on",
                 "title" => form.title = v,
                 "body" => form.body = v,
                 "parent" => form.parent = v,
@@ -193,6 +199,7 @@ pub async fn create_task(
                 body: form.body,
                 extra_projects,
                 requires_plan: form.plan_first,
+                start_now: form.start_now,
                 ..NewTask::default()
             },
         )
@@ -266,6 +273,110 @@ pub async fn request_plan_changes(
         &form.back,
         id,
     )
+}
+
+#[derive(Deserialize)]
+pub struct RequestForm {
+    /// The task version the human read; the decision applies only while it is current.
+    /// Required: a form without it is refused rather than decided at version 0.
+    #[serde(default)]
+    version: Option<i64>,
+    #[serde(default)]
+    note: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    back: String,
+}
+
+/// A decision on a request that has since changed says so (409) instead of acting on it.
+fn request_error(e: TaskError) -> UiError {
+    match e {
+        TaskError::RequestChanged => {
+            UiError::Conflict("Nothing was done: this request changed — review it again.".into())
+        }
+        e => task_error(e),
+    }
+}
+
+impl RequestForm {
+    /// The version the human read; a form without one is a 400, so the stale guard cannot
+    /// be skipped.
+    fn version(&self) -> UiResult<i64> {
+        self.version.ok_or(UiError::BadRequest(
+            "Nothing was done: the form has no version.",
+        ))
+    }
+}
+
+/// The human approves work request `id` as they read it; it is routed or queued.
+pub async fn approve_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<RequestForm>,
+) -> UiResult<Response> {
+    let id = task_id(&id)?;
+    state
+        .tasks
+        .approve_request(id, form.version()?)
+        .await
+        .map_err(request_error)?;
+    Ok(see_other(&back_to(&form.back, id)))
+}
+
+/// The human declines work request `id`, with an optional note to the requester.
+pub async fn decline_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<RequestForm>,
+) -> UiResult<Response> {
+    let id = task_id(&id)?;
+    state
+        .tasks
+        .decline_request(id, form.version()?, Some(&form.note))
+        .await
+        .map_err(request_error)?;
+    Ok(see_other(&back_to(&form.back, id)))
+}
+
+/// The human answers the requester in the request's thread. The request stays pending; the
+/// requester's agent is woken to read the answer. (A requested task has no owner, so the
+/// thread post itself wakes nobody.)
+pub async fn reply_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<RequestForm>,
+) -> UiResult<Response> {
+    let id = task_id(&id)?;
+    form.version()?;
+    required_body(&form.body)?;
+    let task = state
+        .store
+        .get_task(id)
+        .await?
+        .ok_or(UiError::NotFound("No such task."))?;
+    state
+        .messages
+        .send_as_human(NewMessage {
+            to: Address::Task(id),
+            subject: None,
+            body: form.body,
+            importance: Importance::Normal,
+            reply_to: None,
+        })
+        .await
+        .map_err(message_error)?;
+    if let Some(requester) = task.created_by.ids().0 {
+        // The reply is saved; a failed wake is logged, never shown as a failed reply.
+        if let Err(e) = state
+            .wake
+            .wake_agent(requester, WakeTrigger::HumanReply)
+            .await
+        {
+            eprintln!("axl: failed to wake the requester of request {id}: {e}");
+        }
+    }
+    Ok(see_other(&back_to(&form.back, id)))
 }
 
 #[derive(Deserialize)]
@@ -640,6 +751,111 @@ pub async fn rename_project(
         Err(StoreError::NotFound(_)) => Err(UiError::NotFound("No such project.")),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Writes a thread-less system note to the human's inbox (and tells the live UI).
+async fn human_note(state: &AppState, project: Option<ProjectId>, body: String) -> UiResult<()> {
+    let message = Message {
+        id: MessageId::new(),
+        project_id: project,
+        from: Actor::Human,
+        to: Address::Human,
+        subject: None,
+        body,
+        importance: Importance::Normal,
+        task_id: None,
+        reply_to: None,
+        created_at: state.clock.now(),
+        kind: MessageKind::System,
+        options: Vec::new(),
+    };
+    state.store.insert_message(&message, None).await?;
+    state
+        .bus
+        .emit(Event::MessageCreated {
+            id: message.id,
+            to: message.to,
+            project_id: message.project_id,
+        })
+        .await;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct AutoStartForm {
+    /// A ticked checkbox sends `on`; an unticked one sends nothing.
+    #[serde(default)]
+    auto_start: String,
+}
+
+/// Turns a project's auto-start of peers' work requests on or off. A change writes a system
+/// note; saving the current state again does not.
+pub async fn set_auto_start(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<AutoStartForm>,
+) -> UiResult<Response> {
+    let id: ProjectId = id
+        .parse()
+        .map_err(|_| UiError::NotFound("No such project."))?;
+    let project = state
+        .store
+        .get_project(id)
+        .await?
+        .ok_or(UiError::NotFound("No such project."))?;
+    let on = form.auto_start == "on";
+    let mut settings = state.store.wake_settings(id).await?;
+    if settings.auto_start != on {
+        settings.auto_start = on;
+        state
+            .store
+            .put_wake_settings(&settings, state.clock.now())
+            .await?;
+        let word = if on { "on" } else { "off" };
+        human_note(
+            &state,
+            Some(id),
+            format!("Auto-start turned {word} for {}", project.display_name),
+        )
+        .await?;
+    }
+    Ok(see_other("/ui/projects"))
+}
+
+#[derive(Deserialize)]
+pub struct WakePauseForm {
+    /// `on` pauses wake-ups; anything else resumes them.
+    #[serde(default)]
+    pause: String,
+}
+
+/// The wake-up kill switch. Resuming places the work that queued up meanwhile.
+pub async fn set_wake_paused(
+    State(state): State<AppState>,
+    Form(form): Form<WakePauseForm>,
+) -> UiResult<Response> {
+    let pause = form.pause == "on";
+    let mut settings = state.store.server_settings().await?;
+    if settings.wake_paused != pause {
+        settings.wake_paused = pause;
+        state
+            .store
+            .put_server_settings(&settings, state.clock.now())
+            .await?;
+        let note = if pause {
+            "Wake-ups paused"
+        } else {
+            "Wake-ups resumed"
+        };
+        human_note(&state, None, note.into()).await?;
+        if !pause {
+            // The settings are saved; a failed placement is logged, the ticker retries.
+            if let Err(e) = state.wake.place_queued().await {
+                eprintln!("axl: failed to place queued work after resuming wake-ups: {e}");
+            }
+        }
+    }
+    Ok(see_other("/ui/"))
 }
 
 pub async fn revoke_token(

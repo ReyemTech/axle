@@ -15,8 +15,9 @@ use crate::config::Backend;
 use crate::domain::{
     Actor, Address, Agent, AgentId, Billing, BlockDetail, Enrollment, EnrollmentId, EnrollmentKind,
     Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState, Project,
-    ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus,
-    TokenId, TokenInfo, UsageId, WaitingOn,
+    ProjectId, ProjectWakeSettings, ServerSettings, Session, SessionId, Task, TaskEvent,
+    TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, TurnState, UsageId, WaitingOn,
+    WakeAttempt, WakeChannel, WakeKind, WakeOutcome, WakeTrigger,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +34,11 @@ pub enum StoreError {
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
+
+/// A stored count or limit as `u32`.
+fn to_u32(n: i64) -> StoreResult<u32> {
+    u32::try_from(n).map_err(|_| StoreError::Corrupt(format!("{n} out of range")))
+}
 
 /// A new enrollment row; `secret_hash` / `user_code_hash` are SHA-256 hex of the secrets.
 #[derive(Debug, Clone)]
@@ -214,14 +220,21 @@ pub trait Store: Send + Sync {
     /// message of its thread in one transaction. `token` is the writer's token. A child task is
     /// refused (nothing written, `false`) while its parent is `planning`: the parent's status
     /// is read under the write lock, so the check and the insert are atomic.
+    ///
+    /// `cover` is the session the covering rule sanctions a child for: when `Some`, the child
+    /// keeps `task.sanctioned` only if, under the same lock, its parent is still sanctioned,
+    /// past its plan gate and held by that session (`planning`, `claimed`, `blocked` or
+    /// `review`); otherwise it is written pull-only (`sanctioned = false`). The outcome says
+    /// which was written.
     async fn insert_task(
         &self,
         task: &Task,
         extra_projects: &[ProjectId],
+        cover: Option<SessionId>,
         token: Option<TokenId>,
         event: &TaskEvent,
         first_message: &Message,
-    ) -> StoreResult<bool>;
+    ) -> StoreResult<TaskInsert>;
     /// Appends participating projects to a top-level task, in one transaction: locks the task,
     /// applies only if it has no parent, is not `done` / `cancelled` and `req.editor` is `None`
     /// (the human), its creator or the session holding it. Projects already listed are skipped;
@@ -254,6 +267,126 @@ pub trait Store: Send + Sync {
     /// Every link of `task`, whichever way it points, oldest first.
     async fn task_links(&self, task: TaskId) -> StoreResult<Vec<TaskLink>>;
     async fn get_task(&self, id: TaskId) -> StoreResult<Option<Task>>;
+
+    // ---- wake-up: requests, settings and the wake log ----
+
+    /// The project's wake settings; the defaults when it has no row.
+    async fn wake_settings(&self, project: ProjectId) -> StoreResult<ProjectWakeSettings>;
+    /// Inserts or replaces the project's wake settings row.
+    async fn put_wake_settings(
+        &self,
+        s: &ProjectWakeSettings,
+        now: OffsetDateTime,
+    ) -> StoreResult<()>;
+    /// The server-wide switches; both off when never set.
+    async fn server_settings(&self) -> StoreResult<ServerSettings>;
+    async fn put_server_settings(&self, s: &ServerSettings, now: OffsetDateTime)
+    -> StoreResult<()>;
+    /// Appends one row to the wake log.
+    async fn insert_wake_attempt(&self, a: &WakeAttempt) -> StoreResult<()>;
+    /// The newest `sent` wake (kind `wake`) to `session`, if any: what a later outcome row
+    /// for the same wake (claimed, expired, delivered, failed) takes its trigger from.
+    async fn last_wake_sent(&self, session: SessionId) -> StoreResult<Option<WakeAttempt>>;
+    /// How many wake-log rows match `q`.
+    async fn count_wake_attempts(&self, q: &AttemptQuery) -> StoreResult<u32>;
+    /// The newest task in `project` with this dedupe key that `from` created at or after
+    /// `since`, whatever its status.
+    async fn find_request(
+        &self,
+        from: AgentId,
+        project: ProjectId,
+        dedupe_key: &str,
+        since: OffsetDateTime,
+    ) -> StoreResult<Option<Task>>;
+    /// Tasks with a dedupe key that `from` created at or after `since`.
+    async fn count_requests_by(&self, from: AgentId, since: OffsetDateTime) -> StoreResult<u32>;
+    /// When the oldest of the tasks `count_requests_by(from, since)` counts was created.
+    async fn oldest_request_by(
+        &self,
+        from: AgentId,
+        since: OffsetDateTime,
+    ) -> StoreResult<Option<OffsetDateTime>>;
+    /// Tasks in `project` still waiting for approval (status `requested`).
+    async fn count_pending_requests(&self, project: ProjectId) -> StoreResult<u32>;
+    /// Admits a work request in one guarded transaction (SQLite's write lock, Postgres under
+    /// `TASK_LOCK`), so concurrent requests see one another: the newest task with `task`'s
+    /// dedupe key that its creating agent made in `task.project_id` at or after
+    /// `admit.dedupe_since` is returned as it stands; else the creator's requests since
+    /// `admit.rate_since` against `admit.per_hour`, then the project's `requested` tasks against
+    /// `admit.pending_cap`; else (and only while a parent is not `planning`) the task, its
+    /// event and first message are written. `task` must carry a dedupe key and an agent
+    /// creator.
+    async fn insert_request(
+        &self,
+        task: &Task,
+        token: Option<TokenId>,
+        event: &TaskEvent,
+        first_message: &Message,
+        admit: &RequestAdmission,
+    ) -> StoreResult<RequestInsert>;
+    // ---- wake-up: turn state, reservations and the queue ----
+
+    /// Records what `session`'s harness reports: `state` and `channel` are each kept when
+    /// `None`, and `turn_state_at` moves to `now` only when the state changes. Reporting
+    /// `Busy` clears a reservation that has no task (a wake to read the inbox was delivered)
+    /// and returns the session; reservations for a task are cleared by the claim. `NotFound`
+    /// for an unknown session.
+    async fn report_turn(
+        &self,
+        session: SessionId,
+        state: Option<TurnState>,
+        channel: Option<WakeChannel>,
+        now: OffsetDateTime,
+    ) -> StoreResult<Option<SessionId>> {
+        self.report_turn_at(session, state, channel, None, now)
+            .await
+    }
+    /// [`Self::report_turn`] for a report the harness made at `reported_at` (its own clock,
+    /// so only compared with its other reports). A state reported before the stored report's
+    /// time is ignored, guarded in the write, so a heartbeat carrying an old turn file cannot
+    /// undo a newer hook report; the channel still applies. A report with no time (an older
+    /// client) always applies and leaves the stored time as it is.
+    async fn report_turn_at(
+        &self,
+        session: SessionId,
+        state: Option<TurnState>,
+        channel: Option<WakeChannel>,
+        reported_at: Option<OffsetDateTime>,
+        now: OffsetDateTime,
+    ) -> StoreResult<Option<SessionId>>;
+    /// Reserves the session for one wake with a single guarded write; `false` when the
+    /// session is not free (see `Reservation`) or another reserver won the race.
+    async fn reserve_session(&self, r: &Reservation) -> StoreResult<bool>;
+    /// Clears every reservation pointing at `task` and returns those sessions.
+    async fn clear_task_reservations(&self, task: TaskId) -> StoreResult<Vec<SessionId>>;
+    /// Clears `session`'s own reservation when it carries no task or carries `task`, with one
+    /// guarded write; `false` when the session holds no such reservation.
+    async fn clear_session_reservation(
+        &self,
+        session: SessionId,
+        task: Option<TaskId>,
+    ) -> StoreResult<bool>;
+    /// Clears every reservation with `wake_until <= now` and returns each session with the
+    /// task it was reserved for.
+    async fn expire_reservations(
+        &self,
+        now: OffsetDateTime,
+    ) -> StoreResult<Vec<(SessionId, Option<TaskId>)>>;
+    /// Sessions that are live (heartbeat at or after `live_since`), idle since at or before
+    /// `idle_before`, wakeable and not reserved at `now`, with their agents: never-woken
+    /// first, then least recently woken, then idle the longest. Leases, eligibility and the
+    /// requester are the router's to filter.
+    async fn wake_candidates(
+        &self,
+        live_since: OffsetDateTime,
+        idle_before: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> StoreResult<Vec<(Agent, Session)>>;
+    /// Sanctioned tasks waiting for a session: `open`, or `claimed` / `planning` with a lease
+    /// expired at `now`, and no unexpired reservation pointing at them. FIFO by the latest
+    /// `queued` event (else the lease expiry, else creation), then id.
+    async fn list_queued(&self, now: OffsetDateTime) -> StoreResult<Vec<Task>>;
+
     /// The extra participating projects listed for `id` (not its home project).
     async fn task_projects(&self, id: TaskId) -> StoreResult<Vec<ProjectId>>;
     /// Tasks matching every set filter field, in `filter.order` (oldest first by default). `project` also matches tasks
@@ -266,6 +399,10 @@ pub trait Store: Send + Sync {
     /// or not done are skipped (their descendants too). Returns the ids newly acked.
     async fn ack_done_tasks(&self, ids: &[TaskId], now: OffsetDateTime)
     -> StoreResult<Vec<TaskId>>;
+    /// Appends `event` to its task's history and nothing else: the task row (status,
+    /// `version`, `updated_at`) is untouched and a child's event is not bubbled to its
+    /// parent. For Axle's own notes (`queued`, `routed`, `wake_sent`, `wake_failed`).
+    async fn append_task_event(&self, event: &TaskEvent) -> StoreResult<()>;
     /// A task's history, oldest first.
     async fn task_events(&self, id: TaskId) -> StoreResult<Vec<TaskEvent>>;
     /// A page of a task's history, newest first: only events of `kind` when set, and only
@@ -657,6 +794,21 @@ pub fn send_time_recipient(to: &Address) -> Option<(Option<AgentId>, Option<Sess
     }
 }
 
+/// Whether `claimant` may claim `task`, whose extra participating projects are
+/// `extra_projects`: the task's harness and host filters (when set) match exactly, and the
+/// claimant's home project is the task's home project or one of the extra ones. A claimant
+/// with no home project is never eligible. The claim (both stores) and the wake router use
+/// this one rule.
+pub fn eligible(task: &Task, extra_projects: &[ProjectId], claimant: &Claimant) -> bool {
+    let matches =
+        |filter: &Option<String>, value: &str| filter.as_deref().is_none_or(|f| f == value);
+    matches(&task.eligibility.harness, &claimant.harness)
+        && matches(&task.eligibility.host, &claimant.host)
+        && claimant
+            .project
+            .is_some_and(|p| p == task.project_id || extra_projects.contains(&p))
+}
+
 /// The caller of a claim, with everything the eligibility guard needs.
 #[derive(Debug, Clone)]
 pub struct Claimant {
@@ -667,6 +819,43 @@ pub struct Claimant {
     pub project: Option<ProjectId>,
     pub harness: String,
     pub host: String,
+}
+
+/// The admission limits [`Store::insert_request`] applies.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestAdmission {
+    /// A request with the same dedupe key created at or after this is returned instead.
+    pub dedupe_since: OffsetDateTime,
+    /// The start of the creator's rate window.
+    pub rate_since: OffsetDateTime,
+    /// Requests the creator may make per rate window.
+    pub per_hour: u32,
+    /// `requested` tasks a project may hold.
+    pub pending_cap: u32,
+}
+
+/// What [`Store::insert_task`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskInsert {
+    /// The task was written, with this `sanctioned` value.
+    Inserted { sanctioned: bool },
+    /// The parent is `planning`; nothing was written.
+    ParentPlanning,
+}
+
+/// What [`Store::insert_request`] did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RequestInsert {
+    /// The request was written.
+    Inserted,
+    /// A request with the same dedupe key exists; nothing was written.
+    Existing(Box<Task>),
+    /// The creator is at its hourly rate; `oldest` is its oldest request in the window.
+    TooMany { oldest: OffsetDateTime },
+    /// The project holds `pending_cap` requests waiting for approval.
+    ProjectFull,
+    /// The parent is `planning`; nothing was written.
+    ParentPlanning,
 }
 
 #[derive(Debug, Clone)]
@@ -731,6 +920,10 @@ pub struct TransitionRequest {
     /// When the transition makes the task `done`: unblocks, in the same transaction, every
     /// `blocked` task waiting on it (see `UnblockRule`). `None` leaves them alone.
     pub unblock: Option<UnblockRule>,
+    /// Required version: applies only while the task's `version` equals this.
+    pub version: Option<i64>,
+    /// `None` keeps `sanctioned`.
+    pub sanctioned: Option<bool>,
 }
 
 /// Block detail written by a transition. Each `None` keeps the stored value (on entering
@@ -847,6 +1040,37 @@ pub fn unblocked_records(
         options: Vec::new(),
     };
     (event, note)
+}
+
+/// One guarded reservation of a session for a wake (`Store::reserve_session`). It applies
+/// only while the session is wakeable, `idle` since at or before `idle_before`, heartbeating
+/// at or after `live_since` and unreserved at `now`; with `new_job` the session must also own
+/// no task in `planning`, `claimed`, `blocked` or `review`. It sets `wake_task_id = task`,
+/// `wake_until = until` and `last_woken_at = now`.
+#[derive(Debug, Clone)]
+pub struct Reservation {
+    pub session: SessionId,
+    /// `None`: a wake with no task (to read the inbox).
+    pub task: Option<TaskId>,
+    pub now: OffsetDateTime,
+    pub until: OffsetDateTime,
+    pub live_since: OffsetDateTime,
+    pub idle_before: OffsetDateTime,
+    /// A wake for work the session does not already hold.
+    pub new_job: bool,
+}
+
+/// Which wake-log rows `Store::count_wake_attempts` counts: `kind` and `outcome` always, and
+/// every set field, from `since` (inclusive) on.
+#[derive(Debug, Clone)]
+pub struct AttemptQuery {
+    pub kind: WakeKind,
+    pub outcome: WakeOutcome,
+    pub session: Option<SessionId>,
+    pub task: Option<TaskId>,
+    pub from_agent: Option<AgentId>,
+    pub triggers: Option<Vec<WakeTrigger>>,
+    pub since: OffsetDateTime,
 }
 
 /// A request to append participating projects to a task (see `Store::add_task_projects`).
@@ -1135,7 +1359,7 @@ pub fn child_event(child: &Task, parent: TaskId, source: &TaskEvent) -> Option<T
         TaskEventKind::Claimed | TaskEventKind::LeaseExpiredTakeover => TaskEventKind::ChildClaimed,
         TaskEventKind::Blocked => TaskEventKind::ChildBlocked,
         TaskEventKind::Done => TaskEventKind::ChildDone,
-        TaskEventKind::Cancelled => TaskEventKind::ChildCancelled,
+        TaskEventKind::Cancelled | TaskEventKind::RequestDeclined => TaskEventKind::ChildCancelled,
         _ => return None,
     };
     Some(TaskEvent {
@@ -1154,7 +1378,10 @@ pub fn child_event(child: &Task, parent: TaskId, source: &TaskEvent) -> Option<T
 
 /// Whether a child event can be the one that finishes the last open child.
 pub fn closes_child(source: &TaskEvent) -> bool {
-    matches!(source.kind, TaskEventKind::Done | TaskEventKind::Cancelled)
+    matches!(
+        source.kind,
+        TaskEventKind::Done | TaskEventKind::Cancelled | TaskEventKind::RequestDeclined
+    )
 }
 
 /// The event recorded on a parent whose children are all `done` / `cancelled`.

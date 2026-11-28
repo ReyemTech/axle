@@ -20,6 +20,7 @@ variables.
 | `AXL_RATE_LIMIT_PER_SEC` | `20` | Sustained requests per second, per agent token. Must be a positive whole number. |
 | `AXL_RATE_LIMIT_BURST` | `100` | Burst size, per agent token. Must be a positive whole number. |
 | `AXL_DONE_AUTO_ACK_DAYS` | `7` | Days a finished task stays on the board's Done column before it counts as auto-acked. A positive whole number. |
+| `AXL_WAKE_MAX_DEPTH` | `2` | Longest chain of work requests: a request raised while working on a request counts one deeper. A request past the limit, or one that would loop back to a project already in its chain, is refused. A positive whole number. |
 | `AXL_PRICES_FILE` | unset | A TOML file of API prices merged over the built-in table (see [Prices](#prices)). A file that cannot be read or parsed stops the server at start. Blank means unset. |
 
 Invalid values stop the server at start with a message naming the variable, for example
@@ -42,6 +43,11 @@ These are not configurable yet:
 | Enrollment and device-login requests | 10 per minute per client IP |
 | One-time code lifetime | 15 minutes, single use |
 | Device login lifetime | 10 minutes, polled every 7 seconds |
+| Wakes per session | 1 per minute and 30 per hour |
+| Wakes of one session about the same task | 1 per 5 minutes |
+| A woken session's reservation (time to claim) | 2 minutes |
+| A session counts as idle after reporting idle for | 5 seconds |
+| Wake ticker (expire reservations, place queued work) | every 15 seconds |
 
 ### Prices
 

@@ -23,6 +23,15 @@
       <input id="name-{{ p.id }}" name="display_name" value="{{ p.name }}" maxlength="{{ max }}" required>
       <button type="submit" class="secondary">Rename</button>
     </form>
+    <details class="wake-panel">
+      <summary>Wake-ups{% if p.auto_start %} · auto-start on{% else %} · auto-start off{% endif %}</summary>
+      <form class="inline-form" method="post" action="/ui/projects/{{ p.id }}/wake">
+        <input type="hidden" name="csrf" value="{{ token }}">
+        <label class="check"><input type="checkbox" name="auto_start" value="on"{% if p.auto_start %} checked{% endif %}> Auto-start work requests from other agents</label>
+        <p class="hint">Peers can start work here without asking you. Changes still land on branches and PRs you merge.</p>
+        <button type="submit" class="secondary">Save wake-ups</button>
+      </form>
+    </details>
     {% endif %}
   </li>
 {% endfor %}

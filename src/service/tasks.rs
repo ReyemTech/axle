@@ -12,16 +12,20 @@ use crate::clock::Clock;
 use crate::config::ServerConfig;
 use crate::domain::{
     Actor, Address, AgentId, Eligibility, Importance, LinkKind, Message, MessageId, MessageKind,
-    PlanState, ProjectId, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus,
-    TokenId, WaitingOn,
+    PlanState, ProjectId, RequestState, SessionId, Task, TaskEvent, TaskEventKind, TaskId,
+    TaskLink, TaskStatus, TokenId, WaitingOn, WakeTrigger,
 };
 use crate::events::{Event, EventBus};
 use crate::service::identity::{IdentityError, NAME_MAX, Resolved, check_label};
 use crate::service::messages::{MessageError, SUBJECT_MAX, check_body, check_subject};
+use crate::service::wake::guards::{
+    self, DEDUPE_WINDOW, GuardError, Lineage, PENDING_PER_PROJECT, REQUESTS_PER_HOUR,
+};
+use crate::service::wake::{HELD, RouteOutcome, WakeService, held_origin};
 use crate::store::{
     AddProjectsRequest, BlockWrite, ClaimRequest, Claimant, EditRequest, LeaseUpdate, MoveRequest,
-    Moved, RelateRequest, Related, Store, StoreError, TaskFilter, TransitionRequest, Transitioned,
-    UnblockRule, claim_event,
+    Moved, RelateRequest, Related, RequestAdmission, RequestInsert, Store, StoreError, TaskFilter,
+    TaskInsert, TransitionRequest, Transitioned, UnblockRule, claim_event,
 };
 
 /// The most links one task may have (both directions count).
@@ -80,6 +84,55 @@ pub struct NewTask {
     /// The plan gate: claiming moves it to `planning`, and the human approves a plan before
     /// the work starts.
     pub requires_plan: bool,
+    /// The human's **Start now**: the task is sanctioned and routed at once. Only the UI's
+    /// New task form sets it; an agent's create ignores it.
+    pub start_now: bool,
+}
+
+/// A work request: a task another agent asks for in `project_id` (see `TaskService::request`).
+#[derive(Debug, Clone)]
+pub struct NewRequest {
+    pub project_id: ProjectId,
+    pub title: String,
+    pub body: String,
+    pub eligibility: Eligibility,
+    /// The importance of the request's first thread message.
+    pub importance: Importance,
+    pub parent_id: Option<TaskId>,
+}
+
+/// A work request and where it stands.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestOutcome {
+    pub task: Task,
+    pub state: RequestState,
+}
+
+/// The request columns of a task being inserted.
+struct RequestRow {
+    status: TaskStatus,
+    sanctioned: bool,
+    lineage: Lineage,
+    dedupe_key: String,
+    importance: Importance,
+    /// The dedupe window and caps the store re-checks under its write lock.
+    admission: RequestAdmission,
+    /// The target project's key, for the pending-cap refusal.
+    project_key: String,
+}
+
+/// What [`TaskService::insert`] did: wrote the task, or found the request it duplicates.
+enum Inserted {
+    New(Task),
+    Existing(Task),
+}
+
+impl Inserted {
+    fn task(self) -> Task {
+        match self {
+            Self::New(t) | Self::Existing(t) => t,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -105,6 +158,8 @@ pub enum ClaimOutcome {
     NotFound,
     /// The task is `done` or `cancelled`.
     Closed(TaskStatus),
+    /// The task is a work request the human has not approved yet.
+    AwaitingApproval,
 }
 
 /// How far a parent's direct children have got.
@@ -273,6 +328,13 @@ pub enum TaskError {
          ancestors; a task cannot wait on its own ancestor, so re-point or clear that wait first"
     )]
     MoveMakesAncestorWait { task: TaskId, title: String },
+    /// The decision named a request version that has since moved (or it is no longer a
+    /// request).
+    #[error("this request changed — review it again")]
+    RequestChanged,
+    /// A loop or abuse guard refused a work request.
+    #[error(transparent)]
+    Guard(#[from] GuardError),
     /// The task body is over the message cap, or a promoted message does not exist.
     #[error(transparent)]
     Message(#[from] MessageError),
@@ -288,7 +350,18 @@ pub struct TaskService {
     /// A session is stale (open to same-agent takeover) after this long without a heartbeat.
     presence_stale: Duration,
     events: Option<EventBus>,
+    /// Routes auto-started and approved work requests; `None` leaves them queued.
+    wake: Option<Arc<WakeService>>,
+    /// Deepest allowed chain of work requests (`AXL_WAKE_MAX_DEPTH`).
+    wake_max_depth: u32,
 }
+
+/// How far back a requester's requests count toward `REQUESTS_PER_HOUR`.
+const REQUEST_RATE_WINDOW: Duration = Duration::HOUR;
+/// The depth limit when no config sets one.
+const DEFAULT_WAKE_MAX_DEPTH: u32 = 2;
+/// The thread note when the human declines a request without a note.
+const DECLINED_NOTE: &str = "The human declined this request.";
 
 /// A guarded write that agents retry only when a re-read says the guard should now pass.
 const MAX_GUARD_RETRIES: usize = 3;
@@ -388,8 +461,10 @@ fn may_change(by: Caller<'_>, task: &Task) -> bool {
     }
 }
 
-/// The statuses a task can be cancelled from.
-const CANCELLABLE: [TaskStatus; 5] = [
+/// The statuses a task can be cancelled from (a pending request included, so its requester
+/// can withdraw it).
+const CANCELLABLE: [TaskStatus; 6] = [
+    TaskStatus::Requested,
     TaskStatus::Open,
     TaskStatus::Planning,
     TaskStatus::Claimed,
@@ -420,7 +495,15 @@ impl TaskService {
             idle_renew_cap,
             presence_stale,
             events: None,
+            wake: None,
+            wake_max_depth: DEFAULT_WAKE_MAX_DEPTH,
         }
+    }
+
+    /// Routes auto-started and approved work requests through `wake`.
+    pub fn with_wake(mut self, wake: Arc<WakeService>) -> Self {
+        self.wake = Some(wake);
+        self
     }
 
     /// Publishes `TaskChanged` on `bus` after every status change (creation, claims and the
@@ -431,19 +514,22 @@ impl TaskService {
     }
 
     pub fn from_config(store: Arc<dyn Store>, clock: Arc<dyn Clock>, cfg: &ServerConfig) -> Self {
-        Self::new(
-            store,
-            clock,
-            cfg.lease_ttl,
-            cfg.idle_renew_cap,
-            cfg.presence_stale,
-        )
+        Self {
+            wake_max_depth: cfg.wake_max_depth,
+            ..Self::new(
+                store,
+                clock,
+                cfg.lease_ttl,
+                cfg.idle_renew_cap,
+                cfg.presence_stale,
+            )
+        }
     }
 
     /// Creates an open task; its body becomes the first message of its thread (same
     /// transaction).
     pub async fn create(&self, by: Caller<'_>, new: NewTask) -> Result<Task, TaskError> {
-        self.insert(by, new, None).await
+        Ok(self.insert(by, new, None, None).await?.task())
     }
 
     /// Promotes a message to a task. An empty title defaults to the message's subject (else
@@ -471,7 +557,175 @@ impl TaskService {
         if new.body.trim().is_empty() {
             new.body = message.body;
         }
-        self.insert(by, new, Some(source)).await
+        Ok(self.insert(by, new, Some(source), None).await?.task())
+    }
+
+    /// Asks for work in another project as `caller` (spec "Work requests"). In order: checks
+    /// the title and body; returns an identical request (same sender, project and normalised
+    /// title) from the last 10 minutes as it stands; applies the hourly rate and the target's
+    /// pending cap; computes the lineage from the caller session's held task with the highest
+    /// `request_depth` and refuses a request too deep or looping back. The task is inserted
+    /// `requested`, or `open` and sanctioned in a project with auto-start on, where it is
+    /// routed at once (never to the caller's own agent).
+    pub async fn request(
+        &self,
+        caller: &Resolved,
+        new: NewRequest,
+    ) -> Result<RequestOutcome, TaskError> {
+        check_body(&new.body)?;
+        check_subject("title", &new.title)?;
+        check_eligibility(&new.eligibility)?;
+        let project = self
+            .store
+            .get_project(new.project_id)
+            .await?
+            .ok_or(TaskError::UnknownProject)?;
+        let from = caller.agent.id;
+        let now = self.clock.now();
+        let key = guards::dedupe_key(from, project.id, &new.title);
+        // A fast path: `insert_request` re-runs the dedupe lookup and both caps with the
+        // insert, under the store's write lock, so overlapping requests cannot pass them.
+        if let Some(task) = self
+            .store
+            .find_request(from, project.id, &key, now - DEDUPE_WINDOW)
+            .await?
+        {
+            let state = self.request_state(&task).await?;
+            return Ok(RequestOutcome { task, state });
+        }
+        let since = now - REQUEST_RATE_WINDOW;
+        if self.store.count_requests_by(from, since).await? >= REQUESTS_PER_HOUR {
+            let oldest = self
+                .store
+                .oldest_request_by(from, since)
+                .await?
+                .unwrap_or(now);
+            return Err(GuardError::TooMany {
+                minutes: minutes_until(oldest + REQUEST_RATE_WINDOW, now),
+            }
+            .into());
+        }
+        if self.store.count_pending_requests(project.id).await? >= PENDING_PER_PROJECT {
+            return Err(GuardError::ProjectFull(project.key).into());
+        }
+        let lineage = guards::lineage_of(self.origin_of(caller).await?.as_ref());
+        guards::check_lineage(&lineage, project.id, &project.key, self.wake_max_depth)?;
+        let auto_start = self.store.wake_settings(project.id).await?.auto_start;
+        let row = RequestRow {
+            status: if auto_start {
+                TaskStatus::Open
+            } else {
+                TaskStatus::Requested
+            },
+            sanctioned: auto_start,
+            lineage,
+            dedupe_key: key,
+            importance: new.importance,
+            admission: RequestAdmission {
+                dedupe_since: now - DEDUPE_WINDOW,
+                rate_since: since,
+                per_hour: REQUESTS_PER_HOUR,
+                pending_cap: PENDING_PER_PROJECT,
+            },
+            project_key: project.key.clone(),
+        };
+        let inserted = self
+            .insert(
+                Caller::Agent(caller),
+                NewTask {
+                    project_id: project.id,
+                    parent_id: new.parent_id,
+                    title: new.title,
+                    body: new.body,
+                    eligibility: new.eligibility,
+                    ..NewTask::default()
+                },
+                None,
+                Some(row),
+            )
+            .await?;
+        let task = match inserted {
+            Inserted::New(task) => task,
+            Inserted::Existing(task) => {
+                let state = self.request_state(&task).await?;
+                return Ok(RequestOutcome { task, state });
+            }
+        };
+        let state = if auto_start {
+            self.route(&task, WakeTrigger::AutoStart, Some(from)).await
+        } else {
+            RequestState::AwaitingHuman
+        };
+        self.emit(Event::RequestCreated {
+            request: task.id,
+            project_id: task.project_id,
+            state,
+        })
+        .await;
+        Ok(RequestOutcome { task, state })
+    }
+
+    /// The human approves work request `id` at `version` (the one they read): guarded
+    /// `requested -> open` and sanctioned, then routed (never to the requester's agent). A
+    /// system note in the thread says where it went. `RequestChanged` when the version moved
+    /// or it is no longer a request.
+    pub async fn approve_request(
+        &self,
+        id: TaskId,
+        version: i64,
+    ) -> Result<(Task, RequestState), TaskError> {
+        let task = self
+            .decide_request(
+                id,
+                version,
+                TaskStatus::Open,
+                Some(true),
+                TaskEventKind::RequestApproved,
+                None,
+            )
+            .await?;
+        let requester = task.created_by.ids().0;
+        let state = self
+            .route(&task, WakeTrigger::RequestApproved, requester)
+            .await;
+        let body = match state {
+            RequestState::Routed => match self.reserved_agent(&task).await {
+                Some(label) => format!("routed to {label}"),
+                None => "routed".to_string(),
+            },
+            _ => "queued".to_string(),
+        };
+        let note = self.request_note(&task, "request approved", body);
+        match self.store.insert_message(&note, None).await {
+            Ok(()) => self.message_created(&note).await,
+            Err(e) => eprintln!("axl: failed to note the approval of request {id}: {e}"),
+        }
+        Ok((task, state))
+    }
+
+    /// The human declines work request `id` at `version`: guarded `requested -> cancelled`
+    /// with a thread note to the requester (`note`, else a default). Nobody is woken.
+    pub async fn decline_request(
+        &self,
+        id: TaskId,
+        version: i64,
+        note: Option<&str>,
+    ) -> Result<Task, TaskError> {
+        let body = note
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .unwrap_or(DECLINED_NOTE)
+            .to_string();
+        check_body(&body)?;
+        self.decide_request(
+            id,
+            version,
+            TaskStatus::Cancelled,
+            None,
+            TaskEventKind::RequestDeclined,
+            Some(body),
+        )
+        .await
     }
 
     async fn insert(
@@ -479,7 +733,8 @@ impl TaskService {
         by: Caller<'_>,
         new: NewTask,
         reply_to: Option<MessageId>,
-    ) -> Result<Task, TaskError> {
+        request: Option<RequestRow>,
+    ) -> Result<Inserted, TaskError> {
         check_body(&new.body)?;
         check_subject("title", &new.title)?;
         check_eligibility(&new.eligibility)?;
@@ -488,21 +743,22 @@ impl TaskService {
             Some(d) => Some(Duration::seconds(d.whole_seconds())),
             None => None,
         };
+        let mut parent = None;
         if let Some(parent_id) = new.parent_id {
             if !new.extra_projects.is_empty() {
                 return Err(TaskError::ChildExtraProjects);
             }
-            let parent = self
+            let p = self
                 .store
                 .get_task(parent_id)
                 .await?
                 .ok_or(TaskError::NotFound)?;
-            if parent.status == TaskStatus::Planning {
-                return Err(TaskError::PlanNotApproved(parent.plan_state));
+            if p.status == TaskStatus::Planning {
+                return Err(TaskError::PlanNotApproved(p.plan_state));
             }
             // A task's projects are only ever added to, so checking outside the insert is
             // safe (the store re-checks the parent's status under its lock).
-            if parent.project_id != new.project_id
+            if p.project_id != new.project_id
                 && !self
                     .store
                     .task_projects(parent_id)
@@ -511,9 +767,26 @@ impl TaskService {
             {
                 return Err(TaskError::ChildProjectMismatch);
             }
+            parent = Some(p);
         }
+        // What routes the task once it is written (spec "Trigger rules"): the human's Start
+        // now, or the covering rule for a child its parent's holder (the coordinator) creates
+        // under a sanctioned task past its plan gate. Work requests route themselves;
+        // anything else, including another agent's child of a sanctioned task, is pull-only.
+        let mut trigger = match (&request, by, &parent) {
+            (Some(_), _, _) => None,
+            (None, Caller::Human, _) => new.start_now.then_some(WakeTrigger::StartNow),
+            (None, Caller::Agent(r), Some(p)) if covers_children(p, r) => {
+                Some(WakeTrigger::ChildOfSanctioned)
+            }
+            (None, Caller::Agent(_), _) => None,
+        };
         let now = self.clock.now();
-        let task = Task {
+        let (kind, importance) = match &request {
+            Some(r) => (TaskEventKind::RequestCreated, r.importance),
+            None => (TaskEventKind::Created, Importance::Normal),
+        };
+        let mut task = Task {
             id: TaskId::new(),
             project_id: new.project_id,
             parent_id: new.parent_id,
@@ -535,8 +808,30 @@ impl TaskService {
             requires_plan: new.requires_plan,
             plan_state: PlanState::None,
             block: None,
+            sanctioned: false,
+            request_depth: 0,
+            origin_task_id: None,
+            request_chain: Vec::new(),
+            request_dedupe_key: None,
         };
-        let event = self.event(task.id, by.actor(), TaskEventKind::Created, None, None);
+        // A child is not a new request: it sits where its parent sits in a chain.
+        if let Some(p) = &parent {
+            task.request_depth = p.request_depth;
+            task.request_chain = p.request_chain.clone();
+        }
+        task.sanctioned = trigger.is_some();
+        let admission = request
+            .as_ref()
+            .map(|r| (r.admission, r.project_key.clone()));
+        if let Some(r) = request {
+            task.status = r.status;
+            task.sanctioned = r.sanctioned;
+            task.request_depth = r.lineage.depth;
+            task.origin_task_id = r.lineage.origin;
+            task.request_chain = r.lineage.chain;
+            task.request_dedupe_key = Some(r.dedupe_key);
+        }
+        let event = self.event(task.id, by.actor(), kind, None, None);
         let first = Message {
             id: MessageId::new(),
             project_id: Some(task.project_id),
@@ -544,18 +839,62 @@ impl TaskService {
             to: Address::Task(task.id),
             subject: Some(task.title.clone()),
             body: task.body.clone(),
-            importance: Importance::Normal,
+            importance,
             task_id: Some(task.id),
             reply_to,
             created_at: now,
             kind: MessageKind::Message,
             options: Vec::new(),
         };
-        if !self
-            .store
-            .insert_task(&task, &new.extra_projects, by.token(), &event, &first)
-            .await?
-        {
+        // The covering rule was read from a snapshot; the store re-checks it under the insert's
+        // lock and writes the child pull-only if the parent was released, cancelled or
+        // re-gated in between.
+        let cover = match (trigger, by) {
+            (Some(WakeTrigger::ChildOfSanctioned), Caller::Agent(r)) => Some(r.session.id),
+            _ => None,
+        };
+        let written = match admission {
+            None => match self
+                .store
+                .insert_task(
+                    &task,
+                    &new.extra_projects,
+                    cover,
+                    by.token(),
+                    &event,
+                    &first,
+                )
+                .await?
+            {
+                TaskInsert::Inserted { sanctioned } => {
+                    if !sanctioned && cover.is_some() {
+                        task.sanctioned = false;
+                        trigger = None;
+                    }
+                    true
+                }
+                TaskInsert::ParentPlanning => false,
+            },
+            Some((admit, project_key)) => match self
+                .store
+                .insert_request(&task, by.token(), &event, &first, &admit)
+                .await?
+            {
+                RequestInsert::Inserted => true,
+                RequestInsert::ParentPlanning => false,
+                RequestInsert::Existing(existing) => return Ok(Inserted::Existing(*existing)),
+                RequestInsert::TooMany { oldest } => {
+                    return Err(GuardError::TooMany {
+                        minutes: minutes_until(oldest + REQUEST_RATE_WINDOW, now),
+                    }
+                    .into());
+                }
+                RequestInsert::ProjectFull => {
+                    return Err(GuardError::ProjectFull(project_key).into());
+                }
+            },
+        };
+        if !written {
             let parent = task.parent_id.expect("only a child insert is refused");
             let state = self
                 .store
@@ -564,8 +903,11 @@ impl TaskService {
                 .map_or(PlanState::Drafting, |p| p.plan_state);
             return Err(TaskError::PlanNotApproved(state));
         }
-        self.changed(&task, TaskEventKind::Created).await;
-        Ok(task)
+        self.changed(&task, kind).await;
+        if let Some(trigger) = trigger {
+            self.route(&task, trigger, by.actor().ids().0).await;
+        }
+        Ok(Inserted::New(task))
     }
 
     pub async fn claim(&self, caller: &Resolved, id: TaskId) -> Result<ClaimOutcome, TaskError> {
@@ -577,10 +919,12 @@ impl TaskService {
         Ok(match attempt.claimed {
             Some(task) => {
                 self.changed(&task, claim_event(&previous, &req).kind).await;
+                self.end_wakes(&task, caller).await;
                 ClaimOutcome::Claimed(task)
             }
             None => match (previous.status, previous.owner_agent_id) {
                 (s @ (TaskStatus::Done | TaskStatus::Cancelled), _) => ClaimOutcome::Closed(s),
+                (TaskStatus::Requested, _) => ClaimOutcome::AwaitingApproval,
                 _ if !attempt.eligible => ClaimOutcome::NotEligible,
                 (_, Some(by)) => ClaimOutcome::AlreadyOwned {
                     by,
@@ -609,6 +953,7 @@ impl TaskService {
             .await?;
         if let Some(task) = &task {
             self.changed(task, TaskEventKind::Claimed).await;
+            self.end_wakes(task, caller).await;
         }
         Ok(task)
     }
@@ -707,17 +1052,20 @@ impl TaskService {
              with the work as planned.",
             task.title
         );
-        self.decide_plan(
-            &task,
-            TaskStatus::Claimed,
-            PlanState::Approved,
-            LeaseUpdate::Set(until),
-            TaskEventKind::PlanApproved,
-            None,
-            plan,
-            ("plan approved", body, MessageKind::System),
-        )
-        .await
+        let task = self
+            .decide_plan(
+                &task,
+                TaskStatus::Claimed,
+                PlanState::Approved,
+                LeaseUpdate::Set(until),
+                TaskEventKind::PlanApproved,
+                None,
+                plan,
+                ("plan approved", body, MessageKind::System),
+            )
+            .await?;
+        self.wake_owner(&task, WakeTrigger::HumanDecision).await;
+        Ok(task)
     }
 
     /// The human asks for changes (a note is required): the plan state becomes
@@ -736,21 +1084,24 @@ impl TaskService {
         check_body(note)?;
         let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
         let until = self.clock.now() + task.lease_ttl.unwrap_or(self.lease_ttl);
-        self.decide_plan(
-            &task,
-            TaskStatus::Planning,
-            PlanState::ChangesRequested,
-            LeaseUpdate::Set(until),
-            TaskEventKind::PlanChangesRequested,
-            Some(note.to_string()),
-            plan,
-            (
-                "plan changes requested",
-                note.to_string(),
-                MessageKind::Message,
-            ),
-        )
-        .await
+        let task = self
+            .decide_plan(
+                &task,
+                TaskStatus::Planning,
+                PlanState::ChangesRequested,
+                LeaseUpdate::Set(until),
+                TaskEventKind::PlanChangesRequested,
+                Some(note.to_string()),
+                plan,
+                (
+                    "plan changes requested",
+                    note.to_string(),
+                    MessageKind::Message,
+                ),
+            )
+            .await?;
+        self.wake_owner(&task, WakeTrigger::HumanDecision).await;
+        Ok(task)
     }
 
     /// Adds participating projects to a top-level task (append-only). Allowed for the human,
@@ -814,31 +1165,34 @@ impl TaskService {
         }
     }
 
-    /// Gives the task back: `open`, no owner, no lease.
+    /// Gives the task back: `open`, no owner, no lease. A sanctioned task is routed again.
     pub async fn release(
         &self,
         caller: &Resolved,
         id: TaskId,
         note: Option<String>,
     ) -> Result<Task, TaskError> {
-        self.owner_transition(
-            caller,
-            id,
-            &[
-                TaskStatus::Planning,
-                TaskStatus::Claimed,
-                TaskStatus::Blocked,
-                TaskStatus::Review,
-            ],
-            TaskStatus::Open,
-            Some(TaskStatus::Open),
-            LeaseUpdate::Clear,
-            true,
-            TaskEventKind::Released,
-            note,
-            None,
-        )
-        .await
+        let task = self
+            .owner_transition(
+                caller,
+                id,
+                &[
+                    TaskStatus::Planning,
+                    TaskStatus::Claimed,
+                    TaskStatus::Blocked,
+                    TaskStatus::Review,
+                ],
+                TaskStatus::Open,
+                Some(TaskStatus::Open),
+                LeaseUpdate::Clear,
+                true,
+                TaskEventKind::Released,
+                note,
+                None,
+            )
+            .await?;
+        self.reroute(&task).await;
+        Ok(task)
     }
 
     /// `claimed → blocked` with only a reason (see `block_with`).
@@ -1479,24 +1833,28 @@ impl TaskService {
         .await
     }
 
-    /// Human only: takes the task away from its owner and reopens it.
+    /// Human only: takes the task away from its owner and reopens it. A sanctioned task is
+    /// routed again.
     pub async fn force_release(&self, id: TaskId) -> Result<Task, TaskError> {
-        self.unowned_transition(
-            id,
-            Actor::Human,
-            None,
-            &[
-                TaskStatus::Planning,
-                TaskStatus::Claimed,
-                TaskStatus::Blocked,
-                TaskStatus::Review,
-            ],
-            TaskStatus::Open,
-            true,
-            TaskEventKind::ForceReleased,
-            None,
-        )
-        .await
+        let task = self
+            .unowned_transition(
+                id,
+                Actor::Human,
+                None,
+                &[
+                    TaskStatus::Planning,
+                    TaskStatus::Claimed,
+                    TaskStatus::Blocked,
+                    TaskStatus::Review,
+                ],
+                TaskStatus::Open,
+                true,
+                TaskEventKind::ForceReleased,
+                None,
+            )
+            .await?;
+        self.reroute(&task).await;
+        Ok(task)
     }
 
     /// Heartbeat renewal: extends the session's live `claimed` leases to `now + ttl` (per
@@ -1562,6 +1920,177 @@ impl TaskService {
 
     // ---------------------------------------------------------------- internals
 
+    /// The human's guarded decision on a work request: `requested -> to` at `version`, with
+    /// `note` (when set) posted to the thread in the same transaction. Publishes
+    /// `RequestDecided`.
+    async fn decide_request(
+        &self,
+        id: TaskId,
+        version: i64,
+        to: TaskStatus,
+        sanctioned: Option<bool>,
+        kind: TaskEventKind,
+        note: Option<String>,
+    ) -> Result<Task, TaskError> {
+        let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+        let message = note.map(|body| self.request_note(&task, "request declined", body));
+        let req = TransitionRequest {
+            task: id,
+            from: vec![TaskStatus::Requested],
+            to: Some(to),
+            owner: None,
+            lease: LeaseUpdate::Clear,
+            clear_owner: false,
+            now: self.clock.now(),
+            token: None,
+            event: self.event(id, Actor::Human, kind, None, None),
+            plan_from: None,
+            plan_to: None,
+            message: message.clone(),
+            latest_plan: None,
+            archive_plans: false,
+            block: None,
+            unblock: None,
+            version: Some(version),
+            sanctioned,
+        };
+        let Some(done) = self.store.transition_task(&req).await? else {
+            return Err(TaskError::RequestChanged);
+        };
+        self.after_transition(&done, &req.event, None).await;
+        if let Some(message) = &message {
+            self.message_created(message).await;
+        }
+        self.emit(Event::RequestDecided {
+            request: id,
+            project_id: done.task.project_id,
+            approved: to == TaskStatus::Open,
+        })
+        .await;
+        Ok(done.task)
+    }
+
+    /// A system note from the human in a request's thread.
+    fn request_note(&self, task: &Task, subject: &str, body: String) -> Message {
+        Message {
+            id: MessageId::new(),
+            project_id: Some(task.project_id),
+            from: Actor::Human,
+            to: Address::Task(task.id),
+            subject: Some(subject.to_string()),
+            body,
+            importance: Importance::Normal,
+            task_id: Some(task.id),
+            reply_to: None,
+            created_at: self.clock.now(),
+            kind: MessageKind::System,
+            options: Vec::new(),
+        }
+    }
+
+    /// Routes a sanctioned task, as a request state. Without a router, or when routing fails
+    /// after the task is written, it stays queued for the ticker or a pull.
+    async fn route(
+        &self,
+        task: &Task,
+        trigger: WakeTrigger,
+        requester: Option<AgentId>,
+    ) -> RequestState {
+        let Some(wake) = &self.wake else {
+            return RequestState::Queued;
+        };
+        match wake.route(task, trigger, requester).await {
+            Ok(RouteOutcome::Routed { .. }) => RequestState::Routed,
+            Ok(RouteOutcome::Queued | RouteOutcome::Paused) => RequestState::Queued,
+            Err(e) => {
+                eprintln!("axl: failed to route request {}: {e}", task.id);
+                RequestState::Queued
+            }
+        }
+    }
+
+    /// A sanctioned task given back (`open` again) is placed again, or queued, never to the
+    /// agent that created it (as `place_queued` does).
+    async fn reroute(&self, task: &Task) {
+        if task.sanctioned && task.status == TaskStatus::Open {
+            let requester = task.created_by.ids().0;
+            self.route(task, WakeTrigger::Queue, requester).await;
+        }
+    }
+
+    /// `caller` claimed `task`: clears every wake reservation for it (`claimed` for the
+    /// caller, `expired` for any other session). Runs after the commit: a failure is logged,
+    /// never returned, and the reservation then lapses on the ticker.
+    async fn end_wakes(&self, task: &Task, caller: &Resolved) {
+        if let Some(wake) = &self.wake
+            && let Err(e) = wake.on_claimed(task.id, caller.session.id).await
+        {
+            eprintln!(
+                "axl: failed to clear wake reservations for task {}: {e}",
+                task.id
+            );
+        }
+    }
+
+    /// Wakes the session holding `task` about it. Runs after the commit: a failure is
+    /// logged, never returned.
+    async fn wake_owner(&self, task: &Task, trigger: WakeTrigger) {
+        if let Some(wake) = &self.wake
+            && let Err(e) = wake.wake_owner(task, trigger, None).await
+        {
+            eprintln!("axl: failed to wake the owner of task {}: {e}", task.id);
+        }
+    }
+
+    /// `harness@host` of the agent the task was last routed to, if any.
+    async fn reserved_agent(&self, task: &Task) -> Option<String> {
+        let events = self
+            .store
+            .task_events_page(task.id, Some(TaskEventKind::Routed), None, 1)
+            .await
+            .ok()?;
+        let agent: AgentId = events
+            .first()?
+            .payload
+            .as_ref()?
+            .get("agent_id")?
+            .as_str()?
+            .parse()
+            .ok()?;
+        let agent = self.store.get_agent(agent).await.ok()??;
+        Some(format!("{}@{}", agent.harness, agent.host))
+    }
+
+    /// Where an existing request stands: awaiting the human while `requested`, else by its
+    /// latest routing note (`routed` or `queued`; queued when it has none).
+    async fn request_state(&self, task: &Task) -> Result<RequestState, TaskError> {
+        if task.status == TaskStatus::Requested {
+            return Ok(RequestState::AwaitingHuman);
+        }
+        let routed = self
+            .store
+            .task_events(task.id)
+            .await?
+            .into_iter()
+            .rev()
+            .find(|e| matches!(e.kind, TaskEventKind::Routed | TaskEventKind::Queued));
+        Ok(match routed {
+            Some(e) if e.kind == TaskEventKind::Routed => RequestState::Routed,
+            _ => RequestState::Queued,
+        })
+    }
+
+    /// The task the caller's session holds with the highest `request_depth`, if any.
+    async fn origin_of(&self, caller: &Resolved) -> Result<Option<Task>, TaskError> {
+        Ok(held_origin(&*self.store, caller.agent.id, caller.session.id).await?)
+    }
+
+    async fn emit(&self, event: Event) {
+        if let Some(bus) = &self.events {
+            bus.emit(event).await;
+        }
+    }
+
     async fn changed(&self, task: &Task, kind: TaskEventKind) {
         if let Some(bus) = &self.events {
             bus.emit(Event::TaskChanged {
@@ -1602,7 +2131,10 @@ impl TaskService {
         };
         if !matches!(
             event.kind,
-            TaskEventKind::Blocked | TaskEventKind::Done | TaskEventKind::Cancelled
+            TaskEventKind::Blocked
+                | TaskEventKind::Done
+                | TaskEventKind::Cancelled
+                | TaskEventKind::RequestDeclined
         ) {
             return;
         }
@@ -1690,6 +2222,8 @@ impl TaskService {
             return;
         }
         self.message_created(&message).await;
+        // Axle's own note, not a peer's post: outside the peer-wake budget.
+        self.wake_owner(parent, WakeTrigger::ChildClosed).await;
     }
 
     fn claim_request(&self, caller: &Resolved) -> ClaimRequest {
@@ -1798,6 +2332,8 @@ impl TaskService {
                 archive_plans: g.archive_plans,
                 block: g.block.clone(),
                 unblock: (g.to == Some(TaskStatus::Done)).then(|| self.unblock_rule()),
+                version: None,
+                sanctioned: None,
             };
             if let Some(done) = self.store.transition_task(&req).await? {
                 if g.kind != TaskEventKind::Renewed {
@@ -1893,6 +2429,9 @@ impl TaskService {
                 archive_plans: true,
                 block: None,
                 unblock: None,
+                version: None,
+                // Approving the plan is the human saying go: the task's children route.
+                sanctioned: (plan_to == PlanState::Approved).then_some(true),
             };
             if let Some(done) = self.store.transition_task(&req).await? {
                 self.after_transition(&done, &req.event, None).await;
@@ -2010,8 +2549,20 @@ impl TaskService {
             archive_plans: false,
             block: None,
             unblock: None,
+            version: None,
+            sanctioned: None,
         }
     }
+}
+
+/// The covering rule: a sanctioned task past its plan gate sanctions (and routes) the
+/// children its holder creates under it. Only the session that currently holds the parent
+/// (the coordinator) is covered; any other agent's child is pull-only.
+fn covers_children(parent: &Task, caller: &Resolved) -> bool {
+    parent.sanctioned
+        && (!parent.requires_plan || parent.plan_state == PlanState::Approved)
+        && parent.owner_session_id == Some(caller.session.id)
+        && HELD.contains(&parent.status)
 }
 
 /// Eligibility values are shown to models next to peer data, so they follow the same label
@@ -2069,6 +2620,14 @@ impl Guarded<'_> {
             block: None,
         }
     }
+}
+
+/// Whole minutes from `now` until `at`, rounded up and at least 1.
+fn minutes_until(at: time::OffsetDateTime, now: time::OffsetDateTime) -> u32 {
+    let seconds = u64::try_from((at - now).whole_seconds()).unwrap_or(0);
+    u32::try_from(seconds.div_ceil(60))
+        .unwrap_or(u32::MAX)
+        .max(1)
 }
 
 /// `prefix` + `text`, cut to the subject cap.

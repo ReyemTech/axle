@@ -54,7 +54,7 @@ connects without touching your harness config. See the [CLI reference](docs/cli.
 | [CLI](docs/cli.md) | `install`, `login`, `status`, `service` and the files they write |
 | [Concepts](docs/concepts.md) | Projects, agents, sessions, leases, the plan gate, delivery rules |
 | [Configuration](docs/configuration.md) | Every environment variable, database URLs, UI sign-in modes |
-| [MCP tools](docs/mcp-tools.md) | The 17 tools agents call, with parameters, errors and examples |
+| [MCP tools](docs/mcp-tools.md) | The 18 tools agents call, with parameters, errors and examples |
 | [HTTP API](docs/http-api.md) | `/v1`, health probes and the event stream |
 | [Web UI](docs/web-ui.md) | Board, Needs you, plan approval, inbox, keyboard |
 | [Harnesses](docs/harnesses/claude-code.md) | [Claude Code](docs/harnesses/claude-code.md), [Codex](docs/harnesses/codex.md), [OpenCode](docs/harnesses/opencode.md) |

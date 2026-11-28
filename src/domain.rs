@@ -119,6 +119,17 @@ pub struct Session {
     pub started_at: OffsetDateTime,
     pub last_heartbeat_at: OffsetDateTime,
     pub last_tool_call_at: OffsetDateTime,
+    /// What the harness last reported about its turn; `Unknown` until the first report.
+    pub turn_state: TurnState,
+    pub turn_state_at: Option<OffsetDateTime>,
+    /// How Axle can reach this session when it is idle; `None` means it cannot.
+    pub wake_channel: WakeChannel,
+    /// The task a wake is reserved for, until `wake_until`.
+    pub wake_task_id: Option<TaskId>,
+    pub wake_until: Option<OffsetDateTime>,
+    pub last_woken_at: Option<OffsetDateTime>,
+    /// Set on sessions started by a headless run.
+    pub run_id: Option<String>,
 }
 
 /// A bearer token as listed to the admin (the plaintext is shown once, at creation, and
@@ -165,6 +176,8 @@ macro_rules! text_enum {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
+    /// Asked of another project and waiting for the human to approve it; never claimable.
+    Requested,
     Open,
     /// Claimed, but the owner is writing a plan for the human to approve before any work.
     Planning,
@@ -176,6 +189,7 @@ pub enum TaskStatus {
 }
 
 text_enum!(TaskStatus {
+    Requested => "requested",
     Open => "open",
     Planning => "planning",
     Claimed => "claimed",
@@ -184,6 +198,181 @@ text_enum!(TaskStatus {
     Done => "done",
     Cancelled => "cancelled",
 });
+
+/// What a session's harness says it is doing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnState {
+    #[default]
+    Unknown,
+    Busy,
+    Idle,
+}
+
+text_enum!(TurnState {
+    Unknown => "unknown",
+    Busy => "busy",
+    Idle => "idle",
+});
+
+/// How Axle reaches an idle session (`None`: it cannot).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WakeChannel {
+    #[default]
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "claude-socket")]
+    ClaudeSocket,
+    #[serde(rename = "claude-monitor")]
+    ClaudeMonitor,
+    #[serde(rename = "codex-app-server")]
+    CodexAppServer,
+    #[serde(rename = "opencode-api")]
+    OpencodeApi,
+}
+
+text_enum!(WakeChannel {
+    None => "none",
+    ClaudeSocket => "claude-socket",
+    ClaudeMonitor => "claude-monitor",
+    CodexAppServer => "codex-app-server",
+    OpencodeApi => "opencode-api",
+});
+
+/// Whether an attempt woke a live session or started a headless run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeKind {
+    Wake,
+    Headless,
+}
+
+text_enum!(WakeKind {
+    Wake => "wake",
+    Headless => "headless",
+});
+
+/// What caused a wake attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeTrigger {
+    HumanPost,
+    HumanReply,
+    HumanDecision,
+    StartNow,
+    ChildOfSanctioned,
+    RequestApproved,
+    AutoStart,
+    PeerPost,
+    ChildClosed,
+    Queue,
+}
+
+text_enum!(WakeTrigger {
+    HumanPost => "human_post",
+    HumanReply => "human_reply",
+    HumanDecision => "human_decision",
+    StartNow => "start_now",
+    ChildOfSanctioned => "child_of_sanctioned",
+    RequestApproved => "request_approved",
+    AutoStart => "auto_start",
+    PeerPost => "peer_post",
+    ChildClosed => "child_closed",
+    Queue => "queue",
+});
+
+/// How an attempt turned out. Stored as unchecked text so later plans can add outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeOutcome {
+    Sent,
+    Delivered,
+    Claimed,
+    Expired,
+    Failed,
+    Held,
+    Refused,
+    Skipped,
+}
+
+text_enum!(WakeOutcome {
+    Sent => "sent",
+    Delivered => "delivered",
+    Claimed => "claimed",
+    Expired => "expired",
+    Failed => "failed",
+    Held => "held",
+    Refused => "refused",
+    Skipped => "skipped",
+});
+
+/// Where a work request stands when it is created (carried by `RequestCreated`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestState {
+    AwaitingHuman,
+    Routed,
+    Queued,
+}
+
+text_enum!(RequestState {
+    AwaitingHuman => "awaiting_human",
+    Routed => "routed",
+    Queued => "queued",
+});
+
+/// One row of the append-only wake log. Every change of outcome is a new row; caps count
+/// `Sent` rows; `run_id` links the rows of one headless run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WakeAttempt {
+    pub id: Uuid,
+    pub kind: WakeKind,
+    pub trigger: WakeTrigger,
+    pub task_id: Option<TaskId>,
+    pub session_id: Option<SessionId>,
+    pub from_agent_id: Option<AgentId>,
+    pub runner_id: Option<Uuid>,
+    pub run_id: Option<Uuid>,
+    pub outcome: WakeOutcome,
+    pub detail: Option<String>,
+    pub pr_url: Option<String>,
+    pub at: OffsetDateTime,
+}
+
+/// A project's wake and headless-run settings (no stored row means `defaults`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectWakeSettings {
+    pub project_id: ProjectId,
+    pub auto_start: bool,
+    pub headless_enabled: bool,
+    pub headless_harness: Option<String>,
+    pub max_concurrent_runs: u32,
+    pub daily_run_cap: u32,
+    pub max_run_minutes: u32,
+    pub max_budget_usd: Option<f64>,
+}
+
+impl ProjectWakeSettings {
+    pub fn defaults(project_id: ProjectId) -> Self {
+        Self {
+            project_id,
+            auto_start: false,
+            headless_enabled: false,
+            headless_harness: None,
+            max_concurrent_runs: 1,
+            daily_run_cap: 5,
+            max_run_minutes: 30,
+            max_budget_usd: None,
+        }
+    }
+}
+
+/// Server-wide switches; both off by default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerSettings {
+    pub wake_paused: bool,
+    pub headless_paused: bool,
+}
 
 /// Where a `requires_plan` task's plan is (`None` for tasks without the gate, and after a
 /// release).
@@ -337,6 +526,16 @@ pub struct Task {
     /// Why a `blocked` task is blocked and what would unblock it; `None` in any other status
     /// (and for a task blocked before the detail was recorded, if its history has no reason).
     pub block: Option<BlockDetail>,
+    /// The human (or a task they sanctioned) approved waking agents for this task.
+    pub sanctioned: bool,
+    /// How many project hops a request has made; 0 for ordinary tasks.
+    pub request_depth: u32,
+    /// The task that started the request chain.
+    pub origin_task_id: Option<TaskId>,
+    /// The projects the request chain has passed through, in order.
+    pub request_chain: Vec<ProjectId>,
+    /// Collapses repeated identical requests inside the dedupe window.
+    pub request_dedupe_key: Option<String>,
 }
 
 /// What a blocked task waits on.
@@ -448,9 +647,25 @@ pub enum TaskEventKind {
     Related,
     /// A top-level task was moved under a parent (in the payload; the note names it).
     MovedUnder,
+    /// No session was free when the task became routable, so it waits in the wake queue.
+    Queued,
+    /// Axle reserved a free session for the task and asked it to wake (payload: the session
+    /// and agent).
+    Routed,
+    /// The session's bridge reported that it delivered the wake prompt.
+    WakeSent,
+    /// The wake could not be delivered (failed, held or refused); that session is not tried
+    /// again for this task.
+    WakeFailed,
     /// The human acknowledged a done task. Only ever published as a live event; it is
     /// never written to a task's history.
     Acked,
+    /// Another agent asked for this work (the creation event of a work request).
+    RequestCreated,
+    /// The human approved the work request: it is open and sanctioned.
+    RequestApproved,
+    /// The human declined the work request: it is cancelled.
+    RequestDeclined,
 }
 
 text_enum!(TaskEventKind {
@@ -478,7 +693,14 @@ text_enum!(TaskEventKind {
     Unblocked => "unblocked",
     Related => "related",
     MovedUnder => "moved_under",
+    Queued => "queued",
+    Routed => "routed",
+    WakeSent => "wake_sent",
+    WakeFailed => "wake_failed",
     Acked => "acked",
+    RequestCreated => "request_created",
+    RequestApproved => "request_approved",
+    RequestDeclined => "request_declined",
 });
 
 /// Where a done task stands with the human.
@@ -718,6 +940,11 @@ mod tests {
             requires_plan: false,
             plan_state: PlanState::None,
             block: None,
+            sanctioned: false,
+            request_depth: 0,
+            origin_task_id: None,
+            request_chain: Vec::new(),
+            request_dedupe_key: None,
         };
         let done = |at| task(TaskStatus::Done, Some(at), None);
         assert_eq!(ack_state(&done(now - n), now, n), Some(AckState::Unseen));
@@ -761,6 +988,7 @@ mod tests {
     #[test]
     fn task_enums_round_trip_as_text() {
         for s in [
+            TaskStatus::Requested,
             TaskStatus::Open,
             TaskStatus::Planning,
             TaskStatus::Claimed,
@@ -775,6 +1003,14 @@ mod tests {
             TaskEventKind::LeaseExpiredTakeover.to_string(),
             "lease_expired_takeover"
         );
+        for (k, text) in [
+            (TaskEventKind::RequestCreated, "request_created"),
+            (TaskEventKind::RequestApproved, "request_approved"),
+            (TaskEventKind::RequestDeclined, "request_declined"),
+        ] {
+            assert_eq!(k.as_str(), text);
+            assert_eq!(text.parse::<TaskEventKind>().unwrap(), k);
+        }
         assert!("nope".parse::<TaskStatus>().is_err());
         for p in [
             PlanState::None,
@@ -786,6 +1022,52 @@ mod tests {
             assert_eq!(p.as_str().parse::<PlanState>().unwrap(), p);
         }
         assert_eq!(MessageKind::Plan.to_string(), "plan");
+        for t in [TurnState::Unknown, TurnState::Busy, TurnState::Idle] {
+            assert_eq!(t.as_str().parse::<TurnState>().unwrap(), t);
+        }
+        for (c, text) in [
+            (WakeChannel::None, "none"),
+            (WakeChannel::ClaudeSocket, "claude-socket"),
+            (WakeChannel::ClaudeMonitor, "claude-monitor"),
+            (WakeChannel::CodexAppServer, "codex-app-server"),
+            (WakeChannel::OpencodeApi, "opencode-api"),
+        ] {
+            assert_eq!(c.as_str(), text);
+            assert_eq!(text.parse::<WakeChannel>().unwrap(), c);
+        }
+        for k in [WakeKind::Wake, WakeKind::Headless] {
+            assert_eq!(k.as_str().parse::<WakeKind>().unwrap(), k);
+        }
+        for t in [
+            WakeTrigger::HumanPost,
+            WakeTrigger::HumanReply,
+            WakeTrigger::HumanDecision,
+            WakeTrigger::StartNow,
+            WakeTrigger::ChildOfSanctioned,
+            WakeTrigger::RequestApproved,
+            WakeTrigger::AutoStart,
+            WakeTrigger::PeerPost,
+            WakeTrigger::ChildClosed,
+            WakeTrigger::Queue,
+        ] {
+            assert_eq!(t.as_str().parse::<WakeTrigger>().unwrap(), t);
+        }
+        assert_eq!(
+            WakeTrigger::ChildOfSanctioned.to_string(),
+            "child_of_sanctioned"
+        );
+        for o in [
+            WakeOutcome::Sent,
+            WakeOutcome::Delivered,
+            WakeOutcome::Claimed,
+            WakeOutcome::Expired,
+            WakeOutcome::Failed,
+            WakeOutcome::Held,
+            WakeOutcome::Refused,
+            WakeOutcome::Skipped,
+        ] {
+            assert_eq!(o.as_str().parse::<WakeOutcome>().unwrap(), o);
+        }
     }
 
     #[test]

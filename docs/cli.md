@@ -123,6 +123,19 @@ harness, `(from config)` when `[usage.billing]` set it, `(not a billing kind; ig
 a value it does not know, or `not reported yet`) and
 `usage report` (`last sent <time>` or `none sent yet`).
 
+When the server is reachable, each live session on this machine (a bridge whose harness is
+still running) gets a `session` line with what the server knows about it:
+
+```text
+session  claude-code · github.com/acme/web-app · wake: claude-socket · turn: idle
+```
+
+`wake` is how Axle can wake the session when it is idle (`none` means it cannot); `turn`
+is `busy`, `idle` or `unknown`, as the hooks last reported it. A session whose bridge talks
+to a different server is listed as `another server (<url>)` and not asked about, so your
+token only ever goes to the configured server. These lines are information only and never
+carry a fix.
+
 ## `axl service`
 
 ```sh

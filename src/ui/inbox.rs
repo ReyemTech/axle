@@ -291,14 +291,7 @@ pub(super) fn reply_target(m: &Message) -> Option<ReplyTarget> {
     }
 }
 
-/// `Re: <subject>` (not doubled).
-fn reply_subject(subject: Option<&str>) -> String {
-    match subject.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) if s.to_ascii_lowercase().starts_with("re:") => s.to_string(),
-        Some(s) => format!("Re: {s}"),
-        None => String::new(),
-    }
-}
+use crate::service::messages::reply_subject;
 
 #[cfg(test)]
 mod tests {

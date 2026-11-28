@@ -1,6 +1,6 @@
 # OpenCode
 
-OpenCode connects to Axle through the stdio bridge and gets all [17 tools](../mcp-tools.md)
+OpenCode connects to Axle through the stdio bridge and gets all [18 tools](../mcp-tools.md)
 plus a short instructions block. It has no shell-hook system, so there is no wake-up yet:
 the agent sees new messages only when it calls `fetch_inbox` or `whoami`.
 

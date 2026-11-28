@@ -10,7 +10,7 @@ use axle::domain::{
 };
 use axle::service::identity::{IdentityInput, IdentityService, Resolved};
 use axle::service::tasks::{
-    Caller, ClaimOutcome, Completion, NewTask, Progress, TaskError, TaskService,
+    Caller, ClaimOutcome, Completion, NewRequest, NewTask, Progress, TaskError, TaskService,
 };
 use axle::store::{InboxFilter, Recipient, Store, TaskFilter};
 use time::macros::datetime;
@@ -966,6 +966,76 @@ store_matrix!(
         assert_eq!(detail.events[5].actor, Actor::Human);
         // Renewals and the child's own created event do not bubble.
         assert_eq!(kinds(&env, &parent).await.len(), 6);
+    }
+);
+
+store_matrix!(
+    declined_child_request_closes_like_a_cancelled_child,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let a = env.session("mac", "claude-code").await;
+        let b = env.session("linux", "claude-code").await;
+        let peer = env
+            .session_in(Some("github.com/reyemtech/other"), "peer", "codex")
+            .await;
+        let parent = env.task(&a, Eligibility::default()).await;
+        claimed(env.svc.claim(&a, parent.id).await.unwrap());
+        let c1 = child_of(&env, &parent).await;
+        let asked = env
+            .svc
+            .request(
+                &peer,
+                NewRequest {
+                    project_id: parent.project_id,
+                    title: "a piece of the parent".into(),
+                    body: "please".into(),
+                    eligibility: Eligibility::default(),
+                    importance: Importance::Normal,
+                    parent_id: Some(parent.id),
+                },
+            )
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(asked.status, TaskStatus::Requested);
+        claimed(env.svc.claim(&b, c1.id).await.unwrap());
+        env.svc.complete(&b, c1.id, done("one")).await.unwrap();
+        assert_eq!(
+            env.svc.get(parent.id).await.unwrap().task.status,
+            TaskStatus::Claimed
+        );
+
+        env.svc
+            .decline_request(asked.id, asked.version, None)
+            .await
+            .unwrap();
+        let detail = env.svc.get(parent.id).await.unwrap();
+        assert_eq!(detail.task.status, TaskStatus::Review);
+        assert_eq!(detail.progress.done, 2);
+        let tail: Vec<_> = detail.events.iter().rev().take(2).map(|e| e.kind).collect();
+        assert_eq!(
+            tail,
+            vec![
+                TaskEventKind::ChildrenComplete,
+                TaskEventKind::ChildCancelled
+            ]
+        );
+        let notes: Vec<_> = env
+            .store
+            .task_thread(parent.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|m| m.subject)
+            .collect();
+        assert!(
+            notes.contains(&"child task cancelled".to_string()),
+            "{notes:?}"
+        );
+        assert!(
+            notes.contains(&"child tasks complete".to_string()),
+            "{notes:?}"
+        );
     }
 );
 

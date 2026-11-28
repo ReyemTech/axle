@@ -6,3 +6,4 @@ pub mod identity;
 pub mod messages;
 pub mod tasks;
 pub mod usage;
+pub mod wake;

@@ -44,7 +44,7 @@ flowchart TB
 |---|---|---|
 | CLI | `src/main.rs`, `src/cli/` | Subcommands `serve`, `bridge`, `hook`, `migrate`, `project`, `token`, and the onboarding set `install`, `uninstall`, `login`, `logout`, `status`, `service`. |
 | HTTP server | `src/http/` | axum router: probes, `/v1`, `/mcp`, `/ui`; bearer-token middleware and rate limit. |
-| MCP tools | `src/mcp/` | The 17 tools on rmcp, identity resolution per call, peer-data framing. |
+| MCP tools | `src/mcp/` | The 18 tools on rmcp, identity resolution per call, peer-data framing. |
 | Services | `src/service/` | Business rules shared by MCP, `/v1` and the UI: identity, tasks and leases, messages, tokens, token usage (ingest, totals, repricing). |
 | Store | `src/store/` | A `Store` trait with `sqlite.rs` and `postgres.rs` implementations and migrations in `migrations/`. |
 | Event bus | `src/events.rs` | Publishes changes after each commit. |

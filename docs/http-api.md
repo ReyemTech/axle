@@ -12,6 +12,9 @@ treat `/v1` as internal: it may change between releases.
 | `POST /mcp` (and `GET`, `DELETE`) | bearer token | MCP over Streamable HTTP |
 | `POST /v1/register` | bearer token | Register a session |
 | `POST /v1/heartbeat` | bearer token | Presence and lease renewal |
+| `POST /v1/turn` | bearer token | A hook's turn report (busy or idle) |
+| `POST /v1/wake/result` | bearer token | A bridge's report of what its adapter did with a wake |
+| `GET /v1/session` | bearer token | One session's wake channel and turn state, for `axl status` |
 | `GET /v1/events` | bearer token | Server-sent events for one session |
 | `GET /v1/inbox/summary` | bearer token | Unread mail, for hooks |
 | `GET /v1/leases` | bearer token | Tasks the session holds, for hooks |
@@ -50,7 +53,7 @@ The Helm chart wires both into the pod's probes.
 
 ## `/mcp`
 
-The same 17 [MCP tools](mcp-tools.md) the bridge serves, over the MCP Streamable HTTP
+The same 18 [MCP tools](mcp-tools.md) the bridge serves, over the MCP Streamable HTTP
 transport. Requests are limited to 1 MB. Use this for MCP clients that can send headers and
 cannot spawn a local process.
 
@@ -164,7 +167,65 @@ curl -s http://127.0.0.1:7420/v1/heartbeat \
 
 `leases` lists the ids of tasks this session holds (`planning`, `claimed`, `blocked` or
 `review`). An unknown session is 404 `{"error":"unknown session"}`; the bridge then
-registers again.
+registers again. Once the session is marked alive and its leases renewed, a failure to
+place queued work on it is logged on the server and the heartbeat still succeeds.
+
+Optional fields carry the bridge's view of the session; older bridges send none of them,
+and a missing field leaves the stored value as it is:
+
+| Field | Values | Notes |
+|---|---|---|
+| `turn_state` | `busy`, `idle` | The hooks' last turn report, read from `~/.axl/sessions/<harness-pid>.turn`, so a report the server missed heals within 30 seconds. |
+| `turn_state_at` | RFC 3339 time | When the hooks wrote that state, from the same file. A `turn_state` older than the last report the server applied is ignored, so a heartbeat cannot undo a newer hook report. A malformed time counts as absent. |
+| `wake_channel` | `none`, `claude-socket`, `claude-monitor`, `codex-app-server`, `opencode-api` | How Axle can wake the session when it is idle. |
+
+```json
+{ "session_id": "0199a000-0000-7000-8000-000000000003", "turn_state": "idle", "turn_state_at": "2026-11-28T09:00:01Z", "wake_channel": "claude-socket" }
+```
+
+## `POST /v1/turn`
+
+A hook's report of the session's turn state: `busy` while the model works, `idle` when it
+waits for input. Going idle lets the wake router place queued work on the session (once it
+has been idle for 5 seconds); going busy marks a delivered wake. Returns 204 with no body.
+
+```sh
+curl -s -X POST http://127.0.0.1:7420/v1/turn \
+  -H "Authorization: Bearer $AXL_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"session_id":"0199a000-0000-7000-8000-000000000003","state":"idle","at":"2026-11-28T09:00:01Z"}'
+```
+
+`state` is `unknown`, `busy` or `idle`; anything else is a 4xx. The optional `at` is when
+the hook made the report (RFC 3339, the agent machine's clock; the same time it writes to
+the turn file). A report older than the last one the server applied, by these times, is
+ignored and still returns 204; a report without `at`, or with a malformed one, always
+applies. An unknown session is 404,
+another token's session 403. The hooks send it with a 2 second timeout and ignore every
+error: a lost report is healed by the next heartbeat.
+
+## `POST /v1/wake/result`
+
+A bridge's report of what its wake adapter did with a `WakeRequested` event from
+`/v1/events`. Body: `{"session_id", "task_id", "outcome", "detail"}`, where `task_id` and
+`detail` may be null and `outcome` is `sent`, `held`, `refused` or `failed`. A word that is
+not a wake outcome at all is 422 (the body does not parse); another known outcome, such as
+`expired`, is 400. `detail` is cut at 500 characters and kept in the wake log only; it never
+reaches task history. Returns 204 with no body. An unknown session is 404, another token's
+session 403. A `task_id` must be the session's current reservation or the task of its newest
+`sent` wake; any other task, including one that does not exist, is 404
+(`this session was not woken for that task`) and nothing is recorded. The bridge waits at most 30 seconds for its adapter, then
+reports `failed`. A bridge whose adapter has no working channel (today: every bridge) opens
+no wake stream and reports no `wake_channel` in its heartbeat.
+
+## `GET /v1/session`
+
+One of the calling token's sessions (`?session=<id>`): `{"session_id", "wake_channel",
+"turn_state"}`. `axl status` uses it for each live session on the machine. Errors as for
+`/v1/turn`.
+
+```json
+{ "session_id": "0199a000-0000-7000-8000-000000000003", "wake_channel": "none", "turn_state": "busy" }
+```
 
 ## `GET /v1/inbox/summary`
 
@@ -187,6 +248,7 @@ curl -s -H "Authorization: Bearer $AXL_TOKEN" \
   {
     "id": "01a21e49-2ab1-7782-b68a-4deae8e35420",
     "from": "acme/web-app · build-02 · codex",
+    "from_human": false,
     "subject": null,
     "project": "github.com/acme/web-app",
     "importance": "normal",
@@ -196,7 +258,11 @@ curl -s -H "Authorization: Bearer $AXL_TOKEN" \
 ```
 
 `preview` is the body on one line, at most 120 characters. These fields are not framed; the
-hooks frame them before showing them to the model.
+hooks frame them before showing them to the model. `from_human` is true for text the human
+typed in the UI: hooks frame its body `[from the human owner, via the Axle UI] …` instead of
+as peer data. Its subject stays peer data, framed as from `subject_from`: `human`, or, for a
+reply (whose subject is the original's), the replied-to author's label. A client that does
+not read the field (or a server that does not send it) gets the peer frame.
 
 ## `GET /v1/leases`
 
@@ -331,7 +397,11 @@ data: {"id":"01a21e49-812d-71b1-a958-8ed6820c5bc3","to":{"kind":"project","id":"
 |---|---|---|
 | `MessageCreated` | `id`, `to` (`kind` and `id`), `project_id` | The message is addressed to it: its session, its agent, its home project, or a task its agent owns or created. Never for its agent's own messages. |
 | `TaskChanged` | `id`, `project_id`, `status`, `kind` (the history event kind) | The task is in its home project, spans its home project, or its agent owns or created it. |
+| `WakeRequested` | `session`, `task` (or `null`), `trigger` (`human_post`, `peer_post`, `queue`, …), `text` | The event names this session. No other session sees it. The bridge types `text` into the harness as the wake prompt. |
 | `Lagged` | the number of dropped events | The subscriber fell behind. Re-read the inbox and tasks. |
+
+Axle also publishes `WakeResult`, `RequestCreated` and `RequestDecided` on its internal
+bus. They drive the web UI's live updates and are never sent to an agent stream.
 
 The stream sends keep-alive comments and ends when the server shuts down. There is no
 replay or `Last-Event-ID` yet; after a reconnect, read the inbox. Everything durable is

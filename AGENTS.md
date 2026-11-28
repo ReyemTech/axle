@@ -38,7 +38,7 @@ with `--features pg-tests`, a fresh schema per test). New store behaviour gets a
 `docs/architecture.md` maps the tree; the load-bearing ideas:
 
 - **Layers:** `src/http/` (axum router: probes, `/v1`, `/mcp`, `/ui`, bearer auth, rate
-  limits) → `src/mcp/` (the 17 MCP tools on rmcp) and `src/ui/` → `src/service/` (business
+  limits) → `src/mcp/` (the 18 MCP tools on rmcp) and `src/ui/` → `src/service/` (business
   rules shared by MCP, `/v1` and the UI) → `src/store/` (`Store` trait with `sqlite.rs` and
   `postgres.rs`). Rules live in services and in the store's guarded SQL, not in handlers.
 - **Two stores, one behaviour.** Every store method exists in both backends with identical

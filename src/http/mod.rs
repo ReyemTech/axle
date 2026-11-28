@@ -29,6 +29,7 @@ use crate::service::enroll::EnrollService;
 use crate::service::messages::MessageService;
 use crate::service::tasks::TaskService;
 use crate::service::usage::UsageService;
+use crate::service::wake::WakeService;
 use crate::store::Store;
 use crate::ui::UiState;
 use crate::usage::prices::PriceTable;
@@ -44,6 +45,8 @@ pub struct AppState {
     pub messages: Arc<MessageService>,
     pub tasks: Arc<TaskService>,
     pub enroll: Arc<EnrollService>,
+    /// The wake router; `serve` runs its ticker (`WakeService::spawn_ticker`).
+    pub wake: Arc<WakeService>,
     pub usage: Arc<UsageService>,
     /// Fired when the server starts shutting down; long-lived responses (SSE) end on it.
     pub shutdown: Shutdown,
@@ -119,20 +122,27 @@ impl AppState {
     /// Builds the services over `store`, with message and task changes published on one bus.
     pub fn new(store: Arc<dyn Store>, clock: Arc<dyn Clock>, config: ServerConfig) -> Self {
         let bus = EventBus::new(store.clone(), clock.clone());
+        let wake = Arc::new(
+            WakeService::new(store.clone(), clock.clone(), &config).with_events(bus.clone()),
+        );
         Self {
             auth: Arc::new(AuthService::new(store.clone(), clock.clone())),
             messages: Arc::new(
-                MessageService::new(store.clone(), clock.clone()).with_events(bus.clone()),
+                MessageService::new(store.clone(), clock.clone())
+                    .with_events(bus.clone())
+                    .with_wake(wake.clone()),
             ),
             tasks: Arc::new(
                 TaskService::from_config(store.clone(), clock.clone(), &config)
-                    .with_events(bus.clone()),
+                    .with_events(bus.clone())
+                    .with_wake(wake.clone()),
             ),
             enroll: Arc::new(EnrollService::new(
                 store.clone(),
                 clock.clone(),
                 bus.clone(),
             )),
+            wake,
             usage: Arc::new(UsageService::new(
                 store.clone(),
                 clock.clone(),

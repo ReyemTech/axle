@@ -10,21 +10,23 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 use time::{Duration as TimeDuration, OffsetDateTime};
 
 use super::{
-    AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate,
-    MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome, Priced, Pricer,
-    ProjectsAdded, Recipient, RelateRequest, Related, RepriceRow, Store, StoreError, StoreResult,
-    StoredUsage, TaskFilter, TaskOrder, TaskScope, TransitionRequest, Transitioned, UnblockRule,
-    Unblocked, UsageBatch, UsageCounts, UsageFilter, UsageGroup, UsageRow, UsageWritten,
+    AddProjectsRequest, AttemptQuery, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter,
+    LeaseUpdate, MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome, Priced,
+    Pricer, ProjectsAdded, Recipient, RelateRequest, Related, RepriceRow, RequestAdmission,
+    RequestInsert, Reservation, Store, StoreError, StoreResult, StoredUsage, TaskFilter,
+    TaskInsert, TaskOrder, TaskScope, TransitionRequest, Transitioned, UnblockRule, Unblocked,
+    UsageBatch, UsageCounts, UsageFilter, UsageGroup, UsageRow, UsageWritten,
     block_previous_payload, child_event, children_complete_event, claim_event, closes_child,
-    edit_payload, enrollment_token_label, like_pattern, options_from, options_to,
-    projects_added_note, projects_added_payload, related_payload, send_time_recipient,
+    edit_payload, eligible, enrollment_token_label, like_pattern, options_from, options_to,
+    projects_added_note, projects_added_payload, related_payload, send_time_recipient, to_u32,
     unblocked_records,
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId,
-    EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId, Session,
-    SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo,
-    UsageId, WaitingOn,
+    EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId,
+    ProjectWakeSettings, ServerSettings, Session, SessionId, Task, TaskEvent, TaskEventKind,
+    TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, TurnState, UsageId, WaitingOn, WakeAttempt,
+    WakeChannel,
 };
 
 /// The columns `enrollment_from` reads (a macro so queries can `concat!` it statically).
@@ -129,6 +131,11 @@ fn agent_from(row: &SqliteRow, p: &str) -> StoreResult<Agent> {
     })
 }
 
+fn opt_ts(row: &SqliteRow, col: &str) -> StoreResult<Option<OffsetDateTime>> {
+    let text: Option<&str> = row.try_get(col)?;
+    text.map(ts::dec).transpose()
+}
+
 fn session_from(row: &SqliteRow) -> StoreResult<Session> {
     Ok(Session {
         id: uuid_of(row.try_get("id")?)?,
@@ -137,6 +144,35 @@ fn session_from(row: &SqliteRow) -> StoreResult<Session> {
         started_at: ts::dec(row.try_get("started_at")?)?,
         last_heartbeat_at: ts::dec(row.try_get("last_heartbeat_at")?)?,
         last_tool_call_at: ts::dec(row.try_get("last_tool_call_at")?)?,
+        turn_state: parse_text(row.try_get("turn_state")?)?,
+        turn_state_at: opt_ts(row, "turn_state_at")?,
+        wake_channel: parse_text(row.try_get("wake_channel")?)?,
+        wake_task_id: opt_uuid(row, "wake_task_id")?,
+        wake_until: opt_ts(row, "wake_until")?,
+        last_woken_at: opt_ts(row, "last_woken_at")?,
+        run_id: row.try_get("run_id")?,
+    })
+}
+
+/// A request chain as a JSON array of project id strings.
+fn request_chain_json(chain: &[ProjectId]) -> String {
+    serde_json::Value::from(chain.iter().map(ToString::to_string).collect::<Vec<_>>()).to_string()
+}
+
+fn attempt_from(row: &SqliteRow) -> StoreResult<WakeAttempt> {
+    Ok(WakeAttempt {
+        id: uuid_of(row.try_get("id")?)?,
+        kind: parse_text(row.try_get("kind")?)?,
+        trigger: parse_text(row.try_get("trigger")?)?,
+        task_id: opt_uuid(row, "task_id")?,
+        session_id: opt_uuid(row, "session_id")?,
+        from_agent_id: opt_uuid(row, "from_agent_id")?,
+        runner_id: opt_uuid(row, "runner_id")?,
+        run_id: opt_uuid(row, "run_id")?,
+        outcome: parse_text(row.try_get("outcome")?)?,
+        detail: row.try_get("detail")?,
+        pr_url: row.try_get("pr_url")?,
+        at: ts::dec(row.try_get("created_at")?)?,
     })
 }
 
@@ -174,6 +210,19 @@ fn task_from(row: &SqliteRow) -> StoreResult<Task> {
         requires_plan: row.try_get("requires_plan")?,
         plan_state: parse_text(row.try_get("plan_state")?)?,
         block: block_from(row)?,
+        sanctioned: row.try_get("sanctioned")?,
+        request_depth: u32::try_from(row.try_get::<i64, _>("request_depth")?)
+            .map_err(|e| StoreError::Corrupt(format!("request_depth: {e}")))?,
+        origin_task_id: opt_uuid(row, "origin_task_id")?,
+        request_chain: {
+            let chain: Vec<String> = serde_json::from_str(row.try_get("request_chain")?)
+                .map_err(|e| StoreError::Corrupt(format!("request_chain: {e}")))?;
+            chain
+                .iter()
+                .map(|id| uuid_of(id))
+                .collect::<StoreResult<_>>()?
+        },
+        request_dedupe_key: row.try_get("request_dedupe_key")?,
     })
 }
 
@@ -319,7 +368,8 @@ macro_rules! task_cols {
          lease_expires_at, lease_epoch, lease_ttl_secs, eligible_harness, eligible_host,
          created_by_agent_id, created_by_session_id, created_at, updated_at, version,
          requires_plan, plan_state, done_at, acked_at, block_reason, blocked_at, waiting_kind,
-         waiting_task_id, waiting_text, unblock_text"
+         waiting_task_id, waiting_text, unblock_text, sanctioned, request_depth,
+         origin_task_id, request_chain, request_dedupe_key"
     };
 }
 
@@ -382,7 +432,8 @@ pub fn count_tasks_sql(filter: &TaskFilter) -> &'static str {
     }
 }
 
-/// Whether the claimant may claim the `tasks` row in scope. Binds, in order:
+/// `store::eligible` as SQL over the `tasks` row in scope, for picking a candidate in
+/// `claim_next_task` (the claim itself decides with `store::eligible`). Binds, in order:
 /// harness, host, home project, home project.
 macro_rules! eligible {
     () => {
@@ -403,23 +454,12 @@ async fn claim_locked(
     let c = &req.claimant;
     let id = task.to_string();
     let agent = c.agent.to_string();
-    let project = c.project.map(|p| p.to_string());
     let now = ts::enc(req.now);
 
-    let Some(row) = sqlx::query(concat!(
-        "SELECT ",
-        task_cols!(),
-        ", ",
-        eligible!(),
-        " AS eligible FROM tasks WHERE id = ?"
-    ))
-    .bind(&c.harness)
-    .bind(&c.host)
-    .bind(&project)
-    .bind(&project)
-    .bind(&id)
-    .fetch_optional(&mut *conn)
-    .await?
+    let Some(row) = sqlx::query(concat!("SELECT ", task_cols!(), " FROM tasks WHERE id = ?"))
+        .bind(&id)
+        .fetch_optional(&mut *conn)
+        .await?
     else {
         return Ok(ClaimAttempt {
             previous: None,
@@ -428,7 +468,21 @@ async fn claim_locked(
         });
     };
     let previous = task_from(&row)?;
-    let eligible: bool = row.try_get("eligible")?;
+    let extra: Vec<ProjectId> =
+        sqlx::query_scalar::<_, String>("SELECT project_id FROM task_projects WHERE task_id = ?")
+            .bind(&id)
+            .fetch_all(&mut *conn)
+            .await?
+            .iter()
+            .map(|p| uuid_of(p))
+            .collect::<StoreResult<_>>()?;
+    if !eligible(&previous, &extra, c) {
+        return Ok(ClaimAttempt {
+            previous: Some(previous),
+            eligible: false,
+            claimed: None,
+        });
+    }
 
     // A `requires_plan` task is claimed into `planning`; a planning task stays planning on a
     // takeover, and a submitted plan (waiting on the human) keeps having no lease.
@@ -453,9 +507,7 @@ async fn claim_locked(
                           OR NOT EXISTS (SELECT 1 FROM sessions s
                                           WHERE s.id = tasks.owner_session_id
                                             AND s.last_heartbeat_at >= ?))))
-            AND ",
-        eligible!(),
-        " RETURNING ",
+          RETURNING ",
         task_cols!()
     ))
     .bind(c.session.to_string())
@@ -467,10 +519,6 @@ async fn claim_locked(
     .bind(&agent)
     .bind(c.session.to_string())
     .bind(ts::enc(req.live_since))
-    .bind(&c.harness)
-    .bind(&c.host)
-    .bind(&project)
-    .bind(&project)
     .fetch_optional(&mut *conn)
     .await?
     .as_ref()
@@ -482,7 +530,7 @@ async fn claim_locked(
     }
     Ok(ClaimAttempt {
         previous: Some(previous),
-        eligible,
+        eligible: true,
         claimed,
     })
 }
@@ -769,7 +817,9 @@ fn fts_query(query: &str) -> String {
 /// Session columns (alias `s`) as a literal, so queries stay static SQL.
 macro_rules! session_cols {
     () => {
-        "s.id, s.agent_id, s.token_id, s.started_at, s.last_heartbeat_at, s.last_tool_call_at"
+        "s.id, s.agent_id, s.token_id, s.started_at, s.last_heartbeat_at, s.last_tool_call_at,
+         s.turn_state, s.turn_state_at, s.wake_channel, s.wake_task_id, s.wake_until,
+         s.last_woken_at, s.run_id"
     };
 }
 
@@ -916,6 +966,7 @@ async fn transition_in(
         "UPDATE tasks
             SET status = COALESCE(?, status),
                 plan_state = COALESCE(?, plan_state),
+                sanctioned = COALESCE(?, sanctioned),
                 lease_expires_at = CASE WHEN ? THEN lease_expires_at ELSE ? END,
                 owner_session_id = CASE WHEN ? THEN NULL ELSE owner_session_id END,
                 owner_agent_id = CASE WHEN ? THEN NULL ELSE owner_agent_id END,
@@ -946,11 +997,13 @@ async fn transition_in(
                  OR ? = (SELECT p.id FROM messages p
                           WHERE p.task_id = tasks.id AND p.kind = 'plan'
                           ORDER BY p.seq DESC LIMIT 1))
+            AND (? IS NULL OR version = ?)
           RETURNING ",
         task_cols!()
     ))
     .bind(req.to.map(|s| s.as_str()))
     .bind(req.plan_to.map(|s| s.as_str()))
+    .bind(req.sanctioned)
     .bind(keep_lease)
     .bind(lease)
     .bind(req.clear_owner)
@@ -983,6 +1036,8 @@ async fn transition_in(
     .bind(&owner)
     .bind(req.latest_plan.map(|m| m.to_string()))
     .bind(req.latest_plan.map(|m| m.to_string()))
+    .bind(req.version)
+    .bind(req.version)
     .fetch_optional(&mut *conn)
     .await?
     .as_ref()
@@ -1496,68 +1551,43 @@ impl Store for SqliteStore {
         &self,
         task: &Task,
         extra_projects: &[ProjectId],
+        cover: Option<SessionId>,
         token: Option<TokenId>,
         event: &TaskEvent,
         first_message: &Message,
-    ) -> StoreResult<bool> {
-        let (by_agent, by_session) = task.created_by.ids();
+    ) -> StoreResult<TaskInsert> {
         let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let mut sanctioned = task.sanctioned;
         if let Some(parent) = task.parent_id {
-            let status: Option<String> =
-                sqlx::query_scalar("SELECT status FROM tasks WHERE id = ?")
-                    .bind(parent.to_string())
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            if status.as_deref() == Some("planning") {
-                tx.commit().await?;
-                return Ok(false);
-            }
-        }
-        sqlx::query(
-            "INSERT INTO tasks
-                 (id, project_id, parent_id, title, body, status, owner_session_id,
-                  owner_agent_id, lease_expires_at, lease_epoch, lease_ttl_secs,
-                  eligible_harness, eligible_host, created_by_agent_id, created_by_session_id,
-                  token_id, created_at, updated_at, version, requires_plan, plan_state)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(task.id.to_string())
-        .bind(task.project_id.to_string())
-        .bind(task.parent_id.map(|p| p.to_string()))
-        .bind(&task.title)
-        .bind(&task.body)
-        .bind(task.status.as_str())
-        .bind(task.owner_session_id.map(|s| s.to_string()))
-        .bind(task.owner_agent_id.map(|a| a.to_string()))
-        .bind(task.lease_expires_at.map(ts::enc))
-        .bind(task.lease_epoch)
-        .bind(task.lease_ttl.map(|d| d.whole_seconds()))
-        .bind(&task.eligibility.harness)
-        .bind(&task.eligibility.host)
-        .bind(by_agent.map(|a| a.to_string()))
-        .bind(by_session.map(|s| s.to_string()))
-        .bind(token.map(|t| t.to_string()))
-        .bind(ts::enc(task.created_at))
-        .bind(ts::enc(task.updated_at))
-        .bind(task.version)
-        .bind(task.requires_plan)
-        .bind(task.plan_state.as_str())
-        .execute(&mut *tx)
-        .await?;
-        for project in extra_projects {
-            sqlx::query(
-                "INSERT INTO task_projects (task_id, project_id) VALUES (?, ?)
-                 ON CONFLICT DO NOTHING",
+            // The parent's status and the covering rule, read under the write lock.
+            let row: Option<(String, Option<bool>)> = sqlx::query_as(
+                "SELECT status,
+                        sanctioned = 1 AND (requires_plan = 0 OR plan_state = 'approved')
+                          AND owner_session_id = ?2
+                          AND status IN ('planning', 'claimed', 'blocked', 'review')
+                   FROM tasks WHERE id = ?1",
             )
-            .bind(task.id.to_string())
-            .bind(project.to_string())
-            .execute(&mut *tx)
+            .bind(parent.to_string())
+            .bind(cover.map(|s| s.to_string()))
+            .fetch_optional(&mut *tx)
             .await?;
+            if row.as_ref().is_some_and(|(status, _)| status == "planning") {
+                tx.commit().await?;
+                return Ok(TaskInsert::ParentPlanning);
+            }
+            if cover.is_some() {
+                sanctioned &= row.and_then(|(_, covered)| covered).unwrap_or(false);
+            }
+        } else if cover.is_some() {
+            sanctioned = false;
         }
-        insert_event(&mut tx, event, token).await?;
-        insert_message(&mut tx, first_message, token).await?;
+        let task = Task {
+            sanctioned,
+            ..task.clone()
+        };
+        write_task_rows(&mut tx, &task, extra_projects, token, event, first_message).await?;
         tx.commit().await?;
-        Ok(true)
+        Ok(TaskInsert::Inserted { sanctioned })
     }
 
     async fn add_task_projects(
@@ -1902,6 +1932,253 @@ impl Store for SqliteStore {
             .transpose()
     }
 
+    async fn wake_settings(&self, project: ProjectId) -> StoreResult<ProjectWakeSettings> {
+        let row = sqlx::query(
+            "SELECT auto_start, headless_enabled, headless_harness, max_concurrent_runs,
+                    daily_run_cap, max_run_minutes, max_budget_usd
+               FROM project_wake_settings WHERE project_id = ?",
+        )
+        .bind(project.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(ProjectWakeSettings::defaults(project));
+        };
+        Ok(ProjectWakeSettings {
+            project_id: project,
+            auto_start: row.try_get("auto_start")?,
+            headless_enabled: row.try_get("headless_enabled")?,
+            headless_harness: row.try_get("headless_harness")?,
+            max_concurrent_runs: to_u32(row.try_get("max_concurrent_runs")?)?,
+            daily_run_cap: to_u32(row.try_get("daily_run_cap")?)?,
+            max_run_minutes: to_u32(row.try_get("max_run_minutes")?)?,
+            max_budget_usd: row.try_get("max_budget_usd")?,
+        })
+    }
+
+    async fn put_wake_settings(
+        &self,
+        s: &ProjectWakeSettings,
+        now: OffsetDateTime,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO project_wake_settings
+                 (project_id, auto_start, headless_enabled, headless_harness,
+                  max_concurrent_runs, daily_run_cap, max_run_minutes, max_budget_usd,
+                  updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (project_id) DO UPDATE SET
+                 auto_start = excluded.auto_start,
+                 headless_enabled = excluded.headless_enabled,
+                 headless_harness = excluded.headless_harness,
+                 max_concurrent_runs = excluded.max_concurrent_runs,
+                 daily_run_cap = excluded.daily_run_cap,
+                 max_run_minutes = excluded.max_run_minutes,
+                 max_budget_usd = excluded.max_budget_usd,
+                 updated_at = excluded.updated_at",
+        )
+        .bind(s.project_id.to_string())
+        .bind(s.auto_start)
+        .bind(s.headless_enabled)
+        .bind(&s.headless_harness)
+        .bind(i64::from(s.max_concurrent_runs))
+        .bind(i64::from(s.daily_run_cap))
+        .bind(i64::from(s.max_run_minutes))
+        .bind(s.max_budget_usd)
+        .bind(ts::enc(now))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn server_settings(&self) -> StoreResult<ServerSettings> {
+        let row =
+            sqlx::query("SELECT wake_paused, headless_paused FROM server_settings WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(row) = row else {
+            return Ok(ServerSettings::default());
+        };
+        Ok(ServerSettings {
+            wake_paused: row.try_get("wake_paused")?,
+            headless_paused: row.try_get("headless_paused")?,
+        })
+    }
+
+    async fn put_server_settings(
+        &self,
+        s: &ServerSettings,
+        now: OffsetDateTime,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO server_settings (id, wake_paused, headless_paused, updated_at)
+             VALUES (1, ?, ?, ?)
+             ON CONFLICT (id) DO UPDATE SET
+                 wake_paused = excluded.wake_paused,
+                 headless_paused = excluded.headless_paused,
+                 updated_at = excluded.updated_at",
+        )
+        .bind(s.wake_paused)
+        .bind(s.headless_paused)
+        .bind(ts::enc(now))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_wake_attempt(&self, a: &WakeAttempt) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO wake_attempts
+                 (id, kind, trigger, task_id, session_id, from_agent_id, runner_id, run_id,
+                  outcome, detail, pr_url, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(a.id.to_string())
+        .bind(a.kind.as_str())
+        .bind(a.trigger.as_str())
+        .bind(a.task_id.map(|t| t.to_string()))
+        .bind(a.session_id.map(|s| s.to_string()))
+        .bind(a.from_agent_id.map(|g| g.to_string()))
+        .bind(a.runner_id.map(|r| r.to_string()))
+        .bind(a.run_id.map(|r| r.to_string()))
+        .bind(a.outcome.as_str())
+        .bind(&a.detail)
+        .bind(&a.pr_url)
+        .bind(ts::enc(a.at))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn last_wake_sent(&self, session: SessionId) -> StoreResult<Option<WakeAttempt>> {
+        sqlx::query(
+            "SELECT id, kind, trigger, task_id, session_id, from_agent_id, runner_id, run_id,
+                    outcome, detail, pr_url, created_at
+               FROM wake_attempts
+              WHERE session_id = ? AND kind = 'wake' AND outcome = 'sent'
+              ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(session.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(attempt_from)
+        .transpose()
+    }
+
+    async fn count_wake_attempts(&self, q: &AttemptQuery) -> StoreResult<u32> {
+        let triggers = q.triggers.as_ref().map(|list| {
+            format!(
+                ",{},",
+                list.iter()
+                    .map(|t| t.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        });
+        let session = q.session.map(|s| s.to_string());
+        let task = q.task.map(|t| t.to_string());
+        let from_agent = q.from_agent.map(|a| a.to_string());
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM wake_attempts
+              WHERE kind = ? AND outcome = ? AND created_at >= ?
+                AND (? IS NULL OR session_id = ?)
+                AND (? IS NULL OR task_id = ?)
+                AND (? IS NULL OR from_agent_id = ?)
+                AND (? IS NULL OR instr(?, ',' || trigger || ',') > 0)",
+        )
+        .bind(q.kind.as_str())
+        .bind(q.outcome.as_str())
+        .bind(ts::enc(q.since))
+        .bind(&session)
+        .bind(&session)
+        .bind(&task)
+        .bind(&task)
+        .bind(&from_agent)
+        .bind(&from_agent)
+        .bind(&triggers)
+        .bind(&triggers)
+        .fetch_one(&self.pool)
+        .await?;
+        to_u32(n)
+    }
+
+    async fn find_request(
+        &self,
+        from: AgentId,
+        project: ProjectId,
+        dedupe_key: &str,
+        since: OffsetDateTime,
+    ) -> StoreResult<Option<Task>> {
+        find_request_in(&self.pool, from, project, dedupe_key, since).await
+    }
+
+    async fn count_requests_by(&self, from: AgentId, since: OffsetDateTime) -> StoreResult<u32> {
+        count_requests_in(&self.pool, from, since).await
+    }
+
+    async fn oldest_request_by(
+        &self,
+        from: AgentId,
+        since: OffsetDateTime,
+    ) -> StoreResult<Option<OffsetDateTime>> {
+        oldest_request_in(&self.pool, from, since).await
+    }
+
+    async fn count_pending_requests(&self, project: ProjectId) -> StoreResult<u32> {
+        count_pending_in(&self.pool, project).await
+    }
+
+    async fn insert_request(
+        &self,
+        task: &Task,
+        token: Option<TokenId>,
+        event: &TaskEvent,
+        first_message: &Message,
+        admit: &RequestAdmission,
+    ) -> StoreResult<RequestInsert> {
+        let from = task.created_by.ids().0.ok_or_else(|| {
+            StoreError::Corrupt(format!("request {} has no creating agent", task.id))
+        })?;
+        let key = task
+            .request_dedupe_key
+            .as_deref()
+            .ok_or_else(|| StoreError::Corrupt(format!("request {} has no dedupe key", task.id)))?;
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        // BEGIN IMMEDIATE takes the write lock first, so concurrent requests see one another.
+        if let Some(existing) =
+            find_request_in(&mut *tx, from, task.project_id, key, admit.dedupe_since).await?
+        {
+            tx.commit().await?;
+            return Ok(RequestInsert::Existing(Box::new(existing)));
+        }
+        if count_requests_in(&mut *tx, from, admit.rate_since).await? >= admit.per_hour {
+            let oldest = oldest_request_in(&mut *tx, from, admit.rate_since)
+                .await?
+                .unwrap_or(task.created_at);
+            tx.commit().await?;
+            return Ok(RequestInsert::TooMany { oldest });
+        }
+        if count_pending_in(&mut *tx, task.project_id).await? >= admit.pending_cap {
+            tx.commit().await?;
+            return Ok(RequestInsert::ProjectFull);
+        }
+        if let Some(parent) = task.parent_id {
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM tasks WHERE id = ?")
+                    .bind(parent.to_string())
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if status.as_deref() == Some("planning") {
+                tx.commit().await?;
+                return Ok(RequestInsert::ParentPlanning);
+            }
+        }
+        write_task_rows(&mut tx, task, &[], token, event, first_message).await?;
+        tx.commit().await?;
+        Ok(RequestInsert::Inserted)
+    }
+
     async fn task_projects(&self, id: TaskId) -> StoreResult<Vec<ProjectId>> {
         sqlx::query_scalar::<_, String>(
             "SELECT project_id FROM task_projects WHERE task_id = ? ORDER BY project_id",
@@ -1911,6 +2188,219 @@ impl Store for SqliteStore {
         .await?
         .iter()
         .map(|p| uuid_of(p))
+        .collect()
+    }
+
+    async fn report_turn_at(
+        &self,
+        session: SessionId,
+        state: Option<TurnState>,
+        channel: Option<WakeChannel>,
+        reported_at: Option<OffsetDateTime>,
+        now: OffsetDateTime,
+    ) -> StoreResult<Option<SessionId>> {
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let row = sqlx::query("SELECT wake_task_id, wake_until FROM sessions WHERE id = ?")
+            .bind(session.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound("session"))?;
+        let task: Option<&str> = row.try_get("wake_task_id")?;
+        let until: Option<&str> = row.try_get("wake_until")?;
+        if let Some(channel) = channel {
+            sqlx::query("UPDATE sessions SET wake_channel = ? WHERE id = ?")
+                .bind(channel.as_str())
+                .bind(session.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
+        let mut cleared = false;
+        if let Some(state) = state {
+            let busy = state == TurnState::Busy && until.is_some() && task.is_none();
+            let reported_at = reported_at.map(ts::enc);
+            // The guard is the rule: a report older than the stored one changes nothing.
+            let applied = sqlx::query(
+                "UPDATE sessions
+                    SET turn_state_at = CASE WHEN ? <> turn_state THEN ? ELSE turn_state_at END,
+                        turn_state = ?,
+                        turn_reported_at = COALESCE(?, turn_reported_at),
+                        wake_until = CASE WHEN ? THEN NULL ELSE wake_until END
+                  WHERE id = ?
+                    AND (? IS NULL OR turn_reported_at IS NULL OR turn_reported_at <= ?)",
+            )
+            .bind(state.as_str())
+            .bind(ts::enc(now))
+            .bind(state.as_str())
+            .bind(&reported_at)
+            .bind(busy)
+            .bind(session.to_string())
+            .bind(&reported_at)
+            .bind(&reported_at)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+                == 1;
+            cleared = busy && applied;
+        }
+        tx.commit().await?;
+        Ok(cleared.then_some(session))
+    }
+
+    async fn reserve_session(&self, r: &Reservation) -> StoreResult<bool> {
+        // One statement: SQLite takes the write lock before it evaluates the guard, so
+        // concurrent reservers are serialised and exactly one sees the session free. The
+        // same write lock orders it against claims and cancels: a new job's task must still
+        // be routable by `list_queued`'s rule (sanctioned; open, or a lapsed claim; no other
+        // live reservation), so a stale snapshot cannot reserve for a taken task.
+        let task = r.task.map(|t| t.to_string());
+        let done = sqlx::query(
+            "UPDATE sessions
+                SET wake_task_id = ?, wake_until = ?, last_woken_at = ?
+              WHERE id = ?
+                AND wake_channel <> 'none'
+                AND turn_state = 'idle' AND turn_state_at <= ?
+                AND last_heartbeat_at >= ?
+                AND (wake_until IS NULL OR wake_until <= ?)
+                AND (NOT ? OR NOT EXISTS (
+                        SELECT 1 FROM tasks t
+                         WHERE t.owner_session_id = sessions.id
+                           AND t.status IN ('planning', 'claimed', 'blocked', 'review')))
+                AND (NOT ? OR ? IS NULL OR EXISTS (
+                        SELECT 1 FROM tasks t
+                         WHERE t.id = ?
+                           AND t.sanctioned = 1
+                           AND (t.status = 'open'
+                                OR (t.status IN ('claimed', 'planning')
+                                    AND t.lease_expires_at <= ?))
+                           AND NOT EXISTS (SELECT 1 FROM sessions o
+                                            WHERE o.wake_task_id = t.id AND o.wake_until > ?
+                                              AND o.id <> sessions.id)))",
+        )
+        .bind(&task)
+        .bind(ts::enc(r.until))
+        .bind(ts::enc(r.now))
+        .bind(r.session.to_string())
+        .bind(ts::enc(r.idle_before))
+        .bind(ts::enc(r.live_since))
+        .bind(ts::enc(r.now))
+        .bind(r.new_job)
+        .bind(r.new_job)
+        .bind(&task)
+        .bind(&task)
+        .bind(ts::enc(r.now))
+        .bind(ts::enc(r.now))
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn clear_session_reservation(
+        &self,
+        session: SessionId,
+        task: Option<TaskId>,
+    ) -> StoreResult<bool> {
+        let done = sqlx::query(
+            "UPDATE sessions SET wake_task_id = NULL, wake_until = NULL
+              WHERE id = ? AND wake_until IS NOT NULL
+                AND (wake_task_id IS NULL OR wake_task_id = ?)",
+        )
+        .bind(session.to_string())
+        .bind(task.map(|t| t.to_string()))
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn clear_task_reservations(&self, task: TaskId) -> StoreResult<Vec<SessionId>> {
+        let mut ids = sqlx::query_scalar::<_, String>(
+            "UPDATE sessions SET wake_task_id = NULL, wake_until = NULL
+              WHERE wake_task_id = ? RETURNING id",
+        )
+        .bind(task.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|s| uuid_of(s))
+        .collect::<StoreResult<Vec<SessionId>>>()?;
+        ids.sort_by_key(|s| s.as_uuid());
+        Ok(ids)
+    }
+
+    async fn expire_reservations(
+        &self,
+        now: OffsetDateTime,
+    ) -> StoreResult<Vec<(SessionId, Option<TaskId>)>> {
+        let now = ts::enc(now);
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let expired =
+            sqlx::query("SELECT id, wake_task_id FROM sessions WHERE wake_until <= ? ORDER BY id")
+                .bind(&now)
+                .fetch_all(&mut *tx)
+                .await?
+                .iter()
+                .map(|row| Ok((uuid_of(row.try_get("id")?)?, opt_uuid(row, "wake_task_id")?)))
+                .collect::<StoreResult<Vec<_>>>()?;
+        sqlx::query(
+            "UPDATE sessions SET wake_task_id = NULL, wake_until = NULL WHERE wake_until <= ?",
+        )
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(expired)
+    }
+
+    async fn wake_candidates(
+        &self,
+        live_since: OffsetDateTime,
+        idle_before: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> StoreResult<Vec<(Agent, Session)>> {
+        let sql = concat!(
+            "SELECT ",
+            session_cols!(),
+            ", a.id AS a_id, a.project_id AS a_project_id, a.host AS a_host,
+                    a.harness AS a_harness, a.created_at AS a_created_at
+             FROM sessions s JOIN agents a ON a.id = s.agent_id
+             WHERE s.last_heartbeat_at >= ?
+               AND s.turn_state = 'idle' AND s.turn_state_at <= ?
+               AND s.wake_channel <> 'none'
+               AND (s.wake_until IS NULL OR s.wake_until <= ?)
+             ORDER BY s.last_woken_at NULLS FIRST, s.turn_state_at, s.id"
+        );
+        sqlx::query(sql)
+            .bind(ts::enc(live_since))
+            .bind(ts::enc(idle_before))
+            .bind(ts::enc(now))
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(|row| Ok((agent_from(row, "a_")?, session_from(row)?)))
+            .collect()
+    }
+
+    async fn list_queued(&self, now: OffsetDateTime) -> StoreResult<Vec<Task>> {
+        let now = ts::enc(now);
+        sqlx::query(concat!(
+            "SELECT ",
+            task_cols!(),
+            " FROM tasks
+               WHERE sanctioned = 1
+                 AND (status = 'open'
+                      OR (status IN ('claimed', 'planning') AND lease_expires_at <= ?))
+                 AND NOT EXISTS (SELECT 1 FROM sessions s
+                                  WHERE s.wake_task_id = tasks.id AND s.wake_until > ?)
+               ORDER BY COALESCE((SELECT MAX(e.created_at) FROM task_events e
+                                   WHERE e.task_id = tasks.id AND e.kind = 'queued'),
+                                 tasks.lease_expires_at, tasks.created_at),
+                        tasks.id"
+        ))
+        .bind(&now)
+        .bind(&now)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(task_from)
         .collect()
     }
 
@@ -1977,6 +2467,11 @@ impl Store for SqliteStore {
             .fetch_one(&self.pool)
             .await?;
         Ok(n as u64)
+    }
+
+    async fn append_task_event(&self, event: &TaskEvent) -> StoreResult<()> {
+        let mut conn = self.pool.acquire().await?;
+        insert_event(&mut conn, event, None).await
     }
 
     async fn task_events(&self, id: TaskId) -> StoreResult<Vec<TaskEvent>> {
@@ -2801,4 +3296,142 @@ async fn held_tasks(
     .bind(ts::enc(at))
     .fetch_all(conn)
     .await?)
+}
+
+/// Writes a new task's rows (the task, its extra projects, its first event and message)
+/// inside the caller's transaction.
+async fn write_task_rows(
+    tx: &mut SqliteConnection,
+    task: &Task,
+    extra_projects: &[ProjectId],
+    token: Option<TokenId>,
+    event: &TaskEvent,
+    first_message: &Message,
+) -> StoreResult<()> {
+    let (by_agent, by_session) = task.created_by.ids();
+    sqlx::query(
+        "INSERT INTO tasks
+             (id, project_id, parent_id, title, body, status, owner_session_id,
+              owner_agent_id, lease_expires_at, lease_epoch, lease_ttl_secs,
+              eligible_harness, eligible_host, created_by_agent_id, created_by_session_id,
+              token_id, created_at, updated_at, version, requires_plan, plan_state,
+              sanctioned, request_depth, origin_task_id, request_chain,
+              request_dedupe_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 ?)",
+    )
+    .bind(task.id.to_string())
+    .bind(task.project_id.to_string())
+    .bind(task.parent_id.map(|p| p.to_string()))
+    .bind(&task.title)
+    .bind(&task.body)
+    .bind(task.status.as_str())
+    .bind(task.owner_session_id.map(|s| s.to_string()))
+    .bind(task.owner_agent_id.map(|a| a.to_string()))
+    .bind(task.lease_expires_at.map(ts::enc))
+    .bind(task.lease_epoch)
+    .bind(task.lease_ttl.map(|d| d.whole_seconds()))
+    .bind(&task.eligibility.harness)
+    .bind(&task.eligibility.host)
+    .bind(by_agent.map(|a| a.to_string()))
+    .bind(by_session.map(|s| s.to_string()))
+    .bind(token.map(|t| t.to_string()))
+    .bind(ts::enc(task.created_at))
+    .bind(ts::enc(task.updated_at))
+    .bind(task.version)
+    .bind(task.requires_plan)
+    .bind(task.plan_state.as_str())
+    .bind(task.sanctioned)
+    .bind(i64::from(task.request_depth))
+    .bind(task.origin_task_id.map(|t| t.to_string()))
+    .bind(request_chain_json(&task.request_chain))
+    .bind(&task.request_dedupe_key)
+    .execute(&mut *tx)
+    .await?;
+    for project in extra_projects {
+        sqlx::query(
+            "INSERT INTO task_projects (task_id, project_id) VALUES (?, ?)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(task.id.to_string())
+        .bind(project.to_string())
+        .execute(&mut *tx)
+        .await?;
+    }
+    insert_event(&mut *tx, event, token).await?;
+    insert_message(&mut *tx, first_message, token).await?;
+    Ok(())
+}
+
+async fn find_request_in<'e>(
+    ex: impl sqlx::SqliteExecutor<'e>,
+    from: AgentId,
+    project: ProjectId,
+    dedupe_key: &str,
+    since: OffsetDateTime,
+) -> StoreResult<Option<Task>> {
+    sqlx::query(concat!(
+        "SELECT ",
+        task_cols!(),
+        " FROM tasks
+           WHERE created_by_agent_id = ? AND project_id = ? AND request_dedupe_key = ?
+             AND created_at >= ?
+           ORDER BY created_at DESC, id DESC LIMIT 1"
+    ))
+    .bind(from.to_string())
+    .bind(project.to_string())
+    .bind(dedupe_key)
+    .bind(ts::enc(since))
+    .fetch_optional(ex)
+    .await?
+    .as_ref()
+    .map(task_from)
+    .transpose()
+}
+
+async fn count_requests_in<'e>(
+    ex: impl sqlx::SqliteExecutor<'e>,
+    from: AgentId,
+    since: OffsetDateTime,
+) -> StoreResult<u32> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tasks
+          WHERE created_by_agent_id = ? AND request_dedupe_key IS NOT NULL
+            AND created_at >= ?",
+    )
+    .bind(from.to_string())
+    .bind(ts::enc(since))
+    .fetch_one(ex)
+    .await?;
+    to_u32(n)
+}
+
+async fn oldest_request_in<'e>(
+    ex: impl sqlx::SqliteExecutor<'e>,
+    from: AgentId,
+    since: OffsetDateTime,
+) -> StoreResult<Option<OffsetDateTime>> {
+    let oldest: Option<String> = sqlx::query_scalar(
+        "SELECT MIN(created_at) FROM tasks
+          WHERE created_by_agent_id = ? AND request_dedupe_key IS NOT NULL
+            AND created_at >= ?",
+    )
+    .bind(from.to_string())
+    .bind(ts::enc(since))
+    .fetch_one(ex)
+    .await?;
+    oldest.as_deref().map(ts::dec).transpose()
+}
+
+async fn count_pending_in<'e>(
+    ex: impl sqlx::SqliteExecutor<'e>,
+    project: ProjectId,
+) -> StoreResult<u32> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tasks WHERE project_id = ? AND status = 'requested'",
+    )
+    .bind(project.to_string())
+    .fetch_one(ex)
+    .await?;
+    to_u32(n)
 }

@@ -22,7 +22,8 @@
   {% if let Some(r) = card.blocked_line %}<p class="card-blocked"><span class="card-blocked-label">{% if card.blocked_on_you %}Blocked on you:{% else %}Blocked:{% endif %}</span> <span class="card-blocked-reason" title="Agent-written">{{ r }}</span></p>{% endif %}
   {% if let Some((pid, ptitle)) = card.parent %}<p class="card-parent">Subtask of <a href="/ui/tasks/{{ pid }}">{{ ptitle }}</a></p>{% endif %}
   <div class="card-meta">
-    <span class="state" data-status="{{ card.status }}" data-aspect="{{ card.aspect }}"><span class="aspect" data-aspect="{{ card.aspect }}" aria-hidden="true"></span><span class="status">{{ card.label }}</span></span>
+    {% if card.status != "requested" %}<span class="state" data-status="{{ card.status }}" data-aspect="{{ card.aspect }}"><span class="aspect" data-aspect="{{ card.aspect }}" aria-hidden="true"></span><span class="status">{{ card.label }}</span></span>{% endif %}
+    {% if let Some(b) = card.badge %}<span class="badge-state" data-badge="{{ b }}" title="{% if card.badge == Some("queued") %}Approved; waiting for a free session to take it{% else %}A request from another agent; waiting for you to approve it{% endif %}"><span class="aspect" data-aspect="{{ b }}" aria-hidden="true"></span>{{ b }}</span>{% endif %}
     <span class="project" data-line="{{ card.project.line }}" title="{{ card.project.key }}">{{ card.project.name }}</span>
   </div>
   {% if let Some(owner) = card.owner %}

@@ -16,8 +16,8 @@ use time::{Duration, OffsetDateTime};
 use super::SessionCtx;
 use super::needs::{NeedCard, needs_you};
 use crate::domain::{
-    Actor, Address, Agent, AgentId, Importance, PlanState, Project, ProjectId, Task, TaskId,
-    TaskStatus,
+    Actor, Address, Agent, AgentId, Importance, PlanState, Project, ProjectId, SessionId, Task,
+    TaskEventKind, TaskId, TaskStatus,
 };
 use crate::events::Event;
 use crate::http::AppState;
@@ -53,6 +53,9 @@ pub enum UiError {
     /// A form value the action cannot use (422).
     #[error("{0}")]
     Invalid(String),
+    /// A form that is missing a field our own pages always send (400).
+    #[error("{0}")]
+    BadRequest(&'static str),
     /// The action does not fit the current state, like releasing an open task (409).
     #[error("{0}")]
     Conflict(String),
@@ -77,6 +80,7 @@ impl IntoResponse for UiError {
         match self {
             UiError::NotFound(what) => error_page(StatusCode::NOT_FOUND, what),
             UiError::Invalid(why) => error_page(StatusCode::UNPROCESSABLE_ENTITY, &why),
+            UiError::BadRequest(why) => error_page(StatusCode::BAD_REQUEST, why),
             UiError::Conflict(why) => error_page(StatusCode::CONFLICT, &why),
             UiError::Internal(e) => {
                 eprintln!("axl: ui error: {e}");
@@ -289,6 +293,9 @@ pub struct CardView {
     pub urgent: bool,
     /// Whether a compact card names its project (not when the board shows one project).
     pub show_project: bool,
+    /// `requested` (a work request awaiting the human) or `queued` (approved, waiting for a
+    /// free session); shown as a word beside its glyph.
+    pub badge: Option<&'static str>,
 }
 
 /// Characters of a blocked task's reason in a compact card's tooltip.
@@ -498,7 +505,12 @@ async fn card(labels: &mut Labels<'_>, ctx: CardCtx, task: &Task) -> StoreResult
     let (aspect, label) = state_mark(task);
     Ok(CardView {
         id: task.id.to_string(),
-        title: task.title.clone(),
+        // A request's words are another agent's: shown defused, on one line, and cut.
+        title: if task.status == TaskStatus::Requested {
+            super::needs::peer_line(&task.title, 120)
+        } else {
+            task.title.clone()
+        },
         status: task.status.as_str(),
         aspect,
         label,
@@ -516,7 +528,33 @@ async fn card(labels: &mut Labels<'_>, ctx: CardCtx, task: &Task) -> StoreResult
         compact: false,
         urgent: false,
         show_project: true,
+        badge: badge(labels.store, ctx.now, task).await?,
     })
+}
+
+/// `requested` for a work request awaiting approval; `queued` for a sanctioned open task
+/// that has a `queued` event and no live reservation (waiting for a free session).
+async fn badge(
+    store: &dyn Store,
+    now: OffsetDateTime,
+    task: &Task,
+) -> StoreResult<Option<&'static str>> {
+    match task.status {
+        TaskStatus::Requested => Ok(Some("requested")),
+        TaskStatus::Open if task.sanctioned => {
+            let was_queued = store
+                .task_events(task.id)
+                .await?
+                .iter()
+                .any(|e| e.kind == TaskEventKind::Queued);
+            if !was_queued {
+                return Ok(None);
+            }
+            let waiting = store.list_queued(now).await?;
+            Ok(waiting.iter().any(|t| t.id == task.id).then_some("queued"))
+        }
+        _ => Ok(None),
+    }
 }
 
 #[derive(Template)]
@@ -636,6 +674,9 @@ pub struct ColumnView {
     pub more: Option<MoreLink>,
     /// For an expanded column with more than the cap: the "Show top 12" link back.
     pub fewer: Option<MoreLink>,
+    /// Work requests awaiting approval: a lane above the cards of the Open column (empty
+    /// elsewhere).
+    pub requested: Vec<CardView>,
     /// `Some` only for the Done column.
     pub done: Option<DoneHead>,
 }
@@ -981,6 +1022,22 @@ async fn columns(
                 }
             }
         }
+        let mut requested = Vec::new();
+        if status == TaskStatus::Open {
+            let mut asks = state
+                .store
+                .list_tasks(&TaskFilter {
+                    project,
+                    status: Some(TaskStatus::Requested),
+                    ..TaskFilter::default()
+                })
+                .await?;
+            asks.retain(|t| t.parent_id.is_none());
+            asks.sort_by_key(|t| (t.created_at, t.id));
+            for t in &asks {
+                requested.push(card(labels, ctx, t).await?);
+            }
+        }
         out.push(ColumnView {
             status: key,
             label,
@@ -989,6 +1046,7 @@ async fn columns(
             expanded,
             more,
             fewer,
+            requested,
             done,
         });
     }
@@ -1119,6 +1177,8 @@ pub struct AgentCard {
     pub live: bool,
     pub last_seen: String,
     pub last_seen_at: String,
+    /// `woken 2m ago · <task>` from the session's latest wake that was sent.
+    pub woken: Option<String>,
 }
 
 #[derive(Template)]
@@ -1189,26 +1249,40 @@ async fn overview_data(state: &AppState) -> UiResult<(Counters, Vec<AgentCard>)>
     };
 
     // One card per agent: its most recently seen session, if seen within the window.
-    let mut latest: HashMap<AgentId, (&Agent, OffsetDateTime)> = HashMap::new();
+    let mut latest: HashMap<AgentId, (&Agent, OffsetDateTime, SessionId)> = HashMap::new();
     for (agent, session) in &sessions {
         let seen = session.last_heartbeat_at;
-        let entry = latest.entry(agent.id).or_insert((agent, seen));
+        let entry = latest.entry(agent.id).or_insert((agent, seen, session.id));
         if seen > entry.1 {
             entry.1 = seen;
+            entry.2 = session.id;
         }
     }
     let mut recent: Vec<_> = latest
         .into_values()
-        .filter(|(_, seen)| *seen >= now - AGENT_WINDOW)
+        .filter(|(_, seen, _)| *seen >= now - AGENT_WINDOW)
         .collect();
     recent.sort_by(|a, b| {
         b.1.cmp(&a.1)
             .then_with(|| a.0.harness.cmp(&b.0.harness))
             .then_with(|| a.0.host.cmp(&b.0.host))
     });
-    let labels = Labels::load(&*state.store).await?;
+    let mut labels = Labels::load(&*state.store).await?;
     let mut agents = Vec::with_capacity(recent.len());
-    for (agent, seen) in recent {
+    for (agent, seen, session) in recent {
+        let woken = match state.store.last_wake_sent(session).await? {
+            Some(w) => {
+                let task = match w.task_id {
+                    Some(t) => labels.task_title(t).await?,
+                    None => None,
+                };
+                Some(match task {
+                    Some(title) => format!("woken {} · {title}", ago(now, w.at)),
+                    None => format!("woken {}", ago(now, w.at)),
+                })
+            }
+            None => None,
+        };
         let current_task = state
             .store
             .list_tasks(&TaskFilter {
@@ -1237,6 +1311,7 @@ async fn overview_data(state: &AppState) -> UiResult<(Counters, Vec<AgentCard>)>
             live: seen >= live_since,
             last_seen: ago(now, seen),
             last_seen_at: seen.format(&Rfc3339).unwrap_or_default(),
+            woken,
         });
     }
     Ok((counters, agents))
@@ -1274,6 +1349,8 @@ pub struct Pulse {
     pub live: usize,
     pub blocked: usize,
     pub need: usize,
+    /// The wake-up kill switch is on.
+    pub wake_paused: bool,
 }
 
 pub async fn pulse_counts(state: &AppState) -> StoreResult<Pulse> {
@@ -1300,6 +1377,7 @@ pub async fn pulse_counts(state: &AppState) -> StoreResult<Pulse> {
         live: live.len(),
         blocked,
         need,
+        wake_paused: state.store.server_settings().await?.wake_paused,
     })
 }
 
@@ -1375,6 +1453,16 @@ async fn task_frames(state: &AppState, event: &Event) -> UiResult<Frames> {
         Event::EnrollmentChanged { .. } => {
             return Ok(vec![("tokens".to_string(), PING.to_string())]);
         }
+        // The needs-you panel (and the pulse) re-fetch on `overview`; a request may also have
+        // changed a card's column.
+        Event::RequestCreated { .. } | Event::RequestDecided { .. } => {
+            return Ok(vec![
+                ("overview".to_string(), PING.to_string()),
+                ("board".into(), PING.into()),
+            ]);
+        }
+        // Wake prompts and their results are for the bridge and the wake log, not a page.
+        Event::WakeRequested { .. } | Event::WakeResult { .. } => return Ok(Vec::new()),
         Event::MessageCreated { id, to, .. } => {
             let mut frames = vec![("inbox".to_string(), PING.to_string())];
             if let Address::Task(t) = to {

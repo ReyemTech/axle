@@ -20,6 +20,7 @@ use tokio::sync::broadcast::error::RecvError;
 use super::{ApiError, AppState, AuthToken};
 use crate::domain::{
     Actor, Address, AgentId, Importance, MessageId, ProjectId, SessionId, TaskId, TaskStatus,
+    TurnState, WakeChannel, WakeOutcome,
 };
 use crate::events::Event;
 use crate::service::identity::{IdentityError, IdentityInput, IdentityService, Resolved};
@@ -38,6 +39,9 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/register", post(register))
         .route("/heartbeat", post(heartbeat))
+        .route("/turn", post(turn))
+        .route("/wake/result", post(wake_result))
+        .route("/session", get(session_state))
         .route("/events", get(events))
         .route("/inbox/summary", get(inbox_summary))
         .route("/leases", get(leases))
@@ -193,6 +197,16 @@ async fn usage(
 #[derive(Debug, Deserialize)]
 pub struct HeartbeatRequest {
     pub session_id: SessionId,
+    /// The bridge's view of the turn (from the hooks' turn file); older bridges omit it.
+    #[serde(default)]
+    pub turn_state: Option<TurnState>,
+    /// When the hooks wrote that turn state (RFC 3339, the agent machine's clock), so an old
+    /// one cannot undo a newer report; older bridges omit it, and a malformed one is ignored.
+    #[serde(default)]
+    pub turn_state_at: Option<String>,
+    /// How Axle can wake this session, as the bridge last checked; older bridges omit it.
+    #[serde(default)]
+    pub wake_channel: Option<WakeChannel>,
 }
 
 #[derive(Debug, Serialize)]
@@ -218,6 +232,20 @@ async fn heartbeat(
         .renew_by_heartbeat(r.session.id)
         .await
         .map_err(ApiError::internal)?;
+    // After the touch, so an idle report can place queued work on this (now live) session.
+    // The heartbeat has already committed: a routing error is logged, never a failed beat.
+    if let Err(e) = state
+        .wake
+        .on_turn_report(
+            r.session.id,
+            req.turn_state,
+            req.wake_channel,
+            report_time(req.turn_state_at.as_deref()),
+        )
+        .await
+    {
+        eprintln!("axl: wake routing after a heartbeat failed: {e}");
+    }
     let unread = state
         .messages
         .unread_count(&r)
@@ -225,6 +253,113 @@ async fn heartbeat(
         .map_err(ApiError::internal)?;
     let leases = held(&state, &r).await?.into_iter().map(|t| t.id).collect();
     Ok(Json(HeartbeatResponse { unread, leases }))
+}
+
+// ---------------------------------------------------------------- turn
+
+#[derive(Debug, Deserialize)]
+pub struct TurnRequest {
+    pub session_id: SessionId,
+    pub state: TurnState,
+    /// When the hook made the report (RFC 3339, the agent machine's clock); older hooks omit
+    /// it, and a malformed one is ignored.
+    #[serde(default)]
+    pub at: Option<String>,
+}
+
+/// A client's report time, RFC 3339; anything else is treated as absent.
+fn report_time(at: Option<&str>) -> Option<time::OffsetDateTime> {
+    time::OffsetDateTime::parse(at?, &time::format_description::well_known::Rfc3339).ok()
+}
+
+/// A hook's turn report: records the state and, going idle, tries to place queued work
+/// (going busy marks a delivered wake). `204` with no body.
+async fn turn(
+    State(state): State<AppState>,
+    Extension(AuthToken(token)): Extension<AuthToken>,
+    Json(req): Json<TurnRequest>,
+) -> Result<StatusCode, ApiError> {
+    let r = session_for(&state, token, req.session_id).await?;
+    state
+        .wake
+        .on_turn_report(
+            r.session.id,
+            Some(req.state),
+            None,
+            report_time(req.at.as_deref()),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WakeResultRequest {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub task_id: Option<TaskId>,
+    pub outcome: WakeOutcome,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// Longest outcome detail kept, in characters.
+const WAKE_DETAIL_MAX: usize = 500;
+
+/// A bridge's report of what its adapter did with a wake. Only the named session's own
+/// token may report for it, and only what a bridge can observe (`sent`, `held`, `refused`,
+/// `failed`). `204` with no body.
+async fn wake_result(
+    State(state): State<AppState>,
+    Extension(AuthToken(token)): Extension<AuthToken>,
+    Json(req): Json<WakeResultRequest>,
+) -> Result<StatusCode, ApiError> {
+    let r = session_for(&state, token, req.session_id).await?;
+    if !matches!(
+        req.outcome,
+        WakeOutcome::Sent | WakeOutcome::Held | WakeOutcome::Refused | WakeOutcome::Failed
+    ) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "a bridge reports sent, held, refused or failed",
+        ));
+    }
+    let detail = req
+        .detail
+        .map(|d| d.chars().take(WAKE_DETAIL_MAX).collect::<String>());
+    let accepted = state
+        .wake
+        .report(r.session.id, req.task_id, req.outcome, detail)
+        .await
+        .map_err(ApiError::internal)?;
+    if !accepted {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "this session was not woken for that task",
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionState {
+    pub session_id: SessionId,
+    pub wake_channel: WakeChannel,
+    pub turn_state: TurnState,
+}
+
+/// One session's wake channel and turn state, for `axl status`.
+async fn session_state(
+    State(state): State<AppState>,
+    Extension(AuthToken(token)): Extension<AuthToken>,
+    Query(q): Query<SessionQuery>,
+) -> Result<Json<SessionState>, ApiError> {
+    let r = session_for(&state, token, q.session).await?;
+    Ok(Json(SessionState {
+        session_id: r.session.id,
+        wake_channel: r.session.wake_channel,
+        turn_state: r.session.turn_state,
+    }))
 }
 
 /// The tasks this session holds (`planning`, `claimed`, `blocked` or `review`).
@@ -367,8 +502,15 @@ impl Watcher {
         let result = match *event {
             Event::MessageCreated { id, to, .. } => self.wants_message(id, to).await,
             Event::TaskChanged { id, project_id, .. } => self.wants_task(id, project_id).await,
-            // The human's inbox is not an agent's business.
-            Event::HumanArchived { .. } | Event::EnrollmentChanged { .. } => Ok(false),
+            // A wake prompt goes to the one session it names.
+            Event::WakeRequested { session, .. } => Ok(session == self.session),
+            // The human's inbox, wake results and work-request hints are not an agent's
+            // business.
+            Event::HumanArchived { .. }
+            | Event::EnrollmentChanged { .. }
+            | Event::WakeResult { .. }
+            | Event::RequestCreated { .. }
+            | Event::RequestDecided { .. } => Ok(false),
         };
         result.unwrap_or_else(|e| {
             eprintln!("axl: dropping event for session {}: {e}", self.session);
@@ -438,6 +580,12 @@ pub struct InboxSummaryItem {
     pub id: MessageId,
     /// `human`, or the sending agent as `<project> · <host> · <harness>`.
     pub from: String,
+    /// The human typed it in the UI: hooks frame its body as the human's, not as peer data.
+    pub from_human: bool,
+    /// For a human message with a subject, who wrote that subject (`human`, or the
+    /// replied-to agent's label): hooks frame the subject as that author's peer text, never
+    /// as the human's.
+    pub subject_from: Option<String>,
     pub subject: Option<String>,
     /// The message's project key (where it was sent), for the `in <project>` label.
     pub project: Option<String>,
@@ -472,6 +620,24 @@ async fn inbox_summary(
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         let m = item.message;
+        // A human reply's subject is the original's: name that author for the subject.
+        let subject_from = match crate::mcp::subject_author(&*state.store, &m)
+            .await
+            .map_err(ApiError::internal)?
+        {
+            _ if !crate::mcp::is_human_typed(&m) || m.subject.is_none() => None,
+            Actor::Human => Some("human".to_string()),
+            Actor::Agent(a, _) => Some(match labels.get(&a) {
+                Some(l) => l.clone(),
+                None => {
+                    let l = agent_label(&*state.store, a)
+                        .await
+                        .map_err(ApiError::internal)?;
+                    labels.insert(a, l.clone());
+                    l
+                }
+            }),
+        };
         let from = match m.from {
             Actor::Human => "human".to_string(),
             Actor::Agent(a, _) => match labels.get(&a) {
@@ -504,6 +670,8 @@ async fn inbox_summary(
         out.push(InboxSummaryItem {
             id: m.id,
             from,
+            from_human: crate::mcp::is_human_typed(&m),
+            subject_from,
             subject: m.subject,
             project,
             importance: m.importance,

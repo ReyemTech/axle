@@ -5,7 +5,7 @@
 pub mod api;
 pub mod config;
 
-pub use api::{Api, DeviceStartReply, PollStatus, WhoAmI};
+pub use api::{Api, DeviceStartReply, PollStatus, SessionState, WhoAmI};
 
 pub use config::{
     AxlDir, ClientConfig, ClientError, DEFAULT_SERVER_URL, UsageConfig, load_config, read_token,

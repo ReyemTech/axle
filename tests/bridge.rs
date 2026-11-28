@@ -471,3 +471,334 @@ async fn bridge_heartbeats_and_reregisters_when_forgotten() {
     assert!(stderr.contains("heartbeat rejected (500"), "{stderr}");
     assert!(!stderr.contains("tok-123"), "token must never be logged");
 }
+
+#[tokio::test]
+async fn bridge_heartbeat_carries_the_hooks_turn_state() {
+    let seen: Seen = Arc::default();
+    let server = fake_v1(seen.clone()).await;
+    let home = TempDir::new();
+    let work = TempDir::new();
+    let bridge = spawn_bridge(
+        &work.0,
+        &[
+            ("HOME", home.0.to_str().unwrap()),
+            ("AXL_SERVER_URL", server.as_str()),
+            ("AXL_TOKEN", "tok-123"),
+            ("AXL_HEARTBEAT_MS", "50"),
+        ],
+    )
+    .await;
+    let beats = |seen: &Seen| -> Vec<Value> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(w, _, _)| *w == "heartbeat")
+            .map(|(_, _, b)| b.clone())
+            .collect()
+    };
+    for _ in 0..200 {
+        if !beats(&seen).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // No turn file yet: the old shape.
+    assert!(
+        beats(&seen)[0].get("turn_state").is_none(),
+        "{:?}",
+        beats(&seen)
+    );
+
+    // A hook records idle; a later heartbeat carries it, with the time it was written.
+    let turn = axle::bridge::session_file::turn_path(&home.0, std::process::id());
+    let at = time::macros::datetime!(2026-11-28 9:00:01.5 UTC);
+    axle::bridge::session_file::write_turn(&turn, axle::domain::TurnState::Idle, at).unwrap();
+    let mut carried = false;
+    for _ in 0..200 {
+        if beats(&seen)
+            .iter()
+            .any(|b| b["turn_state"] == "idle" && b["turn_state_at"] == "2026-11-28T09:00:01.5Z")
+        {
+            carried = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(carried, "{:?}", beats(&seen));
+
+    let (ok, _) = bridge.close().await;
+    assert!(ok);
+    assert!(!turn.exists(), "the turn file goes with the session file");
+}
+
+// ---------------------------------------------------------------- wake listener
+
+use axle::bridge::wake::{PokeOutcome, WakeAdapter, wake_loop};
+use axle::domain::{TurnState, WakeChannel, WakeOutcome, WakeTrigger};
+use axle::events::Event;
+
+/// Records every poke and answers with `outcome`.
+struct Recording {
+    pokes: Mutex<Vec<String>>,
+    outcome: PokeOutcome,
+}
+
+#[async_trait::async_trait]
+impl WakeAdapter for Recording {
+    fn channel(&self) -> WakeChannel {
+        WakeChannel::ClaudeSocket
+    }
+    async fn check(&self) -> bool {
+        true
+    }
+    async fn turn_state(&self) -> Option<TurnState> {
+        None
+    }
+    async fn poke(&self, text: &str) -> PokeOutcome {
+        self.pokes.lock().unwrap().push(text.to_string());
+        self.outcome.clone()
+    }
+}
+
+fn wake_config(server: &str, token: &str) -> axle::bridge::Config {
+    let env = Env::from_pairs([
+        ("AXL_SERVER_URL", server),
+        ("AXL_TOKEN", token),
+        ("AXL_HEARTBEAT_MS", "50"),
+        ("AXL_PROJECT", "github.com/reyemtech/wake"),
+    ]);
+    axle::bridge::Config::resolve("test-harness", Path::new("/"), &env)
+}
+
+async fn register(server: &str, token: &str, cfg: &axle::bridge::Config) {
+    let res = reqwest::Client::new()
+        .post(format!("{server}/v1/register"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "session_id": cfg.session_id, "host": cfg.host, "harness": cfg.harness,
+            "project_key": cfg.project_key,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "{}", res.status());
+}
+
+fn serve(state: AppState, listener: tokio::net::TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router(state)).into_future().await;
+    })
+}
+
+fn test_state(store: Arc<dyn Store>) -> AppState {
+    let config = ServerConfig::from_lookup(|k| match k {
+        "DATABASE_URL" => Some("sqlite::memory:".into()),
+        "AXL_ADMIN_SECRET" => Some("test-secret-0123456789".into()),
+        _ => None,
+    })
+    .unwrap();
+    AppState::new(store, Arc::new(SystemClock), config)
+}
+
+async fn wait_for<F: Fn() -> bool>(what: &str, f: F) {
+    for _ in 0..200 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+store_matrix!(
+    bridge_forwards_wake_to_adapter_and_reports_result,
+    |store: Arc<dyn Store>| async move {
+        let state = test_state(store);
+        let token = state.auth.create("wake").await.unwrap().1;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}", listener.local_addr().unwrap());
+        let _srv = serve(state.clone(), listener);
+
+        let cfg = wake_config(&server, &token);
+        register(&server, &token, &cfg).await;
+        let session = cfg.session_id;
+        let adapter = Arc::new(Recording {
+            pokes: Mutex::default(),
+            outcome: PokeOutcome::Sent,
+        });
+        let bridge = axle::bridge::Bridge::new(cfg);
+        let looped = tokio::spawn(wake_loop(bridge, adapter.clone()));
+
+        // The results the server publishes (the UI's view of an attempt).
+        let mut results = state.bus.subscribe();
+        // Let the bridge's stream subscribe, then wake it (and some other session).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let wake = |s, text: &str| Event::WakeRequested {
+            session: s,
+            task: None,
+            trigger: WakeTrigger::HumanPost,
+            text: text.into(),
+        };
+        state
+            .bus
+            .publish(wake(axle::domain::SessionId::new(), "not for us"))
+            .await
+            .unwrap();
+        state
+            .bus
+            .publish(wake(session, "[axl from human] hello"))
+            .await
+            .unwrap();
+
+        wait_for("the poke", || !adapter.pokes.lock().unwrap().is_empty()).await;
+        assert_eq!(
+            *adapter.pokes.lock().unwrap(),
+            ["[axl from human] hello".to_string()]
+        );
+        let got = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Event::WakeResult {
+                    session: s,
+                    outcome,
+                    ..
+                } = results.recv().await.unwrap()
+                {
+                    return (s, outcome);
+                }
+            }
+        })
+        .await
+        .expect("the bridge reports the outcome");
+        assert_eq!(got, (session, WakeOutcome::Sent));
+        looped.abort();
+    }
+);
+
+/// A fake `/v1/events` whose streams end by themselves (a server restart, as the bridge
+/// sees it): the first connection ends at once, the second delivers a wake for the
+/// session and ends, and `/v1/wake/result` reports are recorded.
+async fn fake_restarting_events(connections: Arc<Mutex<u32>>, reports: Seen) -> String {
+    use axum::extract::Query;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::{get, post};
+
+    let app = axum::Router::new()
+        .route(
+            "/v1/events",
+            get(
+                move |Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                    let n = {
+                        let mut c = connections.lock().unwrap();
+                        *c += 1;
+                        *c
+                    };
+                    let body = if n == 1 {
+                        ": hello\n\n".to_string()
+                    } else {
+                        let data = serde_json::json!({
+                            "session": q["session"], "task": null,
+                            "trigger": "queue", "text": "after restart",
+                        });
+                        format!("event: WakeRequested\ndata: {data}\n\n")
+                    };
+                    ([("content-type", "text/event-stream")], body)
+                },
+            ),
+        )
+        .route(
+            "/v1/wake/result",
+            post(
+                move |headers: HeaderMap, body: axum::Json<Value>| async move {
+                    let auth = headers["authorization"].to_str().unwrap().to_string();
+                    reports.lock().unwrap().push(("result", auth, body.0));
+                    StatusCode::NO_CONTENT
+                },
+            ),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(axum::serve(listener, app).into_future());
+    url
+}
+
+#[tokio::test]
+async fn bridge_survives_server_restart() {
+    let connections = Arc::new(Mutex::new(0));
+    let reports: Seen = Arc::default();
+    let server = fake_restarting_events(connections.clone(), reports.clone()).await;
+    let cfg = wake_config(&server, "tok-1");
+    let session = cfg.session_id;
+    let adapter = Arc::new(Recording {
+        pokes: Mutex::default(),
+        outcome: PokeOutcome::Failed("boom".into()),
+    });
+    let looped = tokio::spawn(wake_loop(axle::bridge::Bridge::new(cfg), adapter.clone()));
+
+    wait_for("the poke after the stream dropped and reconnected", || {
+        !adapter.pokes.lock().unwrap().is_empty()
+    })
+    .await;
+    assert_eq!(
+        *adapter.pokes.lock().unwrap(),
+        ["after restart".to_string()]
+    );
+    assert!(*connections.lock().unwrap() >= 2);
+    wait_for("the report", || !reports.lock().unwrap().is_empty()).await;
+    let (_, auth, body) = reports.lock().unwrap()[0].clone();
+    assert_eq!(auth, "Bearer tok-1");
+    assert_eq!(body["session_id"], session.to_string());
+    assert_eq!(body["outcome"], "failed");
+    assert_eq!(body["detail"], "boom");
+    looped.abort();
+}
+
+#[tokio::test]
+async fn wake_result_rejects_other_token() {
+    let (store, _file) = common::sqlite_store().await;
+    let state = test_state(store);
+    let owner = state.auth.create("owner").await.unwrap().1;
+    let other = state.auth.create("other").await.unwrap().1;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    let _srv = serve(state, listener);
+    let cfg = wake_config(&server, &owner);
+    register(&server, &owner, &cfg).await;
+
+    let post = |token: String, session: String| {
+        let url = format!("{server}/v1/wake/result");
+        async move {
+            reqwest::Client::new()
+                .post(url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({
+                    "session_id": session, "task_id": null, "outcome": "sent", "detail": null,
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+    assert_eq!(post(other, cfg.session_id.to_string()).await, 403);
+    assert_eq!(post(owner.clone(), cfg.session_id.to_string()).await, 204);
+    let unknown = axle::domain::SessionId::new().to_string();
+    assert_eq!(post(owner.clone(), unknown).await, 404);
+
+    // A task this session was never woken for (here: one that does not exist) is a 404,
+    // never a 500 from the wake log's foreign key.
+    let status = reqwest::Client::new()
+        .post(format!("{server}/v1/wake/result"))
+        .bearer_auth(owner)
+        .json(&serde_json::json!({
+            "session_id": cfg.session_id.to_string(),
+            "task_id": axle::domain::TaskId::new().to_string(),
+            "outcome": "failed", "detail": "forged",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(status, 404);
+}

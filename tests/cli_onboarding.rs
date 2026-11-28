@@ -2113,3 +2113,112 @@ async fn status_readyz_500_is_a_server_error_not_unreachable() {
     );
     assert!(r.fix.is_some());
 }
+
+#[tokio::test]
+async fn status_shows_wake_channel_and_turn() {
+    let srv = server().await;
+    let home = full_home(&srv).await;
+    let service = FakeService::default();
+    let (installed, _) = run(&home, args(), &NoPrompt, false, &service, T1).await;
+    installed.unwrap();
+    let token = std::fs::read_to_string(AxlDir::new(home.path()).token_path()).unwrap();
+    let token = token.trim();
+
+    // A live bridge session (this process is its harness) that reported a channel and a turn.
+    let session = axle::domain::SessionId::new();
+    let http = reqwest::Client::new();
+    let post = |path: &str, body: serde_json::Value| {
+        http.post(format!("{}/v1/{path}", srv.base))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+    };
+    let res = post(
+        "register",
+        serde_json::json!({"session_id": session, "host": "mac", "harness": "claude-code",
+            "project_key": "github.com/acme/platform-infra"}),
+    )
+    .await
+    .unwrap();
+    assert!(res.status().is_success());
+    post(
+        "heartbeat",
+        serde_json::json!({"session_id": session, "wake_channel": "claude-socket"}),
+    )
+    .await
+    .unwrap();
+    let res = post(
+        "turn",
+        serde_json::json!({"session_id": session, "state": "busy"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(res.status().as_u16(), 204);
+    let info = serde_json::json!({"session_id": session,
+        "project_key": "github.com/acme/platform-infra",
+        "server_url": srv.base, "harness": "claude-code"})
+    .to_string();
+    home.write(&format!(".axl/sessions/{}.json", std::process::id()), &info);
+    // A session file whose harness is gone is not a live session.
+    let dead = serde_json::json!({"session_id": axle::domain::SessionId::new(),
+        "project_key": null, "server_url": srv.base, "harness": "codex"})
+    .to_string();
+    home.write(".axl/sessions/999999.json", &dead);
+
+    let (report, text) = run_status(&home, &service, home.exe("bin/axl")).await;
+    assert!(report.ok, "{text}");
+    let sessions: Vec<_> = report
+        .lines
+        .iter()
+        .filter(|l| l.label == "session")
+        .collect();
+    assert_eq!(sessions.len(), 1, "{text}");
+    assert_eq!(
+        sessions[0].value,
+        "claude-code · github.com/acme/platform-infra · wake: claude-socket · turn: busy",
+        "{text}"
+    );
+    assert!(sessions[0].fix.is_none());
+}
+
+#[tokio::test]
+async fn status_never_sends_the_token_to_another_server() {
+    let srv = server().await;
+    let home = full_home(&srv).await;
+    let service = FakeService::default();
+    let (installed, _) = run(&home, args(), &NoPrompt, false, &service, T1).await;
+    installed.unwrap();
+
+    // Another server that records every request it gets.
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counted = hits.clone();
+    let app = axum::Router::new().fallback(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        async { "{}" }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let other = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(axum::serve(listener, app).into_future());
+
+    // A live session (this process is its harness) whose bridge talks to the other server.
+    let info = serde_json::json!({"session_id": axle::domain::SessionId::new(),
+        "project_key": "github.com/acme/elsewhere",
+        "server_url": other, "harness": "codex"})
+    .to_string();
+    home.write(&format!(".axl/sessions/{}.json", std::process::id()), &info);
+
+    let (report, text) = run_status(&home, &service, home.exe("bin/axl")).await;
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "{text}");
+    let sessions: Vec<_> = report
+        .lines
+        .iter()
+        .filter(|l| l.label == "session")
+        .collect();
+    assert_eq!(sessions.len(), 1, "{text}");
+    assert_eq!(
+        sessions[0].value,
+        format!("codex · github.com/acme/elsewhere · another server ({other})"),
+        "{text}"
+    );
+    assert!(sessions[0].fix.is_none());
+}

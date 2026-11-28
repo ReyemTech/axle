@@ -176,6 +176,15 @@ pub fn routes(state: AppState) -> Router<AppState> {
             "/ui/tasks/{id}/plan/changes",
             post(actions::request_plan_changes),
         )
+        .route(
+            "/ui/tasks/{id}/request/approve",
+            post(actions::approve_request),
+        )
+        .route(
+            "/ui/tasks/{id}/request/decline",
+            post(actions::decline_request),
+        )
+        .route("/ui/tasks/{id}/request/reply", post(actions::reply_request))
         .route("/ui/tasks/{id}/projects", post(actions::add_project))
         .route("/ui/tasks/{id}/related", post(actions::add_related))
         .route("/ui/tasks/{id}/parent", post(actions::move_under))
@@ -190,6 +199,8 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/ui/messages", post(actions::send_message))
         .route("/ui/projects", get(admin::projects))
         .route("/ui/projects/{id}/rename", post(actions::rename_project))
+        .route("/ui/projects/{id}/wake", post(actions::set_auto_start))
+        .route("/ui/settings/wake-pause", post(actions::set_wake_paused))
         .route("/ui/tokens", get(admin::tokens))
         .route("/ui/tokens/{id}/revoke", post(actions::revoke_token))
         .route("/ui/tokens/connect", post(connect::connect_machine))

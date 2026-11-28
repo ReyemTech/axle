@@ -17,10 +17,12 @@ use std::sync::Arc;
 use crate::clock::Clock;
 use crate::domain::{
     Actor, Address, Importance, InboxItem, Message, MessageId, ProjectId, TaskId, TokenId,
+    WakeTrigger,
 };
 use crate::events::{Event, EventBus};
 use crate::service::identity::Resolved;
 use crate::service::tasks::Caller;
+use crate::service::wake::WakeService;
 use crate::store::{Recipient, Store, StoreError};
 
 pub use crate::store::InboxFilter;
@@ -67,6 +69,15 @@ pub enum MessageError {
 }
 
 /// Rejects a subject or title over `SUBJECT_MAX` characters.
+/// `Re: <subject>` (not doubled), cut to `SUBJECT_MAX` characters; empty without a subject.
+pub fn reply_subject(subject: Option<&str>) -> String {
+    match subject.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) if s.to_ascii_lowercase().starts_with("re:") => s.to_string(),
+        Some(s) => format!("Re: {s}").chars().take(SUBJECT_MAX).collect(),
+        None => String::new(),
+    }
+}
+
 pub fn check_subject(field: &'static str, text: &str) -> Result<(), MessageError> {
     if text.chars().count() > SUBJECT_MAX {
         return Err(MessageError::TooLong {
@@ -125,6 +136,9 @@ pub struct MessageService {
     store: Arc<dyn Store>,
     clock: Arc<dyn Clock>,
     events: Option<EventBus>,
+    /// Wakes owners and agents after human posts and replies and peer task posts; `None`
+    /// wakes nobody.
+    wake: Option<Arc<WakeService>>,
 }
 
 impl MessageService {
@@ -133,7 +147,15 @@ impl MessageService {
             store,
             clock,
             events: None,
+            wake: None,
         }
+    }
+
+    /// Wakes sessions through `wake` after the sends that call for it (spec "Trigger
+    /// rules").
+    pub fn with_wake(mut self, wake: Arc<WakeService>) -> Self {
+        self.wake = Some(wake);
+        self
     }
 
     /// Publishes `MessageCreated` on `bus` after every send.
@@ -164,7 +186,10 @@ impl MessageService {
     /// The human sends a message. When it replies to a message addressed to the human, it
     /// must go to that message's sending agent or its task thread, and the human's copy of
     /// the original is archived in the same transaction (answered mail stops waiting).
-    pub async fn send_as_human(&self, new: NewMessage) -> Result<Message, MessageError> {
+    ///
+    /// A reply's subject is always derived here from the original's (`Re: <subject>`); any
+    /// subject the caller supplied is ignored, so a posted form field cannot set it.
+    pub async fn send_as_human(&self, mut new: NewMessage) -> Result<Message, MessageError> {
         let answers_human = match new.reply_to {
             Some(id) => {
                 let original = self
@@ -172,6 +197,8 @@ impl MessageService {
                     .get_message(id)
                     .await?
                     .ok_or(MessageError::NotFound("message"))?;
+                new.subject =
+                    Some(reply_subject(original.subject.as_deref())).filter(|s| !s.is_empty());
                 if original.to == Address::Human {
                     let to_sender = matches!(
                         (original.from, new.to),
@@ -252,7 +279,56 @@ impl MessageService {
             })
             .await;
         }
+        self.wake_for(&message).await;
         Ok(message)
+    }
+
+    /// After a committed send, wakes whoever the trigger table says it should (spec
+    /// "Trigger rules"). Runs after the commit: a failure is logged, never returned.
+    async fn wake_for(&self, message: &Message) {
+        let Some(wake) = &self.wake else {
+            return;
+        };
+        if let Err(e) = self.wake_with(wake, message).await {
+            eprintln!("axl: failed to wake for message {}: {e}", message.id);
+        }
+    }
+
+    /// - The human posts in a task thread: the owner session (`HumanPost`).
+    /// - The human replies, outside a thread, to an agent's message, addressed to that agent
+    ///   or the session that wrote it: one live idle session of the agent (`HumanReply`).
+    /// - An agent posts in a task another agent owns: the owner, within the peer guards
+    ///   (`WakeService::peer_post`).
+    ///
+    /// Any other message (an agent's `send_message`, project mail) wakes nobody.
+    async fn wake_with(&self, wake: &WakeService, message: &Message) -> Result<(), StoreError> {
+        match (message.from, message.to) {
+            (Actor::Human, Address::Task(t)) => {
+                if let Some(task) = self.store.get_task(t).await? {
+                    wake.wake_owner(&task, WakeTrigger::HumanPost, None).await?;
+                }
+            }
+            (Actor::Human, to) => {
+                let Some(id) = message.reply_to else {
+                    return Ok(());
+                };
+                let Some(original) = self.store.get_message(id).await? else {
+                    return Ok(());
+                };
+                if let Actor::Agent(agent, session) = original.from
+                    && (to == Address::Agent(agent) || to == Address::Session(session))
+                {
+                    wake.wake_agent(agent, WakeTrigger::HumanReply).await?;
+                }
+            }
+            (Actor::Agent(agent, session), Address::Task(t)) => {
+                if let Some(task) = self.store.get_task(t).await? {
+                    wake.peer_post(&task, agent, session).await?;
+                }
+            }
+            (Actor::Agent(..), _) => {}
+        }
+        Ok(())
     }
 
     /// The caller's unacked messages, oldest first; marks the returned ones delivered.

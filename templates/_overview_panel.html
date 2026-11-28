@@ -20,6 +20,7 @@
     <span class="agent-id"><span class="harness">{{ a.harness }}</span><span class="at">@</span><span class="host">{{ a.host }}</span></span>
     <span class="agent-project">{% if let Some(p) = a.project %}<span class="project" data-line="{{ p.line }}" title="{{ p.key }}">{{ p.name }}</span>{% else %}<span class="muted">no project</span>{% endif %}</span>
     <span class="agent-task">{% if let Some(t) = a.current_task %}<span class="visually-hidden">Working on </span>{{ t }}{% else %}<span class="muted">No task</span>{% endif %}</span>
+    {% if let Some(w) = a.woken %}<span class="agent-woken">{{ w }}</span>{% endif %}
     <span class="agent-seen"><time datetime="{{ a.last_seen_at }}" title="{{ a.last_seen_at }}">{{ a.last_seen }}</time></span>
   </li>
 {% endfor %}

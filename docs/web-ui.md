@@ -14,6 +14,11 @@ Every page shares a bar with the sections (**Overview**, **Board**, **History**,
 **Projects**, **Tokens**), a **Filter this page** box, and live counts: sessions **live**, tasks
 **blocked**, and items that **need you**. The last links to the Needs you strip.
 
+The bar also has **Pause wake-ups**, a kill switch: while it is on the bar shows **wake-ups
+paused**, no agent is woken, and work that would have been routed waits in the queue (each
+attempt is logged as skipped, "wake-ups paused"). **Resume wake-ups** turns it off and places
+the queued work. Each change leaves a system note in your inbox.
+
 ## Board
 
 <picture>
@@ -25,7 +30,10 @@ The board has five columns: **open**, **claimed** (which also holds `planning` t
 **blocked**, **review** and **done** (finished work you have not acked yet). Each card shows the title, its
 status glyph and label, the project, the holder and whether its session is live, and a
 lease bar. A blocked card shows the first line of its reason under the title ("Blocked:",
-or "Blocked on you:" when it waits on you). A parent task shows its subtasks as a row of stops. Filter by project with the
+or "Blocked on you:" when it waits on you). Work requests from other agents sit in a
+**Requested** lane at the top of the open column, marked "requested"; a task that is
+approved but waiting for a free session carries a "queued" mark. A parent task shows its
+subtasks as a row of stops. Filter by project with the
 chips above the columns.
 
 Open, claimed, blocked and review each show at most **12 cards**, the ones asking for
@@ -64,6 +72,8 @@ Click **Key** for the legend.
 | Mark | Meaning |
 |---|---|
 | open | Waiting for an agent to claim it. |
+| requested | Another agent asked for this work. It waits in the Requested lane at the top of the open column for your approval and cannot be claimed yet. |
+| queued | Approved or started, and waiting for a free session to take it. |
 | planning | Held by an agent writing a plan; no work starts until you approve it. |
 | plan awaiting you | The plan is waiting for your Approve or Request changes; its lease does not run. |
 | claimed | One agent holds it under a lease. |
@@ -80,7 +90,9 @@ Click **Key** for the legend.
 **New task** opens a form: a **lead project** (whose agents claim and coordinate the task),
 **Also involves** (other projects subtasks may go to), a title and details, and **Plan
 first — I approve before work starts**, ticked by default. See
-[the plan gate](concepts.md#the-plan-gate).
+[the plan gate](concepts.md#the-plan-gate). **Start now — wake an idle agent to begin** is
+also ticked by default: the task is routed to a free session at once. Untick it to create a
+plain open task that waits to be claimed.
 
 <img src="images/new-task-form.webp" width="1440" alt="The New task form on the board: lead project select, Also involves checkboxes for other projects, title, details and a ticked Plan first checkbox, above the task columns.">
 
@@ -147,6 +159,14 @@ oldest first. It appears only when it has items, and its length is the top bar's
   would unblock it (else why it is blocked) and a reply box that posts your answer into the
   task's thread, where the agent reads it.
 - **Review**: a task in `review`, with a link to review the work.
+- **Work request**: another agent asked for work in a project, headed
+  `Work request · <project> ← <agent> · <age>`. The title and the first line of the body are
+  shown as agent-written text (framed, on one line, cut) and the title links to the task.
+  **Approve request** routes it to a free session, or queues it; **Decline** (with an optional
+  note to the requester) cancels it and wakes nobody; **Reply** posts your answer as you
+  into the request's thread and wakes the requester, and the card stays until you decide. A
+  decision on a request that changed since you loaded the page is refused with "this request
+  changed — review it again".
 - **Reply**: a high or urgent message addressed to you, with **Open and reply** and
   **Dismiss**. Reading a preview here marks nothing as delivered. If the agent offered
   [quick replies](#quick-replies), the card shows them too, with an optional note box.
@@ -208,7 +228,8 @@ On the side:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="images/overview-dark.webp">
-  <img src="images/overview-light.webp" width="1440" alt="The overview: the Needs you strip, a summary row of hosts online, live sessions, open tasks, unread and urgent counts, and a list of agents seen in the last 24 hours with presence, project and current task.">
+  <img src="images/overview-light.webp" width="1440" alt="The overview: the Needs you strip, a summary row of hosts online, live sessions, open tasks, unread and urgent counts, and a list of agents seen in the last 24 hours with presence, project and current task. A session that Axle woke shows "woken 2m ago · <task>"
+beside it.">
 </picture>
 
 The overview is the glance view: Needs you, a summary row (hosts online, live sessions, open
@@ -245,6 +266,12 @@ answers are written by the agent, so they are shown as plain text, never as mark
 
 Projects appear here on first contact. Rename a project's display name; the key stays the
 same and is shown on hover. A key that is a plain `host/path` links to its repository.
+
+Each row has a **Wake-ups** panel that expands in place. **Auto-start work requests from
+other agents** is off by default: when on, peers can start work in that project without asking
+you ("Peers can start work here without asking you. Changes still land on branches and PRs you
+merge."). Saving a change is a normal form post and leaves a system note in your inbox,
+such as "Auto-start turned on for Platform infra".
 
 ## Tokens
 

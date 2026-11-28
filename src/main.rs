@@ -42,7 +42,7 @@ enum Command {
     /// Always exits 0 (fail-open); problems are one line on stderr. Codex's commands add
     /// `--harness codex`.
     Hook {
-        /// session-start | user-prompt-submit | post-tool-use | stop | session-end (anything
+        /// session-start | user-prompt-submit | post-tool-use | stop | session-end | notification (anything
         /// else is ignored)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -354,6 +354,7 @@ async fn serve(bind: Option<SocketAddr>, trusted_header: Option<String>) -> CliR
     let store = open_store(&config.backend).await?;
     let addr = config.bind;
     let state = AppState::new(store, Arc::new(SystemClock), config).with_prices(prices);
+    state.wake.clone().spawn_ticker(state.shutdown.clone());
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("axl: listening on http://{}", listener.local_addr()?);
     axle::http::serve(listener, state, stop_signal()).await?;

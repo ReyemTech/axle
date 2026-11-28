@@ -2,6 +2,7 @@
 //! the board and the overview. Its length is the top bar's "N need you" count.
 //!
 //! A card is one of:
+//! - a work request from another agent (a `requested` task), with Approve, Decline and Reply;
 //! - a plan awaiting approval (a `planning` task whose plan is `submitted`), with Approve and
 //!   Request changes inline;
 //! - a task blocked waiting on the human ("Blocked on you"), with what would unblock it and a
@@ -36,6 +37,7 @@ pub enum Need {
     BlockedOnYou,
     Review,
     Reply,
+    WorkRequest,
 }
 
 impl Need {
@@ -45,6 +47,7 @@ impl Need {
             Need::BlockedOnYou => "blocked",
             Need::Review => "review",
             Need::Reply => "reply",
+            Need::WorkRequest => "request",
         }
     }
 
@@ -54,6 +57,7 @@ impl Need {
             Need::BlockedOnYou => "Blocked on you",
             Need::Review => "Review",
             Need::Reply => "Reply",
+            Need::WorkRequest => "Work request",
         }
     }
 }
@@ -89,6 +93,30 @@ pub struct NeedCard {
     pub reply: Option<ReplyTarget>,
     /// For "Blocked on you" cards: the task whose thread the reply box posts to.
     pub reply_task: Option<String>,
+    /// For work-request cards: the line `Work request · <project> ← <agent> · <age>`, and the
+    /// version the decision applies to.
+    pub request_head: Option<String>,
+    pub request_version: Option<i64>,
+}
+
+/// Characters of a request's title shown on its card.
+const TITLE_CUT: usize = 80;
+
+/// Peer-written text for a card: its frame markers defused, control and bidirectional
+/// characters dropped, folded to one line and cut at `max` characters.
+pub(super) fn peer_line(text: &str, max: usize) -> String {
+    let clean: String = crate::mcp::defuse(text)
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .filter(|c| {
+            !c.is_control() && !matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .collect();
+    let flat = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}…", &flat[..cut]),
+        None => flat,
+    }
 }
 
 /// "42s", "12m", "3h", "2d".
@@ -130,6 +158,50 @@ pub(super) async fn needs_you(
     let now = state.clock.now();
     let since = |t: OffsetDateTime| t.format(&Rfc3339).unwrap_or_default();
     let mut cards = Vec::new();
+
+    let mut requests: Vec<Task> = state
+        .store
+        .list_tasks(&TaskFilter {
+            status: Some(TaskStatus::Requested),
+            ..TaskFilter::default()
+        })
+        .await?;
+    requests.sort_by_key(|t| (t.created_at, t.id));
+    for t in requests {
+        let project = labels.project(t.project_id);
+        let agent = match t.created_by.ids().0 {
+            Some(a) => Some(labels.agent_label(a).await?),
+            None => None,
+        };
+        let waited = waited(now, t.created_at);
+        let head = format!(
+            "Work request · {} ← {} · {waited}",
+            project.name,
+            agent.as_deref().unwrap_or("an agent")
+        );
+        cards.push(NeedCard {
+            need: Need::WorkRequest,
+            aspect: "plan-submitted",
+            title: peer_line(&t.title, TITLE_CUT),
+            href: format!("/ui/tasks/{}", t.id),
+            project: Some(project),
+            agent,
+            task_title: None,
+            preview: Some(peer_line(&t.body, PREVIEW)),
+            plan_html: None,
+            waited,
+            since: since(t.created_at),
+            task_id: Some(t.id.to_string()),
+            plan_id: None,
+            message_id: None,
+            importance: "high",
+            options: Vec::new(),
+            reply: None,
+            reply_task: None,
+            request_head: Some(head),
+            request_version: Some(t.version),
+        });
+    }
 
     let planning: Vec<Task> = state
         .store
@@ -177,6 +249,8 @@ pub(super) async fn needs_you(
             options: Vec::new(),
             reply: None,
             reply_task: None,
+            request_head: None,
+            request_version: None,
         });
     }
 
@@ -214,6 +288,8 @@ pub(super) async fn needs_you(
             options: Vec::new(),
             reply: None,
             reply_task: None,
+            request_head: None,
+            request_version: None,
         });
     }
 
@@ -257,6 +333,8 @@ pub(super) async fn needs_you(
             },
             options: m.options,
             reply_task: None,
+            request_head: None,
+            request_version: None,
         });
     }
     Ok(cards)
@@ -318,6 +396,8 @@ async fn blocked_on_you(
             options: Vec::new(),
             reply: None,
             reply_task: Some(t.id.to_string()),
+            request_head: None,
+            request_version: None,
         });
     }
     Ok(cards)

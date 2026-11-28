@@ -22,7 +22,7 @@ use crate::domain::{
 use crate::service::identity::Resolved;
 use crate::service::messages::{InboxFilter, NewMessage, check_body, check_subject};
 use crate::service::tasks::{
-    BlockInput, Caller, ClaimOutcome, Completion, MoveContext, NewTask, UNBLOCK_MAX,
+    BlockInput, Caller, ClaimOutcome, Completion, MoveContext, NewRequest, NewTask, UNBLOCK_MAX,
 };
 use crate::store::{DoneFilter, TaskFilter};
 
@@ -176,9 +176,25 @@ pub struct TaskCreateParams {
     pub requires_plan: Option<bool>,
 }
 
+/// A work request: a task you ask another project's agents to take.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TaskRequestParams {
+    /// The project that should do the work (key or display name).
+    pub project: String,
+    pub title: String,
+    /// The first message of the request's thread (at most 64 KB).
+    pub body: String,
+    pub eligibility: Option<EligibilityParams>,
+    /// Importance of the request's first message (default `normal`).
+    pub importance: Option<ImportanceParam>,
+    /// Parent task id, to make the request a child task.
+    pub parent: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum StatusParam {
+    Requested,
     Open,
     Planning,
     Claimed,
@@ -191,6 +207,7 @@ pub enum StatusParam {
 impl From<StatusParam> for TaskStatus {
     fn from(s: StatusParam) -> Self {
         match s {
+            StatusParam::Requested => TaskStatus::Requested,
             StatusParam::Open => TaskStatus::Open,
             StatusParam::Planning => TaskStatus::Planning,
             StatusParam::Claimed => TaskStatus::Claimed,
@@ -455,6 +472,22 @@ impl AxleMcp {
     }
 
     #[tool(description = described!(
+        "Ask another project's agents to do work: creates a work request the human approves \
+         first, unless the target project auto-starts requests, in which case it goes straight \
+         to a free session or the queue. Your identity is the requester, automatically. \
+         `request_state` is `awaiting_human`, `routed` or `queued` while the request is \
+         pending; a request you repeat within 10 minutes returns the existing one."
+    ))]
+    async fn task_request(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<TaskRequestParams>,
+    ) -> CallToolResult {
+        let me = me!(self, parts);
+        render(self.task_request_impl(&me, p).await)
+    }
+
+    #[tool(description = described!(
         "List tasks, oldest first, filtered by project, status, owner and parent; paged \
          (`limit`, `after` = the previous page's `next`). Done tasks the human has acked, or \
          that finished more than the auto-ack window ago, are left out unless `include_acked` \
@@ -620,6 +653,10 @@ impl AxleMcp {
             "session": me.session.id,
             "leases": leases,
             "unread": self.state.messages.unread_count(me).await?,
+            "wake": {
+                "channel": me.session.wake_channel,
+                "turn_state": me.session.turn_state,
+            },
         }))
     }
 
@@ -866,6 +903,8 @@ impl AxleMcp {
             },
             lease_ttl: None,
             requires_plan: p.requires_plan.unwrap_or(false),
+            // `task_create` never wakes anyone by itself.
+            start_now: false,
         };
         let task = match p.from_message {
             Some(m) => {
@@ -883,6 +922,44 @@ impl AxleMcp {
             }
         };
         self.labels().task(&task).await
+    }
+
+    async fn task_request_impl(&self, me: &Resolved, p: TaskRequestParams) -> ToolResult {
+        let project_id = self.project(&p.project).await?.id;
+        let parent_id = p
+            .parent
+            .as_deref()
+            .map(|id| parse_id::<TaskId>("parent task", id))
+            .transpose()?;
+        let eligibility = p.eligibility.unwrap_or_default();
+        let outcome = self
+            .state
+            .tasks
+            .request(
+                me,
+                NewRequest {
+                    project_id,
+                    title: p.title,
+                    body: p.body,
+                    eligibility: Eligibility {
+                        harness: non_blank(eligibility.harness),
+                        host: non_blank(eligibility.host),
+                    },
+                    importance: p.importance.map_or(Importance::Normal, Into::into),
+                    parent_id,
+                },
+            )
+            .await?;
+        let mut summary = self.labels().task_summary(&outcome.task).await?;
+        // A repeated request can return one that is no longer pending (declined, done):
+        // then its `status` says where it stands and there is no request state to report.
+        if matches!(
+            outcome.task.status,
+            TaskStatus::Requested | TaskStatus::Open
+        ) {
+            summary["request_state"] = json!(outcome.state);
+        }
+        Ok(summary)
     }
 
     async fn task_list_impl(&self, p: TaskListParams) -> ToolResult {
@@ -1004,6 +1081,9 @@ impl AxleMcp {
                     ClaimOutcome::Closed(status) => {
                         Err(ToolError::invalid(format!("the task is {status}")))
                     }
+                    ClaimOutcome::AwaitingApproval => Err(ToolError::invalid(
+                        "waiting for the human to approve this request",
+                    )),
                 }
             }
             (None, true) => {

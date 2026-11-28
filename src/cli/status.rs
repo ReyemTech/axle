@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use super::install::{InstallEnv, display_name, redact};
+use crate::bridge::session_file::SessionInfo;
 use crate::client::{
     Api, AxlDir, ClientConfig, ClientError, load_config, read_token,
     resolve_server_url_with_warning, usage_off,
@@ -108,14 +109,14 @@ pub async fn status_with(
     lines.push(line("server", url.clone(), None));
     let service = service_line(env);
     let stopped = service.as_ref().is_some_and(|l| l.fix.is_some());
-    server_lines(
-        &mut lines,
-        &url,
-        read_token(env_token, &dir),
-        service,
-        stopped,
-    )
-    .await;
+    let token = read_token(env_token, &dir);
+    server_lines(&mut lines, &url, token.clone(), service, stopped).await;
+    let reachable = lines
+        .iter()
+        .any(|l| l.label == "reachable" && l.fix.is_none() && l.value.starts_with("yes"));
+    if let (Ok(token), true) = (&token, reachable) {
+        session_lines(&mut lines, &env.home, &url, token).await;
+    }
     harness_lines(&mut lines, env, &dir);
     let cfg = load_config(&dir).map_err(|e| {
         (
@@ -259,6 +260,72 @@ async fn server_lines(
         }
     }
     lines.extend(service);
+}
+
+/// One `session` line per live bridge on this machine (a session file whose harness process
+/// still runs): `<harness> · <project> · wake: <channel> · turn: <state>`, as its server
+/// knows them. Informational only; a session the server cannot describe says so. Only
+/// sessions of the configured `server` are asked; another server's are listed unqueried.
+async fn session_lines(lines: &mut Vec<StatusLine>, home: &Path, server: &str, token: &str) {
+    let dir = home.join(".axl").join("sessions");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut live: Vec<(u32, SessionInfo)> = entries
+        .filter_map(|e| {
+            let path = e.ok()?.path();
+            if path.extension()? != "json" {
+                return None;
+            }
+            let pid: u32 = path.file_stem()?.to_str()?.parse().ok()?;
+            let info = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            alive(pid).then_some((pid, info))
+        })
+        .collect();
+    live.sort_by_key(|(pid, _)| *pid);
+    for (_, info) in live {
+        let project = info.project_key.as_deref().unwrap_or("no project");
+        // The token belongs to the configured server: never send it anywhere else.
+        if !same_server(&info.server_url, server) {
+            let value = format!(
+                "{} · {project} · another server ({})",
+                info.harness, info.server_url
+            );
+            lines.push(line("session", value, None));
+            continue;
+        }
+        let state = Api::new(&info.server_url)
+            .session_state(token, info.session_id)
+            .await;
+        let value = match state {
+            Ok(s) => format!(
+                "{} · {project} · wake: {} · turn: {}",
+                info.harness, s.wake_channel, s.turn_state
+            ),
+            Err(e) => format!("{} · {project} · could not check ({e})", info.harness),
+        };
+        lines.push(line("session", value, None));
+    }
+}
+
+/// Whether two server URLs name the same server: compared without surrounding whitespace
+/// or trailing slashes, ignoring ASCII case.
+fn same_server(a: &str, b: &str) -> bool {
+    let norm = |u: &str| u.trim().trim_end_matches('/').to_ascii_lowercase();
+    norm(a) == norm(b)
+}
+
+/// Whether process `pid` exists (a process of another user counts).
+fn alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 1 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks that the process exists; nothing is sent.
+    let found = unsafe { libc::kill(pid, 0) } == 0;
+    found || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 fn service_line(env: &InstallEnv<'_>) -> Option<StatusLine> {
