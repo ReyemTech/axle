@@ -836,6 +836,7 @@ impl TaskService {
         Ok(match attempt.claimed {
             Some(task) => {
                 self.changed(&task, claim_event(&previous, &req).kind).await;
+                self.end_wakes(&task, caller).await;
                 ClaimOutcome::Claimed(task)
             }
             None => match (previous.status, previous.owner_agent_id) {
@@ -869,6 +870,7 @@ impl TaskService {
             .await?;
         if let Some(task) = &task {
             self.changed(task, TaskEventKind::Claimed).await;
+            self.end_wakes(task, caller).await;
         }
         Ok(task)
     }
@@ -1928,6 +1930,20 @@ impl TaskService {
     async fn reroute(&self, task: &Task) {
         if task.sanctioned && task.status == TaskStatus::Open {
             self.route(task, WakeTrigger::Queue, None).await;
+        }
+    }
+
+    /// `caller` claimed `task`: clears every wake reservation for it (`claimed` for the
+    /// caller, `expired` for any other session). Runs after the commit: a failure is logged,
+    /// never returned, and the reservation then lapses on the ticker.
+    async fn end_wakes(&self, task: &Task, caller: &Resolved) {
+        if let Some(wake) = &self.wake
+            && let Err(e) = wake.on_claimed(task.id, caller.session.id).await
+        {
+            eprintln!(
+                "axl: failed to clear wake reservations for task {}: {e}",
+                task.id
+            );
         }
     }
 

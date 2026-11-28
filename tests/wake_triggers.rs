@@ -925,3 +925,58 @@ async fn peer_message_and_top_level_create_never_wake() {
     assert_eq!(env.reserved_task(&free).await, None);
     assert_eq!(env.sent().await, 0);
 }
+
+// ---------------------------------------------------------------- claiming ends the wake
+
+/// After the woken session claims its task, the reservation is gone at once and the wake is
+/// recorded `claimed`; a tick past the reservation's lapse records no `expired`.
+async fn assert_claim_cleared(env: &Env, s: &Resolved, task: TaskId) {
+    assert_eq!(env.reserved_task(s).await, None, "session reservable again");
+    let session = env.store.get_session(s.session.id).await.unwrap().unwrap();
+    assert_eq!(session.wake_task_id, None);
+    let claimed = Count {
+        outcome: Some(WakeOutcome::Claimed),
+        session: Some(s.session.id),
+        task: Some(task),
+        ..Count::default()
+    };
+    assert_eq!(env.count(claimed).await, 1);
+    env.advance(Duration::minutes(3));
+    env.wake.tick().await.unwrap();
+    let expired = Count {
+        outcome: Some(WakeOutcome::Expired),
+        ..Count::default()
+    };
+    assert_eq!(env.count(expired).await, 0);
+    assert_eq!(env.count(claimed).await, 1);
+}
+
+#[tokio::test]
+async fn claim_by_woken_session_clears_its_reservation() {
+    let env = Env::new().await;
+    let free = env.session_of(PA, "f").await;
+    env.idle(&free).await;
+    let task = env.human_task(PA, "now", true).await;
+    assert_eq!(env.reserved_task(&free).await, Some(task.id));
+
+    env.claim(&free, task.id).await;
+    assert_claim_cleared(&env, &free, task.id).await;
+}
+
+#[tokio::test]
+async fn claim_next_by_woken_session_clears_its_reservation() {
+    let env = Env::new().await;
+    let free = env.session_of(PA, "f").await;
+    env.idle(&free).await;
+    let task = env.human_task(PA, "now", true).await;
+    assert_eq!(env.reserved_task(&free).await, Some(task.id));
+
+    let claimed = env
+        .tasks
+        .claim_next(&free, task.project_id)
+        .await
+        .unwrap()
+        .expect("claims the routed task");
+    assert_eq!(claimed.id, task.id);
+    assert_claim_cleared(&env, &free, task.id).await;
+}
