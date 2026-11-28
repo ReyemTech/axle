@@ -4965,6 +4965,24 @@ mod stage_board {
     }
 
     #[tokio::test]
+    async fn compact_rows_keep_stage_and_pr_chips() {
+        let (app, cookie, web, _shop) = two_projects().await;
+        set_stages(&app, &web, &[InPr, Merged]).await;
+        delivering(&app, &web, "web work", "https://github.com/acme/web/pull/4").await;
+        let set = app
+            .get("/ui/board/density?set=compact", Some(&cookie))
+            .await;
+        let both = format!("{cookie}; {}", cookie_pair(&set.set_cookie.unwrap()));
+        let page = app.get("/ui/board", Some(&both)).await;
+        let row = "article.card[data-density=\"compact\"]";
+        assert_eq!(select_texts(&page, &format!("{row} .pr-chip")), ["PR #4"]);
+        assert_eq!(
+            select_texts(&page, &format!("{row} .stage-word")),
+            ["In PR"]
+        );
+    }
+
+    #[tokio::test]
     async fn task_sits_in_own_column() {
         let (app, cookie, web, shop) = two_projects().await;
         // The task reaches `in_pr` while the shop has it enabled, then the shop narrows to

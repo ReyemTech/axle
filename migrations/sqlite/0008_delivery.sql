@@ -1,12 +1,15 @@
 -- no-transaction
 -- Delivery stages (docs/superpowers/specs/2026-11-28-delivery-status-design.md), SQLite
--- flavour. Kept in step with migrations/postgres/0008_delivery.sql. Numbers 0006 and 0007
--- are reserved by other branches; the gap is intentional.
+-- flavour. Kept in step with migrations/postgres/0008_delivery.sql. It follows
+-- 0006_blocked_detail and 0007_related_links.
 --
 -- SQLite cannot change a CHECK constraint in place, so `tasks` is rebuilt (the documented
 -- create-copy-drop-rename procedure, as 0002 did). Foreign keys must be off while the old
 -- table is dropped, and `PRAGMA foreign_keys` is a no-op inside a transaction, so this
--- migration runs outside sqlx's transaction and opens its own around the rebuild.
+-- migration runs outside sqlx's transaction and opens its own around the rebuild. The new
+-- table carries every column of 0001-0007 (0006's block detail included) and every index
+-- on `tasks`; `task_links`, `waiting_task_id` and the other references to `tasks(id)` name
+-- the table, so they follow the rename.
 
 PRAGMA foreign_keys = OFF;
 
@@ -40,6 +43,13 @@ CREATE TABLE tasks_new (
                                                  'changes_requested', 'approved')),
     done_at                TEXT,
     acked_at               TEXT,
+    block_reason           TEXT,
+    blocked_at             TEXT,
+    waiting_kind           TEXT
+                           CHECK (waiting_kind IS NULL OR waiting_kind IN ('human', 'task', 'external')),
+    waiting_task_id        TEXT REFERENCES tasks(id),
+    waiting_text           TEXT,
+    unblock_text           TEXT,
     -- The furthest delivery stage reached; NULL until `in_pr` is reached.
     delivery_stage         TEXT
                            CHECK (delivery_stage IN ('in_pr', 'merged', 'released', 'deployed'))
@@ -49,11 +59,13 @@ INSERT INTO tasks_new
     (id, project_id, parent_id, title, body, status, owner_session_id, owner_agent_id,
      lease_expires_at, lease_ttl_secs, lease_epoch, eligible_harness, eligible_host,
      created_by_agent_id, created_by_session_id, token_id, created_at, updated_at, version,
-     requires_plan, plan_state, done_at, acked_at)
+     requires_plan, plan_state, done_at, acked_at, block_reason, blocked_at, waiting_kind,
+     waiting_task_id, waiting_text, unblock_text)
 SELECT id, project_id, parent_id, title, body, status, owner_session_id, owner_agent_id,
        lease_expires_at, lease_ttl_secs, lease_epoch, eligible_harness, eligible_host,
        created_by_agent_id, created_by_session_id, token_id, created_at, updated_at, version,
-       requires_plan, plan_state, done_at, acked_at
+       requires_plan, plan_state, done_at, acked_at, block_reason, blocked_at, waiting_kind,
+       waiting_task_id, waiting_text, unblock_text
   FROM tasks;
 
 DROP TABLE tasks;
@@ -63,6 +75,7 @@ CREATE INDEX tasks_project_status ON tasks (project_id, status, created_at);
 CREATE INDEX tasks_parent ON tasks (parent_id);
 CREATE INDEX tasks_owner_session ON tasks (owner_session_id);
 CREATE INDEX tasks_done ON tasks (done_at, id) WHERE status = 'done';
+CREATE INDEX tasks_waiting_task ON tasks (waiting_task_id) WHERE waiting_task_id IS NOT NULL;
 CREATE INDEX tasks_delivery ON tasks (project_id, status, delivery_stage);
 
 -- One row per project; no row means no stages (today's behaviour).

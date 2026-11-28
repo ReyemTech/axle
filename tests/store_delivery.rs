@@ -9,7 +9,7 @@ use axle::delivery::stages::CompletionTarget;
 use axle::domain::{
     Actor, Address, DeliveryStage, DeploySource, Eligibility, Importance, Message, MessageId,
     MessageKind, PlanState, ProjectDelivery, ReleaseSource, Task, TaskEvent, TaskEventKind, TaskId,
-    TaskStatus, short_id,
+    TaskStatus, WaitingOn, short_id,
 };
 use axle::domain::{
     DeliverySignal, PrLinkedBy, Project, SessionId, SignalKind, SignalOutcome, SignalSource,
@@ -109,9 +109,9 @@ store_matrix!(delivering_round_trips, |store: Arc<dyn Store>| async move {
     assert_eq!(read.delivery_stage, Some(DeliveryStage::Merged));
 });
 
-/// Copies the migrations of `backend` numbered up to and including 0005 into a fresh
+/// Copies the migrations of `backend` numbered up to and including 0007 into a fresh
 /// directory, so a database can be built at the state before the delivery migration.
-fn migrations_through_0005(backend: &str) -> std::path::PathBuf {
+fn migrations_through_0007(backend: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("axle-mig-{}", Uuid::now_v7()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -120,9 +120,11 @@ fn migrations_through_0005(backend: &str) -> std::path::PathBuf {
     for entry in std::fs::read_dir(src).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name().into_string().unwrap();
-        if ["0001_", "0002_", "0003_", "0004_", "0005_"]
-            .iter()
-            .any(|p| name.starts_with(p))
+        if [
+            "0001_", "0002_", "0003_", "0004_", "0005_", "0006_", "0007_",
+        ]
+        .iter()
+        .any(|p| name.starts_with(p))
         {
             std::fs::copy(entry.path(), dir.join(&name)).unwrap();
         }
@@ -131,7 +133,8 @@ fn migrations_through_0005(backend: &str) -> std::path::PathBuf {
 }
 
 /// The delivery migration rebuilds `tasks` on SQLite: a done task keeps `done_at` and
-/// `acked_at`, and every earlier index survives next to the new one.
+/// `acked_at`, a blocked task keeps its 0006 block detail, a 0007 link survives, and every
+/// earlier index survives next to the new one.
 #[tokio::test]
 async fn migration_keeps_earlier_columns_sqlite() {
     use axle::store::sqlite::SqliteStore;
@@ -144,7 +147,7 @@ async fn migration_keeps_earlier_columns_sqlite() {
         .connect(&format!("sqlite://{}?mode=rwc", path.display()))
         .await
         .unwrap();
-    let dir = migrations_through_0005("sqlite");
+    let dir = migrations_through_0007("sqlite");
     sqlx::migrate::Migrator::new(dir.as_path())
         .await
         .unwrap()
@@ -185,7 +188,40 @@ async fn migration_keeps_earlier_columns_sqlite() {
     .await
     .unwrap();
 
-    // Opening the store runs 0008 (0006 and 0007 are reserved gaps).
+    // A blocked task waiting on the done one (0006) and linked to it (0007).
+    let blocked_id = TaskId::new();
+    sqlx::query(
+        "INSERT INTO tasks (id, project_id, title, status, created_at, updated_at, block_reason,
+                            blocked_at, waiting_kind, waiting_task_id, waiting_text, unblock_text)
+         VALUES (?, ?, 'b', 'blocked', '2026-11-20T00:00:00.000000Z',
+                 '2026-11-26T10:00:00.000000Z', 'needs the API', '2026-11-26T10:00:00.000000Z',
+                 'task', ?, NULL, 'the API task ships')",
+    )
+    .bind(blocked_id.to_string())
+    .bind(&project)
+    .bind(done_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_links (task_id, target_id, kind, created_at)
+         VALUES (?, ?, 'follow-up', '2026-11-26T10:00:00.000000Z')",
+    )
+    .bind(blocked_id.to_string())
+    .bind(done_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut before: Vec<String> = sqlx::query("SELECT name FROM pragma_index_list('tasks')")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<String, _>("name"))
+        .collect();
+
+    // Opening the store runs 0008.
     let store = SqliteStore::from_pool(pool.clone()).await.unwrap();
     let events = store.task_events(done_id).await.unwrap();
     assert_eq!(events.len(), 1);
@@ -214,23 +250,69 @@ async fn migration_keeps_earlier_columns_sqlite() {
     assert!(task.requires_plan);
     assert_eq!(task.plan_state, PlanState::Approved);
     assert_eq!(task.delivery_stage, None);
+    let blocked = store.get_task(blocked_id).await.unwrap().unwrap();
+    assert_eq!(blocked.status, TaskStatus::Blocked);
+    let block = blocked.block.expect("block detail survives the rebuild");
+    assert_eq!(block.reason, "needs the API");
+    assert_eq!(block.since, Some(datetime!(2026-11-26 10:00 UTC)));
+    assert_eq!(block.waiting_on, Some(WaitingOn::Task(done_id)));
+    assert_eq!(block.unblock.as_deref(), Some("the API task ships"));
+    let links: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT task_id, target_id, kind FROM task_links")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        links,
+        vec![(
+            blocked_id.to_string(),
+            done_id.to_string(),
+            "follow-up".to_string()
+        )]
+    );
+    // The CHECK on `waiting_kind` came through the rebuild.
+    assert!(
+        sqlx::query("UPDATE tasks SET waiting_kind = 'bogus' WHERE id = ?")
+            .bind(blocked_id.to_string())
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let waiting_index: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'tasks_waiting_task'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        waiting_index.contains("WHERE waiting_task_id IS NOT NULL"),
+        "{waiting_index}"
+    );
 
-    let indexes: Vec<String> = sqlx::query("SELECT name FROM pragma_index_list('tasks')")
+    let mut indexes: Vec<String> = sqlx::query("SELECT name FROM pragma_index_list('tasks')")
         .fetch_all(&pool)
         .await
         .unwrap()
         .iter()
         .map(|r| r.get::<String, _>("name"))
         .collect();
-    for want in [
-        "tasks_project_status",
-        "tasks_parent",
-        "tasks_owner_session",
-        "tasks_done",
-        "tasks_delivery",
-    ] {
-        assert!(indexes.iter().any(|i| i == want), "{want} in {indexes:?}");
-    }
+    indexes.sort();
+    before.push("tasks_delivery".to_string());
+    before.sort();
+    assert_eq!(indexes, before, "the rebuild keeps every index on tasks");
+    // Every index on `tasks` after 0007 (plus the primary key's), and the new one.
+    assert_eq!(
+        indexes,
+        [
+            "sqlite_autoindex_tasks_1",
+            "tasks_delivery",
+            "tasks_done",
+            "tasks_owner_session",
+            "tasks_parent",
+            "tasks_project_status",
+            "tasks_waiting_task",
+        ]
+    );
     // A delivering task is now allowed; an unknown stage is not.
     sqlx::query("UPDATE tasks SET status = 'delivering', delivery_stage = 'merged' WHERE id = ?")
         .bind(done_id.to_string())
@@ -260,7 +342,7 @@ async fn migration_keeps_earlier_columns_postgres() {
 
     let schema = common::pg_bare_schema().await;
     let pool = schema.pool().await;
-    let dir = migrations_through_0005("postgres");
+    let dir = migrations_through_0007("postgres");
     let outcome = common::catch_body({
         let pool = pool.clone();
         let dir = dir.clone();

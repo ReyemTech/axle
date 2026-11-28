@@ -1,6 +1,6 @@
 -- Delivery stages (docs/superpowers/specs/2026-11-28-delivery-status-design.md), Postgres
--- flavour. Kept in step with migrations/sqlite/0008_delivery.sql. Numbers 0006 and 0007 are
--- reserved by other branches; the gap is intentional.
+-- flavour. Kept in step with migrations/sqlite/0008_delivery.sql. It follows
+-- 0006_blocked_detail and 0007_related_links.
 
 ALTER TABLE tasks DROP CONSTRAINT tasks_status_check;
 ALTER TABLE tasks ADD CONSTRAINT tasks_status_check
