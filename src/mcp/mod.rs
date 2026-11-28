@@ -427,7 +427,7 @@ impl<'a> Labels<'a> {
         self.wrap_edited(from, None, project, text).await
     }
 
-    /// Message text (`subject`, `body` or an option) framed by its sender: text the human
+    /// Message text (the `body` or an option) framed by its sender: text the human
     /// typed in the UI is `[from the human owner, via the Axle UI] <text>` with no tail; any
     /// other text is peer data (`wrap`). Server-written notes (`System`, `Plan`) keep the peer
     /// frame even from the human, because they embed task titles.
@@ -436,6 +436,14 @@ impl<'a> Labels<'a> {
             return Ok(format!("{HUMAN_FRAME} {}", defuse(text)));
         }
         self.wrap(m.from, m.project_id, text).await
+    }
+
+    /// A message's subject, always peer data: the human frame covers only what the human
+    /// typed (the body and options). A human reply's subject is derived server-side from the
+    /// original's, so it is framed as that original's author's text (`subject_author`).
+    async fn subject(&mut self, m: &Message, subject: &str) -> Result<String, ToolError> {
+        let author = subject_author(self.store, m).await?;
+        self.wrap(author, m.project_id, subject).await
     }
 
     /// `wrap`, naming the actor who last rewrote `text` when that is not its author.
@@ -531,7 +539,7 @@ impl<'a> Labels<'a> {
             "from": self.actor(m.from).await?,
             "to": self.address(m.to).await?,
             "subject": match &m.subject {
-                Some(subject) => Some(self.message_text(m, subject).await?),
+                Some(subject) => Some(self.subject(m, subject).await?),
                 None => None,
             },
             "importance": m.importance,
@@ -616,6 +624,27 @@ impl<'a> Labels<'a> {
 /// send as the human).
 pub fn is_human_typed(m: &Message) -> bool {
     matches!(m.from, Actor::Human) && m.kind == MessageKind::Message
+}
+
+/// Who wrote a message's subject: a human-typed reply inherits its subject from the
+/// replied-to message (`send_as_human` derives it), so that message's author wrote it;
+/// otherwise the sender did. A chain of human replies is followed back to the message that
+/// set the subject (bounded; an over-long chain is attributed to its last agent-free link).
+pub async fn subject_author(store: &dyn Store, m: &Message) -> crate::store::StoreResult<Actor> {
+    let mut current = m.clone();
+    for _ in 0..32 {
+        if !is_human_typed(&current) {
+            break;
+        }
+        let Some(original) = current.reply_to else {
+            break;
+        };
+        let Some(original) = store.get_message(original).await? else {
+            break;
+        };
+        current = original;
+    }
+    Ok(current.from)
 }
 
 /// Whether two actors are the same author (agents compare by agent, not session).

@@ -69,6 +69,15 @@ pub enum MessageError {
 }
 
 /// Rejects a subject or title over `SUBJECT_MAX` characters.
+/// `Re: <subject>` (not doubled), cut to `SUBJECT_MAX` characters; empty without a subject.
+pub fn reply_subject(subject: Option<&str>) -> String {
+    match subject.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) if s.to_ascii_lowercase().starts_with("re:") => s.to_string(),
+        Some(s) => format!("Re: {s}").chars().take(SUBJECT_MAX).collect(),
+        None => String::new(),
+    }
+}
+
 pub fn check_subject(field: &'static str, text: &str) -> Result<(), MessageError> {
     if text.chars().count() > SUBJECT_MAX {
         return Err(MessageError::TooLong {
@@ -177,7 +186,10 @@ impl MessageService {
     /// The human sends a message. When it replies to a message addressed to the human, it
     /// must go to that message's sending agent or its task thread, and the human's copy of
     /// the original is archived in the same transaction (answered mail stops waiting).
-    pub async fn send_as_human(&self, new: NewMessage) -> Result<Message, MessageError> {
+    ///
+    /// A reply's subject is always derived here from the original's (`Re: <subject>`); any
+    /// subject the caller supplied is ignored, so a posted form field cannot set it.
+    pub async fn send_as_human(&self, mut new: NewMessage) -> Result<Message, MessageError> {
         let answers_human = match new.reply_to {
             Some(id) => {
                 let original = self
@@ -185,6 +197,8 @@ impl MessageService {
                     .get_message(id)
                     .await?
                     .ok_or(MessageError::NotFound("message"))?;
+                new.subject =
+                    Some(reply_subject(original.subject.as_deref())).filter(|s| !s.is_empty());
                 if original.to == Address::Human {
                     let to_sender = matches!(
                         (original.from, new.to),

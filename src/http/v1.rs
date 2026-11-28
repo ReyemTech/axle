@@ -526,8 +526,12 @@ pub struct InboxSummaryItem {
     pub id: MessageId,
     /// `human`, or the sending agent as `<project> · <host> · <harness>`.
     pub from: String,
-    /// The human typed it in the UI: hooks frame it as the human's, not as peer data.
+    /// The human typed it in the UI: hooks frame its body as the human's, not as peer data.
     pub from_human: bool,
+    /// For a human message with a subject, who wrote that subject (`human`, or the
+    /// replied-to agent's label): hooks frame the subject as that author's peer text, never
+    /// as the human's.
+    pub subject_from: Option<String>,
     pub subject: Option<String>,
     /// The message's project key (where it was sent), for the `in <project>` label.
     pub project: Option<String>,
@@ -562,6 +566,24 @@ async fn inbox_summary(
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         let m = item.message;
+        // A human reply's subject is the original's: name that author for the subject.
+        let subject_from = match crate::mcp::subject_author(&*state.store, &m)
+            .await
+            .map_err(ApiError::internal)?
+        {
+            _ if !crate::mcp::is_human_typed(&m) || m.subject.is_none() => None,
+            Actor::Human => Some("human".to_string()),
+            Actor::Agent(a, _) => Some(match labels.get(&a) {
+                Some(l) => l.clone(),
+                None => {
+                    let l = agent_label(&*state.store, a)
+                        .await
+                        .map_err(ApiError::internal)?;
+                    labels.insert(a, l.clone());
+                    l
+                }
+            }),
+        };
         let from = match m.from {
             Actor::Human => "human".to_string(),
             Actor::Agent(a, _) => match labels.get(&a) {
@@ -595,6 +617,7 @@ async fn inbox_summary(
             id: m.id,
             from,
             from_human: crate::mcp::is_human_typed(&m),
+            subject_from,
             subject: m.subject,
             project,
             importance: m.importance,

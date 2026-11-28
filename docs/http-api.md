@@ -253,9 +253,10 @@ curl -s -H "Authorization: Bearer $AXL_TOKEN" \
 
 `preview` is the body on one line, at most 120 characters. These fields are not framed; the
 hooks frame them before showing them to the model. `from_human` is true for text the human
-typed in the UI: hooks frame it `[from the human owner, via the Axle UI] …` instead of as
-peer data. A client that does not read the field (or a server that does not send it) gets
-the peer frame.
+typed in the UI: hooks frame its body `[from the human owner, via the Axle UI] …` instead of
+as peer data. Its subject stays peer data, framed as from `subject_from`: `human`, or, for a
+reply (whose subject is the original's), the replied-to author's label. A client that does
+not read the field (or a server that does not send it) gets the peer frame.
 
 ## `GET /v1/leases`
 
