@@ -13,10 +13,48 @@ use super::views::{Pulse, UiError, UiResult, html, line_colours, pulse_counts};
 use crate::domain::DISPLAY_NAME_MAX;
 use crate::http::AppState;
 
+/// `https://host/path` for a project key shaped `host[:port]/seg/seg…`, else `None`.
+/// Keys are agent-supplied, so this is the security boundary for the link: a strict
+/// allow-list of host and path characters, no scheme, userinfo, query, fragment or `..`.
+pub fn repo_url(key: &str) -> Option<String> {
+    let (host, path) = key.split_once('/')?;
+    let (name, port) = match host.split_once(':') {
+        Some((n, p)) => (n, Some(p)),
+        None => (host, None),
+    };
+    let label_ok = |l: &str| {
+        !l.is_empty()
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if !name.contains('.') || !name.split('.').all(label_ok) {
+        return None;
+    }
+    if let Some(p) = port
+        && (p.is_empty() || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let seg_ok = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-'))
+    };
+    if !path.split('/').all(seg_ok) {
+        return None;
+    }
+    Some(format!("https://{key}"))
+}
+
 pub struct ProjectRow {
     pub id: String,
     pub name: String,
     pub key: String,
+    /// The repository page for `key`, when the key is a plain `host/path`.
+    pub repo_url: Option<String>,
     /// The project's line colour (see `views::line_colours`).
     pub line: u8,
     pub created: Stamp,
@@ -47,6 +85,7 @@ pub async fn projects(
             id: p.id.to_string(),
             line: lines.get(&p.id).copied().unwrap_or(0),
             name: p.display_name,
+            repo_url: repo_url(&p.key),
             key: p.key,
             created: Stamp::new(now, p.created_at),
         })
@@ -129,4 +168,46 @@ pub(super) async fn tokens_page(
     })?;
     *res.status_mut() = status;
     Ok(res)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repo_url;
+
+    #[test]
+    fn links_plain_hosts() {
+        let u = |k| repo_url(k).unwrap();
+        assert_eq!(u("github.com/acme/web"), "https://github.com/acme/web");
+        assert_eq!(u("gitlab.com/a/b/c"), "https://gitlab.com/a/b/c");
+        assert_eq!(
+            u("git.example.org:8443/team/repo.name"),
+            "https://git.example.org:8443/team/repo.name"
+        );
+    }
+
+    #[test]
+    fn rejects_everything_else() {
+        for k in [
+            "javascript:alert(1)",
+            "github.com/a/../b",
+            "github.com/a b",
+            "local",
+            "github.com",
+            "github.com/a?x",
+            "user@host:repo",
+            "github.com/a/%2e%2e",
+            "github.com/a//b",
+            "github.com/a/",
+            "github.com/a#x",
+            "github.com/a\\b",
+            "user@github.com/a",
+            "localhost/a",
+            "-x.com/a",
+            "github.com:/a",
+            "github.com:80a/a",
+            "https://github.com/a",
+        ] {
+            assert_eq!(repo_url(k), None, "{k}");
+        }
+    }
 }

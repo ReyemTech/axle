@@ -125,7 +125,7 @@ presence, project and current task.
 <img src="images/projects.webp" width="1440" alt="The Projects page listing three projects by display name with their keys and a rename field for each.">
 
 Projects appear here on first contact. Rename a project's display name; the key stays the
-same and is shown on hover.
+same and is shown on hover. A key that is a plain `host/path` links to its repository.
 
 ## Tokens
 
