@@ -1865,6 +1865,7 @@ impl TaskService {
             reply_to: None,
             created_at: self.clock.now(),
             kind: MessageKind::System,
+            options: Vec::new(),
         }
     }
 

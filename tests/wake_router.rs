@@ -191,6 +191,7 @@ impl Env {
             reply_to: None,
             created_at: now,
             kind: MessageKind::Message,
+            options: Vec::new(),
         };
         assert!(
             self.store

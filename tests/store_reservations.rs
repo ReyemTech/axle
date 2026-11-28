@@ -126,6 +126,7 @@ async fn insert(store: &Arc<dyn Store>, project: ProjectId, title: &str, sanctio
         reply_to: None,
         created_at: task.created_at,
         kind: MessageKind::Message,
+        options: Vec::new(),
     };
     assert!(
         store
