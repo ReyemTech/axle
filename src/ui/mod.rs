@@ -192,6 +192,10 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/ui/messages", post(actions::send_message))
         .route("/ui/projects", get(admin::projects))
         .route("/ui/projects/{id}/rename", post(actions::rename_project))
+        .route(
+            "/ui/projects/{id}/delivery",
+            post(actions::set_project_delivery),
+        )
         .route("/ui/tokens", get(admin::tokens))
         .route("/ui/tokens/{id}/revoke", post(actions::revoke_token))
         .route("/ui/tokens/connect", post(connect::connect_machine))

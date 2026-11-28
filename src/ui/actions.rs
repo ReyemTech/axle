@@ -13,8 +13,8 @@ use super::SessionCtx;
 use super::task_page::{TaskQuery, render_task_page};
 use super::views::{UiError, UiResult};
 use crate::domain::{
-    Actor, Address, Importance, LinkKind, MessageId, ProjectId, Task, TaskId, TokenId,
-    clean_display_name,
+    Actor, Address, DeliveryStage, Importance, LinkKind, MessageId, ProjectId, Task, TaskId,
+    TokenId, clean_display_name,
 };
 use crate::http::AppState;
 use crate::service::auth::AuthError;
@@ -724,6 +724,45 @@ pub async fn rename_project(
         Ok(()) => Ok(see_other("/ui/projects")),
         Err(StoreError::NotFound(_)) => Err(UiError::NotFound("No such project.")),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// `POST /ui/projects/{id}/delivery` (`csrf`, repeated `stage`): replaces the project's
+/// delivery stages with exactly the ticked ones. An unknown stage refuses the whole save;
+/// none ticked turns stages off.
+pub async fn set_project_delivery(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    RawForm(raw): RawForm,
+) -> UiResult<Response> {
+    let id: ProjectId = id
+        .parse()
+        .map_err(|_| UiError::NotFound("No such project."))?;
+    let fields: Vec<(String, String)> =
+        serde_urlencoded::from_bytes(&raw).map_err(|_| UiError::Invalid("Bad form.".into()))?;
+    let mut stages = Vec::new();
+    for (k, v) in &fields {
+        if k == "stage" {
+            match v.parse::<DeliveryStage>() {
+                Ok(stage) => stages.push(stage),
+                Err(_) => {
+                    return Ok((StatusCode::BAD_REQUEST, "Unknown delivery stage.").into_response());
+                }
+            }
+        }
+    }
+    let project = state
+        .store
+        .get_project(id)
+        .await?
+        .ok_or(UiError::NotFound("No such project."))?;
+    match state.delivery.set_stages(&project, stages).await {
+        Ok(_) => Ok(see_other("/ui/projects")),
+        Err(DeliveryError::Store(StoreError::NotFound(_))) => {
+            Err(UiError::NotFound("No such project."))
+        }
+        Err(DeliveryError::Store(e)) => Err(e.into()),
+        Err(e) => Err(UiError::Internal(e.to_string())),
     }
 }
 

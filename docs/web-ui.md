@@ -214,6 +214,11 @@ answers are written by the agent, so they are shown as plain text, never as mark
 Projects appear here on first contact. Rename a project's display name; the key stays the
 same and is shown on hover. A key that is a plain `host/path` links to its repository.
 
+Each project row has a **Delivery stages** disclosure with four checkboxes (**In PR**,
+**Merged**, **Released**, **Deployed**) and **Save stages**. Tasks with a PR move through the
+ticked stages after the agent completes them; done means the last one ticked. Unticking all
+turns stages off and finishes any task still delivering.
+
 ## Tokens
 
 <img src="images/tokens.webp" width="1440" alt="The Tokens page listing four agent tokens by label with active or revoked state, last use and creation time, and a Revoke button on each active token.">

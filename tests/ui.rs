@@ -5362,3 +5362,140 @@ mod delivery_panel {
         assert!(!buttons(&page).contains(&unlink));
     }
 }
+
+// ---------------------------------------------------------------- project delivery stages
+
+mod project_delivery {
+    use super::*;
+    use axle::domain::DeliveryStage::{self, InPr, Merged};
+
+    const WEB: &str = "github.com/acme/web";
+
+    async fn setup() -> (App, String, String, Resolved, String) {
+        let app = app().await;
+        let cookie = app.login().await;
+        let web = app.agent(WEB, "mac", "claude-code").await;
+        let project = web.agent.project_id.unwrap();
+        let csrf = csrf_for(&app, &cookie).await;
+        let path = format!("/ui/projects/{project}/delivery");
+        (app, cookie, csrf, web, path)
+    }
+
+    async fn stored(app: &App, web: &Resolved) -> Vec<DeliveryStage> {
+        let project = app
+            .state
+            .store
+            .get_project(web.agent.project_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        app.state.delivery.settings(&project).await.unwrap().stages
+    }
+
+    #[tokio::test]
+    async fn delivery_settings_save() {
+        let (app, cookie, csrf, web, path) = setup().await;
+        let page = app.get("/ui/projects", Some(&cookie)).await;
+        assert_eq!(
+            select_texts(&page, ".delivery-stages label"),
+            ["In PR", "Merged", "Released", "Deployed"]
+        );
+        assert!(page.text().contains(
+            "Tasks with a PR move through these after the agent completes them. Done means the last one ticked."
+        ));
+        assert_eq!(
+            select_texts(&page, ".delivery-stages button"),
+            ["Save stages"]
+        );
+
+        let body = format!("csrf={csrf}&stage=in_pr&stage=merged");
+        let r = app.post_form(&path, Some(&cookie), &body).await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+        assert_eq!(r.location.as_deref(), Some("/ui/projects"));
+        assert_eq!(stored(&app, &web).await, [InPr, Merged]);
+
+        let page = app.get("/ui/projects", Some(&cookie)).await;
+        let checked = Html::parse_document(&page.body)
+            .select(&Selector::parse(".delivery-stages input[checked]").unwrap())
+            .count();
+        assert_eq!(checked, 2);
+    }
+
+    #[tokio::test]
+    async fn delivery_settings_csrf() {
+        let (app, cookie, _csrf, web, path) = setup().await;
+        let r = app.post_form(&path, Some(&cookie), "stage=in_pr").await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN);
+        assert!(stored(&app, &web).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_stage_rejected() {
+        let (app, cookie, csrf, web, path) = setup().await;
+        let body = format!("csrf={csrf}&stage=in_pr&stage=shipped");
+        let r = app.post_form(&path, Some(&cookie), &body).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+        assert!(stored(&app, &web).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unticking_all_moves_delivering_to_done() {
+        let (app, cookie, csrf, web, path) = setup().await;
+        let project = app
+            .state
+            .store
+            .get_project(web.agent.project_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        app.state
+            .delivery
+            .set_stages(&project, vec![InPr, Merged])
+            .await
+            .unwrap();
+        let task = app.task(&web, "Ship it", None).await;
+        app.claim(&web, task.id).await;
+        app.state
+            .delivery
+            .link_pr(
+                Caller::Agent(&web),
+                task.id,
+                "https://github.com/acme/web/pull/12",
+            )
+            .await
+            .unwrap();
+        app.state
+            .tasks
+            .complete(
+                &web,
+                task.id,
+                Completion {
+                    summary: "done".into(),
+                    ..Completion::default()
+                },
+            )
+            .await
+            .unwrap();
+        let t = app.state.store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Delivering);
+
+        let r = app
+            .post_form(&path, Some(&cookie), &format!("csrf={csrf}"))
+            .await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+        assert!(stored(&app, &web).await.is_empty());
+        let t = app.state.store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Done);
+
+        let page = app
+            .get(&format!("/ui/tasks/{}", task.id), Some(&cookie))
+            .await;
+        assert!(
+            select_texts(&page, ".event-note")
+                .iter()
+                .any(|n| n.contains("delivery stages turned off")),
+            "{}",
+            page.body
+        );
+    }
+}
