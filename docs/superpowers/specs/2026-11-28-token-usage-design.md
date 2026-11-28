@@ -128,10 +128,24 @@ session held at `occurred_at` and writes one row per task with `parts = n`, or o
 known at ingest; recomputing them per page load would replay task history for every
 record, and the split stays stable when a task is later released or re-claimed.
 
-"Held at `occurred_at`" comes from `task_events`: a claim by this session at or before
-that time with no release, completion, force release, cancel or expiry of that lease
-before it. This matters: the turn that finishes a task ends after `task_complete`, so the
-holdings at ingest time would put the whole turn under "no task".
+"Held at `occurred_at`" comes from `task_events` (Controller's call). A task is held from
+this session's `claimed` until its `released`, `done`, `cancelled` or `force_released`, or
+another session's `claimed` or `lease_expired_takeover`. Blocked, review and an expired
+lease nobody re-claimed still count as held. No new event kind. The query: tasks whose
+latest such event at or before `occurred_at` is this session's claim.
+
+```sql
+SELECT e.task_id FROM task_events e
+WHERE e.kind = 'claimed' AND e.actor_session_id = :s AND e.created_at <= :t
+  AND NOT EXISTS (SELECT 1 FROM task_events x
+    WHERE x.task_id = e.task_id AND x.created_at > e.created_at AND x.created_at <= :t
+      AND (x.kind IN ('released', 'done', 'cancelled', 'force_released')
+           OR (x.kind IN ('claimed', 'lease_expired_takeover')
+               AND x.actor_session_id IS NOT :s)))
+```
+
+This matters: the turn that finishes a task ends after `task_complete`, so the holdings
+at ingest time would put the whole turn under "no task".
 
 **Duplicates merge upward:** an existing `(harness, dedupe_key)` keeps the larger value of
 each count (`GREATEST` / `MAX` in the upsert) and its first session and allocation. A
@@ -207,18 +221,24 @@ harness. The hook calls it on Stop and SessionEnd.
   Codex asks the user to trust the new hook, as today.
 - On Stop it runs concurrently with the inbox fetch, in the same 2.5 s budget and 4 s
   ceiling; the urgent-mail block never waits for it. SessionEnd: collector only, 1 s.
-- The hook reads `transcript_path` from stdin (it already parses Stop input). The session
-  comes from `find_session`, as today.
+- The hook reads `transcript_path` from stdin. The session comes from `find_session`, or
+  from the cursor once the bridge has gone (below).
+- Usage is collected **before** the `stop_hook_active` loop guard, so continuation turns
+  are counted; the guard still prevents blocking (Controller's call).
 
 **Cursor file:** `~/.axl/sessions/usage/<sha256 of transcript path>.json`, mode 0600,
 written atomically. It holds the path, `dev`, `ino`, byte `offset`, parser id, parser
-state (Codex's current model), the billing kind and `updated_at`.
+state (Codex's current model), the billing kind and `updated_at`. It also caches the last
+Axle session id and server URL, never the token, so Stop and SessionEnd can report after
+the bridge removed its session file. The server accepts usage for an ended session (the
+row persists) as long as it belongs to the token (Controller's call).
 
 - Keyed by transcript, so the bridge's cleanup cannot delete it before SessionEnd, and
   `--resume` continues it. New records go to the session `find_session` returns now.
 - Read from `offset` to the last complete newline; a partial line waits.
-- Advance only after a 2xx. On timeout or 5xx keep it; the next Stop resends and the
-  server dedupes. On 403, 404 or a 400 envelope error advance anyway, with one stderr
+- Advance only after a 2xx. On timeout, 429, 5xx or any send failure keep it; the next
+  Stop or SessionEnd resends and the server dedupes. No separate rate bucket in v1; each
+  send is capped at 500 records and the rest goes next time (Controller's call). On 403, 404 or a 400 envelope error advance anyway, with one stderr
   line, so a bad batch cannot loop forever.
 - A file that shrank or has a new inode restarts at 0; dedupe makes that safe.
 - A new cursor starts at 0 but drops records older than the session file's mtime, so
@@ -367,16 +387,17 @@ B is worth it if a harness stops logging usage locally, or has telemetry but no 
    when a turn finishes, and `opencode/1` reading `opencode.db` read-only. Waits for a
    stable plugin event API.
 
-## Open questions
+## Settled questions (Controller's call)
 
-1. **Subscription value:** show the monthly plan price next to the API-equivalent cost?
-2. **Retention:** one row per API request is about 1.5M rows a year for a heavy owner.
-   Keep raw forever, or roll up to daily rows after N days (`AXL_USAGE_RETENTION_DAYS`)?
-3. **Codex cache writes:** is `cache_write_input_tokens` inside `input_tokens`, like
-   cached reads? We assume not; a fixture with a non-zero value settles it.
-4. **Surcharges:** price `inference_geo: "us"` (1.1x) and web search ($10 per 1,000)?
-5. **OpenCode cost:** use OpenCode's own per-message `cost`, or always our table?
-6. **Live updates:** should the Usage page and task line update over `/ui/live`?
+1. **Subscription value:** no plan price shown in v1.
+2. **Retention:** per-request rows are kept 90 days (`AXL_USAGE_RAW_DAYS`), then rolled up
+   to daily rows per session and model; allocations roll up with them.
+3. **Codex cache writes:** whether `cache_write_input_tokens` is inside `input_tokens` is
+   a builder spike with fixtures in PR 3.
+4. **Surcharges:** no `inference_geo` or web-search pricing in v1; a future addition.
+5. **OpenCode cost:** use its own per-message `cost` when present and the harness is
+   API-billed; otherwise our table.
+6. **Live updates:** none on the Usage page in v1.
 
 ## Appendix: sources
 
