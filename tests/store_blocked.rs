@@ -338,6 +338,8 @@ store_matrix!(waits_that_could_never_end_are_refused, |store: Arc<
                 record_previous: false,
             }),
             unblock: None,
+            version: None,
+            sanctioned: None,
         })
         .await
         .unwrap();

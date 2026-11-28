@@ -1864,6 +1864,8 @@ impl TaskService {
             message: message.clone(),
             latest_plan: None,
             archive_plans: false,
+            block: None,
+            unblock: None,
             version: Some(version),
             sanctioned,
         };

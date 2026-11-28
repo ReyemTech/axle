@@ -1,13 +1,17 @@
 -- no-transaction
 -- Wake idle agents (docs/superpowers/specs/2026-11-28-wake-up-design.md), SQLite flavour.
--- Kept in step with migrations/postgres/0007_wake_up.sql.
+-- Kept in step with migrations/postgres/0008_wake_up.sql.
 --
 -- SQLite cannot change a CHECK constraint in place, so `tasks` is rebuilt (the same
 -- create-copy-drop-rename procedure as 0002) to admit the `requested` status and gain the
 -- request columns. Foreign keys must be off while the old table is dropped, and
 -- `PRAGMA foreign_keys` is a no-op inside a transaction, so this migration runs outside
--- sqlx's transaction and opens its own around the rebuild. `done_at` / `acked_at` (0004) are
--- copied, and the `tasks_done` partial index is recreated.
+-- sqlx's transaction and opens its own around the rebuild. `done_at` / `acked_at` (0004) and
+-- the block detail (0006: `block_reason`, `blocked_at`, `waiting_*`, `unblock_text`) are
+-- copied with their CHECK and REFERENCES, and the `tasks_done` and `tasks_waiting_task`
+-- partial indexes are recreated. Other tables' references to `tasks` (`task_links` from 0007,
+-- `task_projects`, `task_events`, messages) name the table, so they bind to the rebuilt one;
+-- `PRAGMA foreign_key_check` runs before the commit, as SQLite's rebuild procedure says.
 
 PRAGMA foreign_keys = OFF;
 
@@ -42,6 +46,15 @@ CREATE TABLE tasks_new (
                                                  'changes_requested', 'approved')),
     done_at                TEXT,
     acked_at               TEXT,
+    -- Why a blocked task is blocked and what would unblock it (0006).
+    block_reason           TEXT,
+    blocked_at             TEXT,
+    waiting_kind           TEXT
+                           CHECK (waiting_kind IS NULL
+                                  OR waiting_kind IN ('human', 'task', 'external')),
+    waiting_task_id        TEXT REFERENCES tasks(id),
+    waiting_text           TEXT,
+    unblock_text           TEXT,
     -- The human (or a task they sanctioned) approved waking agents for this task.
     sanctioned             INTEGER NOT NULL DEFAULT 0 CHECK (sanctioned IN (0, 1)),
     -- Cross-project requests: how deep the chain is, where it started, the projects it has
@@ -56,11 +69,13 @@ INSERT INTO tasks_new
     (id, project_id, parent_id, title, body, status, owner_session_id, owner_agent_id,
      lease_expires_at, lease_ttl_secs, lease_epoch, eligible_harness, eligible_host,
      created_by_agent_id, created_by_session_id, token_id, created_at, updated_at, version,
-     requires_plan, plan_state, done_at, acked_at)
+     requires_plan, plan_state, done_at, acked_at, block_reason, blocked_at, waiting_kind,
+     waiting_task_id, waiting_text, unblock_text)
 SELECT id, project_id, parent_id, title, body, status, owner_session_id, owner_agent_id,
        lease_expires_at, lease_ttl_secs, lease_epoch, eligible_harness, eligible_host,
        created_by_agent_id, created_by_session_id, token_id, created_at, updated_at, version,
-       requires_plan, plan_state, done_at, acked_at
+       requires_plan, plan_state, done_at, acked_at, block_reason, blocked_at, waiting_kind,
+       waiting_task_id, waiting_text, unblock_text
   FROM tasks;
 
 DROP TABLE tasks;
@@ -71,6 +86,7 @@ CREATE INDEX tasks_parent ON tasks (parent_id);
 CREATE INDEX tasks_owner_session ON tasks (owner_session_id);
 CREATE INDEX tasks_done ON tasks (done_at, id) WHERE status = 'done';
 CREATE INDEX tasks_request_dedupe ON tasks (request_dedupe_key, created_at);
+CREATE INDEX tasks_waiting_task ON tasks (waiting_task_id) WHERE waiting_task_id IS NOT NULL;
 
 -- What a session reports about its turn, and how Axle can reach it.
 ALTER TABLE sessions ADD COLUMN turn_state TEXT NOT NULL DEFAULT 'unknown'
@@ -137,6 +153,8 @@ CREATE TABLE server_settings (
     headless_paused  INTEGER NOT NULL DEFAULT 0 CHECK (headless_paused IN (0, 1)),
     updated_at       TEXT NOT NULL
 );
+
+PRAGMA foreign_key_check;
 
 COMMIT;
 

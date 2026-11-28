@@ -100,6 +100,7 @@ fn task_in(project: ProjectId, title: &str, sanctioned: bool) -> Task {
         origin_task_id: None,
         request_chain: Vec::new(),
         request_dedupe_key: None,
+        block: None,
     }
 }
 
@@ -164,6 +165,8 @@ async fn queue(store: &Arc<dyn Store>, task: TaskId, at: OffsetDateTime) {
         archive_plans: false,
         version: None,
         sanctioned: None,
+        block: None,
+        unblock: None,
     };
     assert!(store.transition_task(&req).await.unwrap().is_some());
 }

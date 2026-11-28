@@ -169,6 +169,7 @@ impl Env {
             origin_task_id: None,
             request_chain: Vec::new(),
             request_dedupe_key: None,
+            block: None,
         };
         let event = TaskEvent {
             id: uuid::Uuid::now_v7(),
@@ -253,6 +254,8 @@ impl Env {
             archive_plans: false,
             version: None,
             sanctioned: None,
+            block: None,
+            unblock: None,
         };
         assert!(self.store.transition_task(&req).await.unwrap().is_some());
     }

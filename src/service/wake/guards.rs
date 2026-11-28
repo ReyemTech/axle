@@ -166,6 +166,7 @@ mod tests {
             origin_task_id: None,
             request_chain: chain,
             request_dedupe_key: None,
+            block: None,
         }
     }
 

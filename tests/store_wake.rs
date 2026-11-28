@@ -6,9 +6,10 @@ use std::sync::Arc;
 
 use axle::clock::{Clock, TestClock};
 use axle::domain::{
-    Actor, Address, AgentId, Eligibility, Importance, Message, MessageId, MessageKind, PlanState,
-    ProjectId, ProjectWakeSettings, ServerSettings, SessionId, Task, TaskEvent, TaskEventKind,
-    TaskId, TaskStatus, TurnState, WakeAttempt, WakeChannel, WakeKind, WakeOutcome, WakeTrigger,
+    Actor, Address, AgentId, Eligibility, Importance, LinkKind, Message, MessageId, MessageKind,
+    PlanState, ProjectId, ProjectWakeSettings, ServerSettings, SessionId, Task, TaskEvent,
+    TaskEventKind, TaskId, TaskStatus, TurnState, WaitingOn, WakeAttempt, WakeChannel, WakeKind,
+    WakeOutcome, WakeTrigger,
 };
 use axle::service::identity::{IdentityInput, IdentityService, Resolved};
 use axle::store::{
@@ -64,6 +65,7 @@ fn task_in(project: ProjectId, title: &str, now: OffsetDateTime) -> Task {
         origin_task_id: None,
         request_chain: Vec::new(),
         request_dedupe_key: None,
+        block: None,
     }
 }
 
@@ -395,6 +397,8 @@ fn transition(id: TaskId, version: Option<i64>, sanctioned: Option<bool>) -> Tra
         archive_plans: false,
         version,
         sanctioned,
+        block: None,
+        unblock: None,
     }
 }
 
@@ -664,7 +668,7 @@ store_matrix!(append_task_event_leaves_the_task_alone, |store: Arc<
     assert_eq!(events[1], event);
 });
 
-/// Copies every migration of `backend` before 0007 (wake-up) into a fresh directory.
+/// Copies every migration of `backend` before 0008 (wake-up) into a fresh directory.
 fn old_migrations(backend: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("axle-mig-{}", uuid::Uuid::now_v7()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -674,11 +678,28 @@ fn old_migrations(backend: &str) -> std::path::PathBuf {
     for entry in std::fs::read_dir(src).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name().into_string().unwrap();
-        if name.ends_with(".sql") && name.as_str() < "0007_" {
+        if name.ends_with(".sql") && name.as_str() < "0008_" {
             std::fs::copy(entry.path(), dir.join(&name)).unwrap();
         }
     }
     dir
+}
+
+/// The blocked task `blocked` (waiting on `target`, with a follow-up link to it) kept its
+/// block detail and its link through the 0008 migration.
+async fn assert_kept_block(store: &dyn Store, blocked: TaskId, target: TaskId) {
+    let task = store.get_task(blocked).await.unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Blocked);
+    let block = task.block.expect("block detail kept");
+    assert_eq!(block.reason, "needs the schema");
+    assert_eq!(block.since, Some(datetime!(2026-11-22 9:00 UTC)));
+    assert_eq!(block.waiting_on, Some(WaitingOn::Task(target)));
+    assert_eq!(block.unblock.as_deref(), Some("schema merged"));
+    let links = store.task_links(blocked).await.unwrap();
+    assert_eq!(links.len(), 1, "{links:?}");
+    assert_eq!(links[0].task_id, blocked);
+    assert_eq!(links[0].target_id, target);
+    assert_eq!(links[0].kind, LinkKind::FollowUp);
 }
 
 #[tokio::test]
@@ -740,6 +761,31 @@ async fn migrates_populated_tasks_table_sqlite() {
         .await
         .unwrap();
     }
+    // A blocked task waiting on `open` (0006's columns) and a link to it (0007's table).
+    let blocked = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO tasks (id, project_id, title, status, block_reason, blocked_at,
+                            waiting_kind, waiting_task_id, waiting_text, unblock_text,
+                            created_at, updated_at)
+         VALUES (?, ?, 't', 'blocked', 'needs the schema', '2026-11-22T09:00:00.000000Z',
+                 'task', ?, NULL, 'schema merged', '2026-11-01T00:00:00.000000Z',
+                 '2026-11-01T00:00:00.000000Z')",
+    )
+    .bind(&blocked)
+    .bind(&project)
+    .bind(&open)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_links (task_id, target_id, kind, created_at)
+         VALUES (?, ?, 'follow-up', '2026-11-22T09:00:00.000000Z')",
+    )
+    .bind(&blocked)
+    .bind(&open)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let store = SqliteStore::from_pool(pool.clone()).await.unwrap();
     let kept = store
@@ -761,8 +807,16 @@ async fn migrates_populated_tasks_table_sqlite() {
             .await
             .unwrap()
             .len(),
-        3
+        4
     );
+    let blocked_id: TaskId = blocked.parse::<uuid::Uuid>().unwrap().into();
+    let open_id: TaskId = open.parse::<uuid::Uuid>().unwrap().into();
+    assert_kept_block(&store, blocked_id, open_id).await;
+    let fk: Vec<sqlx::sqlite::SqliteRow> = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(fk.is_empty(), "foreign key violations after the rebuild");
 
     // The partial index and the new dedupe index survived the rebuild, and `requested` is
     // admitted by the new CHECK.
@@ -780,6 +834,7 @@ async fn migrates_populated_tasks_table_sqlite() {
         "tasks_owner_session",
         "tasks_done",
         "tasks_request_dedupe",
+        "tasks_waiting_task",
     ] {
         assert!(
             indexes.iter().any(|i| i == want),
@@ -844,8 +899,44 @@ async fn migrates_populated_tasks_table_postgres() {
             .execute(&pool)
             .await
             .unwrap();
+            // A blocked task waiting on another (0006's columns) and a link (0007's table).
+            let target = uuid::Uuid::now_v7();
+            let blocked = uuid::Uuid::now_v7();
+            sqlx::query(
+                "INSERT INTO tasks (id, project_id, title, status, created_at, updated_at)
+                 VALUES ($1, $2, 't', 'open', '2026-11-01T00:00:00Z', '2026-11-01T00:00:00Z')",
+            )
+            .bind(target)
+            .bind(project)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO tasks (id, project_id, title, status, block_reason, blocked_at,
+                                    waiting_kind, waiting_task_id, waiting_text, unblock_text,
+                                    created_at, updated_at)
+                 VALUES ($1, $2, 't', 'blocked', 'needs the schema', '2026-11-22T09:00:00Z',
+                         'task', $3, NULL, 'schema merged', '2026-11-01T00:00:00Z',
+                         '2026-11-01T00:00:00Z')",
+            )
+            .bind(blocked)
+            .bind(project)
+            .bind(target)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO task_links (task_id, target_id, kind, created_at)
+                 VALUES ($1, $2, 'follow-up', '2026-11-22T09:00:00Z')",
+            )
+            .bind(blocked)
+            .bind(target)
+            .execute(&pool)
+            .await
+            .unwrap();
 
             let store = PostgresStore::from_pool(pool.clone()).await.unwrap();
+            assert_kept_block(&store, blocked.into(), target.into()).await;
             let kept = store.get_task(done.into()).await.unwrap().unwrap();
             assert_eq!(kept.status, TaskStatus::Done);
             assert_eq!(kept.done_at, Some(datetime!(2026-11-20 9:00 UTC)));

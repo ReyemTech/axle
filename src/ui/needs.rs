@@ -197,6 +197,7 @@ pub(super) async fn needs_you(
             importance: "high",
             options: Vec::new(),
             reply: None,
+            reply_task: None,
             request_head: Some(head),
             request_version: Some(t.version),
         });
