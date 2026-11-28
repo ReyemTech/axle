@@ -200,9 +200,13 @@ error: a lost report is healed by the next heartbeat.
 
 A bridge's report of what its wake adapter did with a `WakeRequested` event from
 `/v1/events`. Body: `{"session_id", "task_id", "outcome", "detail"}`, where `task_id` and
-`detail` may be null and `outcome` is `sent`, `held`, `refused` or `failed` (anything else
-is 400; `detail` is cut at 500 characters). Returns 204 with no body. An unknown session is
-404, another token's session 403. The bridge waits at most 30 seconds for its adapter, then
+`detail` may be null and `outcome` is `sent`, `held`, `refused` or `failed`. A word that is
+not a wake outcome at all is 422 (the body does not parse); another known outcome, such as
+`expired`, is 400. `detail` is cut at 500 characters and kept in the wake log only; it never
+reaches task history. Returns 204 with no body. An unknown session is 404, another token's
+session 403. A `task_id` must be the session's current reservation or the task of its newest
+`sent` wake; any other task, including one that does not exist, is 404
+(`this session was not woken for that task`) and nothing is recorded. The bridge waits at most 30 seconds for its adapter, then
 reports `failed`. A bridge whose adapter has no working channel (today: every bridge) opens
 no wake stream and reports no `wake_channel` in its heartbeat.
 

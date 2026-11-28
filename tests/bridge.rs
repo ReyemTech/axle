@@ -784,5 +784,22 @@ async fn wake_result_rejects_other_token() {
     assert_eq!(post(other, cfg.session_id.to_string()).await, 403);
     assert_eq!(post(owner.clone(), cfg.session_id.to_string()).await, 204);
     let unknown = axle::domain::SessionId::new().to_string();
-    assert_eq!(post(owner, unknown).await, 404);
+    assert_eq!(post(owner.clone(), unknown).await, 404);
+
+    // A task this session was never woken for (here: one that does not exist) is a 404,
+    // never a 500 from the wake log's foreign key.
+    let status = reqwest::Client::new()
+        .post(format!("{server}/v1/wake/result"))
+        .bearer_auth(owner)
+        .json(&serde_json::json!({
+            "session_id": cfg.session_id.to_string(),
+            "task_id": axle::domain::TaskId::new().to_string(),
+            "outcome": "failed", "detail": "forged",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(status, 404);
 }

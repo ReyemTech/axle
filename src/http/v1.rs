@@ -270,11 +270,17 @@ async fn wake_result(
     let detail = req
         .detail
         .map(|d| d.chars().take(WAKE_DETAIL_MAX).collect::<String>());
-    state
+    let accepted = state
         .wake
         .report(r.session.id, req.task_id, req.outcome, detail)
         .await
         .map_err(ApiError::internal)?;
+    if !accepted {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "this session was not woken for that task",
+        ));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

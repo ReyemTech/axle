@@ -378,6 +378,9 @@ Event kinds: `created`, `claimed`, `renewed`, `released`, `blocked`, `review`, `
 `plan_approved`, `plan_changes_requested`, `projects_added`, `block_updated`, `unblocked`,
 `related`, `moved_under`, the work-request events `request_created`, `request_approved`,
 `request_declined`, and Axle's wake-up notes `queued`, `routed`, `wake_sent`, `wake_failed`.
+Axle writes those four itself (they show `"by": "human"`, as Axle has no actor of its own);
+their note is at most the outcome word (`failed`, `held` or `refused`), never text a bridge
+or agent supplied.
 
 A blocked task also carries `blocked`: `reason`, `since`, `waiting_on` (`{"human": true}`,
 `{"task": "<id>"}`, `{"external": "<text>"}` or `null`) and `unblock`. The agent-written

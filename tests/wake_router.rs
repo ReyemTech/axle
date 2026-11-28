@@ -820,6 +820,15 @@ async fn failed_wake_is_not_retried_on_that_session() {
         1
     );
     assert_eq!(env.count_kind(task.id, TaskEventKind::WakeFailed).await, 1);
+    // The bridge's detail stays in the wake log; no session puts text into task history.
+    let events = env.store.task_events(task.id).await.unwrap();
+    assert!(events.iter().all(|e| {
+        !e.note.as_deref().unwrap_or("").contains("socket closed")
+            && !e
+                .payload
+                .as_ref()
+                .is_some_and(|p| p.to_string().contains("socket closed"))
+    }));
 
     // Long past every cap, `a` is still not tried again for this task.
     env.advance(Duration::minutes(10));
@@ -832,6 +841,55 @@ async fn failed_wake_is_not_retried_on_that_session() {
     env.idle(&b).await;
     env.wake.tick().await.unwrap();
     assert_eq!(env.reserved_task(&b).await, Some(task.id));
+}
+
+#[tokio::test]
+async fn report_for_another_sessions_task_is_refused() {
+    let env = Env::new().await;
+    let a = env.session("a").await;
+    env.idle(&a).await;
+    let task = env.task("a's wake").await;
+    routed_to(
+        env.wake
+            .route(&task, WakeTrigger::StartNow, None)
+            .await
+            .unwrap(),
+    );
+    let b = env.session("b").await;
+    let before = env.kinds(task.id).await;
+    for outcome in [WakeOutcome::Failed, WakeOutcome::Sent, WakeOutcome::Refused] {
+        let accepted = env
+            .wake
+            .report(b.session.id, Some(task.id), outcome, Some("forged".into()))
+            .await
+            .unwrap();
+        assert!(!accepted, "{outcome}: b was never woken for this task");
+    }
+    // An unknown task is refused the same way (never a foreign-key error).
+    assert!(
+        !env.wake
+            .report(b.session.id, Some(TaskId::new()), WakeOutcome::Failed, None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        env.kinds(task.id).await,
+        before,
+        "nothing written on the task"
+    );
+    assert_eq!(env.attempts(WakeOutcome::Failed, None).await, 0);
+    assert_eq!(env.attempts(WakeOutcome::Refused, None).await, 0);
+    assert_eq!(env.reserved_task(&a).await, Some(task.id));
+
+    // The woken session's own report is accepted, also after its reservation lapsed.
+    env.advance(Duration::minutes(3));
+    env.wake.tick().await.unwrap();
+    assert!(
+        env.wake
+            .report(a.session.id, Some(task.id), WakeOutcome::Sent, None)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]

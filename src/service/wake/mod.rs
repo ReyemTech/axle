@@ -507,15 +507,38 @@ impl WakeService {
     /// the router never tries that session for the task again. `Sent` (the prompt reached the
     /// harness) adds a `wake_sent` history event; the router already logged the `sent` row
     /// the caps count. Other outcomes are logged as they are.
+    ///
+    /// A report may name only a task the session was woken for: its current reservation or
+    /// its newest `sent` wake. Any other task (another session's, or an unknown one) is
+    /// refused with `false` and nothing is recorded. The bridge's `detail` is kept in the
+    /// wake log only, never in task history, so no session can put text there.
     pub async fn report(
         &self,
         session: SessionId,
         task: Option<TaskId>,
         outcome: WakeOutcome,
         detail: Option<String>,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<bool> {
         let _routing = self.routing.lock().await;
         let now = self.clock.now();
+        if let Some(t) = task {
+            let reserved = self
+                .store
+                .get_session(session)
+                .await?
+                .is_some_and(|s| s.wake_task_id == Some(t));
+            let sent = || async {
+                StoreResult::Ok(
+                    self.store
+                        .last_wake_sent(session)
+                        .await?
+                        .is_some_and(|l| l.task_id == Some(t)),
+                )
+            };
+            if !reserved && !sent().await? {
+                return Ok(false);
+            }
+        }
         match outcome {
             WakeOutcome::Failed | WakeOutcome::Held | WakeOutcome::Refused => {
                 if let Some(t) = task {
@@ -534,10 +557,7 @@ impl WakeService {
                     self.note(
                         t,
                         TaskEventKind::WakeFailed,
-                        Some(format!(
-                            "{outcome}: {}",
-                            detail.as_deref().unwrap_or("no detail")
-                        )),
+                        Some(outcome.to_string()),
                         Some(json!({ "session_id": session.to_string() })),
                         now,
                     )
@@ -566,7 +586,7 @@ impl WakeService {
                 self.follow_up(session, task, outcome, detail, now).await?;
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     // ------------------------------------------------------------ helpers
