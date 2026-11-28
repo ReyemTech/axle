@@ -598,15 +598,16 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
 .presence[data-presence="stale"] { color: var(--warn); }
 
 /* Compact cards: one 30px row per task. State with its word, the title cut to one line
-   (the full title in its tooltip), project key on an all-projects board, holder, lease, then
-   only the attention chips and the subtask count. The title gives way first. */
+   (the full title in its tooltip), project on an all-projects board, holder, lease, then
+   only the attention chips and the subtask count. The title gives way first; when a narrow
+   column still cannot hold the signals, they wrap to a second line rather than being cut. */
 .card[data-density="compact"] {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 2px 8px;
   min-height: 30px;
   padding: 4px 8px;
-  overflow: hidden;
   overflow-wrap: normal;
   font-size: 12px;
   line-height: 18px;
@@ -616,7 +617,7 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
 .card[data-density="compact"] > * { flex: none; }
 .card[data-density="compact"] .state { gap: 4px; }
 .card[data-density="compact"] .card-title {
-  flex: 1 1 auto;
+  flex: 1 1 8ch;
   min-width: 3ch;
   overflow: hidden;
   text-overflow: ellipsis;
