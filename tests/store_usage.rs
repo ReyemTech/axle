@@ -491,6 +491,35 @@ store_matrix!(
     }
 );
 
+store_matrix!(
+    usage_takeover_opens_holding,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let a = env.session("mac", "claude-code").await;
+        let b = env.session("linux", "claude-code").await;
+        let t = env.task(&a).await;
+        let at = |m: i64| T0 + Duration::minutes(m);
+
+        env.claim(&a, &t).await;
+        env.set_time(Duration::minutes(20));
+        // Another agent takes the expired lease: a `lease_expired_takeover`, not `claimed`.
+        env.claim(&b, &t).await;
+
+        report(&env, &b, &[rec("b-after", at(21), 1)], &NoPrice).await;
+        assert_eq!(
+            env.allocations("b-after").await,
+            split(&[&t], 1),
+            "a lease takeover opens the new owner's holding"
+        );
+        report(&env, &a, &[rec("a-after", at(21), 1)], &NoPrice).await;
+        assert_eq!(env.allocations("a-after").await, vec![(None, 1)]);
+        report(&env, &a, &[rec("a-before", at(10), 1)], &NoPrice).await;
+        assert_eq!(env.allocations("a-before").await, split(&[&t], 1));
+        report(&env, &b, &[rec("b-before", at(10), 1)], &NoPrice).await;
+        assert_eq!(env.allocations("b-before").await, vec![(None, 1)]);
+    }
+);
+
 /// Two agents (mac/claude-code in PROJECT, linux/codex in OTHER). The first holds a child
 /// task and a loose task together at minute 2, so that record is split in two.
 struct Seeded {

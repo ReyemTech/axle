@@ -2777,9 +2777,10 @@ fn counts_from(row: &SqliteRow) -> StoreResult<UsageCounts> {
     })
 }
 
-/// The tasks (id text) `session` held at `at`: claimed by it at or before `at`, with no
-/// release, finish or claim by another session after that claim and up to `at`. A session
-/// that re-claimed a task it still held has two qualifying claims, hence `DISTINCT`.
+/// The tasks (id text) `session` held at `at`: claimed by it (a `claimed`, which covers a
+/// resume and a same-agent takeover, or a `lease_expired_takeover`) at or before `at`, with
+/// no release, finish or claim by another session after that claim and up to `at`. A
+/// session that re-claimed a task it still held has two qualifying claims, hence `DISTINCT`.
 async fn held_tasks(
     conn: &mut SqliteConnection,
     session: SessionId,
@@ -2787,7 +2788,8 @@ async fn held_tasks(
 ) -> StoreResult<Vec<String>> {
     Ok(sqlx::query_scalar(
         "SELECT DISTINCT e.task_id FROM task_events e
-         WHERE e.kind = 'claimed' AND e.actor_session_id = ?1 AND e.created_at <= ?2
+         WHERE e.kind IN ('claimed', 'lease_expired_takeover')
+           AND e.actor_session_id = ?1 AND e.created_at <= ?2
            AND NOT EXISTS (SELECT 1 FROM task_events x
              WHERE x.task_id = e.task_id AND x.created_at > e.created_at
                AND x.created_at <= ?2

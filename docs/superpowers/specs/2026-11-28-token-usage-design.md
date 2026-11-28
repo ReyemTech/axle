@@ -129,14 +129,16 @@ known at ingest; recomputing them per page load would replay task history for ev
 record, and the split stays stable when a task is later released or re-claimed.
 
 "Held at `occurred_at`" comes from `task_events` (Controller's call). A task is held from
-this session's `claimed` until its `released`, `done`, `cancelled` or `force_released`, or
-another session's `claimed` or `lease_expired_takeover`. Blocked, review and an expired
+this session's `claimed` or `lease_expired_takeover` (a takeover is the new owner's claim)
+until its `released`, `done`, `cancelled` or `force_released`, or another session's `claimed`
+or `lease_expired_takeover`. Blocked, review and an expired
 lease nobody re-claimed still count as held. No new event kind. The query: tasks whose
 latest such event at or before `occurred_at` is this session's claim.
 
 ```sql
 SELECT e.task_id FROM task_events e
-WHERE e.kind = 'claimed' AND e.actor_session_id = :s AND e.created_at <= :t
+WHERE e.kind IN ('claimed', 'lease_expired_takeover')
+  AND e.actor_session_id = :s AND e.created_at <= :t
   AND NOT EXISTS (SELECT 1 FROM task_events x
     WHERE x.task_id = e.task_id AND x.created_at > e.created_at AND x.created_at <= :t
       AND (x.kind IN ('released', 'done', 'cancelled', 'force_released')
