@@ -72,6 +72,35 @@
     }
   });
 
+  // Cmd+Enter (macOS) or Ctrl+Enter sends the form around a textarea, exactly as clicking its
+  // submit button would. requestSubmit keeps htmx hx-post forms and hidden CSRF inputs intact.
+  var sending = new WeakSet();
+  document.addEventListener("keydown", function (e) {
+    if (e.key !== "Enter" || !(e.metaKey || e.ctrlKey) || e.isComposing || e.keyCode === 229) return;
+    var t = e.target;
+    if (!(t instanceof HTMLTextAreaElement) || !t.form) return;
+    var form = t.form;
+    e.preventDefault();
+    var submit = form.querySelector('button[type="submit"], input[type="submit"]');
+    if (submit && submit.disabled) return;
+    if (sending.has(form) || form.classList.contains("htmx-request")) return;
+    sending.add(form);
+    setTimeout(function () { sending.delete(form); }, 1000);
+    if (form.requestSubmit) form.requestSubmit(submit || undefined);
+    else form.submit();
+  });
+
+  // Name the shortcut for this platform next to each send button.
+  var isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || "");
+  function labelSendHints() {
+    document.querySelectorAll("[data-send-hint]").forEach(function (el) {
+      var text = isMac ? "\u2318\u21b5 Cmd+Enter to send" : "Ctrl+Enter to send";
+      if (el.textContent !== text) el.textContent = text;
+    });
+  }
+  labelSendHints();
+  document.addEventListener("htmx:load", labelSendHints);
+
   // Search narrows the selectable items (cards, agents) by their text.
   function applySearch() {
     var search = document.getElementById("search");

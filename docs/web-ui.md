@@ -158,6 +158,7 @@ CLI then collects its token. Requests expire after 10 minutes.
 | `Enter` | Expand the selected item |
 | `/` | Focus the filter box |
 | `Esc` | Leave the filter box, or close the Key |
+| `Cmd+Enter` / `Ctrl+Enter` | In any message box, send the form (plain `Enter` adds a new line) |
 
 The filter narrows the current page to items whose text matches.
 
