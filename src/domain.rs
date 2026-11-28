@@ -308,6 +308,10 @@ pub struct Task {
     pub created_by: Actor,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
+    /// When the task last entered `done`; `None` in any other status.
+    pub done_at: Option<OffsetDateTime>,
+    /// When the human acknowledged the done task; cleared when it leaves `done`.
+    pub acked_at: Option<OffsetDateTime>,
     /// Incremented by every state change.
     pub version: i64,
     /// Claiming moves it to `planning`; work starts once the human approves the plan.

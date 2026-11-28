@@ -137,6 +137,8 @@ fn session_from(row: &SqliteRow) -> StoreResult<Session> {
 
 fn task_from(row: &SqliteRow) -> StoreResult<Task> {
     let lease: Option<&str> = row.try_get("lease_expires_at")?;
+    let done: Option<&str> = row.try_get("done_at")?;
+    let acked: Option<&str> = row.try_get("acked_at")?;
     Ok(Task {
         id: uuid_of(row.try_get("id")?)?,
         project_id: uuid_of(row.try_get("project_id")?)?,
@@ -161,6 +163,8 @@ fn task_from(row: &SqliteRow) -> StoreResult<Task> {
         ),
         created_at: ts::dec(row.try_get("created_at")?)?,
         updated_at: ts::dec(row.try_get("updated_at")?)?,
+        done_at: done.map(ts::dec).transpose()?,
+        acked_at: acked.map(ts::dec).transpose()?,
         version: row.try_get("version")?,
         requires_plan: row.try_get("requires_plan")?,
         plan_state: parse_text(row.try_get("plan_state")?)?,
@@ -246,6 +250,7 @@ async fn record_event(
         .fetch_optional(&mut *conn)
         .await?;
     match status.as_deref() {
+        // Never a `done` row, so `done_at` / `acked_at` need no handling here.
         Some("claimed") => {
             sqlx::query(
                 "UPDATE tasks SET status = 'review', lease_expires_at = NULL,
@@ -270,7 +275,7 @@ macro_rules! task_cols {
         "id, project_id, parent_id, title, body, status, owner_session_id, owner_agent_id,
          lease_expires_at, lease_epoch, lease_ttl_secs, eligible_harness, eligible_host,
          created_by_agent_id, created_by_session_id, created_at, updated_at, version,
-         requires_plan, plan_state"
+         requires_plan, plan_state, done_at, acked_at"
     };
 }
 
@@ -1430,6 +1435,11 @@ impl Store for SqliteStore {
                     lease_expires_at = CASE WHEN ? THEN lease_expires_at ELSE ? END,
                     owner_session_id = CASE WHEN ? THEN NULL ELSE owner_session_id END,
                     owner_agent_id = CASE WHEN ? THEN NULL ELSE owner_agent_id END,
+                    done_at = CASE WHEN COALESCE(?, status) = 'done' AND status <> 'done' THEN ?
+                                   WHEN COALESCE(?, status) = 'done' THEN done_at
+                                   ELSE NULL END,
+                    acked_at = CASE WHEN COALESCE(?, status) = 'done' THEN acked_at
+                                    ELSE NULL END,
                     version = version + 1, updated_at = ?
               WHERE id = ?
                 AND instr(?, ',' || status || ',') > 0
@@ -1448,6 +1458,10 @@ impl Store for SqliteStore {
         .bind(lease)
         .bind(req.clear_owner)
         .bind(req.clear_owner)
+        .bind(req.to.map(|s| s.as_str()))
+        .bind(ts::enc(req.now))
+        .bind(req.to.map(|s| s.as_str()))
+        .bind(req.to.map(|s| s.as_str()))
         .bind(ts::enc(req.now))
         .bind(req.task.to_string())
         .bind(from)

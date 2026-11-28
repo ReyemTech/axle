@@ -102,6 +102,8 @@ fn task_from(row: &PgRow) -> StoreResult<Task> {
         ),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+        done_at: row.try_get("done_at")?,
+        acked_at: row.try_get("acked_at")?,
         version: row.try_get("version")?,
         requires_plan: row.try_get("requires_plan")?,
         plan_state: parse_text(row.try_get("plan_state")?)?,
@@ -192,6 +194,7 @@ async fn record_event(
         return Ok(false);
     }
     match status.as_deref() {
+        // Never a `done` row, so `done_at` / `acked_at` need no handling here.
         Some("claimed") => {
             sqlx::query(
                 "UPDATE tasks SET status = 'review', lease_expires_at = NULL,
@@ -216,7 +219,7 @@ macro_rules! task_cols {
         "id, project_id, parent_id, title, body, status, owner_session_id, owner_agent_id,
          lease_expires_at, lease_epoch, lease_ttl_secs, eligible_harness, eligible_host,
          created_by_agent_id, created_by_session_id, created_at, updated_at, version,
-         requires_plan, plan_state"
+         requires_plan, plan_state, done_at, acked_at"
     };
 }
 
@@ -1364,6 +1367,12 @@ impl Store for PostgresStore {
                                             ELSE $3::timestamptz END,
                     owner_session_id = CASE WHEN $4 THEN NULL ELSE owner_session_id END,
                     owner_agent_id = CASE WHEN $4 THEN NULL ELSE owner_agent_id END,
+                    done_at = CASE WHEN COALESCE($1::text, status) = 'done' AND status <> 'done'
+                                   THEN $5
+                                   WHEN COALESCE($1::text, status) = 'done' THEN done_at
+                                   ELSE NULL END,
+                    acked_at = CASE WHEN COALESCE($1::text, status) = 'done' THEN acked_at
+                                    ELSE NULL END,
                     version = version + 1, updated_at = $5
               WHERE id = $6
                 AND status = ANY($7::text[])

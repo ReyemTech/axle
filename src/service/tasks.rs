@@ -370,6 +370,8 @@ impl TaskService {
             created_by: by.actor(),
             created_at: now,
             updated_at: now,
+            done_at: None,
+            acked_at: None,
             version: 0,
             requires_plan: new.requires_plan,
             plan_state: PlanState::None,
