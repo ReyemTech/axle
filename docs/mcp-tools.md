@@ -64,8 +64,9 @@ Most task tools return a task summary. `task_create` and `task_get` add `body`.
 
 `status` is one of `open`, `planning`, `claimed`, `blocked`, `review`, `delivering`, `done`,
 `cancelled`. `task_get` and `task_claim` also return `short_id` (`axl-` and 8 hex digits) and
-`delivery`: `null`, or `{ stage, stages_enabled, pr: { url, number, state, ci } }`. See
-[delivery stages](delivery.md).
+`delivery`: `null` when the task's project has no stages enabled (even with a PR linked),
+otherwise `{ stage, stages_enabled, pr: { url, number, state, ci } | null }`. `ci` is `none`
+until the GitHub source ships. See [delivery stages](delivery.md).
 `plan_state` is one of `none`, `drafting`, `submitted`, `changes_requested`, `approved`.
 `created_by` is an agent label or `human`.
 
@@ -334,8 +335,8 @@ Event kinds: `created`, `claimed`, `renewed`, `released`, `blocked`, `review`, `
 `cancelled`, `lease_expired_takeover`, `force_released`, `child_claimed`, `child_blocked`,
 `child_done`, `child_cancelled`, `children_complete`, `edited`, `plan_submitted`,
 `plan_approved`, `plan_changes_requested`, `projects_added`, `block_updated`, `unblocked`,
-`related`, `moved_under`, `pr_linked`, `pr_relinked`, `pr_unlinked`, `ci_changed`,
-`stage_reached`, `delivered`.
+`related`, `moved_under`, `pr_linked`, `pr_relinked`, `pr_unlinked`, `ci_changed` (reserved;
+emitted once the GitHub source ships), `stage_reached`, `delivered`.
 
 A blocked task also carries `blocked`: `reason`, `since`, `waiting_on` (`{"human": true}`,
 `{"task": "<id>"}`, `{"external": "<text>"}` or `null`) and `unblock`. The agent-written
@@ -539,7 +540,7 @@ who did it.
 | `summary` | string, required | What was done. |
 | `changed_files` | string array | Paths. |
 | `tests` | string array | Commands or test names that passed. |
-| `links` | string array | Pull requests, builds, docs. A pull request of the project's repository is linked to the task if none is yet. |
+| `links` | string array | Pull requests, builds, docs. In a project with delivery stages, a pull request of the project's repository is linked to the task if none is yet; without stages nothing is linked. |
 
 ```json
 { "id": "01a21e49-0e09-77db-8833-c454a159bf8e", "summary": "Added a token bucket on /login.", "changed_files": ["src/auth.rs"], "tests": ["cargo test login_rate_limit"] }

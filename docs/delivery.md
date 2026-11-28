@@ -37,7 +37,7 @@ There are three ways. Axle does not call GitHub for any of them.
 | Way | Who | How |
 |---|---|---|
 | Report | The agent | `task_update { id, pr: "<url>" }`, as soon as the PR exists. |
-| At completion | The agent | A pull request URL of the project's repository in `task_complete`'s `links`, if none is linked yet. The first such URL is linked. |
+| At completion | The agent | A pull request URL of the project's repository in `task_complete`'s `links`, if none is linked yet. The first such URL is linked. Only in a project with stages enabled; without stages, `links` are recorded but nothing is linked. |
 | Link PR | You | The **Link PR** form in the task page's Delivery panel. |
 
 The URL must be a pull request in the project's repository, for example
@@ -78,6 +78,10 @@ reaches <Last stage label>. Nothing more to do." so the agent does not poll.
 `done`, not when the agent completes it. A `delivering` task is never hidden from
 `task_list`.
 
+The task object's `delivery` field ([MCP tools](mcp-tools.md)) is `null` in a project with
+no stages enabled, even when a PR is linked by hand. Linking with `task_update { pr }` or
+**Link PR** still works there; the task page shows the PR.
+
 ## Moving a task along
 
 On the task page, the Delivery panel lists the stages and where the task is. Two buttons
@@ -97,19 +101,27 @@ A parent follows its children. A child counts as closed when it is `done` or `ca
 `delivering` is not closed. When every child is `done`, `delivering` or `cancelled` and at
 least one is `delivering`, the parent becomes `delivering` at the **minimum** stage of its
 delivering children, and follows them forward. It becomes `done` only when all its
-non-cancelled children are `done`.
+non-cancelled children are `done`. This holds whatever the parent's own project's stages: a
+child in another project that runs past them, or a parent in a project with no stages,
+keeps the parent `delivering` until the child is `done`.
+
+The parent's thread gets one `child_done` per child, when that child reaches `done` through
+delivery, not when its agent completes it into `delivering`. **Mark done** on a parent
+finishes only the parent; its delivering children stay `delivering`.
 
 ## Turning stages off
 
 Unticking stages recomputes every delivering task. One at or past the new last stage goes to
 `done`; the others stay at their furthest enabled stage. Unticking all of them moves every
-delivering task in the project to `done`, with the history note "delivery stages turned off".
+delivering task in the project to `done`, with the history note "delivery stages turned off",
+except a parent that still has a delivering child (see [Parents](#parents)).
 
 ## History
 
 Delivery adds these [history](mcp-tools.md#task_get) kinds, also sent as the `kind` of
 `TaskChanged` events ([HTTP API](http-api.md)): `pr_linked`, `pr_relinked` (the previous PR
 is recorded), `pr_unlinked` (likewise), `ci_changed`, `stage_reached` and `delivered`.
-History is append-only.
+History is append-only. `ci_changed` is reserved; it is emitted once the GitHub source ships.
+Until then `delivery.pr.ci` is always `none`.
 
 Later releases add sources, starting with GitHub, that move tasks along on their own.
