@@ -63,11 +63,24 @@ fn hook_codex(home: &Path, event: &str, stdin: &str, token: Option<&str>) -> Out
 }
 
 fn hook_with(home: &Path, args: &[&str], stdin: &str, token: Option<&str>) -> Out {
+    hook_envs(home, args, stdin, token, &[])
+}
+
+/// `hook_with` plus extra environment variables (`AXL_USAGE`, `ANTHROPIC_API_KEY`); the rest
+/// of the environment is still cleared.
+fn hook_envs(
+    home: &Path,
+    args: &[&str],
+    stdin: &str,
+    token: Option<&str>,
+    envs: &[(&str, &str)],
+) -> Out {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_axl"));
     cmd.arg("hook")
         .args(args)
         .env_clear()
         .env("HOME", home)
+        .envs(envs.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -687,7 +700,13 @@ fn codex_stop_active_exits_first() {
         "codex",
     );
     let o = hook_codex(&home.0, "stop", CODEX_STOP_ACTIVE, Some("tok"));
-    assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+    assert_eq!((o.code, o.stdout.as_str()), (0, ""));
+    // The guard never asks the (dead) server for mail. Usage is still collected first, and
+    // the payload's transcript does not exist here, which is the one usage line.
+    assert_eq!(
+        o.stderr,
+        "axl hook: cannot read the transcript for usage (entity not found)\n"
+    );
 }
 
 #[test]
@@ -1310,6 +1329,277 @@ fn bridge_session_file_removal_takes_the_hook_files_with_it() {
     drop(file);
     assert!(path.exists());
     assert!(mine[0].exists());
+}
+
+// ---- Token usage on Stop and SessionEnd.
+
+/// The main Claude Code transcript in a temp home.
+fn transcript(home: &Path) -> PathBuf {
+    home.join("projects").join("p").join("sess.jsonl")
+}
+
+fn usage_stdin(transcript: &Path, extra: Value) -> String {
+    let mut v = json!({"transcript_path": transcript, "session_id": "hs"});
+    v.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    v.to_string()
+}
+
+/// One synthetic assistant line with usage (free text is `…`), stamped a second from now so
+/// it is never older than the session file written before it.
+fn assistant_line(key: &str) -> String {
+    let at = time::OffsetDateTime::now_utc() + time::Duration::seconds(1);
+    let at = at
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    json!({
+        "type": "assistant", "requestId": key, "timestamp": at,
+        "message": {"id": format!("msg_{key}"), "model": "claude-opus-5-5",
+            "content": [{"type": "text", "text": "…"}],
+            "usage": {"input_tokens": 3, "output_tokens": 40, "cache_read_input_tokens": 100}},
+    })
+    .to_string()
+        + "\n"
+}
+
+fn append_line(path: &Path, key: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    f.write_all(assistant_line(key).as_bytes()).unwrap();
+}
+
+/// `hook_envs` off the async runtime, so a server in this process can answer it.
+async fn run_blocking(
+    home: &Path,
+    args: &'static [&'static str],
+    stdin: String,
+    token: Option<String>,
+    envs: &'static [(&'static str, &'static str)],
+) -> Out {
+    let h = home.to_path_buf();
+    tokio::task::spawn_blocking(move || hook_envs(&h, args, &stdin, token.as_deref(), envs))
+        .await
+        .unwrap()
+}
+
+#[test]
+fn session_end_without_anything_is_silent() {
+    let home = TempDir::new();
+    let o = hook(&home.0, "session-end", "{}", None);
+    assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+}
+
+#[test]
+fn session_end_codex_flag() {
+    let home = TempDir::new();
+    let o = raw(&home.0, &["session-end", "--harness", "codex"]);
+    assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+}
+
+#[tokio::test]
+async fn stop_reports_usage_to_the_server() {
+    let (store, _db) = common::sqlite_store().await;
+    let home = TempDir::new();
+    let l = live(store, &home.0).await;
+    let t = transcript(&home.0);
+    append_line(&t, "req_1");
+    let o = run_blocking(
+        &home.0,
+        &["stop"],
+        usage_stdin(&t, json!({})),
+        Some(l.token.clone()),
+        &[("ANTHROPIC_API_KEY", "sk-test")],
+    )
+    .await;
+    assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+    let u = l
+        .state
+        .store
+        .get_usage("claude-code", "req_1")
+        .await
+        .unwrap()
+        .expect("usage stored");
+    assert_eq!(u.session, l.session);
+    assert_eq!(u.harness_session_id.as_deref(), Some("hs"));
+    assert_eq!(u.billing, axle::domain::Billing::Api);
+    assert_eq!((u.counts.input, u.counts.output), (3, 40));
+}
+
+#[tokio::test]
+async fn stop_reports_usage_even_when_stop_hook_active() {
+    let (store, _db) = common::sqlite_store().await;
+    let home = TempDir::new();
+    let l = live(store, &home.0).await;
+    // Urgent mail would block a first stop; a continuing one must not, but still counts.
+    l.send("page", "now", Importance::Urgent).await;
+    let t = transcript(&home.0);
+    append_line(&t, "req_active");
+    let o = run_blocking(
+        &home.0,
+        &["stop"],
+        usage_stdin(&t, json!({"stop_hook_active": true})),
+        Some(l.token.clone()),
+        &[],
+    )
+    .await;
+    assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+    let u = l.state.store.get_usage("claude-code", "req_active").await;
+    assert_eq!(u.unwrap().expect("usage stored").session, l.session);
+}
+
+/// A server whose inbox answers `inbox` and whose `/v1/usage` answers 200 or, with `hang`,
+/// never; counts the usage requests.
+async fn usage_server(inbox: Value, hang: bool) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use axum::routing::{get, post};
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = hits.clone();
+    let app = axum::Router::new()
+        .route(
+            "/v1/inbox/summary",
+            get(move || {
+                let inbox = inbox.clone();
+                async move { axum::Json(inbox) }
+            }),
+        )
+        .route(
+            "/v1/usage",
+            post(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if hang {
+                        std::future::pending::<()>().await;
+                    }
+                    axum::Json(json!({"accepted": 1, "duplicate": 0, "rejected": []}))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(axum::serve(listener, app).into_future());
+    (server, hits)
+}
+
+#[tokio::test]
+async fn urgent_block_prints_while_usage_post_hangs() {
+    let urgent = json!([{
+        "id": "m1", "from": "human", "subject": "disk full",
+        "project": "p", "importance": "urgent", "preview": "now"
+    }]);
+    let (server, hits) = usage_server(urgent, true).await;
+    let home = TempDir::new();
+    write_session(&home.0, SessionId::new(), &server, "p");
+    let t = transcript(&home.0);
+    append_line(&t, "req_hang");
+    let started = std::time::Instant::now();
+    let o = run_blocking(
+        &home.0,
+        &["stop"],
+        usage_stdin(&t, json!({})),
+        Some("tok".into()),
+        &[],
+    )
+    .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(o.code, 0);
+    let v: Value = serde_json::from_str(&o.stdout).unwrap_or_else(|e| panic!("{e}: {o:?}"));
+    assert_eq!(v["decision"], "block");
+    assert!(v["reason"].as_str().unwrap().contains("disk full"), "{v}");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // The mail went fine, so the one stderr line is the usage retry notice.
+    assert_eq!(o.stderr.lines().count(), 1, "{:?}", o.stderr);
+    assert!(o.stderr.contains("will retry"), "{:?}", o.stderr);
+}
+
+#[tokio::test]
+async fn session_end_after_the_bridge_left_uses_the_cursor() {
+    let (store, _db) = common::sqlite_store().await;
+    let home = TempDir::new();
+    let l = live(store, &home.0).await;
+    let t = transcript(&home.0);
+    append_line(&t, "req_a");
+    let o = run_blocking(
+        &home.0,
+        &["stop"],
+        usage_stdin(&t, json!({})),
+        Some(l.token.clone()),
+        &[],
+    )
+    .await;
+    assert_eq!((o.code, o.stderr.as_str()), (0, ""));
+    let first = l.state.store.get_usage("claude-code", "req_a").await;
+    assert!(first.unwrap().is_some());
+
+    // The bridge exits and removes its session file; the last turn lands after that.
+    std::fs::remove_file(axle::bridge::session_file::path(
+        &home.0,
+        std::process::id(),
+    ))
+    .unwrap();
+    append_line(&t, "req_b");
+    let o = run_blocking(
+        &home.0,
+        &["session-end"],
+        usage_stdin(
+            &t,
+            json!({"hook_event_name": "SessionEnd", "reason": "exit"}),
+        ),
+        Some(l.token.clone()),
+        &[],
+    )
+    .await;
+    assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+    let u = l.state.store.get_usage("claude-code", "req_b").await;
+    assert_eq!(
+        u.unwrap().expect("stored after the bridge left").session,
+        l.session
+    );
+}
+
+#[tokio::test]
+async fn usage_off_sends_nothing() {
+    let (server, hits) = usage_server(json!([]), false).await;
+    let home = TempDir::new();
+    write_session(&home.0, SessionId::new(), &server, "p");
+    let t = transcript(&home.0);
+    append_line(&t, "req_off");
+    let events: [&'static [&'static str]; 2] = [&["stop"], &["session-end"]];
+    for args in events {
+        let o = run_blocking(
+            &home.0,
+            args,
+            usage_stdin(&t, json!({})),
+            Some("tok".into()),
+            &[("AXL_USAGE", "off")],
+        )
+        .await;
+        assert_eq!(
+            (o.code, o.stdout.as_str(), o.stderr.as_str()),
+            (0, "", ""),
+            "{args:?}"
+        );
+    }
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // The same run with usage on does report, so the zero above means something.
+    let o = run_blocking(
+        &home.0,
+        &["stop"],
+        usage_stdin(&t, json!({})),
+        Some("tok".into()),
+        &[],
+    )
+    .await;
+    assert_eq!((o.code, o.stderr.as_str()), (0, ""));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 // ---- Turn state reports.

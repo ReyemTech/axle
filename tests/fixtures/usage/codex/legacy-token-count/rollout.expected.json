@@ -1,0 +1,28 @@
+[
+  {
+    "key": "0199a8f2-6c1e-7d30-9a41-0000legacy01:1",
+    "at": "2026-11-28T09:00:07.42Z",
+    "model": "gpt-5.3-codex",
+    "input": 8928,
+    "output": 640,
+    "cache_write_5m": 0,
+    "cache_write_1h": 0,
+    "cache_read": 3072,
+    "reasoning": 256,
+    "speed": null,
+    "billing": "unknown"
+  },
+  {
+    "key": "0199a8f2-6c1e-7d30-9a41-0000legacy01:2",
+    "at": "2026-11-28T09:00:31.9Z",
+    "model": "gpt-5.3-codex",
+    "input": 2236,
+    "output": 210,
+    "cache_write_5m": 0,
+    "cache_write_1h": 0,
+    "cache_read": 11264,
+    "reasoning": 0,
+    "speed": null,
+    "billing": "unknown"
+  }
+]

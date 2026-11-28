@@ -198,10 +198,12 @@ fn empty_home_installs_plugin() {
         ("UserPromptSubmit", "user-prompt-submit"),
         ("PostToolUse", "post-tool-use"),
         ("Stop", "stop"),
+        ("SessionEnd", "session-end"),
     ] {
         let h = &hooks["hooks"][ev][0]["hooks"][0];
         assert_eq!(h["command"], format!("{AXL} hook {arg}"));
-        assert_eq!(h["timeout"], 5);
+        let want = if ev == "SessionEnd" { 3 } else { 5 };
+        assert_eq!(h["timeout"], want, "{ev}");
     }
     let skill = std::fs::read_to_string(dir.join("skills/axle/SKILL.md")).unwrap();
     assert!(skill.starts_with("---\nname: axle\n"));
@@ -378,6 +380,13 @@ fn uninstall_after_adoption_removes_managed_form_only() {
         let home = home_for("handmade");
         let mut m = Manifest::default();
         install(home.path(), &mut m, mode).unwrap();
+        if mode == ClaudeMode::UserScope {
+            let st = std::fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
+            assert!(
+                st.contains("hook session-end"),
+                "installed before uninstall"
+            );
+        }
         let plan = plan_uninstall(home.path(), &m).unwrap();
         apply(&plan, datetime!(2026-11-27 12:10:00 UTC)).unwrap();
         let cj = std::fs::read_to_string(home.path().join(".claude.json")).unwrap();
@@ -388,6 +397,7 @@ fn uninstall_after_adoption_removes_managed_form_only() {
         assert!(cj.contains("\"other\""), "{mode:?}");
         let st = std::fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
         assert!(!st.contains("axl hook"), "{mode:?}: hooks restored");
+        assert!(!st.contains("session-end"), "{mode:?}: SessionEnd removed");
         assert!(st.contains("\"theme\": \"dark\""), "{mode:?}");
         assert!(
             !home
@@ -416,7 +426,7 @@ fn userscope_has_no_plugin_and_runs_things_once() {
     install(home.path(), &mut m, ClaudeMode::UserScope).unwrap();
     assert!(!AxlDir::new(home.path()).integrations_dir().exists());
     let st = std::fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
-    assert_eq!(st.matches("axl hook").count(), 5);
+    assert_eq!(st.matches("axl hook").count(), 6);
     let cj = std::fs::read_to_string(home.path().join(".claude.json")).unwrap();
     assert_eq!(cj.matches("\"axle\"").count(), 1);
     assert!(!cj.contains("env"));

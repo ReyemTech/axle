@@ -1,0 +1,41 @@
+[
+  {
+    "key": "resp_0199a8f2a1",
+    "at": "2026-11-28T11:00:06.412Z",
+    "model": "gpt-5.3-codex",
+    "input": 3072,
+    "output": 912,
+    "cache_write_5m": 0,
+    "cache_write_1h": 0,
+    "cache_read": 15360,
+    "reasoning": 640,
+    "speed": null,
+    "billing": "unknown"
+  },
+  {
+    "key": "resp_0199a8f2b2",
+    "at": "2026-11-28T11:01:09.25Z",
+    "model": "gpt-5.2",
+    "input": 2828,
+    "output": 388,
+    "cache_write_5m": 1024,
+    "cache_write_1h": 0,
+    "cache_read": 18176,
+    "reasoning": 128,
+    "speed": null,
+    "billing": "unknown"
+  },
+  {
+    "key": "resp_0199a8f2c3",
+    "at": "2026-11-28T11:01:15.731Z",
+    "model": "gpt-5.2",
+    "input": 352,
+    "output": 75,
+    "cache_write_5m": 0,
+    "cache_write_1h": 0,
+    "cache_read": 21248,
+    "reasoning": 0,
+    "speed": null,
+    "billing": "unknown"
+  }
+]

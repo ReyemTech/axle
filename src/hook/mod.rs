@@ -4,7 +4,8 @@
 //!
 //! SessionStart always injects the Axle rules, then a status line of the tasks the session
 //! holds and its unread mail. PostToolUse reminds a session once when it edits or runs a
-//! shell command without holding a task (a reminder, never a block).
+//! shell command without holding a task (a reminder, never a block). Stop also reports the
+//! session's token usage (concurrently, in the same budget), and SessionEnd only that.
 //!
 //! Every hook but SessionStart also reports the session's turn state (`POST /v1/turn`, best
 //! effort, errors dropped): UserPromptSubmit and PostToolUse report `busy`; Stop reports
@@ -38,6 +39,10 @@ pub const CEILING: Duration = Duration::from_secs(4);
 /// All of one run's requests together (they run concurrently) give up after this, well
 /// inside the harness's 5 s hook timeout, so SessionStart can still print the rules.
 const NETWORK_BUDGET: Duration = Duration::from_millis(2500);
+/// SessionEnd runs the usage collector alone, under this budget.
+pub const SESSION_END_BUDGET: Duration = Duration::from_secs(1);
+/// The stderr line when the usage collector runs out of its budget.
+const USAGE_TIMED_OUT: &str = "usage report not sent (timed out); will retry";
 /// At most this many messages are listed in one injection.
 const MAX_LISTED: usize = 5;
 const SUBJECT_CHARS: usize = 80;
@@ -60,6 +65,8 @@ pub enum Event {
     /// Claude Code's `Notification`, registered for `idle_prompt` only: it reports idle and
     /// prints nothing.
     Notification,
+    /// Reports token usage only; prints nothing on stdout.
+    SessionEnd,
 }
 
 impl Event {
@@ -71,6 +78,7 @@ impl Event {
             Event::PostToolUse => "PostToolUse",
             Event::Stop => "Stop",
             Event::Notification => "Notification",
+            Event::SessionEnd => "SessionEnd",
         }
     }
 }
@@ -92,6 +100,14 @@ pub enum Harness {
 }
 
 impl Harness {
+    /// The harness's name, as `--harness` takes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Harness::ClaudeCode => "claude-code",
+            Harness::Codex => "codex",
+        }
+    }
+
     /// The harness named by a `--harness <name>` or `--harness=<name>` among `args`; anything
     /// else (no flag, an unknown name) is Claude Code.
     pub fn from_args(args: &[String]) -> Harness {
@@ -193,35 +209,96 @@ const WORK_TOOLS: [&str; 6] = [
 ];
 
 /// Runs one hook. Never fails: every problem becomes at most one stderr line.
+///
+/// `env` is the process environment (`AXL_TOKEN`, `AXL_USAGE`, the billing variables).
+/// Stop reports token usage alongside the mail check, SessionEnd only reports usage.
 pub async fn run(
     event: Event,
     harness: Harness,
     stdin: &str,
     home: Option<&Path>,
-    env_token: Option<&str>,
+    env: &(dyn Fn(&str) -> Option<String> + Sync),
 ) -> Output {
-    if event == Event::SessionStart {
-        return session_start(harness, home, env_token).await;
-    }
-    if event == Event::Notification {
-        // Installed with the `idle_prompt` matcher; any other notification (a permission
-        // prompt) is not an idle session. An unreadable payload is taken at the matcher's word.
-        let input: NotificationInput = serde_json::from_str(stdin).unwrap_or_default();
-        if input.notification_type.is_none_or(|t| t == "idle_prompt") {
-            report_idle(harness, home, env_token).await;
+    let env_token = env("AXL_TOKEN");
+    let env_token = env_token.as_deref();
+    match event {
+        Event::SessionStart => session_start(harness, home, env_token).await,
+        Event::Notification => {
+            // Installed with the `idle_prompt` matcher; any other notification (a permission
+            // prompt) is not an idle session. An unreadable payload is taken at the matcher's word.
+            let input: NotificationInput = serde_json::from_str(stdin).unwrap_or_default();
+            if input.notification_type.is_none_or(|t| t == "idle_prompt") {
+                report_idle(harness, home, env_token).await;
+            }
+            Output::default()
         }
-        return Output::default();
-    }
-    match run_mail(event, harness, stdin, home, env_token).await {
-        Ok(stdout) => Output {
-            stdout,
-            stderr: None,
-        },
-        Err(e) => Output {
+        Event::SessionEnd => Output {
             stdout: None,
-            stderr: Some(e),
+            stderr: usage(harness, stdin, home, env, true, SESSION_END_BUDGET).await,
         },
+        Event::Stop => {
+            // A slow usage report delays the urgent-mail block by at most the shared budget.
+            // Usage is collected even when the loop guard (inside `run_mail`) stays silent.
+            let (mail, usage) = tokio::join!(
+                run_mail(event, harness, stdin, home, env_token),
+                usage(harness, stdin, home, env, false, NETWORK_BUDGET),
+            );
+            match mail {
+                Ok(stdout) => Output {
+                    stdout,
+                    stderr: usage,
+                },
+                // Mail first: its line wins the one stderr line.
+                Err(e) => Output {
+                    stdout: None,
+                    stderr: Some(e),
+                },
+            }
+        }
+        Event::UserPromptSubmit | Event::PostToolUse => {
+            match run_mail(event, harness, stdin, home, env_token).await {
+                Ok(stdout) => Output {
+                    stdout,
+                    stderr: None,
+                },
+                Err(e) => Output {
+                    stdout: None,
+                    stderr: Some(e),
+                },
+            }
+        }
     }
+}
+
+/// One usage collector run under `limit`: `None` is silence, `Some` the one stderr line.
+/// The session comes from the bridge's session file when it is still there (its mtime is the
+/// floor for a new cursor); otherwise the collector falls back to what the cursor cached.
+async fn usage(
+    harness: Harness,
+    stdin: &str,
+    home: Option<&Path>,
+    env: &(dyn Fn(&str) -> Option<String> + Sync),
+    session_end: bool,
+    limit: Duration,
+) -> Option<String> {
+    let home = home?;
+    let session = find_session(home, harness).and_then(|(pid, info)| {
+        let mtime = std::fs::metadata(session_file::path(home, pid))
+            .and_then(|m| m.modified())
+            .ok()?;
+        Some((info, mtime))
+    });
+    let run = crate::usage::collect::collect(crate::usage::collect::Collect {
+        harness,
+        home,
+        stdin,
+        session,
+        env,
+        session_end,
+    });
+    tokio::time::timeout(limit, run)
+        .await
+        .unwrap_or_else(|_| Some(USAGE_TIMED_OUT.to_string()))
 }
 
 /// SessionStart always injects the rules, then (when the server answers) a status line of
@@ -332,7 +409,7 @@ fn status_line(leases: &[Lease]) -> String {
     format!("You hold: {}.", parts.join("; "))
 }
 
-/// UserPromptSubmit, PostToolUse and Stop. `Ok(Some(json))` is the stdout to print,
+/// UserPromptSubmit, PostToolUse and Stop (mail only). `Ok(Some(json))` is the stdout to print,
 /// `Ok(None)` is silence, `Err` is the single stderr line.
 async fn run_mail(
     event: Event,
@@ -434,7 +511,9 @@ async fn mail(
     let mut seen = read_seen(&seen_path);
 
     let (output, surfaced): (Option<Value>, Vec<&Item>) = match event {
+        // SessionStart and SessionEnd never get here (`run` handles them); listed for the match.
         Event::SessionStart
+        | Event::SessionEnd
         | Event::UserPromptSubmit
         | Event::PostToolUse
         | Event::Notification => {

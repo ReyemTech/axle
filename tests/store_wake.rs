@@ -668,7 +668,7 @@ store_matrix!(append_task_event_leaves_the_task_alone, |store: Arc<
     assert_eq!(events[1], event);
 });
 
-/// Copies every migration of `backend` before 0008 (wake-up) into a fresh directory.
+/// Copies every migration of `backend` before 0009 (wake-up) into a fresh directory.
 fn old_migrations(backend: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("axle-mig-{}", uuid::Uuid::now_v7()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -678,7 +678,7 @@ fn old_migrations(backend: &str) -> std::path::PathBuf {
     for entry in std::fs::read_dir(src).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name().into_string().unwrap();
-        if name.ends_with(".sql") && name.as_str() < "0008_" {
+        if name.ends_with(".sql") && name.as_str() < "0009_" {
             std::fs::copy(entry.path(), dir.join(&name)).unwrap();
         }
     }
@@ -686,7 +686,7 @@ fn old_migrations(backend: &str) -> std::path::PathBuf {
 }
 
 /// The blocked task `blocked` (waiting on `target`, with a follow-up link to it) kept its
-/// block detail and its link through the 0008 migration.
+/// block detail and its link through the 0009 migration.
 async fn assert_kept_block(store: &dyn Store, blocked: TaskId, target: TaskId) {
     let task = store.get_task(blocked).await.unwrap().unwrap();
     assert_eq!(task.status, TaskStatus::Blocked);

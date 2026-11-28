@@ -18,6 +18,14 @@ Releases are automated with [release-plz](https://release-plz.dev) (`release-plz
 Versions come from git tags (`git_only = true`), not from crates.io. Before 1.0, a breaking
 change bumps the minor version and everything else bumps the patch.
 
+### Refresh the price table
+
+Before a release, check the model pricing pages against `src/usage/prices.toml`: edit the
+prices, add new models, and bump its `version` (the date; it becomes part of each record's
+`price_ref`). New usage records are priced with the new table straight away. Records already
+stored keep their cost until an operator runs `axl usage reprice` (add `--since` or
+`--unpriced` to limit it), so mention that in the release notes when prices changed.
+
 ### First release (v0.1.0)
 
 release-plz waits until a `v*` tag exists, so the first one is tagged by hand on the merge

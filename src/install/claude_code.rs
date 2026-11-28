@@ -40,14 +40,16 @@ pub enum ClaudeMode {
 /// `strictKnownMarketplaces`) can silently skip it. Claude Code version: not run.
 pub const MODE: ClaudeMode = ClaudeMode::Plugin;
 
-/// Settings key, `axl hook` argument and group matcher for each event the hooks cover.
-/// `Notification` runs only for `idle_prompt` (the session waits for input: it is idle).
-const EVENTS: [(&str, &str, Option<&str>); 5] = [
-    ("SessionStart", "session-start", None),
-    ("UserPromptSubmit", "user-prompt-submit", None),
-    ("PostToolUse", "post-tool-use", None),
-    ("Stop", "stop", None),
-    ("Notification", "notification", Some("idle_prompt")),
+/// Settings key, `axl hook` argument, group matcher and timeout in seconds for each event the
+/// hooks cover. `Notification` runs only for `idle_prompt` (the session waits for input: it is
+/// idle). SessionEnd gets 3 s: Claude Code cancels it when the session is already closing.
+const EVENTS: [(&str, &str, Option<&str>, u32); 6] = [
+    ("SessionStart", "session-start", None, 5),
+    ("UserPromptSubmit", "user-prompt-submit", None, 5),
+    ("PostToolUse", "post-tool-use", None, 5),
+    ("Stop", "stop", None, 5),
+    ("Notification", "notification", Some("idle_prompt"), 5),
+    ("SessionEnd", "session-end", None, 3),
 ];
 
 const PLUGIN_FILES: [&str; 4] = [
@@ -115,20 +117,23 @@ fn mcp_entry(axl: &str) -> CstInputValue {
     ])
 }
 
-fn handler(command: &str) -> CstInputValue {
+fn handler(command: &str, timeout: u32) -> CstInputValue {
     object(vec![
         ("type", string("command")),
         ("command", string(command)),
-        ("timeout", number(5)),
+        ("timeout", number(timeout)),
     ])
 }
 
-fn hook_group(command: &str, matcher: Option<&str>) -> CstInputValue {
+fn hook_group(command: &str, matcher: Option<&str>, timeout: u32) -> CstInputValue {
     let mut props = Vec::new();
     if let Some(m) = matcher {
         props.push(("matcher", string(m)));
     }
-    props.push(("hooks", CstInputValue::Array(vec![handler(command)])));
+    props.push((
+        "hooks",
+        CstInputValue::Array(vec![handler(command, timeout)]),
+    ));
     object(props)
 }
 
@@ -138,10 +143,10 @@ fn hooks_snippet(axl: &str) -> String {
         object(
             EVENTS
                 .iter()
-                .map(|(e, a, m)| {
+                .map(|(e, a, m, t)| {
                     (
                         *e,
-                        CstInputValue::Array(vec![hook_group(&hook_command(axl, a), *m)]),
+                        CstInputValue::Array(vec![hook_group(&hook_command(axl, a), *m, *t)]),
                     )
                 })
                 .collect(),
@@ -456,9 +461,9 @@ fn edit_settings(cx: &mut Ctx, mode: ClaudeMode) -> Result<Option<FileEdit>, Edi
     }
     let axl = cx.axl.clone();
     let desired = |event: &str| -> Option<(String, Value, Option<&str>)> {
-        let (_, arg, matcher) = EVENTS.iter().find(|(e, _, _)| *e == event)?;
+        let (_, arg, matcher, timeout) = EVENTS.iter().find(|(e, _, _, _)| *e == event)?;
         let cmd = hook_command(&axl, arg);
-        let value = jsonc::to_value(&handler(&cmd));
+        let value = jsonc::to_value(&handler(&cmd, *timeout));
         Some((cmd, value, *matcher))
     };
 
@@ -473,7 +478,7 @@ fn edit_settings(cx: &mut Ctx, mode: ClaudeMode) -> Result<Option<FileEdit>, Edi
     let kept: HashSet<&str> = if mode == ClaudeMode::UserScope {
         EVENTS
             .iter()
-            .map(|(e, _, _)| *e)
+            .map(|(e, _, _, _)| *e)
             .filter(|e| {
                 let mine: Vec<&Found> = seen.iter().filter(|f| f.event == *e).collect();
                 let (cmd, value, matcher) = desired(e).expect("known event");
@@ -525,7 +530,7 @@ fn edit_settings(cx: &mut Ctx, mode: ClaudeMode) -> Result<Option<FileEdit>, Edi
             p.remove();
         }
     } else {
-        for (event, arg, matcher) in EVENTS {
+        for (event, arg, matcher, timeout) in EVENTS {
             let key = format!("hooks.{event}");
             if !kept.contains(event) {
                 let hooks = obj
@@ -534,7 +539,7 @@ fn edit_settings(cx: &mut Ctx, mode: ClaudeMode) -> Result<Option<FileEdit>, Edi
                 let arr = hooks
                     .array_value_or_create(event)
                     .ok_or_else(|| manual(&format!("`hooks.{event}` is not an array")))?;
-                arr.append(hook_group(&hook_command(&cx.axl, arg), matcher));
+                arr.append(hook_group(&hook_command(&cx.axl, arg), matcher, timeout));
             }
             // An adoption above already recorded this key; the dedup keeps its original.
             cx.push(&file, EntryKind::Added, &key, None);
@@ -704,7 +709,7 @@ pub fn plan_uninstall(home: &Path, manifest: &Manifest) -> Result<Plan, EditErro
     // ~/.claude/settings.json: every `axl hook <event>` handler.
     let event_keys: Vec<&str> = EVENTS
         .iter()
-        .map(|(e, _, _)| *e)
+        .map(|(e, _, _, _)| *e)
         .filter(|e| has(&paths.settings, &format!("hooks.{e}")))
         .collect();
     if !event_keys.is_empty()

@@ -8,6 +8,7 @@ pub mod config;
 pub use api::{Api, DeviceStartReply, PollStatus, SessionState, WhoAmI};
 
 pub use config::{
-    AxlDir, ClientConfig, ClientError, DEFAULT_SERVER_URL, load_config, read_token, remove_token,
-    resolve_server_url, resolve_server_url_with_warning, save_config, write_token,
+    AxlDir, ClientConfig, ClientError, DEFAULT_SERVER_URL, UsageConfig, load_config, read_token,
+    remove_token, resolve_server_url, resolve_server_url_with_warning, save_config, usage_off,
+    write_token,
 };

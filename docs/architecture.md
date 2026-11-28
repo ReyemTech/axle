@@ -21,7 +21,7 @@ flowchart TB
         MCP["/mcp<br/>Streamable HTTP MCP"]
         V1["/v1<br/>register, heartbeat, events, inbox"]
         UI["/ui<br/>askama + htmx, SSE"]
-        SVC["Services<br/>identity, tasks, messages, auth"]
+        SVC["Services<br/>identity, tasks, messages, auth, usage"]
         BUS["Event bus<br/>outbox + broadcast"]
         ST["Store trait"]
         MCP --> SVC
@@ -45,14 +45,19 @@ flowchart TB
 | CLI | `src/main.rs`, `src/cli/` | Subcommands `serve`, `bridge`, `hook`, `migrate`, `project`, `token`, and the onboarding set `install`, `uninstall`, `login`, `logout`, `status`, `service`. |
 | HTTP server | `src/http/` | axum router: probes, `/v1`, `/mcp`, `/ui`; bearer-token middleware and rate limit. |
 | MCP tools | `src/mcp/` | The 18 tools on rmcp, identity resolution per call, peer-data framing. |
-| Services | `src/service/` | Business rules shared by MCP, `/v1` and the UI: identity, tasks and leases, messages, tokens. |
+| Services | `src/service/` | Business rules shared by MCP, `/v1` and the UI: identity, tasks and leases, messages, tokens, token usage (ingest, totals, repricing). |
 | Store | `src/store/` | A `Store` trait with `sqlite.rs` and `postgres.rs` implementations and migrations in `migrations/`. |
 | Event bus | `src/events.rs` | Publishes changes after each commit. |
 | Web UI | `src/ui/`, `templates/`, `static/` | Server-rendered pages and fragments, embedded in the binary. |
 | Bridge | `src/bridge/` | Stdio MCP proxy, project detection, presence loop, session file. |
 | Hook | `src/hook/` | Claude Code and Codex hooks; strictly fail-open. |
+| Token usage | `src/usage/`, `src/service/usage.rs` | `src/usage/` runs on agent machines (log parsers, cursor, billing detection, report) and holds the price table; `src/service/usage.rs` validates and stores what `POST /v1/usage` receives. |
 | Install | `src/install/`, `src/service/` (service units) | Edits each harness's config with backups and a manifest; writes the launchd or systemd unit. |
 | Enrollment | `src/http/enroll.rs`, `src/http/install_script.rs`, `src/ui/connect.rs` | Unauthenticated `/v1/enroll` and `/v1/login/*` (per-IP limited), `GET /install.sh`, and the Connect a machine and `/ui/connect` pages. |
+
+### Token usage
+
+The hook (`Stop` and `SessionEnd`) reads the harness's own session logs on the agent machine, turns new lines into usage records and sends them to `POST /v1/usage`. The server stores each record once, with its allocations to the tasks the session held at the time. Costs are derived from the price table when a record is stored and are rewritten only by `axl usage reprice`.
 
 ## A tool call, end to end
 

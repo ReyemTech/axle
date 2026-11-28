@@ -42,7 +42,7 @@ enum Command {
     /// Always exits 0 (fail-open); problems are one line on stderr. Codex's commands add
     /// `--harness codex`.
     Hook {
-        /// session-start | user-prompt-submit | post-tool-use | stop | notification (anything
+        /// session-start | user-prompt-submit | post-tool-use | stop | session-end | notification (anything
         /// else is ignored)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -131,6 +131,24 @@ enum Command {
     Token {
         #[command(subcommand)]
         command: TokenCommand,
+    },
+    /// Token usage maintenance (needs DATABASE_URL)
+    Usage {
+        #[command(subcommand)]
+        command: UsageCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum UsageCommand {
+    /// Recompute stored costs with the current price table (built-in, plus AXL_PRICES_FILE)
+    Reprice {
+        /// Only records at or after this time: YYYY-MM-DD (UTC) or RFC 3339
+        #[arg(long)]
+        since: Option<String>,
+        /// Only records that have no price yet
+        #[arg(long)]
+        unpriced: bool,
     },
 }
 
@@ -257,6 +275,7 @@ async fn main() -> ExitCode {
         Command::Service { command } => service(command),
         Command::Migrate => migrate().await,
         Command::Token { command } => token(command).await,
+        Command::Usage { command } => usage(command).await,
         Command::Project => Err("not implemented".into()),
     };
     match result {
@@ -285,8 +304,8 @@ async fn hook(event: axle::hook::Event, harness: axle::hook::Harness) {
             .unwrap_or_default()
         };
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let token = std::env::var("AXL_TOKEN").ok();
-        axle::hook::run(event, harness, &stdin, home.as_deref(), token.as_deref()).await
+        let env = |k: &str| std::env::var(k).ok();
+        axle::hook::run(event, harness, &stdin, home.as_deref(), &env).await
     };
     // Hard ceiling on total runtime, including a stdin that never closes: below the
     // harnesses' 5 s hook timeout, so the hook ends on its own terms.
@@ -321,9 +340,20 @@ async fn serve(bind: Option<SocketAddr>, trusted_header: Option<String>) -> CliR
             config.allowed_hosts.join(", ")
         );
     }
+    let prices = axle::usage::prices::PriceTable::load(config.prices_file.as_deref())?;
+    eprintln!(
+        "axl: prices: {}, {} models{}",
+        prices.version(),
+        prices.len(),
+        config
+            .prices_file
+            .as_ref()
+            .map(|f| format!(" (+ {})", f.display()))
+            .unwrap_or_default()
+    );
     let store = open_store(&config.backend).await?;
     let addr = config.bind;
-    let state = AppState::new(store, Arc::new(SystemClock), config);
+    let state = AppState::new(store, Arc::new(SystemClock), config).with_prices(prices);
     state.wake.clone().spawn_ticker(state.shutdown.clone());
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("axl: listening on http://{}", listener.local_addr()?);
@@ -493,6 +523,29 @@ fn service(command: ServiceCommand) -> CliResult {
 async fn migrate() -> CliResult {
     open_store(&backend_from_env()?).await?;
     eprintln!("axl: migrations applied");
+    Ok(())
+}
+
+async fn usage(command: UsageCommand) -> CliResult {
+    let UsageCommand::Reprice { since, unpriced } = command;
+    let since = since
+        .as_deref()
+        .map(axle::service::usage::parse_since)
+        .transpose()?;
+    let prices_file = std::env::var("AXL_PRICES_FILE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    let prices = axle::usage::prices::PriceTable::load(prices_file.as_deref())?;
+    let store: Arc<dyn Store> = open_store(&backend_from_env()?).await?;
+    let svc =
+        axle::service::usage::UsageService::new(store, Arc::new(SystemClock), Arc::new(prices));
+    let done = svc.reprice(since, unpriced).await?;
+    eprintln!(
+        "axl: repriced {} records ({} without a price)",
+        done.updated, done.unpriced
+    );
     Ok(())
 }
 

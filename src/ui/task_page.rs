@@ -11,6 +11,7 @@ use time::format_description::well_known::Rfc3339;
 
 use super::SessionCtx;
 use super::needs::latest_plan;
+use super::usage::{compact, cost_text, tokens};
 use super::views::{
     Labels, LeaseView, ProjectLabel, ProjectOption, Pulse, UiError, UiResult, ago, html,
     lease_view, project_options, pulse_counts, state_mark,
@@ -21,7 +22,7 @@ use crate::domain::{
 };
 use crate::http::AppState;
 use crate::service::tasks::plan_words;
-use crate::store::{StoreResult, TaskFilter};
+use crate::store::{StoreResult, TaskFilter, TaskScope, UsageFilter, UsageGroup};
 
 /// Events per page of a task's history.
 pub const EVENTS_PER_PAGE: u32 = 50;
@@ -278,6 +279,58 @@ pub struct TaskView {
     pub eligibility: Option<String>,
     pub can_release: bool,
     pub can_cancel: bool,
+    /// What the task's sessions used, when anything was reported.
+    pub usage: Option<UsageLine>,
+}
+
+/// The task page's one-line usage summary and where it links.
+pub struct UsageLine {
+    pub text: String,
+    pub href: String,
+}
+
+/// The usage line for `id` (its subtasks included when it has any); `None` without usage.
+async fn usage_line(state: &AppState, id: TaskId) -> StoreResult<Option<UsageLine>> {
+    let subtasks = state
+        .store
+        .count_tasks(&TaskFilter {
+            parent: Some(id),
+            ..TaskFilter::default()
+        })
+        .await?
+        > 0;
+    let filter = UsageFilter {
+        task: Some(TaskScope::Task { id, subtasks }),
+        ..UsageFilter::default()
+    };
+    let rows = state.usage.summary(&filter, UsageGroup::Total).await?;
+    let Some(row) = rows.into_iter().find(|r| r.requests > 0) else {
+        return Ok(None);
+    };
+    // "$3.40 est. + 2 no price" reads "$3.40 API-equivalent est. + 2 no price"; an all-unpriced
+    // task is just "no price".
+    let mut cost = cost_text(&row);
+    if cost != "no price" {
+        let at = cost
+            .find(" est.")
+            .or_else(|| cost.find(" + "))
+            .unwrap_or(cost.len());
+        cost.insert_str(at, " API-equivalent");
+    }
+    let mut text = format!(
+        "Usage {} tokens \u{b7} {} \u{b7} {} session{}",
+        compact(tokens(&row)),
+        cost,
+        row.sessions,
+        if row.sessions == 1 { "" } else { "s" },
+    );
+    if subtasks {
+        text.push_str(" \u{b7} incl. subtasks");
+    }
+    Ok(Some(UsageLine {
+        text,
+        href: format!("/ui/usage?task={id}&group=agent&range=all"),
+    }))
 }
 
 #[derive(Template)]
@@ -460,6 +513,7 @@ pub async fn task_page(
             TaskStatus::Planning | TaskStatus::Claimed | TaskStatus::Blocked | TaskStatus::Review
         ),
         can_cancel: !matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled),
+        usage: usage_line(&state, id).await?,
     };
 
     // The newest page of the thread (one extra tells whether an earlier page exists),

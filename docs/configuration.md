@@ -21,6 +21,7 @@ variables.
 | `AXL_RATE_LIMIT_BURST` | `100` | Burst size, per agent token. Must be a positive whole number. |
 | `AXL_DONE_AUTO_ACK_DAYS` | `7` | Days a finished task stays on the board's Done column before it counts as auto-acked. A positive whole number. |
 | `AXL_WAKE_MAX_DEPTH` | `2` | Longest chain of work requests: a request raised while working on a request counts one deeper. A request past the limit, or one that would loop back to a project already in its chain, is refused. A positive whole number. |
+| `AXL_PRICES_FILE` | unset | A TOML file of API prices merged over the built-in table (see [Prices](#prices)). A file that cannot be read or parsed stops the server at start. Blank means unset. |
 
 Invalid values stop the server at start with a message naming the variable, for example
 `AXL_RATE_LIMIT_BURST must be a positive whole number, got "0"`.
@@ -47,6 +48,47 @@ These are not configurable yet:
 | A woken session's reservation (time to claim) | 2 minutes |
 | A session counts as idle after reporting idle for | 5 seconds |
 | Wake ticker (expire reservations, place queued work) | every 15 seconds |
+
+### Prices
+
+The server prices each reported usage record at API rates, in USD per million tokens, from a
+built-in table (version printed at start: `axl: prices: 2026-11-28, N models`). A model the
+table does not know gets no price: it shows its tokens and "no price". Point
+`AXL_PRICES_FILE` at a file to add models or change prices; the start-up line then ends with
+`(+ <file>)`. Stored records keep their cost until `axl usage reprice` recomputes it
+([CLI](cli.md#server-and-tokens)).
+
+```toml
+version = "2026-12-01"          # required; becomes part of each record's price_ref
+
+[[model]]
+id = "claude-opus-5-5"          # required; matches this exact model id
+match = ["claude-opus-5-5-*"]   # optional globs; * matches any run of characters
+input = 4.00                    # required, USD per million tokens
+output = 20.00                  # required
+cache_write_5m = 5.00           # optional; defaults to input
+cache_write_1h = 8.00           # optional; defaults to cache_write_5m
+cache_read = 0.20               # optional; defaults to input
+fast = { input = 8.00, output = 40.00 }   # optional; prices for records with speed "fast"
+long_context = { above = 200000, input = 8.00, output = 30.00 }   # optional
+```
+
+- **Merge by `id`.** An entry whose `id` is already in the built-in table replaces it
+  entirely; a new `id` is added. Entries you leave out keep the built-in price.
+- **Matching.** A record's model is matched against exact `id`s first, then against the
+  `match` globs, the longest glob winning. An override glob of the same length as a built-in
+  one loses the tie, because built-ins are listed first: give the entry an exact `id` or a
+  longer glob.
+- **`fast` and `long_context`** overlay only the prices they name. `long_context.above`
+  compares the record's input plus cache tokens (`input`, both cache writes and `cache_read`).
+- **`reasoning` tokens are never priced** on their own: they are already part of `output`.
+- **`cost_micros`** is `round(sum(tokens × price))` in micro-USD, stored with the record.
+- **`price_ref`** records where the price came from, for example
+  `builtin:2026-11-28#claude-opus-5-5` or `file:2026-12-01#claude-opus-5-5`.
+- **A bad file stops the server at start**, naming the file and line (an unknown key, a
+  negative price, a duplicate `id`, a missing `version`). Nothing is half-loaded.
+
+Changing prices does not change the cost of records already stored.
 
 ## Bridge and hooks (`axl bridge`, `axl hook`)
 

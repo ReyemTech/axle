@@ -25,7 +25,9 @@ use crate::domain::{
 use crate::events::Event;
 use crate::service::identity::{IdentityError, IdentityInput, IdentityService, Resolved};
 use crate::service::messages::InboxFilter;
+use crate::service::usage::UsageError;
 use crate::store::{Store, TaskFilter};
+use crate::usage::report::{IngestOutcome, MAX_BODY_BYTES, MAX_RECORDS, UsageReport};
 
 /// Longest inbox-summary preview, in characters.
 pub const PREVIEW_CHARS: usize = 120;
@@ -43,6 +45,7 @@ pub fn routes() -> Router<AppState> {
         .route("/events", get(events))
         .route("/inbox/summary", get(inbox_summary))
         .route("/leases", get(leases))
+        .route("/usage", post(usage))
         .route("/whoami", get(whoami))
         .route("/token/revoke", post(revoke_self))
 }
@@ -159,6 +162,34 @@ async fn session_for(
         }));
     }
     Ok(r)
+}
+
+// ---------------------------------------------------------------- usage
+
+/// Stores a session's token-usage records. The body is read by hand so an oversize one is a
+/// 400 like the other envelope errors. Not a heartbeat: renews no lease, publishes no event.
+async fn usage(
+    State(state): State<AppState>,
+    Extension(AuthToken(token)): Extension<AuthToken>,
+    body: axum::body::Body,
+) -> Result<Json<IngestOutcome>, ApiError> {
+    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "body over 256 KB"))?;
+    let report: UsageReport = serde_json::from_slice(&bytes)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, format!("bad request: {e}")))?;
+    if report.records.len() > MAX_RECORDS {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "more than 500 records",
+        ));
+    }
+    let r = session_for(&state, token, report.session_id).await?;
+    match state.usage.ingest(&r, &report).await {
+        Ok(outcome) => Ok(Json(outcome)),
+        Err(UsageError::Envelope(m)) => Err(ApiError::new(StatusCode::BAD_REQUEST, m)),
+        Err(UsageError::Store(e)) => Err(ApiError::internal(e)),
+    }
 }
 
 // ---------------------------------------------------------------- heartbeat
