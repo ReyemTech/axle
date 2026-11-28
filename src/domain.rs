@@ -346,6 +346,9 @@ pub enum TaskEventKind {
     PlanChangesRequested,
     /// Participating projects were added to a parent task (listed in the payload).
     ProjectsAdded,
+    /// The human acknowledged a done task. Only ever published as a live event; it is
+    /// never written to a task's history.
+    Acked,
 }
 
 text_enum!(TaskEventKind {
@@ -369,7 +372,43 @@ text_enum!(TaskEventKind {
     PlanApproved => "plan_approved",
     PlanChangesRequested => "plan_changes_requested",
     ProjectsAdded => "projects_added",
+    Acked => "acked",
 });
+
+/// Where a done task stands with the human.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckState {
+    /// Not acked and finished within the auto-ack window.
+    Unseen,
+    /// The human acked it.
+    Acked,
+    /// Never acked, but older than the auto-ack window.
+    AutoAcked,
+}
+
+impl AckState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unseen => "unseen",
+            Self::Acked => "acked",
+            Self::AutoAcked => "auto-acked",
+        }
+    }
+}
+
+/// `None` unless the task is done. A task exactly `auto_ack` old is still unseen.
+pub fn ack_state(task: &Task, now: OffsetDateTime, auto_ack: time::Duration) -> Option<AckState> {
+    if task.status != TaskStatus::Done {
+        return None;
+    }
+    if task.acked_at.is_some() {
+        return Some(AckState::Acked);
+    }
+    match task.done_at {
+        Some(done_at) if done_at < now - auto_ack => Some(AckState::AutoAcked),
+        _ => Some(AckState::Unseen),
+    }
+}
 
 /// One append-only entry in a task's history.
 #[derive(Debug, Clone, PartialEq)]
@@ -502,6 +541,47 @@ pub struct InboxItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use time::macros::datetime;
+
+    #[test]
+    fn ack_state_follows_window_and_ack() {
+        let now = datetime!(2026-11-27 9:00 UTC);
+        let n = time::Duration::days(7);
+        let task = |status, done_at, acked_at| Task {
+            id: TaskId::new(),
+            project_id: ProjectId::new(),
+            parent_id: None,
+            title: "t".into(),
+            body: String::new(),
+            status,
+            owner_session_id: None,
+            owner_agent_id: None,
+            lease_expires_at: None,
+            lease_epoch: 0,
+            lease_ttl: None,
+            eligibility: Eligibility::default(),
+            created_by: Actor::from_ids(None, None),
+            created_at: now,
+            updated_at: now,
+            done_at,
+            acked_at,
+            version: 1,
+            requires_plan: false,
+            plan_state: PlanState::None,
+        };
+        let done = |at| task(TaskStatus::Done, Some(at), None);
+        assert_eq!(ack_state(&done(now - n), now, n), Some(AckState::Unseen));
+        assert_eq!(
+            ack_state(&done(now - n - time::Duration::seconds(1)), now, n),
+            Some(AckState::AutoAcked)
+        );
+        let acked = task(TaskStatus::Done, Some(now - n * 2), Some(now));
+        assert_eq!(ack_state(&acked, now, n), Some(AckState::Acked));
+        assert_eq!(ack_state(&task(TaskStatus::Open, None, None), now, n), None);
+        assert_eq!(AckState::AutoAcked.as_str(), "auto-acked");
+        assert_eq!(AckState::Unseen.as_str(), "unseen");
+        assert_eq!(AckState::Acked.as_str(), "acked");
+    }
 
     #[test]
     fn display_names_are_cleaned() {

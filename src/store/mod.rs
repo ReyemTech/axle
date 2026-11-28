@@ -239,6 +239,11 @@ pub trait Store: Send + Sync {
     async fn list_tasks(&self, filter: &TaskFilter) -> StoreResult<Vec<Task>>;
     /// How many tasks `list_tasks(filter)` would return ignoring `after`, `limit` and `order`.
     async fn count_tasks(&self, filter: &TaskFilter) -> StoreResult<u64>;
+    /// In one transaction: for each listed id whose task is `done`, sets `acked_at = now` on it
+    /// and on every `done` descendant, wherever `acked_at` is still null. Ids that are unknown
+    /// or not done are skipped (their descendants too). Returns the ids newly acked.
+    async fn ack_done_tasks(&self, ids: &[TaskId], now: OffsetDateTime)
+    -> StoreResult<Vec<TaskId>>;
     /// A task's history, oldest first.
     async fn task_events(&self, id: TaskId) -> StoreResult<Vec<TaskEvent>>;
     /// A page of a task's history, newest first: only events of `kind` when set, and only

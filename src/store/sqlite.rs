@@ -1347,6 +1347,34 @@ impl Store for SqliteStore {
             .collect()
     }
 
+    async fn ack_done_tasks(
+        &self,
+        ids: &[TaskId],
+        now: OffsetDateTime,
+    ) -> StoreResult<Vec<TaskId>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let listed = serde_json::to_string(&ids.iter().map(|i| i.to_string()).collect::<Vec<_>>())
+            .expect("strings serialize");
+        let rows: Vec<String> = sqlx::query_scalar(
+            "WITH RECURSIVE sub(id) AS (
+                 SELECT id FROM tasks
+                  WHERE id IN (SELECT value FROM json_each(?1)) AND status = 'done'
+                 UNION
+                 SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
+                  WHERE t.status = 'done')
+             UPDATE tasks SET acked_at = ?2
+              WHERE id IN (SELECT id FROM sub) AND acked_at IS NULL
+              RETURNING id",
+        )
+        .bind(listed)
+        .bind(ts::enc(now))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(|s| uuid_of(s)).collect()
+    }
+
     async fn count_tasks(&self, filter: &TaskFilter) -> StoreResult<u64> {
         let (mode, since) = filter.done.parts();
         let n: i64 =

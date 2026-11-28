@@ -1270,6 +1270,32 @@ impl Store for PostgresStore {
             .collect()
     }
 
+    async fn ack_done_tasks(
+        &self,
+        ids: &[TaskId],
+        now: OffsetDateTime,
+    ) -> StoreResult<Vec<TaskId>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let listed: Vec<uuid::Uuid> = ids.iter().map(|i| i.as_uuid()).collect();
+        let rows: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "WITH RECURSIVE sub(id) AS (
+                 SELECT id FROM tasks WHERE id = ANY($1) AND status = 'done'
+                 UNION
+                 SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
+                  WHERE t.status = 'done')
+             UPDATE tasks SET acked_at = $2
+              WHERE id IN (SELECT id FROM sub) AND acked_at IS NULL
+              RETURNING id",
+        )
+        .bind(listed)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(TaskId::from).collect())
+    }
+
     async fn count_tasks(&self, filter: &TaskFilter) -> StoreResult<u64> {
         let (mode, since) = filter.done.parts();
         let n: i64 =

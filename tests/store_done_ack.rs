@@ -9,10 +9,12 @@ use axle::clock::{Clock, TestClock};
 use axle::domain::{
     Actor, ProjectId, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus,
 };
+use axle::events::{Event, EventBus};
 use axle::service::identity::{IdentityInput, IdentityService, Resolved};
 use axle::service::tasks::{Caller, Completion, NewTask, TaskService};
 use axle::store::{
-    DoneFilter, LeaseUpdate, Store, TaskFilter, TaskOrder, TransitionRequest, like_pattern,
+    DoneFilter, LeaseUpdate, Store, TaskFilter, TaskOrder, TransitionRequest, Transitioned,
+    like_pattern,
 };
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
@@ -168,35 +170,7 @@ store_matrix!(
 
         // Reopen (the service never does this; the store rule must hold regardless).
         let now = T0 + Duration::hours(2);
-        let moved = env
-            .store
-            .transition_task(&TransitionRequest {
-                task: id,
-                from: vec![TaskStatus::Done],
-                to: Some(TaskStatus::Open),
-                owner: None,
-                lease: LeaseUpdate::Clear,
-                clear_owner: true,
-                now,
-                token: None,
-                event: TaskEvent {
-                    id: uuid::Uuid::now_v7(),
-                    task_id: id,
-                    at: now,
-                    actor: Actor::from_ids(None, None),
-                    kind: TaskEventKind::Released,
-                    note: None,
-                    payload: None,
-                },
-                plan_from: None,
-                plan_to: None,
-                message: None,
-                latest_plan: None,
-                archive_plans: false,
-            })
-            .await
-            .unwrap()
-            .expect("transition applies");
+        let moved = reopen(&env, id, now).await;
         assert_eq!(moved.task.status, TaskStatus::Open);
         let after = env.get(id).await;
         assert_eq!(after.done_at, None);
@@ -209,6 +183,182 @@ store_matrix!(
         let again = env.get(id).await;
         assert_eq!(again.done_at, Some(T0 + Duration::hours(3)));
         assert_eq!(again.acked_at, None);
+    }
+);
+
+/// Moves a done task back to open through the store (the service never does this).
+async fn reopen(env: &Env, id: TaskId, now: OffsetDateTime) -> Transitioned {
+    env.store
+        .transition_task(&TransitionRequest {
+            task: id,
+            from: vec![TaskStatus::Done],
+            to: Some(TaskStatus::Open),
+            owner: None,
+            lease: LeaseUpdate::Clear,
+            clear_owner: true,
+            now,
+            token: None,
+            event: TaskEvent {
+                id: uuid::Uuid::now_v7(),
+                task_id: id,
+                at: now,
+                actor: Actor::from_ids(None, None),
+                kind: TaskEventKind::Released,
+                note: None,
+                payload: None,
+            },
+            plan_from: None,
+            plan_to: None,
+            message: None,
+            latest_plan: None,
+            archive_plans: false,
+        })
+        .await
+        .unwrap()
+        .expect("transition applies")
+}
+
+fn set(ids: impl IntoIterator<Item = TaskId>) -> HashSet<TaskId> {
+    ids.into_iter().collect()
+}
+
+store_matrix!(
+    ack_parent_covers_done_children_and_is_idempotent,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store).await;
+        let p = env.create_titled("p", None).await;
+        let c1 = env.create_titled("c1", Some(p)).await;
+        let c2 = env.create_titled("c2", Some(p)).await;
+        let g = env.create_titled("g", Some(c1)).await;
+        env.svc.cancel(Caller::Agent(&env.agent), c2).await.unwrap();
+        for id in [g, c1, p] {
+            env.claim(id).await;
+            env.complete(id).await;
+        }
+        let p_before = env.get(p).await;
+
+        env.clock.advance(Duration::minutes(5));
+        let now = env.clock.now();
+        let acked = env.svc.ack_done(&[p]).await.unwrap();
+        assert_eq!(set(acked), set([p, c1, g]));
+        for id in [p, c1, g] {
+            assert_eq!(env.get(id).await.acked_at, Some(now));
+        }
+        assert_eq!(env.get(c2).await.acked_at, None);
+        let p_after = env.get(p).await;
+        assert_eq!(p_after.version, p_before.version);
+        assert_eq!(p_after.updated_at, p_before.updated_at);
+        assert_eq!(p_after.status, TaskStatus::Done);
+
+        env.clock.advance(Duration::minutes(1));
+        assert!(env.svc.ack_done(&[p]).await.unwrap().is_empty());
+        assert_eq!(env.get(p).await.acked_at, Some(now));
+    }
+);
+
+store_matrix!(
+    leaving_done_clears_ack,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store).await;
+        let id = env.create().await;
+        env.claim(id).await;
+        env.set_time(Duration::hours(1));
+        env.complete(id).await;
+        env.set_time(Duration::hours(2));
+        assert_eq!(env.svc.ack_done(&[id]).await.unwrap(), [id]);
+        let acked = env.get(id).await;
+        assert_eq!(acked.acked_at, Some(T0 + Duration::hours(2)));
+        assert_eq!(acked.done_at, Some(T0 + Duration::hours(1)));
+
+        reopen(&env, id, T0 + Duration::hours(3)).await;
+        let after = env.get(id).await;
+        assert_eq!((after.done_at, after.acked_at), (None, None));
+    }
+);
+
+store_matrix!(
+    ack_skips_unknown_and_unfinished,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store).await;
+        let open = env.create().await;
+        let done = env.finish("done", None, Duration::ZERO).await;
+        let acked = env
+            .svc
+            .ack_done(&[TaskId::new(), open, done])
+            .await
+            .unwrap();
+        assert_eq!(acked, [done]);
+        assert_eq!(env.get(open).await.acked_at, None);
+        assert!(env.svc.ack_done(&[]).await.unwrap().is_empty());
+    }
+);
+
+store_matrix!(acked_tasks_leave_both_unseen_sets, |store: Arc<
+    dyn Store,
+>| async move {
+    let env = Env::new(store).await;
+    let old = env.finish("old", None, Duration::ZERO).await;
+    let recent = env.finish("recent", None, Duration::days(9)).await;
+    let now = T0 + Duration::days(10);
+    let since = now - Duration::days(7);
+    let count = |done| {
+        let store = env.store.clone();
+        async move {
+            store
+                .count_tasks(&TaskFilter {
+                    done,
+                    ..TaskFilter::default()
+                })
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(count(DoneFilter::Unseen { since }).await, 1);
+    assert_eq!(count(DoneFilter::AutoAckedUnseen { since }).await, 1);
+
+    env.svc.ack_done(&[old, recent]).await.unwrap();
+    assert_eq!(count(DoneFilter::Unseen { since }).await, 0);
+    assert_eq!(count(DoneFilter::AutoAckedUnseen { since }).await, 0);
+});
+
+store_matrix!(
+    ack_publishes_task_changed,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store.clone()).await;
+        let bus = EventBus::new(store.clone(), env.clock.clone());
+        let svc = TaskService::new(
+            store.clone(),
+            env.clock.clone(),
+            Duration::hours(12),
+            Duration::hours(24),
+            Duration::seconds(90),
+        )
+        .with_events(bus.clone());
+        let t = env.finish("t", None, Duration::ZERO).await;
+        let mut rx = bus.subscribe();
+
+        // Listing an id twice publishes once; an unfinished id publishes nothing.
+        let open = env.create().await;
+        svc.ack_done(&[t, open, t]).await.unwrap();
+        match rx.recv().await.unwrap() {
+            Event::TaskChanged {
+                id,
+                kind: TaskEventKind::Acked,
+                status: TaskStatus::Done,
+                ..
+            } => assert_eq!(id, t),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+        let kinds: Vec<_> = env
+            .store
+            .task_events(t)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(kinds.iter().all(|k| *k != TaskEventKind::Acked));
     }
 );
 
