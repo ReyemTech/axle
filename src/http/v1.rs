@@ -336,7 +336,8 @@ pub struct SessionQuery {
 
 /// SSE stream of the events relevant to one session. Event name = `Event` variant, data =
 /// its JSON. A subscriber that falls behind gets a `Lagged` event (data: how many were
-/// dropped) and should re-read its inbox. The stream ends when the server shuts down.
+/// dropped) and should re-read its inbox; the server re-resolves the session's agent and
+/// project at that point, in case a dropped event was a merge. The stream ends when the server shuts down.
 async fn events(
     State(state): State<AppState>,
     Extension(AuthToken(token)): Extension<AuthToken>,
@@ -370,6 +371,11 @@ async fn events(
                         }
                     }
                     Err(RecvError::Lagged(n)) => {
+                        // A dropped `ProjectMerged` would leave the watcher on retired ids, so
+                        // re-resolve the session rather than rely on having seen the hint.
+                        if let Err(e) = w.reload().await {
+                            eprintln!("axl: reloading session {} after lag: {e}", w.session);
+                        }
                         let sse = SseEvent::default().event("Lagged").data(n.to_string());
                         return Some((Ok(sse), (rx, w)));
                     }

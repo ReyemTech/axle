@@ -358,7 +358,7 @@ data: {"id":"01a21e49-812d-71b1-a958-8ed6820c5bc3","to":{"kind":"project","id":"
 | `MessageCreated` | `id`, `to` (`kind` and `id`), `project_id` | The message is addressed to it: its session, its agent, its home project, or a task its agent owns or created. Never for its agent's own messages. |
 | `TaskChanged` | `id`, `project_id`, `status`, `kind` (the history event kind) | The task is in its home project, spans its home project, or its agent owns or created it. |
 | `ProjectMerged` | `from`, `into` (project ids) | Its home project was a local project the owner just merged into `into` ([adopting a git remote](concepts.md#adopting-a-git-remote)). The stream now follows the session's surviving agent and project; re-read the inbox. |
-| `Lagged` | the number of dropped events | The subscriber fell behind. Re-read the inbox and tasks. |
+| `Lagged` | the number of dropped events | The subscriber fell behind. Re-read the inbox and tasks. The server re-resolves the session's agent and project, so the stream keeps following them even if a dropped event was a `ProjectMerged`. |
 
 The stream sends keep-alive comments and ends when the server shuts down. There is no
 replay or `Last-Event-ID` yet; after a reconnect, read the inbox. Everything durable is

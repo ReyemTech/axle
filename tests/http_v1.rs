@@ -369,6 +369,81 @@ async fn event_stream_follows_a_merge_to_the_surviving_ids() {
 }
 
 #[tokio::test]
+async fn event_stream_reloads_identity_when_it_lags_past_a_merge() {
+    let app = app().await;
+    let token = app.token().await;
+    let reg = |key: &'static str, folder: Option<&'static str>| {
+        let token = token.clone();
+        let app = &app;
+        async move {
+            let session = SessionId::new();
+            let (status, body) = app
+                .post(
+                    &token,
+                    "/v1/register",
+                    json!({
+                        "session_id": session, "host": "mac", "harness": "claude-code",
+                        "project_key": key, "folder": folder,
+                    }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let agent: AgentId = serde_json::from_value(body["agent_id"].clone()).unwrap();
+            (session, agent)
+        }
+    };
+    const FOLDER: &str = "0123456789abcdef";
+    let (_, twin) = reg("github.com/acme/axle-saas", None).await;
+    let target = app.project_id("github.com/acme/axle-saas").await;
+    let (session, _) = reg("local/mac/axl-saas", Some(FOLDER)).await;
+    let local = app.project_id("local/mac/axl-saas").await;
+    reg("github.com/acme/axle-saas", Some(FOLDER)).await;
+    let mut stream = app.events(&token, session).await;
+
+    // The merge happens while the client is not reading, and enough events follow that the
+    // `ProjectMerged` hint falls out of the channel before the stream sees it.
+    let out = app.state.adopt_project(local).await.unwrap();
+    assert!(matches!(out, axle::domain::Adoption::Merged(_)), "{out:?}");
+    for _ in 0..1100 {
+        app.state
+            .bus
+            .publish(axle::events::Event::HumanArchived { archived: vec![] })
+            .await
+            .unwrap();
+    }
+    let (name, _) = next_event(&mut stream, Duration::from_secs(2))
+        .await
+        .expect("a lag notice");
+    assert_eq!(name, "Lagged");
+
+    // The stream re-resolved the session after the lag and follows the surviving ids. The
+    // channel is still full of unread events, so each send may report a further small lag.
+    async fn next_non_lag(
+        stream: &mut (impl futures_util::Stream<Item = String> + Unpin),
+    ) -> Option<(String, Value)> {
+        loop {
+            match next_event(stream, Duration::from_secs(2)).await {
+                Some((name, _)) if name == "Lagged" => continue,
+                other => return other,
+            }
+        }
+    }
+    app.send_from_human(Address::Project(target), "to the git project")
+        .await;
+    let (name, data) = next_non_lag(&mut stream)
+        .await
+        .expect("project broadcast after the lag");
+    assert_eq!(name, "MessageCreated");
+    assert_eq!(data["to"]["id"], json!(target), "{data}");
+    app.send_from_human(Address::Agent(twin), "to the survivor")
+        .await;
+    let (name, _) = next_non_lag(&mut stream)
+        .await
+        .expect("direct mail to the surviving agent");
+    assert_eq!(name, "MessageCreated");
+}
+
+#[tokio::test]
 async fn session_project_reports_a_remote_waiting_for_adoption() {
     let app = app().await;
     let token = app.token().await;
