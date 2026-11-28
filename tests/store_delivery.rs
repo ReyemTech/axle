@@ -374,6 +374,8 @@ async fn delivering_task(
         ))
         .await;
     }
+    // The task's own stage lives in `task_stages`.
+    reach_stage(raw, task.id, stage).await;
     task.id
 }
 
@@ -736,9 +738,22 @@ fn pr(n: i64, linked_by: PrLinkedBy) -> NewTaskPr {
     }
 }
 
+/// What a signal moving the task's own PR to `stage` writes (raw: `advance_stage` is later):
+/// the `task_stages` row, the task's own stage, and `delivery_stage`.
 async fn set_stage(raw: &common::RawDb, task: TaskId, stage: DeliveryStage) {
     raw.execute(&format!(
         "UPDATE tasks SET delivery_stage = '{stage}' WHERE id = '{task}'"
+    ))
+    .await;
+    reach_stage(raw, task, stage).await;
+}
+
+/// Records only the `task_stages` row (the task's own stage), leaving `delivery_stage`.
+async fn reach_stage(raw: &common::RawDb, task: TaskId, stage: DeliveryStage) {
+    raw.execute(&format!(
+        "INSERT INTO task_stages (task_id, stage, reached_at)
+         VALUES ('{task}', '{stage}', '2026-11-28T09:30:00.000000Z')
+         ON CONFLICT (task_id, stage) DO NOTHING"
     ))
     .await;
 }
@@ -1171,11 +1186,42 @@ store_matrix_raw!(
         assert_eq!(delivered.at, T3);
         assert_eq!(delivered.actor, Actor::Human);
         // A delivering parent records no children_complete.
-        assert!(
-            !fx.kinds(parent.id)
-                .await
-                .contains(&TaskEventKind::ChildrenComplete)
-        );
+        let kinds = fx.kinds(parent.id).await;
+        assert!(!kinds.contains(&TaskEventKind::ChildrenComplete));
+        // Exactly one child_done per delivering child: completing into `delivering` does not
+        // bubble, the later `delivered` does.
+        let count = |k: TaskEventKind| kinds.iter().filter(|e| **e == k).count();
+        assert_eq!(count(TaskEventKind::ChildDone), 2, "{kinds:?}");
+        assert_eq!(count(TaskEventKind::ChildCancelled), 1, "{kinds:?}");
+    }
+);
+
+store_matrix!(
+    settings_save_racing_a_child_change_does_not_deadlock,
+    |store: Arc<dyn Store>| async move {
+        use DeliveryStage::*;
+        let fx = Fx::new(store).await;
+        fx.stages(&[InPr, Merged, Released]).await;
+        for round in 0..10 {
+            let parent = fx.claimed("parent", None).await;
+            let a = fx.claimed("a", Some(parent.id)).await;
+            let b = fx.claimed("b", Some(parent.id)).await;
+            fx.link(a.id, 200 + 2 * round).await;
+            fx.link(b.id, 201 + 2 * round).await;
+            fx.complete(a.id, T1).await;
+            fx.complete(b.id, T1).await;
+            fx.complete(parent.id, T1).await;
+            // The save locks every delivering row (children first); the child change locks
+            // the child, then the parent. Both must succeed.
+            let mut d = ProjectDelivery::defaults(&fx.project, T2);
+            d.stages = vec![InPr, Merged, Released];
+            let (saved, _) = tokio::join!(
+                fx.store.set_project_delivery(&d, None),
+                fx.deliver(a.id, T2)
+            );
+            saved.unwrap_or_else(|e| panic!("round {round}: {e}"));
+            assert_eq!(fx.get(parent.id).await.status, TaskStatus::Delivering);
+        }
     }
 );
 
@@ -1207,6 +1253,74 @@ store_matrix!(
                 .count();
             assert_eq!(delivered, 1, "round {round}");
         }
+    }
+);
+
+store_matrix_raw!(
+    delivering_parent_links_its_own_pr,
+    |store: Arc<dyn Store>, raw: common::RawDb| async move {
+        use DeliveryStage::*;
+        let fx = Fx::new(store).await;
+        fx.stages(&[InPr, Merged, Released]).await;
+        let parent = fx.claimed("parent", None).await;
+        let child = fx.claimed("child", Some(parent.id)).await;
+        fx.link(child.id, 80).await;
+        set_stage(&raw, child.id, Merged).await;
+        fx.complete(child.id, T1).await;
+        let (p, _) = fx.complete(parent.id, T1).await;
+        // Shown at the child's Merged, but the parent itself has reached nothing.
+        assert_eq!(p.delivery_stage, Some(Merged));
+
+        // Its own PR is not refused as "already merged" by the derived stage.
+        let LinkOutcome::Linked(linked) = fx.link(parent.id, 81).await else {
+            panic!("expected Linked");
+        };
+        // The recompute is forward only: the shown stage is not lowered to In PR.
+        assert_eq!(linked.status, TaskStatus::Delivering);
+        assert_eq!(linked.delivery_stage, Some(Merged));
+        assert_eq!(linked, fx.get(parent.id).await);
+
+        // Its own PR (In PR) now holds it back after the child is done.
+        fx.deliver(child.id, T2).await;
+        let p = fx.get(parent.id).await;
+        assert_eq!(p.status, TaskStatus::Delivering);
+        assert_eq!(p.delivery_stage, Some(Merged));
+    }
+);
+
+store_matrix_raw!(
+    parent_own_stage_comes_from_task_stages,
+    |store: Arc<dyn Store>, raw: common::RawDb| async move {
+        use DeliveryStage::*;
+        let fx = Fx::new(store).await;
+        fx.stages(&DeliveryStage::ALL).await;
+        let parent = fx.claimed("parent", None).await;
+        let child = fx.claimed("child", Some(parent.id)).await;
+        fx.link(parent.id, 90).await;
+        // Only the task_stages row: `delivery_stage` stays In PR.
+        reach_stage(&raw, parent.id, Released).await;
+        assert_eq!(fx.get(parent.id).await.delivery_stage, Some(InPr));
+        fx.link(child.id, 91).await;
+        set_stage(&raw, child.id, Merged).await;
+        fx.complete(child.id, T1).await;
+        // The minimum of its own Released (from task_stages) and the child's Merged.
+        let (p, target) = fx.complete(parent.id, T1).await;
+        assert_eq!(target, CompletionTarget::Delivering(Merged));
+        assert_eq!(p.delivery_stage, Some(Merged));
+
+        // The child is done: the parent moves forward to its own Released, read from
+        // task_stages (its delivery_stage says Merged), and waits for Deployed.
+        fx.deliver(child.id, T2).await;
+        let p = fx.get(parent.id).await;
+        assert_eq!(p.status, TaskStatus::Delivering);
+        assert_eq!(p.delivery_stage, Some(Released));
+
+        // A task_stages row alone (no delivery_stage write) is the own stage too.
+        reach_stage(&raw, parent.id, Deployed).await;
+        assert_eq!(
+            fx.link(parent.id, 92).await,
+            LinkOutcome::AlreadyMerged { number: Some(90) }
+        );
     }
 );
 

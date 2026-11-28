@@ -9,11 +9,24 @@ use uuid::Uuid;
 use std::sync::LazyLock;
 
 use super::{
-    AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate, MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, RelateRequest, Related, Store, StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, UnblockRule, Unblocked, block_previous_payload, child_event, children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label, like_pattern, options_from, options_to, projects_added_note, projects_added_payload, related_payload, send_time_recipient, unblocked_records, DeliveringRow, finished_by, stages_delivered_event, stages_from_json, stages_to_json, CompleteRequest, Completed, LinkOutcome, LinkPrRequest, NewTaskPr, ParentMove, ParentState, ParentStep, completion_event, parent_move_event, pr_linked_event, pr_unlinked_event, push_moved, recompute_parent, same_pr,
+    AddProjectsRequest, ClaimAttempt, ClaimRequest, CompleteRequest, Completed, DeliveringRow,
+    EditRequest, InboxFilter, LeaseUpdate, LinkOutcome, LinkPrRequest, MessageReceipt, MoveRequest,
+    Moved, NewEnrollment, NewTaskPr, NewToken, ParentMove, ParentState, ParentStep, PollOutcome,
+    ProjectsAdded, Recipient, RelateRequest, Related, Store, StoreError, StoreResult, TaskFilter,
+    TaskOrder, TransitionRequest, Transitioned, UnblockRule, Unblocked, block_previous_payload,
+    child_event, children_complete_event, claim_event, closes_child, completion_event,
+    edit_payload, enrollment_token_label, finished_by, like_pattern, link_refusal, options_from,
+    options_to, parent_move_event, pr_linked_event, pr_unlinked_event, projects_added_note,
+    projects_added_payload, push_moved, recompute_parent, related_payload, same_pr,
+    send_time_recipient, stages_delivered_event, stages_from_json, stages_to_json,
+    unblocked_records,
 };
 use crate::delivery::stages::{ChildState, CompletionTarget, STAGE_RANK_SQL, completion_target};
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId, EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, WaitingOn, DeliveryStage, ProjectDelivery, TaskPr, TaskStageRow,
+    Actor, Address, Agent, AgentId, BlockDetail, DeliveryStage, Eligibility, Enrollment,
+    EnrollmentId, EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project,
+    ProjectDelivery, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId,
+    TaskLink, TaskPr, TaskStageRow, TaskStatus, TokenId, TokenInfo, WaitingOn,
 };
 
 pub struct PostgresStore {
@@ -462,46 +475,10 @@ async fn parent_step(
     }
     let status: TaskStatus = parse_text(row.try_get("status")?)?;
     if status == TaskStatus::Delivering {
-        let has_pr = pr_of(conn, parent).await?.is_some();
-        let state = ParentState {
-            stage: opt_stage(&row)?,
-            has_pr,
-            own: if has_pr {
-                own_stage(conn, parent).await?
-            } else {
-                None
-            },
-        };
         let project: ProjectId = row.try_get::<Uuid, _>("project_id")?.into();
-        let stages = project_stages(conn, project).await?;
-        let children = child_states(conn, parent).await?;
-        let Some(change) = recompute_parent(&stages, &state, &children) else {
-            return Ok(ParentStep::Unchanged);
-        };
-        let query = match change {
-            ParentMove::Done => sqlx::query(concat!(
-                "UPDATE tasks
-                    SET status = 'done', done_at = $1, version = version + 1, updated_at = $1
-                  WHERE id = $2 AND status = 'delivering'
-                  RETURNING ",
-                task_cols!()
-            ))
-            .bind(source.at)
-            .bind(parent.as_uuid()),
-            ParentMove::Stage(stage) => sqlx::query(PARENT_STAGE_SQL.as_str())
-                .bind(source.at)
-                .bind(parent.as_uuid())
-                .bind(stage.as_str())
-                .bind(i32::from(stage.rank())),
-        };
-        let updated = query
-            .fetch_optional(&mut *conn)
-            .await?
-            .as_ref()
-            .map(task_from)
-            .transpose()?;
-        return Ok(match updated {
-            Some(p) => ParentStep::Moved(p, parent_move_event(parent, change, source)),
+        let moved = follow_children(conn, parent, project, opt_stage(&row)?, source).await?;
+        return Ok(match moved {
+            Some((p, ev)) => ParentStep::Moved(p, ev),
             None => ParentStep::Unchanged,
         });
     }
@@ -550,16 +527,76 @@ static PARENT_STAGE_SQL: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-/// `unlink_pr`'s guarded clear. Binds: at, id.
-static UNLINK_SQL: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "UPDATE tasks SET delivery_stage = NULL, version = version + 1, updated_at = $1
-          WHERE id = $2 AND status NOT IN ('done', 'cancelled', 'delivering')
-            AND {STAGE_RANK_SQL} < 2
-          RETURNING {}",
-        task_cols!()
-    )
-});
+/// `unlink_pr`'s guarded clear: the task's own stage (its `task_stages`, read after the row
+/// lock) must be before `merged`. Binds: at, id.
+const UNLINK_SQL: &str = concat!(
+    "UPDATE tasks SET delivery_stage = NULL, version = version + 1, updated_at = $1
+      WHERE id = $2 AND status NOT IN ('done', 'cancelled', 'delivering')
+        AND NOT EXISTS (SELECT 1 FROM task_stages s
+                         WHERE s.task_id = tasks.id
+                           AND s.stage IN ('merged', 'released', 'deployed'))
+      RETURNING ",
+    task_cols!()
+);
+
+/// A project's `delivering` tasks, deepest first (most ancestors), then by `(created_at,
+/// id)`: children always come before their parents, the order every child change locks in
+/// (child, then parent). Binds: project.
+const DELIVERING_LEAF_FIRST_SQL: &str = "WITH RECURSIVE chain(id, up, depth) AS (
+         SELECT id, parent_id, 0 FROM tasks WHERE project_id = $1 AND status = 'delivering'
+         UNION ALL
+         SELECT c.id, t.parent_id, c.depth + 1 FROM chain c JOIN tasks t ON t.id = c.up)
+     SELECT c.id FROM chain c JOIN tasks t ON t.id = c.id
+      GROUP BY c.id, t.created_at
+      ORDER BY MAX(c.depth) DESC, t.created_at, c.id";
+
+/// `recompute_parent` applied to the `delivering` task `parent` (shown at `stage`, its row
+/// locked by the caller), for the change `source`: the row as moved and the event recording
+/// the move (not yet appended), or `None` when it stays. The PR, own stage (its
+/// `task_stages`, see `ParentState`), stages and children are read in statements of their
+/// own after the lock.
+async fn follow_children(
+    conn: &mut PgConnection,
+    parent: TaskId,
+    project: ProjectId,
+    stage: Option<DeliveryStage>,
+    source: &TaskEvent,
+) -> StoreResult<Option<(Task, TaskEvent)>> {
+    let has_pr = pr_of(conn, parent).await?.is_some();
+    let state = ParentState {
+        stage,
+        has_pr,
+        own: own_stage(conn, parent).await?,
+    };
+    let stages = project_stages(conn, project).await?;
+    let children = child_states(conn, parent).await?;
+    let Some(change) = recompute_parent(&stages, &state, &children) else {
+        return Ok(None);
+    };
+    let query = match change {
+        ParentMove::Done => sqlx::query(concat!(
+            "UPDATE tasks
+                SET status = 'done', done_at = $1, version = version + 1, updated_at = $1
+              WHERE id = $2 AND status = 'delivering'
+              RETURNING ",
+            task_cols!()
+        ))
+        .bind(source.at)
+        .bind(parent.as_uuid()),
+        ParentMove::Stage(stage) => sqlx::query(PARENT_STAGE_SQL.as_str())
+            .bind(source.at)
+            .bind(parent.as_uuid())
+            .bind(stage.as_str())
+            .bind(i32::from(stage.rank())),
+    };
+    let updated = query
+        .fetch_optional(&mut *conn)
+        .await?
+        .as_ref()
+        .map(task_from)
+        .transpose()?;
+    Ok(updated.map(|p| (p, parent_move_event(parent, change, source))))
+}
 
 /// The furthest stage the task's own PR reached (its `task_stages` rows).
 async fn own_stage(conn: &mut PgConnection, task: TaskId) -> StoreResult<Option<DeliveryStage>> {
@@ -729,22 +766,10 @@ async fn link_locked(conn: &mut PgConnection, req: &LinkPrRequest) -> StoreResul
     let Some(task) = task_locked(conn, req.task).await? else {
         return Ok(LinkOutcome::NotFound);
     };
-    if matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled) {
-        return Ok(LinkOutcome::Closed(task.status));
-    }
     let existing = pr_of(conn, task.id).await?;
-    if let Some(e) = &existing {
-        if same_pr(e, &req.pr) {
-            return Ok(LinkOutcome::Unchanged(task));
-        }
-        if !req.replace {
-            return Ok(LinkOutcome::HasLink);
-        }
-    }
-    if task.delivery_stage >= Some(DeliveryStage::Merged) {
-        return Ok(LinkOutcome::AlreadyMerged {
-            number: existing.and_then(|e| e.number),
-        });
+    let own = own_stage(conn, task.id).await?;
+    if let Some(refused) = link_refusal(&task, existing.as_ref(), own, req) {
+        return Ok(refused);
     }
     if let Some(owner) = pr_owner(conn, &req.pr, task.id).await? {
         return Ok(LinkOutcome::TakenBy(owner));
@@ -773,10 +798,25 @@ async fn link_locked(conn: &mut PgConnection, req: &LinkPrRequest) -> StoreResul
     .bind(task.id.as_uuid())
     .fetch_one(&mut *conn)
     .await?;
-    let updated = task_from(&updated)?;
+    let mut updated = task_from(&updated)?;
     insert_stage(conn, task.id, DeliveryStage::InPr, req.now).await?;
     let event = pr_linked_event(task.id, &req.pr.url, existing.as_ref(), req.actor, req.now);
     record_event(conn, &updated, &event, req.token).await?;
+    if updated.status == TaskStatus::Delivering {
+        // A delivering parent now also follows its own PR (forward only); its row is locked.
+        let moved = follow_children(
+            conn,
+            task.id,
+            task.project_id,
+            updated.delivery_stage,
+            &event,
+        )
+        .await?;
+        if let Some((p, ev)) = moved {
+            record_event(conn, &p, &ev, req.token).await?;
+            updated = p;
+        }
+    }
     Ok(match existing {
         None => LinkOutcome::Linked(updated),
         Some(previous) => LinkOutcome::Relinked {
@@ -1800,24 +1840,31 @@ impl Store for PostgresStore {
         .execute(&mut *tx)
         .await?;
 
-        let delivering = sqlx::query(
-            "SELECT t.id, t.delivery_stage,
-                    EXISTS (SELECT 1 FROM task_prs p WHERE p.task_id = t.id) AS has_pr
-               FROM tasks t
-              WHERE t.project_id = $1 AND t.status = 'delivering'
-              ORDER BY t.created_at, t.id
-                FOR UPDATE OF t",
-        )
-        .bind(d.project_id.as_uuid())
-        .fetch_all(&mut *tx)
-        .await?;
+        // Lock order: every child change locks the child, then its parent (`parent_step`).
+        // Locking the delivering rows in one statement would take parents first and deadlock
+        // against that, so they are locked one by one, children before parents, all before
+        // any is changed (a change here locks parents in turn, which are then held already).
+        // Parent links never change, so the order read without locks stays valid.
+        let candidates: Vec<Uuid> = sqlx::query_scalar(DELIVERING_LEAF_FIRST_SQL)
+            .bind(d.project_id.as_uuid())
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut delivering = Vec::new();
+        for id in candidates {
+            let still: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM tasks WHERE id = $1 AND status = 'delivering' FOR UPDATE",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            delivering.extend(still.map(TaskId::from));
+        }
         let mut moved = Vec::new();
-        for row in &delivering {
-            let id: TaskId = row.try_get::<Uuid, _>("id")?.into();
+        for id in delivering {
             let state = DeliveringRow {
                 task: id,
-                stage: opt_stage(row)?,
-                has_pr: row.try_get("has_pr")?,
+                stage: own_stage(&mut tx, id).await?,
+                has_pr: pr_of(&mut tx, id).await?.is_some(),
                 children: child_states(&mut tx, id).await?,
             };
             if !finished_by(&d.stages, &state) {
@@ -1878,7 +1925,7 @@ impl Store for PostgresStore {
             tx.rollback().await?;
             return Ok(None);
         };
-        let updated = sqlx::query(UNLINK_SQL.as_str())
+        let updated = sqlx::query(UNLINK_SQL)
             .bind(now)
             .bind(task.as_uuid())
             .fetch_optional(&mut *tx)
@@ -1961,10 +2008,12 @@ impl Store for PostgresStore {
             has_pr = insert_pr(&mut tx, &task, link).await?;
             linked = has_pr.then_some(link);
         }
-        let own = match linked {
-            Some(_) => Some(task.delivery_stage.unwrap_or(DeliveryStage::InPr)),
-            None => task.delivery_stage,
-        };
+        // The task's own stage is its `task_stages` (see `ParentState`); a link made here
+        // reaches In PR.
+        let mut own = own_stage(&mut tx, task.id).await?;
+        if linked.is_some() {
+            own = own.max(Some(DeliveryStage::InPr));
+        }
         let stages = project_stages(&mut tx, task.project_id).await?;
         let children = child_states(&mut tx, task.id).await?;
         let target = completion_target(&stages, own, has_pr, &children);

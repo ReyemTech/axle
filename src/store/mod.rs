@@ -16,7 +16,11 @@ use crate::delivery::stages::{
     ChildState, CompletionTarget, completion_target, last_enabled, parent_stage,
 };
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, Enrollment, EnrollmentId, EnrollmentKind, Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState, Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, WaitingOn, DeliveryStage, ProjectDelivery, PrLinkedBy, TaskPr, TaskStageRow,
+    Actor, Address, Agent, AgentId, BlockDetail, DeliveryStage, Enrollment, EnrollmentId,
+    EnrollmentKind, Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState,
+    PrLinkedBy, Project, ProjectDelivery, ProjectId, Session, SessionId, Task, TaskEvent,
+    TaskEventKind, TaskId, TaskLink, TaskPr, TaskStageRow, TaskStatus, TokenId, TokenInfo,
+    WaitingOn,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -979,15 +983,56 @@ pub(crate) fn completion_event(event: &TaskEvent, target: CompletionTarget) -> T
     event
 }
 
+/// Whether a `done` event is a completion into `delivering` (its payload names the stage).
+pub(crate) fn completes_into_delivering(event: &TaskEvent) -> bool {
+    event.kind == TaskEventKind::Done
+        && event
+            .payload
+            .as_ref()
+            .is_some_and(|p| p.get("delivering").is_some())
+}
+
 /// What the parent rule reads about a `delivering` parent (under its row lock).
+///
+/// **Own stage vs shown stage (binding rule).** A task's *own* furthest stage is always the
+/// greatest of its `task_stages` rows (for a task without children it equals
+/// `tasks.delivery_stage`). `tasks.delivery_stage` of a `delivering` parent holds the derived
+/// minimum the board shows, so it is never read as the parent's own stage. Every writer
+/// keeps this: a stage reached by the task's own PR (link, `advance_stage`) is a
+/// `task_stages` row, and on a `delivering` parent the move recomputes the parent
+/// (`recompute_parent`, forward only) instead of writing the PR's stage into
+/// `delivery_stage`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ParentState {
     /// `tasks.delivery_stage`: the stage the parent shows (the minimum).
     pub stage: Option<DeliveryStage>,
     pub has_pr: bool,
-    /// The furthest stage the parent's own PR reached (its `task_stages` rows): the
-    /// parent's `delivery_stage` is the derived minimum, so it cannot hold this.
+    /// The furthest stage the parent's own PR reached (max of its `task_stages` rows).
     pub own: Option<DeliveryStage>,
+}
+
+/// Why `link_pr` refuses before looking for another holder of the PR, if it does: the
+/// task's own stage is `own` (its `task_stages`), never a parent's derived `delivery_stage`.
+pub(crate) fn link_refusal(
+    task: &Task,
+    existing: Option<&TaskPr>,
+    own: Option<DeliveryStage>,
+    req: &LinkPrRequest,
+) -> Option<LinkOutcome> {
+    if matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled) {
+        return Some(LinkOutcome::Closed(task.status));
+    }
+    if let Some(e) = existing {
+        if same_pr(e, &req.pr) {
+            return Some(LinkOutcome::Unchanged(task.clone()));
+        }
+        if !req.replace {
+            return Some(LinkOutcome::HasLink);
+        }
+    }
+    (own >= Some(DeliveryStage::Merged)).then(|| LinkOutcome::AlreadyMerged {
+        number: existing.and_then(|e| e.number),
+    })
 }
 
 /// Where the parent rule moves a `delivering` parent.
@@ -1240,6 +1285,8 @@ pub fn child_event(child: &Task, parent: TaskId, source: &TaskEvent) -> Option<T
     let kind = match source.kind {
         TaskEventKind::Claimed | TaskEventKind::LeaseExpiredTakeover => TaskEventKind::ChildClaimed,
         TaskEventKind::Blocked => TaskEventKind::ChildBlocked,
+        // A completion into `delivering` is not done yet: its later `delivered` bubbles once.
+        TaskEventKind::Done if completes_into_delivering(source) => return None,
         TaskEventKind::Done | TaskEventKind::Delivered => TaskEventKind::ChildDone,
         TaskEventKind::Cancelled => TaskEventKind::ChildCancelled,
         _ => return None,
@@ -1307,6 +1354,7 @@ pub fn delivered_note(stages: &[DeliveryStage]) -> String {
 #[derive(Debug, Clone)]
 pub(crate) struct DeliveringRow {
     pub task: TaskId,
+    /// The task's own furthest stage (its `task_stages`; see `ParentState`).
     pub stage: Option<DeliveryStage>,
     pub has_pr: bool,
     pub children: Vec<ChildState>,
