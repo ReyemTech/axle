@@ -53,7 +53,8 @@ the chips that ask for attention: **urgent**, **plan awaiting you**, **blocked o
 for the start of the reason; a blocked task's status word carries the same tooltip),
 **N blocked** and **N review** for subtasks, the lease turning into a chip when under a fifth
 is left or it has expired, and "3/5" for a parent's subtasks done. A Done row keeps a small
-**Ack** button at its end.
+**Ack** button at its end. A delivering row also shows its stage word, "waiting for …" in a stage it
+has not reached, and its `PR #123` link.
 
 The done column holds finished top-level tasks you have not seen, newest first, at most 50.
 Its head reads "N unseen". **Ack** under a card hides that task from the board; **Ack all**

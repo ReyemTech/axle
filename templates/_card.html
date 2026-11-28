@@ -1,7 +1,7 @@
 {% if card.compact %}
 <article class="card" id="task-{{ card.id }}" data-status="{{ card.status }}" data-line="{{ card.project.line }}" data-nav tabindex="-1" data-density="compact"
          hx-get="/ui/tasks/{{ card.id }}/card{% if !card.show_project %}?filtered=1{% endif %}" hx-trigger="sse:task-{{ card.id }}" hx-swap="outerHTML">
-  <span class="state" data-status="{{ card.status }}" data-aspect="{{ card.aspect }}"{% if card.status == "blocked" %} title="{{ card.blocked_tip() }}"{% endif %}><span class="aspect" data-aspect="{{ card.aspect }}" aria-hidden="true"></span><span class="status">{{ card.status }}</span></span>
+  <span class="state" data-status="{{ card.status }}" data-aspect="{{ card.aspect }}"{% if card.status == "blocked" %} title="{{ card.blocked_tip() }}"{% endif %}><span class="aspect" data-aspect="{{ card.aspect }}" aria-hidden="true"></span><span class="status">{{ card.status }}</span>{% if let Some(st) = card.stage %} <span class="stage-word">{{ st }}</span>{% endif %}</span>
   <h3 class="card-title" title="{{ card.title }}"><a class="card-link" href="/ui/tasks/{{ card.id }}">{{ card.title }}</a></h3>
   {% if card.show_project %}<span class="project" data-line="{{ card.project.line }}" title="{{ card.project.key }}">{{ card.project.name }}</span>{% endif %}
   <span class="owner" title="{% if card.owner.is_some() %}{% if card.status == "done" %}Done by{% else %}Held by{% endif %}{% else %}Unowned{% endif %}">{% if let Some(owner) = card.owner %}{{ owner }}{% else %}open{% endif %}</span>
@@ -14,6 +14,8 @@
   {% if card.sub_review() > 0 %}<span class="chip" data-chip="review" title="{{ card.sub_review() }} subtask{% if card.sub_review() != 1 %}s{% endif %} in review">{{ card.sub_review() }} review</span>{% endif %}
   <span class="ratio" title="{{ p.done }} of {{ p.total }} subtasks done">{{ p.done }}/{{ p.total }}</span>
   {% endif %}
+  {% if let Some(w) = card.waiting_for %}<span class="waiting-for">waiting for {{ w }}</span>{% endif %}
+  {% if let Some(pr) = card.pr %}<a class="pr-chip" href="{{ pr.url }}" rel="noopener noreferrer" title="Open the pull request">PR #{{ pr.number }}</a>{% endif %}
 </article>
 {% else %}
 <article class="card" id="task-{{ card.id }}" data-status="{{ card.status }}" data-line="{{ card.project.line }}" data-nav tabindex="-1"
