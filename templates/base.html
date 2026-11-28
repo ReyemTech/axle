@@ -28,6 +28,10 @@
   <div id="pulse" class="pulse" hx-get="/ui/pulse" hx-trigger="sse:overview delay:300ms, every 30s" hx-swap="innerHTML" aria-live="polite">
 {% if let Some(p) = pulse %}{% include "_pulse.html" %}{% endif %}
   </div>
+  {% if let Some(p) = pulse %}<form class="wake-pause" method="post" action="/ui/settings/wake-pause">
+    <input type="hidden" name="csrf" value="{{ token }}">
+    {% if p.wake_paused %}<button type="submit" class="link">Resume wake-ups</button>{% else %}<input type="hidden" name="pause" value="on"><button type="submit" class="link">Pause wake-ups</button>{% endif %}
+  </form>{% endif %}
   {% if logout %}<form class="logout" method="post" action="/ui/logout">
     <input type="hidden" name="csrf" value="{{ token }}">
     <button type="submit" class="link">Log out</button>

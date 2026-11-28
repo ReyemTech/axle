@@ -9,9 +9,10 @@ use serde::Deserialize;
 
 use super::views::{UiError, UiResult};
 use crate::domain::{
-    Actor, Address, Importance, LinkKind, MessageId, ProjectId, TaskId, TokenId, WakeTrigger,
-    clean_display_name,
+    Actor, Address, Importance, LinkKind, Message, MessageId, MessageKind, ProjectId, TaskId,
+    TokenId, WakeTrigger, clean_display_name,
 };
+use crate::events::Event;
 use crate::http::AppState;
 use crate::service::auth::AuthError;
 use crate::service::messages::{MessageError, NewMessage};
@@ -738,6 +739,111 @@ pub async fn rename_project(
         Err(StoreError::NotFound(_)) => Err(UiError::NotFound("No such project.")),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Writes a thread-less system note to the human's inbox (and tells the live UI).
+async fn human_note(state: &AppState, project: Option<ProjectId>, body: String) -> UiResult<()> {
+    let message = Message {
+        id: MessageId::new(),
+        project_id: project,
+        from: Actor::Human,
+        to: Address::Human,
+        subject: None,
+        body,
+        importance: Importance::Normal,
+        task_id: None,
+        reply_to: None,
+        created_at: state.clock.now(),
+        kind: MessageKind::System,
+        options: Vec::new(),
+    };
+    state.store.insert_message(&message, None).await?;
+    state
+        .bus
+        .emit(Event::MessageCreated {
+            id: message.id,
+            to: message.to,
+            project_id: message.project_id,
+        })
+        .await;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct AutoStartForm {
+    /// A ticked checkbox sends `on`; an unticked one sends nothing.
+    #[serde(default)]
+    auto_start: String,
+}
+
+/// Turns a project's auto-start of peers' work requests on or off. A change writes a system
+/// note; saving the current state again does not.
+pub async fn set_auto_start(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<AutoStartForm>,
+) -> UiResult<Response> {
+    let id: ProjectId = id
+        .parse()
+        .map_err(|_| UiError::NotFound("No such project."))?;
+    let project = state
+        .store
+        .get_project(id)
+        .await?
+        .ok_or(UiError::NotFound("No such project."))?;
+    let on = form.auto_start == "on";
+    let mut settings = state.store.wake_settings(id).await?;
+    if settings.auto_start != on {
+        settings.auto_start = on;
+        state
+            .store
+            .put_wake_settings(&settings, state.clock.now())
+            .await?;
+        let word = if on { "on" } else { "off" };
+        human_note(
+            &state,
+            Some(id),
+            format!("Auto-start turned {word} for {}", project.display_name),
+        )
+        .await?;
+    }
+    Ok(see_other("/ui/projects"))
+}
+
+#[derive(Deserialize)]
+pub struct WakePauseForm {
+    /// `on` pauses wake-ups; anything else resumes them.
+    #[serde(default)]
+    pause: String,
+}
+
+/// The wake-up kill switch. Resuming places the work that queued up meanwhile.
+pub async fn set_wake_paused(
+    State(state): State<AppState>,
+    Form(form): Form<WakePauseForm>,
+) -> UiResult<Response> {
+    let pause = form.pause == "on";
+    let mut settings = state.store.server_settings().await?;
+    if settings.wake_paused != pause {
+        settings.wake_paused = pause;
+        state
+            .store
+            .put_server_settings(&settings, state.clock.now())
+            .await?;
+        let note = if pause {
+            "Wake-ups paused"
+        } else {
+            "Wake-ups resumed"
+        };
+        human_note(&state, None, note.into()).await?;
+        if !pause {
+            // The settings are saved; a failed placement is logged, the ticker retries.
+            if let Err(e) = state.wake.place_queued().await {
+                eprintln!("axl: failed to place queued work after resuming wake-ups: {e}");
+            }
+        }
+    }
+    Ok(see_other("/ui/"))
 }
 
 pub async fn revoke_token(

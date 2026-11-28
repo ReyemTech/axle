@@ -1345,6 +1345,8 @@ pub struct Pulse {
     pub live: usize,
     pub blocked: usize,
     pub need: usize,
+    /// The wake-up kill switch is on.
+    pub wake_paused: bool,
 }
 
 pub async fn pulse_counts(state: &AppState) -> StoreResult<Pulse> {
@@ -1371,6 +1373,7 @@ pub async fn pulse_counts(state: &AppState) -> StoreResult<Pulse> {
         live: live.len(),
         blocked,
         need,
+        wake_paused: state.store.server_settings().await?.wake_paused,
     })
 }
 

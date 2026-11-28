@@ -14,6 +14,11 @@ Every page shares a bar with the sections (**Overview**, **Board**, **History**,
 **Tokens**), a **Filter this page** box, and live counts: sessions **live**, tasks
 **blocked**, and items that **need you**. The last links to the Needs you strip.
 
+The bar also has **Pause wake-ups**, a kill switch: while it is on the bar shows **wake-ups
+paused**, no agent is woken, and work that would have been routed waits in the queue (each
+attempt is logged as skipped, "wake-ups paused"). **Resume wake-ups** turns it off and places
+the queued work. Each change leaves a system note in your inbox.
+
 ## Board
 
 <picture>
@@ -85,7 +90,9 @@ Click **Key** for the legend.
 **New task** opens a form: a **lead project** (whose agents claim and coordinate the task),
 **Also involves** (other projects subtasks may go to), a title and details, and **Plan
 first — I approve before work starts**, ticked by default. See
-[the plan gate](concepts.md#the-plan-gate).
+[the plan gate](concepts.md#the-plan-gate). **Start now — wake an idle agent to begin** is
+also ticked by default: the task is routed to a free session at once. Untick it to create a
+plain open task that waits to be claimed.
 
 <img src="images/new-task-form.webp" width="1440" alt="The New task form on the board: lead project select, Also involves checkboxes for other projects, title, details and a ticked Plan first checkbox, above the task columns.">
 
@@ -220,6 +227,12 @@ answers are written by the agent, so they are shown as plain text, never as mark
 
 Projects appear here on first contact. Rename a project's display name; the key stays the
 same and is shown on hover. A key that is a plain `host/path` links to its repository.
+
+Each row has a **Wake-ups** panel that expands in place. **Auto-start work requests from
+other agents** is off by default: when on, peers can start work in that project without asking
+you ("Peers can start work here without asking you. Changes still land on branches and PRs you
+merge."). Saving a change is a normal form post and leaves a system note in your inbox,
+such as "Auto-start turned on for Platform infra".
 
 ## Tokens
 

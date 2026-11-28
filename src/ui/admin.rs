@@ -58,6 +58,8 @@ pub struct ProjectRow {
     /// The project's line colour (see `views::line_colours`).
     pub line: u8,
     pub created: Stamp,
+    /// Peers' work requests start here without asking the human.
+    pub auto_start: bool,
 }
 
 #[derive(Template)]
@@ -79,17 +81,18 @@ pub async fn projects(
     let now = state.clock.now();
     let all = state.store.list_projects().await?;
     let lines = line_colours(&all);
-    let mut projects: Vec<ProjectRow> = all
-        .into_iter()
-        .map(|p| ProjectRow {
+    let mut projects = Vec::with_capacity(all.len());
+    for p in all {
+        projects.push(ProjectRow {
             id: p.id.to_string(),
             line: lines.get(&p.id).copied().unwrap_or(0),
+            auto_start: state.store.wake_settings(p.id).await?.auto_start,
             name: p.display_name,
             repo_url: repo_url(&p.key),
             key: p.key,
             created: Stamp::new(now, p.created_at),
-        })
-        .collect();
+        });
+    }
     projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.key.cmp(&b.key)));
     html(&ProjectsPage {
         logout: session.logout,

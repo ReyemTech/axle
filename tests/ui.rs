@@ -5245,3 +5245,263 @@ mod requests {
         assert_eq!(woken, ["woken 2m ago · Roll the users"], "{}", page.body);
     }
 }
+
+// ---------------------------------------------------------------- wake-ups
+
+async fn human_notes(app: &App) -> Vec<String> {
+    app.state
+        .store
+        .list_messages(None, None, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.to == Address::Human && m.kind == axle::domain::MessageKind::System)
+        .map(|m| m.body)
+        .collect()
+}
+
+async fn skipped_wakes(app: &App) -> u32 {
+    use axle::domain::{WakeKind, WakeOutcome};
+    use axle::store::AttemptQuery;
+    app.state
+        .store
+        .count_wake_attempts(&AttemptQuery {
+            kind: WakeKind::Wake,
+            outcome: WakeOutcome::Skipped,
+            session: None,
+            task: None,
+            from_agent: None,
+            triggers: None,
+            since: datetime!(2026-01-01 0:00 UTC),
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn auto_start_toggle_persists_and_notes() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let project = infra.agent.project_id.unwrap();
+    let csrf = csrf_for(&app, &cookie).await;
+    let path = format!("/ui/projects/{project}/wake");
+
+    let page = app.get("/ui/projects", Some(&cookie)).await;
+    let text = page.text();
+    assert!(text.contains("Wake-ups"), "{text}");
+    assert!(text.contains("Auto-start work requests from other agents"));
+    assert!(text.contains(
+        "Peers can start work here without asking you. Changes still land on branches and PRs you merge."
+    ));
+    assert!(
+        !app.state
+            .store
+            .wake_settings(project)
+            .await
+            .unwrap()
+            .auto_start
+    );
+
+    let on = app
+        .post_form(&path, Some(&cookie), &form(&csrf, &[("auto_start", "on")]))
+        .await;
+    assert_eq!(on.status, StatusCode::SEE_OTHER, "{}", on.body);
+    assert_eq!(on.location.as_deref(), Some("/ui/projects"));
+    assert!(
+        app.state
+            .store
+            .wake_settings(project)
+            .await
+            .unwrap()
+            .auto_start
+    );
+    let name = app
+        .state
+        .store
+        .get_project(project)
+        .await
+        .unwrap()
+        .unwrap()
+        .display_name;
+    assert_eq!(
+        human_notes(&app).await,
+        vec![format!("Auto-start turned on for {name}")]
+    );
+    let page = app.get("/ui/projects", Some(&cookie)).await;
+    assert_eq!(
+        select_texts(&page, "input[name=auto_start][checked]").len(),
+        1
+    );
+
+    // Saving the same state again writes no second note.
+    app.post_form(&path, Some(&cookie), &form(&csrf, &[("auto_start", "on")]))
+        .await;
+    assert_eq!(human_notes(&app).await.len(), 1);
+
+    let off = app.post_form(&path, Some(&cookie), &form(&csrf, &[])).await;
+    assert_eq!(off.status, StatusCode::SEE_OTHER);
+    assert!(
+        !app.state
+            .store
+            .wake_settings(project)
+            .await
+            .unwrap()
+            .auto_start
+    );
+    assert!(
+        human_notes(&app)
+            .await
+            .contains(&format!("Auto-start turned off for {name}"))
+    );
+}
+
+#[tokio::test]
+async fn pause_wake_ups_shows_state_and_router_skips() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let project = infra.agent.project_id.unwrap();
+    let csrf = csrf_for(&app, &cookie).await;
+
+    let top = app.get("/ui/", Some(&cookie)).await;
+    assert!(top.text().contains("Pause wake-ups"));
+    assert!(!top.text().contains("wake-ups paused"));
+
+    let page = app
+        .post_form(
+            "/ui/settings/wake-pause",
+            Some(&cookie),
+            &form(&csrf, &[("pause", "on")]),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    assert!(app.state.store.server_settings().await.unwrap().wake_paused);
+    assert!(
+        human_notes(&app)
+            .await
+            .contains(&"Wake-ups paused".to_string())
+    );
+    let top = app.get("/ui/", Some(&cookie)).await;
+    assert!(top.text().contains("wake-ups paused"));
+    assert!(top.text().contains("Resume wake-ups"));
+
+    // A Start-now task is queued with a skipped attempt.
+    let created = app
+        .post_form(
+            "/ui/tasks",
+            Some(&cookie),
+            &form(
+                &csrf,
+                &[
+                    ("project", &project.to_string()),
+                    ("title", "Go now"),
+                    ("start_now", "on"),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::SEE_OTHER, "{}", created.body);
+    assert_eq!(skipped_wakes(&app).await, 1);
+    let queued = app
+        .state
+        .store
+        .list_queued(app.state.clock.now())
+        .await
+        .unwrap();
+    assert_eq!(queued.len(), 1);
+
+    let page = app
+        .post_form("/ui/settings/wake-pause", Some(&cookie), &form(&csrf, &[]))
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER);
+    assert!(!app.state.store.server_settings().await.unwrap().wake_paused);
+    assert!(
+        human_notes(&app)
+            .await
+            .contains(&"Wake-ups resumed".to_string())
+    );
+    let top = app.get("/ui/", Some(&cookie)).await;
+    assert!(top.text().contains("Pause wake-ups"));
+    assert!(!top.text().contains("wake-ups paused"));
+}
+
+#[tokio::test]
+async fn start_now_ticked_by_default() {
+    let app = app().await;
+    let cookie = app.login().await;
+    app.agent(INFRA, "mac", "claude-code").await;
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    assert_eq!(
+        select_texts(
+            &board,
+            "form[action='/ui/tasks'] input[name=start_now][value=on][checked]"
+        )
+        .len(),
+        1
+    );
+    assert!(board.text().contains("Start now"));
+}
+
+#[tokio::test]
+async fn start_now_unticked_creates_plain_open() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let project = infra.agent.project_id.unwrap();
+    let csrf = csrf_for(&app, &cookie).await;
+    // Paused, so a routed task would leave a skipped attempt; a plain one leaves none.
+    app.post_form(
+        "/ui/settings/wake-pause",
+        Some(&cookie),
+        &form(&csrf, &[("pause", "on")]),
+    )
+    .await;
+    let page = app
+        .post_form(
+            "/ui/tasks",
+            Some(&cookie),
+            &form(
+                &csrf,
+                &[("project", &project.to_string()), ("title", "Plain")],
+            ),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    let id: TaskId = page
+        .location
+        .unwrap()
+        .strip_prefix("/ui/tasks/")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let task = app.state.store.get_task(id).await.unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Open);
+    assert_eq!(skipped_wakes(&app).await, 0);
+}
+
+#[tokio::test]
+async fn wake_forms_need_csrf() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let project = infra.agent.project_id.unwrap();
+    for path in [
+        format!("/ui/projects/{project}/wake"),
+        "/ui/settings/wake-pause".to_string(),
+    ] {
+        for body in ["", "csrf=wrong&auto_start=on&pause=on"] {
+            let page = app.post_form(&path, Some(&cookie), body).await;
+            assert_eq!(page.status, StatusCode::FORBIDDEN, "{path} {body:?}");
+        }
+    }
+    assert!(
+        !app.state
+            .store
+            .wake_settings(project)
+            .await
+            .unwrap()
+            .auto_start
+    );
+    assert!(!app.state.store.server_settings().await.unwrap().wake_paused);
+}

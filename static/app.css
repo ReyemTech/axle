@@ -283,7 +283,7 @@ a.pulse-item:hover { color: var(--bar-text); }
 .topbar .aspect[data-aspect="blocked"] { border-color: var(--sig-red); }
 .topbar .aspect[data-aspect="plan-submitted"] { border-color: var(--sig-amber); }
 .pulse-item[href*="needs-you"].is-alert { color: var(--sig-amber); font-weight: 600; }
-.logout { margin: 0; }
+.logout, .wake-pause { margin: 0; }
 .topbar button.link { color: var(--bar-muted); }
 .topbar button.link:hover { color: var(--bar-text); }
 
