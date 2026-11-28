@@ -16,11 +16,11 @@ use crate::delivery::stages::{
     ChildState, CompletionTarget, completion_target, last_enabled, parent_stage,
 };
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, DeliveryStage, Enrollment, EnrollmentId,
-    EnrollmentKind, Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState,
-    PrLinkedBy, Project, ProjectDelivery, ProjectId, Session, SessionId, Task, TaskEvent,
-    TaskEventKind, TaskId, TaskLink, TaskPr, TaskStageRow, TaskStatus, TokenId, TokenInfo,
-    WaitingOn,
+    Actor, Address, Agent, AgentId, BlockDetail, DeliverySignal, DeliveryStage, Enrollment,
+    EnrollmentId, EnrollmentKind, Importance, InboxItem, LinkKind, Message, MessageId, MessageKind,
+    PlanState, PrLinkedBy, Project, ProjectDelivery, ProjectId, Session, SessionId, Task,
+    TaskEvent, TaskEventKind, TaskId, TaskLink, TaskPr, TaskStageRow, TaskStatus, TokenId,
+    TokenInfo, WaitingOn,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -233,6 +233,36 @@ pub trait Store: Send + Sync {
     /// payload gains `"delivering": "<stage>"`. `None` (nothing written, the link included)
     /// when the guard did not match.
     async fn complete_task(&self, req: &CompleteRequest) -> StoreResult<Option<Completed>>;
+
+    // ---- delivery: stage moves and signals ----
+
+    /// Moves `m.task` forward to `m.to`, in one transaction that locks the task row first. The
+    /// guard: the task is not `done` / `cancelled` and its own stage (its `task_stages`, see
+    /// `ParentState`) is before `m.to`, so two moves racing for one task have one winner. On
+    /// match: a task without children gets `delivery_stage = m.to` (the guarded
+    /// `UPDATE … WHERE <STAGE_RANK_SQL> < :rank`); a `delivering` task with children keeps
+    /// its derived minimum and is recomputed by the parent rule (forward only). Either bumps
+    /// `version` / `updated_at = m.now`, records `task_stages` rows for `m.to` (with
+    /// `signal_id` / `detail`) and for each of `m.implied` (`implied = true`), `ON CONFLICT DO
+    /// NOTHING`, and appends `stage_reached` (payload `stage`, `implied`). A `delivering` task
+    /// without children whose `m.to` reaches the project's last enabled stage becomes `done`
+    /// (`done_at = m.now`) with a `delivered` event (payload `stage`); a task in any other
+    /// status only records the stage (stages reached before completion). The parent rule
+    /// then runs up the tree. `None` when the guard did not match (or no such task).
+    async fn advance_stage(&self, m: &StageMove) -> StoreResult<Option<StageMoved>>;
+    /// The human's **Mark done**: guarded `delivering → done` (`done_at = updated_at = now`,
+    /// `version` bumped), a `delivered` event with note `marked done by the human`, then the
+    /// parent rule. `None` when the task is not `delivering`.
+    async fn mark_delivered(
+        &self,
+        task: TaskId,
+        actor: Actor,
+        token: Option<TokenId>,
+        now: OffsetDateTime,
+    ) -> StoreResult<Option<Task>>;
+    /// Appends `s` to the delivery log. `Duplicate` (nothing written) when the project already
+    /// logged a signal with the same `delivery_id`; signals without one never collide.
+    async fn insert_signal(&self, s: &DeliverySignal) -> StoreResult<SignalInsert>;
 
     // ---- agents ----
 
@@ -917,6 +947,94 @@ pub struct CompleteRequest {
 pub struct Completed {
     pub transitioned: Transitioned,
     pub target: CompletionTarget,
+}
+
+/// A forward stage move (see `Store::advance_stage`).
+#[derive(Debug, Clone)]
+pub struct StageMove {
+    pub task: TaskId,
+    pub to: DeliveryStage,
+    /// Stages passed over on the way (`implied_between`), recorded as `implied`.
+    pub implied: Vec<DeliveryStage>,
+    /// The signal that caused the move, if one did.
+    pub signal_id: Option<uuid::Uuid>,
+    /// `version`, `environment` and `url` when known, stored on the `m.to` row.
+    pub detail: Option<serde_json::Value>,
+    pub actor: Actor,
+    pub token: Option<TokenId>,
+    pub now: OffsetDateTime,
+}
+
+/// A stage move that applied.
+#[derive(Debug, Clone)]
+pub struct StageMoved {
+    /// The task as updated.
+    pub task: Task,
+    /// Whether the move finished the task (`delivering → done`).
+    pub delivered: bool,
+}
+
+/// What `insert_signal` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalInsert {
+    Inserted,
+    /// The project already logged this `delivery_id`.
+    Duplicate,
+}
+
+/// The `stage_reached` event of a stage move.
+pub(crate) fn stage_reached_event(m: &StageMove) -> TaskEvent {
+    TaskEvent {
+        id: uuid::Uuid::now_v7(),
+        task_id: m.task,
+        at: m.now,
+        actor: m.actor,
+        kind: TaskEventKind::StageReached,
+        note: None,
+        payload: Some(serde_json::json!({
+            "stage": m.to.as_str(),
+            "implied": m.implied.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        })),
+    }
+}
+
+/// The `delivered` event of a stage move that reached the last enabled stage.
+pub(crate) fn stage_delivered_event(m: &StageMove) -> TaskEvent {
+    TaskEvent {
+        id: uuid::Uuid::now_v7(),
+        task_id: m.task,
+        at: m.now,
+        actor: m.actor,
+        kind: TaskEventKind::Delivered,
+        note: None,
+        payload: Some(serde_json::json!({ "stage": m.to.as_str() })),
+    }
+}
+
+/// The `delivered` event of the human's **Mark done**.
+pub(crate) fn marked_done_event(task: TaskId, actor: Actor, now: OffsetDateTime) -> TaskEvent {
+    TaskEvent {
+        id: uuid::Uuid::now_v7(),
+        task_id: task,
+        at: now,
+        actor,
+        kind: TaskEventKind::Delivered,
+        note: Some("marked done by the human".to_string()),
+        payload: None,
+    }
+}
+
+/// Whether a stage move to `to` finishes a task in `status` (`has_children`: the parent rule
+/// decides instead): a `delivering` leaf reaching the last enabled stage.
+pub(crate) fn move_delivers(
+    stages: &[DeliveryStage],
+    status: TaskStatus,
+    has_children: bool,
+    to: DeliveryStage,
+) -> bool {
+    status == TaskStatus::Delivering
+        && !has_children
+        && last_enabled(stages).is_some_and(|last| to >= last)
 }
 
 /// The `pr_linked` (or, replacing `previous`, `pr_relinked`) event of a link.

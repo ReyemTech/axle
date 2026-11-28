@@ -11,12 +11,14 @@ use axle::domain::{
     MessageKind, PlanState, ProjectDelivery, ReleaseSource, Task, TaskEvent, TaskEventKind, TaskId,
     TaskStatus, short_id,
 };
-use axle::domain::{PrLinkedBy, Project, SessionId};
+use axle::domain::{
+    DeliverySignal, PrLinkedBy, Project, SessionId, SignalKind, SignalOutcome, SignalSource,
+};
 use axle::service::identity::{IdentityInput, IdentityService, Resolved};
 use axle::service::tasks::{Caller, NewTask, TaskService};
 use axle::store::{
-    CompleteRequest, DoneFilter, LeaseUpdate, LinkOutcome, LinkPrRequest, NewTaskPr, Store,
-    TaskFilter, TransitionRequest,
+    CompleteRequest, DoneFilter, LeaseUpdate, LinkOutcome, LinkPrRequest, NewTaskPr, SignalInsert,
+    StageMove, StageMoved, Store, TaskFilter, TransitionRequest,
 };
 use time::macros::datetime;
 use uuid::Uuid;
@@ -1411,5 +1413,392 @@ store_matrix!(delivering_not_hidden_by_task_list, |store: Arc<
             .collect();
         assert_eq!(ids, [task.id], "{done:?}");
         assert_eq!(fx.store.count_tasks(&filter).await.unwrap(), 1);
+    }
+});
+
+// ---- stage moves, Mark done and the signal log ----
+
+/// A stage move of `task` to `to` at `at`, by the human, with no signal.
+fn stage_move(
+    task: TaskId,
+    to: DeliveryStage,
+    implied: &[DeliveryStage],
+    at: time::OffsetDateTime,
+) -> StageMove {
+    StageMove {
+        task,
+        to,
+        implied: implied.to_vec(),
+        signal_id: None,
+        detail: None,
+        actor: Actor::Human,
+        token: None,
+        now: at,
+    }
+}
+
+impl Fx {
+    async fn advance(
+        &self,
+        task: TaskId,
+        to: DeliveryStage,
+        at: time::OffsetDateTime,
+    ) -> Option<StageMoved> {
+        self.store
+            .advance_stage(&stage_move(task, to, &[], at))
+            .await
+            .unwrap()
+    }
+
+    /// A claimed task with PR `#n`, completed into `delivering` at `T1`.
+    async fn delivering(&self, title: &str, parent: Option<TaskId>, n: i64) -> Task {
+        let task = self.claimed(title, parent).await;
+        self.link(task.id, n).await;
+        let (task, target) = self.complete(task.id, T1).await;
+        assert!(matches!(target, CompletionTarget::Delivering(_)));
+        task
+    }
+}
+
+fn signal(project: axle::domain::ProjectId, delivery_id: Option<&str>) -> DeliverySignal {
+    DeliverySignal {
+        id: Uuid::now_v7(),
+        project_id: project,
+        kind: SignalKind::Merged,
+        source: SignalSource::Webhook,
+        version: None,
+        sha: Some("abc123".into()),
+        environment: None,
+        url: None,
+        delivery_id: delivery_id.map(str::to_string),
+        outcome: SignalOutcome::Applied,
+        matched: 1,
+        received_at: T1,
+    }
+}
+
+store_matrix!(advance_forward_only, |store: Arc<dyn Store>| async move {
+    use DeliveryStage::*;
+    let fx = Fx::new(store).await;
+    fx.stages(&[InPr, Merged, Released]).await;
+    let task = fx.claimed("ship", None).await;
+    fx.link(task.id, 12).await;
+    let before = fx.get(task.id).await;
+
+    let moved = fx.advance(task.id, Merged, T2).await.expect("forward move");
+    assert!(!moved.delivered);
+    assert_eq!(moved.task.delivery_stage, Some(Merged));
+    assert_eq!(moved.task.status, TaskStatus::Claimed);
+    assert_eq!(moved.task.version, before.version + 1);
+    assert_eq!(moved.task.updated_at, T2);
+    assert_eq!(moved.task, fx.get(task.id).await);
+    let ev = last_of(
+        &fx.store.task_events(task.id).await.unwrap(),
+        TaskEventKind::StageReached,
+    );
+    assert_eq!(
+        ev.payload,
+        Some(serde_json::json!({ "stage": "merged", "implied": [] }))
+    );
+
+    // Back to In PR, or Merged again: nothing changes.
+    assert!(fx.advance(task.id, InPr, T3).await.is_none());
+    assert!(fx.advance(task.id, Merged, T3).await.is_none());
+    assert_eq!(fx.get(task.id).await, moved.task);
+    // An unknown task misses the guard too.
+    assert!(fx.advance(TaskId::new(), Merged, T3).await.is_none());
+});
+
+store_matrix!(
+    advance_race_has_one_winner,
+    |store: Arc<dyn Store>| async move {
+        use DeliveryStage::*;
+        let fx = Fx::new(store).await;
+        fx.stages(&[InPr, Merged, Released]).await;
+        let task = fx.delivering("ship", None, 12).await;
+        let (a, b) = (fx.store.clone(), fx.store.clone());
+        let (ma, mb) = (
+            stage_move(task.id, Merged, &[], T2),
+            stage_move(task.id, Merged, &[], T2),
+        );
+        let (ra, rb) = tokio::join!(a.advance_stage(&ma), b.advance_stage(&mb));
+        let winners = [ra.unwrap(), rb.unwrap()]
+            .into_iter()
+            .filter(Option::is_some)
+            .count();
+        assert_eq!(winners, 1);
+        let reached = fx
+            .kinds(task.id)
+            .await
+            .into_iter()
+            .filter(|k| *k == TaskEventKind::StageReached)
+            .count();
+        assert_eq!(reached, 1);
+        let t = fx.get(task.id).await;
+        assert_eq!(t.delivery_stage, Some(Merged));
+        assert_eq!(t.version, task.version + 1);
+    }
+);
+
+store_matrix!(
+    implied_stages_recorded,
+    |store: Arc<dyn Store>| async move {
+        use DeliveryStage::*;
+        let fx = Fx::new(store).await;
+        fx.stages(&[InPr, Merged, Released, Deployed]).await;
+        let task = fx.delivering("ship", None, 12).await;
+        let signal_id = Uuid::now_v7();
+        let detail = serde_json::json!({ "version": "v1.2.0" });
+        let m = StageMove {
+            signal_id: Some(signal_id),
+            detail: Some(detail.clone()),
+            ..stage_move(task.id, Released, &[Merged], T2)
+        };
+        let moved = fx.store.advance_stage(&m).await.unwrap().expect("moves");
+        assert_eq!(moved.task.delivery_stage, Some(Released));
+        assert_eq!(moved.task.status, TaskStatus::Delivering);
+
+        let rows = fx.store.task_stages(task.id).await.unwrap();
+        let stages: Vec<DeliveryStage> = rows.iter().map(|r| r.stage).collect();
+        assert_eq!(stages, [InPr, Merged, Released]);
+        let merged = &rows[1];
+        assert!(merged.implied);
+        assert_eq!(merged.reached_at, T2);
+        assert_eq!(merged.signal_id, Some(signal_id));
+        assert_eq!(merged.detail, None);
+        let released = &rows[2];
+        assert!(!released.implied);
+        assert_eq!(released.reached_at, T2);
+        assert_eq!(released.signal_id, Some(signal_id));
+        assert_eq!(released.detail, Some(detail));
+        let ev = last_of(
+            &fx.store.task_events(task.id).await.unwrap(),
+            TaskEventKind::StageReached,
+        );
+        assert_eq!(
+            ev.payload,
+            Some(serde_json::json!({ "stage": "released", "implied": ["merged"] }))
+        );
+    }
+);
+
+store_matrix_raw!(
+    pre_completion_stage_recorded,
+    |store: Arc<dyn Store>, raw: common::RawDb| async move {
+        use DeliveryStage::*;
+        let fx = Fx::new(store).await;
+        fx.stages(&[InPr, Merged]).await;
+        let task = fx.claimed("ship", None).await;
+        fx.link(task.id, 12).await;
+        raw.execute(&format!(
+            "UPDATE tasks SET status = 'review' WHERE id = '{}'",
+            task.id
+        ))
+        .await;
+
+        // Merged is the last stage, but a task in review only records it.
+        let moved = fx.advance(task.id, Merged, T2).await.expect("moves");
+        assert!(!moved.delivered);
+        assert_eq!(moved.task.status, TaskStatus::Review);
+        assert_eq!(moved.task.delivery_stage, Some(Merged));
+        assert_eq!(moved.task.done_at, None);
+        let stages: Vec<DeliveryStage> = fx
+            .store
+            .task_stages(task.id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.stage)
+            .collect();
+        assert_eq!(stages, [InPr, Merged]);
+
+        // Completing it later goes straight to done.
+        let (done, target) = fx.complete(task.id, T3).await;
+        assert_eq!(target, CompletionTarget::Done);
+        assert_eq!(done.status, TaskStatus::Done);
+        assert_eq!(done.done_at, Some(T3));
+        assert_eq!(done.delivery_stage, Some(Merged));
+    }
+);
+
+store_matrix!(last_stage_delivers, |store: Arc<dyn Store>| async move {
+    use DeliveryStage::*;
+    let fx = Fx::new(store).await;
+    fx.stages(&[InPr, Merged]).await;
+    let task = fx.delivering("ship", None, 12).await;
+    assert_eq!(task.delivery_stage, Some(InPr));
+
+    let moved = fx.advance(task.id, Merged, T2).await.expect("moves");
+    assert!(moved.delivered);
+    assert_eq!(moved.task.status, TaskStatus::Done);
+    assert_eq!(moved.task.done_at, Some(T2));
+    assert_eq!(moved.task.delivery_stage, Some(Merged));
+    assert_eq!(moved.task, fx.get(task.id).await);
+    let kinds = fx.kinds(task.id).await;
+    assert_eq!(
+        kinds[kinds.len() - 2..],
+        [TaskEventKind::StageReached, TaskEventKind::Delivered]
+    );
+    let ev = last_of(
+        &fx.store.task_events(task.id).await.unwrap(),
+        TaskEventKind::Delivered,
+    );
+    assert_eq!(ev.at, T2);
+    assert_eq!(ev.payload, Some(serde_json::json!({ "stage": "merged" })));
+
+    // A done task never moves again.
+    assert!(fx.advance(task.id, Released, T3).await.is_none());
+});
+
+store_matrix!(
+    done_at_only_at_final_stage,
+    |store: Arc<dyn Store>| async move {
+        use DeliveryStage::*;
+        let fx = Fx::new(store).await;
+        fx.stages(&[InPr, Merged, Released]).await;
+        let task = fx.delivering("ship", None, 12).await;
+        assert_eq!(task.status, TaskStatus::Delivering);
+        assert_eq!(task.done_at, None);
+
+        let moved = fx.advance(task.id, Merged, T2).await.expect("moves");
+        assert!(!moved.delivered);
+        assert_eq!(moved.task.status, TaskStatus::Delivering);
+        assert_eq!(moved.task.done_at, None);
+
+        // A later signal skipping past the last stage finishes it too.
+        let moved = fx.advance(task.id, Deployed, T3).await.expect("moves");
+        assert!(moved.delivered);
+        assert_eq!(moved.task.status, TaskStatus::Done);
+        assert_eq!(moved.task.done_at, Some(T3));
+    }
+);
+
+store_matrix!(
+    advance_parent_keeps_minimum,
+    |store: Arc<dyn Store>| async move {
+        use DeliveryStage::*;
+        let fx = Fx::new(store).await;
+        fx.stages(&[InPr, Merged, Released]).await;
+        let parent = fx.claimed("parent", None).await;
+        fx.link(parent.id, 70).await;
+        let child = fx.delivering("child", Some(parent.id), 71).await;
+        let (p, target) = fx.complete(parent.id, T1).await;
+        assert_eq!(target, CompletionTarget::Delivering(InPr));
+        assert_eq!(p.delivery_stage, Some(InPr));
+
+        // The parent's own PR reaches Released: its shown stage stays the child's In PR.
+        let moved = fx.advance(parent.id, Released, T2).await.expect("moves");
+        assert!(!moved.delivered);
+        assert_eq!(moved.task.status, TaskStatus::Delivering);
+        assert_eq!(moved.task.delivery_stage, Some(InPr));
+        // Its own stage is Released, so Released again misses.
+        assert!(fx.advance(parent.id, Released, T2).await.is_none());
+
+        // The child moving pulls the parent forward to the new minimum.
+        fx.advance(child.id, Merged, T2).await.expect("moves");
+        let p = fx.get(parent.id).await;
+        assert_eq!(p.status, TaskStatus::Delivering);
+        assert_eq!(p.delivery_stage, Some(Merged));
+
+        // The child finishing finishes the parent (its own PR is past the last stage).
+        let moved = fx.advance(child.id, Released, T3).await.expect("moves");
+        assert!(moved.delivered);
+        let p = fx.get(parent.id).await;
+        assert_eq!(p.status, TaskStatus::Done);
+        assert_eq!(p.done_at, Some(T3));
+    }
+);
+
+store_matrix!(mark_delivered_guarded, |store: Arc<dyn Store>| async move {
+    use DeliveryStage::*;
+    let fx = Fx::new(store).await;
+    fx.stages(&[InPr, Merged, Released]).await;
+    let claimed = fx.claimed("not yet", None).await;
+    assert!(
+        fx.store
+            .mark_delivered(claimed.id, Actor::Human, None, T2)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fx.get(claimed.id).await, claimed);
+
+    let parent = fx.claimed("parent", None).await;
+    let task = fx.delivering("ship", Some(parent.id), 12).await;
+    let done = fx
+        .store
+        .mark_delivered(task.id, Actor::Human, None, T2)
+        .await
+        .unwrap()
+        .expect("delivering task");
+    assert_eq!(done.status, TaskStatus::Done);
+    assert_eq!(done.done_at, Some(T2));
+    assert_eq!(done.updated_at, T2);
+    assert_eq!(done.version, task.version + 1);
+    assert_eq!(done.delivery_stage, Some(InPr));
+    assert_eq!(done, fx.get(task.id).await);
+    let ev = last_of(
+        &fx.store.task_events(task.id).await.unwrap(),
+        TaskEventKind::Delivered,
+    );
+    assert_eq!(ev.note.as_deref(), Some("marked done by the human"));
+    assert_eq!(ev.actor, Actor::Human);
+
+    // The parent rule ran: the last open child closed.
+    let kinds = fx.kinds(parent.id).await;
+    assert!(kinds.contains(&TaskEventKind::ChildDone), "{kinds:?}");
+    assert!(
+        kinds.contains(&TaskEventKind::ChildrenComplete),
+        "{kinds:?}"
+    );
+    assert_eq!(fx.get(parent.id).await.status, TaskStatus::Review);
+
+    // Done already: nothing more.
+    assert!(
+        fx.store
+            .mark_delivered(task.id, Actor::Human, None, T3)
+            .await
+            .unwrap()
+            .is_none()
+    );
+});
+
+store_matrix!(signal_dedupe, |store: Arc<dyn Store>| async move {
+    let project = store.upsert_project(PROJECT, "axle", T0).await.unwrap();
+    let other = store
+        .upsert_project("github.com/reyemtech/other", "other", T0)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .insert_signal(&signal(project.id, Some("d-1")))
+            .await
+            .unwrap(),
+        SignalInsert::Inserted
+    );
+    assert_eq!(
+        store
+            .insert_signal(&signal(project.id, Some("d-1")))
+            .await
+            .unwrap(),
+        SignalInsert::Duplicate
+    );
+    // Another project's delivery ids are its own.
+    assert_eq!(
+        store
+            .insert_signal(&signal(other.id, Some("d-1")))
+            .await
+            .unwrap(),
+        SignalInsert::Inserted
+    );
+    // Signals without a delivery id never collide.
+    for _ in 0..2 {
+        assert_eq!(
+            store
+                .insert_signal(&signal(project.id, None))
+                .await
+                .unwrap(),
+            SignalInsert::Inserted
+        );
     }
 });

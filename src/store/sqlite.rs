@@ -14,19 +14,20 @@ use super::{
     AddProjectsRequest, ClaimAttempt, ClaimRequest, CompleteRequest, Completed, DeliveringRow,
     EditRequest, InboxFilter, LeaseUpdate, LinkOutcome, LinkPrRequest, MessageReceipt, MoveRequest,
     Moved, NewEnrollment, NewTaskPr, NewToken, ParentMove, ParentState, ParentStep, PollOutcome,
-    ProjectsAdded, Recipient, RelateRequest, Related, Store, StoreError, StoreResult, TaskFilter,
-    TaskOrder, TransitionRequest, Transitioned, UnblockRule, Unblocked, block_previous_payload,
-    child_event, children_complete_event, claim_event, closes_child, completion_event,
-    edit_payload, enrollment_token_label, finished_by, like_pattern, link_refusal, options_from,
-    options_to, parent_move_event, pr_linked_event, pr_unlinked_event, projects_added_note,
-    projects_added_payload, push_moved, recompute_parent, related_payload, same_pr,
-    send_time_recipient, stages_delivered_event, stages_from_json, stages_to_json,
-    unblocked_records,
+    ProjectsAdded, Recipient, RelateRequest, Related, SignalInsert, StageMove, StageMoved, Store,
+    StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, UnblockRule,
+    Unblocked, block_previous_payload, child_event, children_complete_event, claim_event,
+    closes_child, completion_event, edit_payload, enrollment_token_label, finished_by,
+    like_pattern, link_refusal, marked_done_event, move_delivers, options_from, options_to,
+    parent_move_event, pr_linked_event, pr_unlinked_event, projects_added_note,
+    projects_added_payload, push_moved, recompute_parent, related_payload, send_time_recipient,
+    stage_delivered_event, stage_reached_event, stages_delivered_event, stages_from_json,
+    stages_to_json, unblocked_records,
 };
 use crate::delivery::stages::{ChildState, CompletionTarget, STAGE_RANK_SQL, completion_target};
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, DeliveryStage, Eligibility, Enrollment,
-    EnrollmentId, EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project,
+    Actor, Address, Agent, AgentId, BlockDetail, DeliverySignal, DeliveryStage, Eligibility,
+    Enrollment, EnrollmentId, EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project,
     ProjectDelivery, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId,
     TaskLink, TaskPr, TaskStageRow, TaskStatus, TokenId, TokenInfo, WaitingOn,
 };
@@ -706,6 +707,124 @@ async fn link_locked(conn: &mut SqliteConnection, req: &LinkPrRequest) -> StoreR
             previous,
         },
     })
+}
+
+/// `advance_stage`'s forward-only move of a task the parent rule does not drive: writes the
+/// stage and, when `deliver` (a delivering leaf at the last stage), finishes the task.
+/// Binds: at, id, stage, stage rank, deliver.
+static ADVANCE_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "UPDATE tasks
+            SET delivery_stage = ?3,
+                status = CASE WHEN ?5 AND status = 'delivering' THEN 'done' ELSE status END,
+                done_at = CASE WHEN ?5 AND status = 'delivering' THEN ?1 ELSE done_at END,
+                version = version + 1, updated_at = ?1
+          WHERE id = ?2 AND status NOT IN ('done', 'cancelled') AND {STAGE_RANK_SQL} < ?4
+          RETURNING {}",
+        task_cols!()
+    )
+});
+
+/// Records a stage of `m` on its task, once: `m.to` with the signal and detail, or an implied
+/// stage (signal only).
+async fn insert_moved_stage(
+    conn: &mut SqliteConnection,
+    m: &StageMove,
+    stage: DeliveryStage,
+) -> StoreResult<()> {
+    let implied = stage != m.to;
+    sqlx::query(
+        "INSERT INTO task_stages (task_id, stage, reached_at, implied, signal_id, detail)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (task_id, stage) DO NOTHING",
+    )
+    .bind(m.task.to_string())
+    .bind(stage.as_str())
+    .bind(ts::enc(m.now))
+    .bind(implied)
+    .bind(m.signal_id.map(|s| s.to_string()))
+    .bind(if implied {
+        None
+    } else {
+        m.detail.as_ref().map(|d| d.to_string())
+    })
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// `advance_stage` inside its write transaction; the caller commits only `Some`.
+async fn advance_locked(
+    conn: &mut SqliteConnection,
+    m: &StageMove,
+) -> StoreResult<Option<StageMoved>> {
+    let Some(task) = task_locked(conn, m.task).await? else {
+        return Ok(None);
+    };
+    // Forward only, against the task's own stage (see `ParentState`).
+    if matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled)
+        || own_stage(conn, task.id).await? >= Some(m.to)
+    {
+        return Ok(None);
+    }
+    let has_children = !child_states(conn, task.id).await?.is_empty();
+    // A delivering parent shows its derived minimum; the parent rule moves it below.
+    let parent_rule = task.status == TaskStatus::Delivering && has_children;
+    let updated = if parent_rule {
+        sqlx::query(concat!(
+            "UPDATE tasks SET version = version + 1, updated_at = ?1
+              WHERE id = ?2 AND status = 'delivering'
+              RETURNING ",
+            task_cols!()
+        ))
+        .bind(ts::enc(m.now))
+        .bind(task.id.to_string())
+        .fetch_optional(&mut *conn)
+        .await?
+    } else {
+        let stages = project_stages(conn, task.project_id).await?;
+        sqlx::query(ADVANCE_SQL.as_str())
+            .bind(ts::enc(m.now))
+            .bind(task.id.to_string())
+            .bind(m.to.as_str())
+            .bind(i64::from(m.to.rank()))
+            .bind(move_delivers(&stages, task.status, has_children, m.to))
+            .fetch_optional(&mut *conn)
+            .await?
+    };
+    let Some(mut updated) = updated.as_ref().map(task_from).transpose()? else {
+        return Ok(None);
+    };
+    for &stage in &m.implied {
+        insert_moved_stage(conn, m, stage).await?;
+    }
+    insert_moved_stage(conn, m, m.to).await?;
+    let reached = stage_reached_event(m);
+    let delivered = updated.status == TaskStatus::Done;
+    if delivered {
+        insert_event(conn, &reached, m.token).await?;
+        record_event(conn, &updated, &stage_delivered_event(m), m.token).await?;
+    } else {
+        record_event(conn, &updated, &reached, m.token).await?;
+    }
+    if parent_rule {
+        let moved = follow_children(
+            conn,
+            task.id,
+            task.project_id,
+            updated.delivery_stage,
+            &reached,
+        )
+        .await?;
+        if let Some((p, ev)) = moved {
+            record_event(conn, &p, &ev, m.token).await?;
+            updated = p;
+        }
+    }
+    Ok(Some(StageMoved {
+        delivered: updated.status == TaskStatus::Done,
+        task: updated,
+    }))
 }
 
 fn stage_row_from(row: &SqliteRow) -> StoreResult<TaskStageRow> {
@@ -2072,6 +2191,77 @@ impl Store for SqliteStore {
             transitioned,
             target,
         }))
+    }
+
+    async fn advance_stage(&self, m: &StageMove) -> StoreResult<Option<StageMoved>> {
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let moved = advance_locked(&mut tx, m).await?;
+        if moved.is_some() {
+            tx.commit().await?;
+        } else {
+            tx.rollback().await?;
+        }
+        Ok(moved)
+    }
+
+    async fn mark_delivered(
+        &self,
+        task: TaskId,
+        actor: Actor,
+        token: Option<TokenId>,
+        now: OffsetDateTime,
+    ) -> StoreResult<Option<Task>> {
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let done = sqlx::query(concat!(
+            "UPDATE tasks
+                SET status = 'done', done_at = ?1, version = version + 1, updated_at = ?1
+              WHERE id = ?2 AND status = 'delivering'
+              RETURNING ",
+            task_cols!()
+        ))
+        .bind(ts::enc(now))
+        .bind(task.to_string())
+        .fetch_optional(&mut *tx)
+        .await?
+        .as_ref()
+        .map(task_from)
+        .transpose()?;
+        let Some(done) = done else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        record_event(&mut tx, &done, &marked_done_event(task, actor, now), token).await?;
+        tx.commit().await?;
+        Ok(Some(done))
+    }
+
+    async fn insert_signal(&self, s: &DeliverySignal) -> StoreResult<SignalInsert> {
+        let done = sqlx::query(
+            "INSERT INTO delivery_signals
+                 (id, project_id, kind, source, version, sha, environment, url, delivery_id,
+                  outcome, matched, received_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (project_id, delivery_id) WHERE delivery_id IS NOT NULL DO NOTHING",
+        )
+        .bind(s.id.to_string())
+        .bind(s.project_id.to_string())
+        .bind(s.kind.as_str())
+        .bind(s.source.as_str())
+        .bind(&s.version)
+        .bind(&s.sha)
+        .bind(&s.environment)
+        .bind(&s.url)
+        .bind(&s.delivery_id)
+        .bind(s.outcome.as_str())
+        .bind(i64::from(s.matched))
+        .bind(ts::enc(s.received_at))
+        .execute(&self.pool)
+        .await?;
+        Ok(if done.rows_affected() == 1 {
+            SignalInsert::Inserted
+        } else {
+            SignalInsert::Duplicate
+        })
     }
 
     async fn upsert_agent(
