@@ -1,5 +1,5 @@
 -- Wake idle agents (docs/superpowers/specs/2026-11-28-wake-up-design.md), Postgres flavour.
--- Kept in step with migrations/sqlite/0005_wake_up.sql.
+-- Kept in step with migrations/sqlite/0006_wake_up.sql.
 
 ALTER TABLE tasks DROP CONSTRAINT tasks_status_check;
 ALTER TABLE tasks ADD CONSTRAINT tasks_status_check

@@ -533,7 +533,7 @@ store_matrix!(
     }
 );
 
-/// Copies migrations 0001..=0004 of `backend` into a fresh directory.
+/// Copies every migration of `backend` before 0006 (wake-up) into a fresh directory.
 fn old_migrations(backend: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("axle-mig-{}", uuid::Uuid::now_v7()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -543,10 +543,7 @@ fn old_migrations(backend: &str) -> std::path::PathBuf {
     for entry in std::fs::read_dir(src).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name().into_string().unwrap();
-        if ["0001_", "0002_", "0003_", "0004_"]
-            .iter()
-            .any(|p| name.starts_with(p))
-        {
+        if name.ends_with(".sql") && name.as_str() < "0006_" {
             std::fs::copy(entry.path(), dir.join(&name)).unwrap();
         }
     }

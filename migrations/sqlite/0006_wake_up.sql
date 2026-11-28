@@ -1,6 +1,6 @@
 -- no-transaction
 -- Wake idle agents (docs/superpowers/specs/2026-11-28-wake-up-design.md), SQLite flavour.
--- Kept in step with migrations/postgres/0005_wake_up.sql.
+-- Kept in step with migrations/postgres/0006_wake_up.sql.
 --
 -- SQLite cannot change a CHECK constraint in place, so `tasks` is rebuilt (the same
 -- create-copy-drop-rename procedure as 0002) to admit the `requested` status and gain the
