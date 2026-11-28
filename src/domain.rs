@@ -427,6 +427,10 @@ pub enum TaskEventKind {
     BlockUpdated,
     /// The task this one waited on is done, so it left `blocked` on its own.
     Unblocked,
+    /// Links to other tasks were added or removed (listed in the payload).
+    Related,
+    /// A top-level task was moved under a parent (in the payload; the note names it).
+    MovedUnder,
     /// The human acknowledged a done task. Only ever published as a live event; it is
     /// never written to a task's history.
     Acked,
@@ -455,6 +459,8 @@ text_enum!(TaskEventKind {
     ProjectsAdded => "projects_added",
     BlockUpdated => "block_updated",
     Unblocked => "unblocked",
+    Related => "related",
+    MovedUnder => "moved_under",
     Acked => "acked",
 });
 
@@ -491,6 +497,47 @@ pub fn ack_state(task: &Task, now: OffsetDateTime, auto_ack: time::Duration) -> 
         Some(done_at) if done_at < now - auto_ack => Some(AckState::AutoAcked),
         _ => Some(AckState::Unseen),
     }
+}
+
+/// What a link says about the task it is written from (`TaskLink::task_id`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LinkKind {
+    /// The two tasks are related; reads the same from both sides.
+    Relates,
+    /// The task follows up on the target.
+    FollowUp,
+    /// The task duplicates the target (and was cancelled for it).
+    Duplicate,
+}
+
+text_enum!(LinkKind {
+    Relates => "relates",
+    FollowUp => "follow-up",
+    Duplicate => "duplicate",
+});
+
+impl LinkKind {
+    /// The link in words, as seen from one of its tasks: `outgoing` from the task it is
+    /// written from, else from its target. Followed by the other task's title.
+    pub fn label(&self, outgoing: bool) -> &'static str {
+        match (self, outgoing) {
+            (LinkKind::Relates, _) => "related to",
+            (LinkKind::FollowUp, true) => "follow-up of",
+            (LinkKind::FollowUp, false) => "follow-up",
+            (LinkKind::Duplicate, true) => "duplicate of",
+            (LinkKind::Duplicate, false) => "duplicated by",
+        }
+    }
+}
+
+/// A link between two tasks, written from `task_id` to `target_id`; both tasks show it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskLink {
+    pub task_id: TaskId,
+    pub target_id: TaskId,
+    pub kind: LinkKind,
+    pub created_at: OffsetDateTime,
 }
 
 /// One append-only entry in a task's history.

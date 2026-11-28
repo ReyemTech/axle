@@ -11,16 +11,21 @@ use uuid::Uuid;
 use crate::clock::Clock;
 use crate::config::ServerConfig;
 use crate::domain::{
-    Actor, Address, AgentId, Eligibility, Importance, Message, MessageId, MessageKind, PlanState,
-    ProjectId, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId, WaitingOn,
+    Actor, Address, AgentId, Eligibility, Importance, LinkKind, Message, MessageId, MessageKind,
+    PlanState, ProjectId, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus,
+    TokenId, WaitingOn,
 };
 use crate::events::{Event, EventBus};
 use crate::service::identity::{IdentityError, NAME_MAX, Resolved, check_label};
 use crate::service::messages::{MessageError, SUBJECT_MAX, check_body, check_subject};
 use crate::store::{
-    AddProjectsRequest, BlockWrite, ClaimRequest, Claimant, EditRequest, LeaseUpdate, Store,
-    StoreError, TaskFilter, TransitionRequest, Transitioned, UnblockRule, claim_event,
+    AddProjectsRequest, BlockWrite, ClaimRequest, Claimant, EditRequest, LeaseUpdate, MoveRequest,
+    Moved, RelateRequest, Related, Store, StoreError, TaskFilter, TransitionRequest, Transitioned,
+    UnblockRule, claim_event,
 };
+
+/// The most links one task may have (both directions count).
+pub const MAX_LINKS: u32 = 20;
 
 /// Most characters in a block's "what unblocks it" and in an external `waiting_on`.
 pub const UNBLOCK_MAX: usize = 500;
@@ -155,6 +160,22 @@ impl Progress {
     }
 }
 
+/// A link as seen from one of its tasks, with the task at the other end.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelatedTask {
+    pub link: TaskLink,
+    /// The link is written from the task it is seen from (else it points at it).
+    pub outgoing: bool,
+    pub other: Task,
+}
+
+impl RelatedTask {
+    /// The link in words, followed by the other task's title (e.g. "duplicate of").
+    pub fn label(&self) -> &'static str {
+        self.link.kind.label(self.outgoing)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskDetail {
     pub task: Task,
@@ -226,6 +247,32 @@ pub enum TaskError {
     NoteRequired,
     #[error("unknown project")]
     UnknownProject,
+    #[error("a task cannot be linked to itself")]
+    SelfLink,
+    #[error("linked task {0} not found")]
+    UnknownLinkTarget(TaskId),
+    #[error("task {0} already has the most links allowed ({MAX_LINKS})")]
+    TooManyLinks(TaskId),
+    #[error("a done task cannot be marked a duplicate")]
+    DuplicateOfDone,
+    #[error("a task can be a duplicate of one task only")]
+    DuplicateTwice,
+    #[error("a task cannot be its own parent")]
+    OwnParent,
+    #[error("parent task not found")]
+    UnknownParent,
+    #[error("the task already has a parent; moving a subtask to another parent is not supported")]
+    AlreadyAChild,
+    #[error("the parent task is {0}")]
+    ParentClosed(TaskStatus),
+    #[error("the parent is a subtask of this task, which would make a cycle")]
+    ParentIsDescendant,
+    /// Moving would make a blocked task wait on its own ancestor.
+    #[error(
+        "task \"{title}\" ({task}) is blocked waiting on the new parent or one of its \
+         ancestors; a task cannot wait on its own ancestor, so re-point or clear that wait first"
+    )]
+    MoveMakesAncestorWait { task: TaskId, title: String },
     /// The task body is over the message cap, or a promoted message does not exist.
     #[error(transparent)]
     Message(#[from] MessageError),
@@ -274,6 +321,80 @@ pub fn plan_words(state: PlanState) -> &'static str {
         PlanState::Approved => "approved",
     }
 }
+
+/// The caller's other writes in the same request, for `TaskService::check_move`.
+#[derive(Debug, Clone, Default)]
+pub struct MoveContext {
+    /// The request also adds participating projects (a task with them cannot be a child).
+    pub adds_projects: bool,
+    /// The request also blocks the task waiting on this task.
+    pub pending_wait: Option<TaskId>,
+}
+
+/// A target named twice keeps its last kind; removals are deduplicated. Returns the additions,
+/// the removals and the duplicate targets, refusing self-links, more than `MAX_LINKS`
+/// additions and more than one duplicate target.
+#[allow(clippy::type_complexity)]
+fn normalize_links(
+    id: TaskId,
+    add: &[(TaskId, LinkKind)],
+    remove: &[TaskId],
+) -> Result<(Vec<(TaskId, LinkKind)>, Vec<TaskId>, Vec<TaskId>), TaskError> {
+    let mut adds: Vec<(TaskId, LinkKind)> = Vec::with_capacity(add.len());
+    for (target, kind) in add {
+        if *target == id {
+            return Err(TaskError::SelfLink);
+        }
+        adds.retain(|(t, _)| t != target);
+        adds.push((*target, *kind));
+    }
+    if adds.len() > MAX_LINKS as usize {
+        return Err(TaskError::TooManyLinks(id));
+    }
+    let duplicates: Vec<TaskId> = adds
+        .iter()
+        .filter(|(_, k)| *k == LinkKind::Duplicate)
+        .map(|(t, _)| *t)
+        .collect();
+    if duplicates.len() > 1 {
+        return Err(TaskError::DuplicateTwice);
+    }
+    let mut removes: Vec<TaskId> = Vec::with_capacity(remove.len());
+    for r in remove {
+        if !removes.contains(r) {
+            removes.push(*r);
+        }
+    }
+    Ok((adds, removes, duplicates))
+}
+
+/// The edit rule, read without a lock: the human, the creating agent, or the session holding
+/// the task (`planning`, `claimed`, `blocked` or `review`).
+fn may_change(by: Caller<'_>, task: &Task) -> bool {
+    match by {
+        Caller::Human => true,
+        Caller::Agent(r) => {
+            matches!(task.created_by, Actor::Agent(a, _) if a == r.agent.id)
+                || (task.owner_session_id == Some(r.session.id)
+                    && matches!(
+                        task.status,
+                        TaskStatus::Planning
+                            | TaskStatus::Claimed
+                            | TaskStatus::Blocked
+                            | TaskStatus::Review
+                    ))
+        }
+    }
+}
+
+/// The statuses a task can be cancelled from.
+const CANCELLABLE: [TaskStatus; 5] = [
+    TaskStatus::Open,
+    TaskStatus::Planning,
+    TaskStatus::Claimed,
+    TaskStatus::Blocked,
+    TaskStatus::Review,
+];
 
 /// Every plan state but `Submitted`: the states in which a planning lease runs.
 const LEASED_PLAN_STATES: [PlanState; 4] = [
@@ -996,6 +1117,340 @@ impl TaskService {
         )
     }
 
+    /// Adds links from task `id` to others and removes links between it and `remove` (either
+    /// way). Allowed for the human, the creating agent and the session holding the task. A
+    /// `duplicate` link marks this task as a duplicate of its target: it is refused on a done
+    /// task, and a task not yet closed is cancelled with a system note naming the target.
+    /// Re-adding a link that is already there changes nothing; a new kind replaces the pair's
+    /// old link. Every task keeps at most `MAX_LINKS` links.
+    pub async fn relate(
+        &self,
+        by: Caller<'_>,
+        id: TaskId,
+        add: &[(TaskId, LinkKind)],
+        remove: &[TaskId],
+    ) -> Result<Task, TaskError> {
+        let (adds, removes, duplicates) = normalize_links(id, add, remove)?;
+        let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+        if !duplicates.is_empty() && task.status == TaskStatus::Done {
+            return Err(TaskError::DuplicateOfDone);
+        }
+        // A duplicate is cancelled in the same transaction as its link (the store re-checks
+        // that it is not done under the lock).
+        let cancel = match duplicates.first() {
+            Some(target) => {
+                let title = self
+                    .store
+                    .get_task(*target)
+                    .await?
+                    .map(|t| t.title)
+                    .unwrap_or_default();
+                let note = format!("Duplicate of \"{title}\" ({target}).");
+                let message = Message {
+                    id: MessageId::new(),
+                    project_id: Some(task.project_id),
+                    from: by.actor(),
+                    to: Address::Task(id),
+                    subject: Some("duplicate".into()),
+                    body: note.clone(),
+                    importance: Importance::Normal,
+                    task_id: Some(id),
+                    reply_to: None,
+                    created_at: self.clock.now(),
+                    kind: MessageKind::System,
+                    options: Vec::new(),
+                };
+                Some(self.unowned_request(
+                    id,
+                    by.actor(),
+                    by.token(),
+                    &CANCELLABLE,
+                    TaskStatus::Cancelled,
+                    false,
+                    TaskEventKind::Cancelled,
+                    Some((note, message)),
+                ))
+            }
+            None => None,
+        };
+        let req = RelateRequest {
+            task: id,
+            add: &adds,
+            remove: &removes,
+            editor: match by {
+                Caller::Agent(r) => Some((r.agent.id, r.session.id)),
+                Caller::Human => None,
+            },
+            token: by.token(),
+            max_links: MAX_LINKS,
+            event: self.event(id, by.actor(), TaskEventKind::Related, None, None),
+            cancel,
+        };
+        let (task, added, removed, cancelled) = match self.store.relate_tasks(&req).await? {
+            Related::Applied {
+                task,
+                added,
+                removed,
+                cancelled,
+            } => (task, added, removed, cancelled),
+            Related::DuplicateOfDone => return Err(TaskError::DuplicateOfDone),
+            Related::Denied => {
+                self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+                return Err(TaskError::NotOwner);
+            }
+            Related::UnknownTarget(t) => return Err(TaskError::UnknownLinkTarget(t)),
+            Related::TooMany(t) => return Err(TaskError::TooManyLinks(t)),
+        };
+        if !added.is_empty() || !removed.is_empty() {
+            self.changed(&task, TaskEventKind::Related).await;
+            for other in added
+                .iter()
+                .map(|l| l.target_id)
+                .chain(removed.iter().copied())
+            {
+                match self.store.get_task(other).await {
+                    Ok(Some(t)) => self.changed(&t, TaskEventKind::Related).await,
+                    Ok(None) => {}
+                    Err(e) => eprintln!("axl: failed to read linked task {other}: {e}"),
+                }
+            }
+        }
+        if let (Some(done), Some(cancel)) = (&cancelled, &req.cancel) {
+            self.after_transition(done, &cancel.event, cancel.token)
+                .await;
+            if let Some(m) = &cancel.message {
+                self.message_created(m).await;
+            }
+        }
+        Ok(task)
+    }
+
+    /// Moves the top-level task `id` under `parent`. Allowed for the human, the creating agent
+    /// and the session holding the task. Refused for the task itself, a task that already has
+    /// a parent (moving a child to another parent is not supported) or extra projects, a parent
+    /// that is planning, done or cancelled or is the task's own subtask, and a parent outside
+    /// the task's project (it must be the parent's project or one the parent spans, as for
+    /// `create`). The parent's progress counts it at once, and the usual rules (the coordinator
+    /// is told when it is blocked or closes, the parent consolidates when its last open child
+    /// closes) apply from then on.
+    pub async fn move_under(
+        &self,
+        by: Caller<'_>,
+        id: TaskId,
+        parent: TaskId,
+    ) -> Result<Task, TaskError> {
+        if id == parent {
+            return Err(TaskError::OwnParent);
+        }
+        let p = self
+            .store
+            .get_task(parent)
+            .await?
+            .ok_or(TaskError::UnknownParent)?;
+        let req = MoveRequest {
+            task: id,
+            parent,
+            editor: match by {
+                Caller::Agent(r) => Some((r.agent.id, r.session.id)),
+                Caller::Human => None,
+            },
+            token: by.token(),
+            event: self.event(
+                id,
+                by.actor(),
+                TaskEventKind::MovedUnder,
+                Some(format!("moved under \"{}\"", p.title)),
+                Some(serde_json::json!({ "parent": parent.to_string() })),
+            ),
+        };
+        match self.store.move_task(&req).await? {
+            Moved::Moved(task) => {
+                self.changed(&task, TaskEventKind::MovedUnder).await;
+                self.changed(&p, TaskEventKind::MovedUnder).await;
+                return Ok(task);
+            }
+            Moved::WaitOnAncestor(w) => {
+                let title = self
+                    .store
+                    .get_task(w)
+                    .await?
+                    .map(|t| t.title)
+                    .unwrap_or_default();
+                return Err(TaskError::MoveMakesAncestorWait { task: w, title });
+            }
+            Moved::Refused => {}
+        }
+        // Explain the refusal from a fresh read.
+        self.check_move(by, id, parent, &MoveContext::default())
+            .await?;
+        Err(TaskError::NotOwner)
+    }
+
+    /// Checks everything about a move that needs no lock, refusing it the way `move_under`
+    /// would, so a caller combining it with other writes can refuse before writing anything.
+    /// `ctx` describes the caller's other writes in the same request. The store re-checks all
+    /// of it under its lock.
+    pub async fn check_move(
+        &self,
+        by: Caller<'_>,
+        id: TaskId,
+        parent: TaskId,
+        ctx: &MoveContext,
+    ) -> Result<(), TaskError> {
+        if id == parent {
+            return Err(TaskError::OwnParent);
+        }
+        let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+        let p = self
+            .store
+            .get_task(parent)
+            .await?
+            .ok_or(TaskError::UnknownParent)?;
+        if !may_change(by, &task) {
+            return Err(TaskError::NotOwner);
+        }
+        if task.parent_id.is_some() {
+            return Err(TaskError::AlreadyAChild);
+        }
+        if ctx.adds_projects || !self.store.task_projects(id).await?.is_empty() {
+            return Err(TaskError::ChildExtraProjects);
+        }
+        match p.status {
+            TaskStatus::Planning => return Err(TaskError::PlanNotApproved(p.plan_state)),
+            s @ (TaskStatus::Done | TaskStatus::Cancelled) => {
+                return Err(TaskError::ParentClosed(s));
+            }
+            _ => {}
+        }
+        // The parent and its ancestors, bounded so a corrupt hierarchy cannot hang this.
+        let mut above = vec![parent];
+        let mut up = p.parent_id;
+        for _ in 0..MAX_CHAIN {
+            let Some(a) = up else { break };
+            if a == id {
+                return Err(TaskError::ParentIsDescendant);
+            }
+            above.push(a);
+            up = self.store.get_task(a).await?.and_then(|t| t.parent_id);
+        }
+        if p.project_id != task.project_id
+            && !self
+                .store
+                .task_projects(parent)
+                .await?
+                .contains(&task.project_id)
+        {
+            return Err(TaskError::ChildProjectMismatch);
+        }
+        // No task of the moved subtree may wait on one of its new ancestors, counting a wait
+        // the same request is about to set on the task itself.
+        if let Some(target) = ctx.pending_wait
+            && above.contains(&target)
+        {
+            return Err(TaskError::MoveMakesAncestorWait {
+                task: id,
+                title: task.title.clone(),
+            });
+        }
+        let mut subtree = vec![task];
+        let mut i = 0;
+        while i < subtree.len() && subtree.len() <= MAX_CHAIN {
+            let t = &subtree[i];
+            if let Some(WaitingOn::Task(target)) =
+                t.block.as_ref().and_then(|b| b.waiting_on.as_ref())
+                && t.status == TaskStatus::Blocked
+                && above.contains(target)
+            {
+                return Err(TaskError::MoveMakesAncestorWait {
+                    task: t.id,
+                    title: t.title.clone(),
+                });
+            }
+            let kids = self
+                .store
+                .list_tasks(&TaskFilter {
+                    parent: Some(t.id),
+                    ..TaskFilter::default()
+                })
+                .await?;
+            subtree.extend(kids);
+            i += 1;
+        }
+        Ok(())
+    }
+
+    /// Checks everything about a link change that needs no lock, refusing it the way `relate`
+    /// would (bad input, permission, a done duplicate, a missing target, the link limit), so a
+    /// caller combining it with other writes can refuse before writing anything. The store
+    /// re-checks all of it under its lock.
+    pub async fn check_relate(
+        &self,
+        by: Caller<'_>,
+        id: TaskId,
+        add: &[(TaskId, LinkKind)],
+        remove: &[TaskId],
+    ) -> Result<(), TaskError> {
+        let (adds, removes, duplicates) = normalize_links(id, add, remove)?;
+        let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+        if !may_change(by, &task) {
+            return Err(TaskError::NotOwner);
+        }
+        if !duplicates.is_empty() && task.status == TaskStatus::Done {
+            return Err(TaskError::DuplicateOfDone);
+        }
+        let links = self.store.task_links(id).await?;
+        let other = |l: &TaskLink| {
+            if l.task_id == id {
+                l.target_id
+            } else {
+                l.task_id
+            }
+        };
+        let mut mine: Vec<TaskId> = links
+            .iter()
+            .map(other)
+            .filter(|t| !removes.contains(t))
+            .collect();
+        for (target, _) in &adds {
+            if self.store.get_task(*target).await?.is_none() {
+                return Err(TaskError::UnknownLinkTarget(*target));
+            }
+            if mine.contains(target) {
+                continue;
+            }
+            mine.push(*target);
+            let theirs = self.store.task_links(*target).await?.len();
+            if theirs >= MAX_LINKS as usize {
+                return Err(TaskError::TooManyLinks(*target));
+            }
+        }
+        if mine.len() > MAX_LINKS as usize {
+            return Err(TaskError::TooManyLinks(id));
+        }
+        Ok(())
+    }
+
+    /// Every link of task `id`, oldest first, with the task at the other end.
+    pub async fn related(&self, id: TaskId) -> Result<Vec<RelatedTask>, TaskError> {
+        let mut out = Vec::new();
+        for link in self.store.task_links(id).await? {
+            let outgoing = link.task_id == id;
+            let other = if outgoing {
+                link.target_id
+            } else {
+                link.task_id
+            };
+            if let Some(other) = self.store.get_task(other).await? {
+                out.push(RelatedTask {
+                    link,
+                    outgoing,
+                    other,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// Cancels a not-yet-closed task. Allowed for the human and for the creating agent.
     pub async fn cancel(&self, by: Caller<'_>, id: TaskId) -> Result<Task, TaskError> {
         let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
@@ -1008,16 +1463,11 @@ impl TaskService {
             id,
             by.actor(),
             by.token(),
-            &[
-                TaskStatus::Open,
-                TaskStatus::Planning,
-                TaskStatus::Claimed,
-                TaskStatus::Blocked,
-                TaskStatus::Review,
-            ],
+            &CANCELLABLE,
             TaskStatus::Cancelled,
             false,
             TaskEventKind::Cancelled,
+            None,
         )
         .await
     }
@@ -1037,6 +1487,7 @@ impl TaskService {
             TaskStatus::Open,
             true,
             TaskEventKind::ForceReleased,
+            None,
         )
         .await
     }
@@ -1484,7 +1935,8 @@ impl TaskService {
         }
     }
 
-    /// A transition with no ownership guard (authorisation is the caller's job).
+    /// A transition with no ownership guard (authorisation is the caller's job). `noted` is
+    /// the event's note and a message written in the same transaction.
     #[allow(clippy::too_many_arguments)]
     async fn unowned_transition(
         &self,
@@ -1495,28 +1947,16 @@ impl TaskService {
         to: TaskStatus,
         clear_owner: bool,
         kind: TaskEventKind,
+        noted: Option<(String, Message)>,
     ) -> Result<Task, TaskError> {
-        let req = TransitionRequest {
-            task: id,
-            from: from.to_vec(),
-            to: Some(to),
-            owner: None,
-            lease: LeaseUpdate::Clear,
-            clear_owner,
-            now: self.clock.now(),
-            token,
-            event: self.event(id, actor, kind, None, None),
-            plan_from: None,
-            plan_to: (to == TaskStatus::Open).then_some(PlanState::None),
-            message: None,
-            latest_plan: None,
-            archive_plans: false,
-            block: None,
-            unblock: None,
-        };
+        let req = self.unowned_request(id, actor, token, from, to, clear_owner, kind, noted);
+        let message = req.message.clone();
         match self.store.transition_task(&req).await? {
             Some(done) => {
                 self.after_transition(&done, &req.event, req.token).await;
+                if let Some(m) = &message {
+                    self.message_created(m).await;
+                }
                 Ok(done.task)
             }
             None => {
@@ -1526,6 +1966,43 @@ impl TaskService {
                     to,
                 })
             }
+        }
+    }
+
+    /// The request behind `unowned_transition`.
+    #[allow(clippy::too_many_arguments)]
+    fn unowned_request(
+        &self,
+        id: TaskId,
+        actor: Actor,
+        token: Option<TokenId>,
+        from: &[TaskStatus],
+        to: TaskStatus,
+        clear_owner: bool,
+        kind: TaskEventKind,
+        noted: Option<(String, Message)>,
+    ) -> TransitionRequest {
+        let (note, message) = match noted {
+            Some((n, m)) => (Some(n), Some(m)),
+            None => (None, None),
+        };
+        TransitionRequest {
+            task: id,
+            from: from.to_vec(),
+            to: Some(to),
+            owner: None,
+            lease: LeaseUpdate::Clear,
+            clear_owner,
+            now: self.clock.now(),
+            token,
+            event: self.event(id, actor, kind, note, None),
+            plan_from: None,
+            plan_to: (to == TaskStatus::Open).then_some(PlanState::None),
+            message,
+            latest_plan: None,
+            archive_plans: false,
+            block: None,
+            unblock: None,
         }
     }
 }

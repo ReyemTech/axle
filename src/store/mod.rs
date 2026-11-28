@@ -14,8 +14,9 @@ use time::{Duration, OffsetDateTime};
 use crate::config::Backend;
 use crate::domain::{
     Actor, Address, Agent, AgentId, BlockDetail, Enrollment, EnrollmentId, EnrollmentKind,
-    Importance, InboxItem, Message, MessageId, MessageKind, PlanState, Project, ProjectId, Session,
-    SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId, TokenInfo, WaitingOn,
+    Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState, Project,
+    ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus,
+    TokenId, TokenInfo, WaitingOn,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -231,6 +232,27 @@ pub trait Store: Send + Sync {
         &self,
         req: &AddProjectsRequest<'_>,
     ) -> StoreResult<Option<ProjectsAdded>>;
+    /// Adds and removes links between `req.task` and other tasks, in one transaction (on
+    /// Postgres under `TASK_LOCK`, so link counts are exact): locks the task and applies only
+    /// if `req.editor` is `None` (the human), its creator or the
+    /// session holding it (`planning`, `claimed`, `blocked` or `review`). Removals run first and
+    /// drop the pair's link whichever way it points; an addition replaces the pair's link
+    /// unless it is the same one. Afterwards no task touched may have more than
+    /// `req.max_links` links, or nothing is written. When anything changed it bumps `version` /
+    /// `updated_at` and appends `req.event` (payload from `related_payload`).
+    async fn relate_tasks(&self, req: &RelateRequest<'_>) -> StoreResult<Related>;
+    /// Moves the top-level task `req.task` under `req.parent`, in one transaction that locks
+    /// both: applies only if the task still has no parent and no extra participating projects,
+    /// `req.editor` is `None` (the human), its creator or the session holding it (`planning`,
+    /// `claimed`, `blocked` or `review`), the parent is not `planning`, `done` or `cancelled`,
+    /// the task's project is the parent's or one the parent spans, and the task is not the
+    /// parent or one of its ancestors. It is also refused (`Moved::WaitOnAncestor`) when the
+    /// task or one of its subtasks is blocked waiting on the new parent or one of the parent's
+    /// ancestors, since a task never waits on its own ancestor. Sets `parent_id`, bumps
+    /// `version` / `updated_at` and appends `req.event`.
+    async fn move_task(&self, req: &MoveRequest) -> StoreResult<Moved>;
+    /// Every link of `task`, whichever way it points, oldest first.
+    async fn task_links(&self, task: TaskId) -> StoreResult<Vec<TaskLink>>;
     async fn get_task(&self, id: TaskId) -> StoreResult<Option<Task>>;
     /// The extra participating projects listed for `id` (not its home project).
     async fn task_projects(&self, id: TaskId) -> StoreResult<Vec<ProjectId>>;
@@ -361,8 +383,9 @@ pub trait Store: Send + Sync {
     /// Delivery receipts for `ids`, in the same order (an unknown id gets an empty receipt).
     async fn message_receipts(&self, ids: &[MessageId]) -> StoreResult<Vec<MessageReceipt>>;
     /// What waits on the human's attention, oldest first, at most `limit`: unarchived
-    /// human-due messages (their own rows, and thread posts not yet materialised) of high or
-    /// urgent importance that are not plans. Read-only: nothing is marked delivered.
+    /// human-due messages (their own rows, and thread posts not yet materialised) that are not
+    /// plans and are of high or urgent importance or carry quick-reply options (a question).
+    /// Read-only: nothing is marked delivered.
     async fn human_attention(&self, limit: u32) -> StoreResult<Vec<Message>>;
     /// The tasks whose thread holds urgent mail waiting on the human (the same messages
     /// `human_attention` would list, urgent only, with no page limit), each once, by id.
@@ -663,6 +686,86 @@ pub struct AddProjectsRequest<'a> {
     pub event: TaskEvent,
     /// Posted to the thread when something was added; its body is filled in.
     pub note: Message,
+}
+
+/// What `move_task` did. Short-lived, so the large variant is not boxed.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum Moved {
+    Moved(Task),
+    /// The guard did not match (callers re-read to explain why).
+    Refused,
+    /// This task (the moved one or a subtask of it) waits on a task that would become its
+    /// ancestor.
+    WaitOnAncestor(TaskId),
+}
+
+/// A request to move a top-level task under a parent (see `Store::move_task`).
+#[derive(Debug, Clone)]
+pub struct MoveRequest {
+    pub task: TaskId,
+    pub parent: TaskId,
+    /// `None`: the human; else the agent (allowed as creator) and its session (as holder).
+    pub editor: Option<(AgentId, SessionId)>,
+    pub token: Option<TokenId>,
+    /// Appended on success (`at` is also the new `updated_at`).
+    pub event: TaskEvent,
+}
+
+/// A request to add and remove links of a task (see `Store::relate_tasks`).
+#[derive(Debug, Clone)]
+pub struct RelateRequest<'a> {
+    pub task: TaskId,
+    /// Links to add, written from `task` to each target. Targets are distinct and not `task`.
+    pub add: &'a [(TaskId, LinkKind)],
+    /// Tasks whose link with `task` (either way) is removed.
+    pub remove: &'a [TaskId],
+    /// `None`: the human; else the agent (allowed as creator) and its session (as holder).
+    pub editor: Option<(AgentId, SessionId)>,
+    pub token: Option<TokenId>,
+    /// The most links any one task may have.
+    pub max_links: u32,
+    /// Set when an addition is a `duplicate`: the cancellation of `task`, applied in the same
+    /// transaction after the links unless the task is already cancelled. A `done` task is
+    /// refused (`Related::DuplicateOfDone`) and nothing is written.
+    pub cancel: Option<TransitionRequest>,
+    /// Appended when something changed (`at` is also the links' `created_at` and the task's
+    /// new `updated_at`); its payload is filled in.
+    pub event: TaskEvent,
+}
+
+/// What `relate_tasks` did. Short-lived, so the large variant is not boxed.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum Related {
+    /// The task does not exist or the editor may not change it.
+    Denied,
+    /// An added target does not exist.
+    UnknownTarget(TaskId),
+    /// This task would have more than `max_links` links.
+    TooMany(TaskId),
+    /// `cancel` was set and the task is `done` (read under the lock).
+    DuplicateOfDone,
+    Applied {
+        task: Task,
+        /// The links written (empty when every addition was already there).
+        added: Vec<TaskLink>,
+        /// The tasks whose link was removed.
+        removed: Vec<TaskId>,
+        /// The duplicate's cancellation, when `cancel` applied.
+        cancelled: Option<Transitioned>,
+    },
+}
+
+/// The event payload for changed links.
+pub fn related_payload(added: &[TaskLink], removed: &[TaskId]) -> serde_json::Value {
+    serde_json::json!({
+        "added": added
+            .iter()
+            .map(|l| serde_json::json!({ "id": l.target_id.to_string(), "kind": l.kind.as_str() }))
+            .collect::<Vec<_>>(),
+        "removed": removed.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+    })
 }
 
 /// What `add_task_projects` did.

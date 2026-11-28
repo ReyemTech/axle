@@ -11,16 +11,18 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 
 use super::{
     AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate,
-    MessageReceipt, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, Store,
-    StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, UnblockRule,
-    Unblocked, block_previous_payload, child_event, children_complete_event, claim_event,
-    closes_child, edit_payload, enrollment_token_label, like_pattern, options_from, options_to,
-    projects_added_note, projects_added_payload, send_time_recipient, unblocked_records,
+    MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome, ProjectsAdded,
+    Recipient, RelateRequest, Related, Store, StoreError, StoreResult, TaskFilter, TaskOrder,
+    TransitionRequest, Transitioned, UnblockRule, Unblocked, block_previous_payload, child_event,
+    children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label,
+    like_pattern, options_from, options_to, projects_added_note, projects_added_payload,
+    related_payload, send_time_recipient, unblocked_records,
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId,
     EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId, Session,
-    SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId, TokenInfo, WaitingOn,
+    SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo,
+    WaitingOn,
 };
 
 /// The columns `enrollment_from` reads (a macro so queries can `concat!` it statically).
@@ -853,6 +855,171 @@ fn enrollment_from(row: &SqliteRow) -> StoreResult<Enrollment> {
     })
 }
 
+/// The guarded state change behind `Store::transition_task`, inside the caller's
+/// transaction (which commits it, also when the guard did not match).
+async fn transition_in(
+    conn: &mut SqliteConnection,
+    req: &TransitionRequest,
+) -> StoreResult<Option<Transitioned>> {
+    let from = format!(
+        ",{},",
+        req.from
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let (keep_lease, lease) = match req.lease {
+        LeaseUpdate::Keep => (true, None),
+        LeaseUpdate::Clear => (false, None),
+        LeaseUpdate::Set(t) => (false, Some(ts::enc(t))),
+    };
+    let owner = req.owner.map(|s| s.to_string());
+    let plan_from = req.plan_from.as_ref().map(|states| {
+        format!(
+            ",{},",
+            states
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    });
+    let block = req.block.clone().unwrap_or_default();
+    let set_waiting = block.waiting_on.is_some();
+    let waiting = block.waiting_on.as_ref();
+    if let Some(target) = waiting.and_then(|w| w.task())
+        && !wait_allowed(conn, req.task, target).await?
+    {
+        return Ok(None);
+    }
+    // The values an update replaces, read under the write lock.
+    let mut event = req.event.clone();
+    if block.record_previous {
+        let previous = sqlx::query(concat!("SELECT ", task_cols!(), " FROM tasks WHERE id = ?"))
+            .bind(req.task.to_string())
+            .fetch_optional(&mut *conn)
+            .await?
+            .as_ref()
+            .map(task_from)
+            .transpose()?
+            .and_then(|t| t.block);
+        event.payload = Some(block_previous_payload(
+            event.payload.as_ref(),
+            previous.as_ref(),
+        ));
+    }
+    let to = req.to.map(|s| s.as_str());
+    let updated = sqlx::query(concat!(
+        "UPDATE tasks
+            SET status = COALESCE(?, status),
+                plan_state = COALESCE(?, plan_state),
+                lease_expires_at = CASE WHEN ? THEN lease_expires_at ELSE ? END,
+                owner_session_id = CASE WHEN ? THEN NULL ELSE owner_session_id END,
+                owner_agent_id = CASE WHEN ? THEN NULL ELSE owner_agent_id END,
+                done_at = CASE WHEN COALESCE(?, status) = 'done' AND status <> 'done' THEN ?
+                               WHEN COALESCE(?, status) = 'done' THEN done_at
+                               ELSE NULL END,
+                acked_at = CASE WHEN COALESCE(?, status) = 'done' THEN acked_at
+                                ELSE NULL END,
+                block_reason = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
+                                    ELSE COALESCE(?, block_reason) END,
+                blocked_at = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
+                                  WHEN status <> 'blocked' THEN ?
+                                  ELSE blocked_at END,
+                waiting_kind = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
+                                    WHEN ? THEN ? ELSE waiting_kind END,
+                waiting_task_id = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
+                                       WHEN ? THEN ? ELSE waiting_task_id END,
+                waiting_text = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
+                                    WHEN ? THEN ? ELSE waiting_text END,
+                unblock_text = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
+                                    ELSE COALESCE(?, unblock_text) END,
+                version = version + 1, updated_at = ?
+          WHERE id = ?
+            AND instr(?, ',' || status || ',') > 0
+            AND (? IS NULL OR instr(?, ',' || plan_state || ',') > 0)
+            AND (? IS NULL OR owner_session_id = ?)
+            AND (? IS NULL
+                 OR ? = (SELECT p.id FROM messages p
+                          WHERE p.task_id = tasks.id AND p.kind = 'plan'
+                          ORDER BY p.seq DESC LIMIT 1))
+          RETURNING ",
+        task_cols!()
+    ))
+    .bind(req.to.map(|s| s.as_str()))
+    .bind(req.plan_to.map(|s| s.as_str()))
+    .bind(keep_lease)
+    .bind(lease)
+    .bind(req.clear_owner)
+    .bind(req.clear_owner)
+    .bind(req.to.map(|s| s.as_str()))
+    .bind(ts::enc(req.now))
+    .bind(req.to.map(|s| s.as_str()))
+    .bind(req.to.map(|s| s.as_str()))
+    .bind(to)
+    .bind(&block.reason)
+    .bind(to)
+    .bind(ts::enc(req.now))
+    .bind(to)
+    .bind(set_waiting)
+    .bind(waiting.map(|w| w.kind()))
+    .bind(to)
+    .bind(set_waiting)
+    .bind(waiting.and_then(|w| w.task()).map(|t| t.to_string()))
+    .bind(to)
+    .bind(set_waiting)
+    .bind(waiting.and_then(|w| w.text()))
+    .bind(to)
+    .bind(&block.unblock)
+    .bind(ts::enc(req.now))
+    .bind(req.task.to_string())
+    .bind(from)
+    .bind(&plan_from)
+    .bind(&plan_from)
+    .bind(&owner)
+    .bind(&owner)
+    .bind(req.latest_plan.map(|m| m.to_string()))
+    .bind(req.latest_plan.map(|m| m.to_string()))
+    .fetch_optional(&mut *conn)
+    .await?
+    .as_ref()
+    .map(task_from)
+    .transpose()?;
+    let Some(task) = updated else {
+        return Ok(None);
+    };
+    let children_complete = record_event(conn, &task, &event, req.token).await?;
+    if req.archive_plans {
+        sqlx::query(
+            "UPDATE message_recipients
+                SET acked_at = ?1, delivered_at = COALESCE(delivered_at, ?1)
+              WHERE recipient_agent_id IS NULL AND recipient_session_id IS NULL
+                AND acked_at IS NULL
+                AND message_id IN (SELECT id FROM messages
+                                    WHERE task_id = ?2 AND kind = 'plan')",
+        )
+        .bind(ts::enc(req.now))
+        .bind(req.task.to_string())
+        .execute(&mut *conn)
+        .await?;
+    }
+    if let Some(message) = &req.message {
+        insert_message(conn, message, req.token).await?;
+    }
+    let unblocked = match req.unblock {
+        Some(rule) if req.to == Some(TaskStatus::Done) && task.status == TaskStatus::Done => {
+            unblock_waiting(conn, &task, req, rule).await?
+        }
+        _ => Vec::new(),
+    };
+    Ok(Some(Transitioned {
+        task,
+        children_complete,
+        unblocked,
+    }))
+}
+
 #[async_trait]
 impl Store for SqliteStore {
     async fn ping(&self) -> StoreResult<()> {
@@ -1471,6 +1638,258 @@ impl Store for SqliteStore {
         Ok(Some(ProjectsAdded { task, added }))
     }
 
+    async fn relate_tasks(&self, req: &RelateRequest<'_>) -> StoreResult<Related> {
+        let (agent, session) = match req.editor {
+            Some((a, s)) => (Some(a.to_string()), Some(s.to_string())),
+            None => (None, None),
+        };
+        let id = req.task.to_string();
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        // The guard, as a read under the write lock (a no-op change writes nothing).
+        let guarded = sqlx::query(concat!(
+            "SELECT ",
+            task_cols!(),
+            " FROM tasks
+             WHERE id = ?1
+               AND (?2 IS NULL OR created_by_agent_id = ?2
+                    OR (owner_session_id = ?3
+                        AND status IN ('planning', 'claimed', 'blocked', 'review')))"
+        ))
+        .bind(&id)
+        .bind(&agent)
+        .bind(&session)
+        .fetch_optional(&mut *tx)
+        .await?
+        .as_ref()
+        .map(task_from)
+        .transpose()?;
+        let Some(mut task) = guarded else {
+            tx.commit().await?;
+            return Ok(Related::Denied);
+        };
+        if req.cancel.is_some() && task.status == TaskStatus::Done {
+            return Ok(Related::DuplicateOfDone);
+        }
+        const UNLINK: &str = "DELETE FROM task_links
+             WHERE (task_id = ?1 AND target_id = ?2) OR (task_id = ?2 AND target_id = ?1)";
+        let mut removed = Vec::new();
+        for other in req.remove {
+            let gone = sqlx::query(UNLINK)
+                .bind(&id)
+                .bind(other.to_string())
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            if gone > 0 {
+                removed.push(*other);
+            }
+        }
+        let mut added = Vec::new();
+        for (target, kind) in req.add {
+            let target_s = target.to_string();
+            let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM tasks WHERE id = ?")
+                .bind(&target_s)
+                .fetch_optional(&mut *tx)
+                .await?;
+            if exists.is_none() {
+                return Ok(Related::UnknownTarget(*target));
+            }
+            let same: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM task_links WHERE task_id = ? AND target_id = ? AND kind = ?",
+            )
+            .bind(&id)
+            .bind(&target_s)
+            .bind(kind.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if same.is_some() {
+                continue;
+            }
+            sqlx::query(UNLINK)
+                .bind(&id)
+                .bind(&target_s)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO task_links (task_id, target_id, kind, created_at) VALUES (?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(&target_s)
+            .bind(kind.as_str())
+            .bind(ts::enc(req.event.at))
+            .execute(&mut *tx)
+            .await?;
+            added.push(TaskLink {
+                task_id: req.task,
+                target_id: *target,
+                kind: *kind,
+                created_at: req.event.at,
+            });
+        }
+        if added.is_empty() && removed.is_empty() && req.cancel.is_none() {
+            tx.commit().await?;
+            return Ok(Related::Applied {
+                task,
+                added,
+                removed,
+                cancelled: None,
+            });
+        }
+        let touched = std::iter::once(req.task).chain(added.iter().map(|l| l.target_id));
+        for t in touched {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM task_links WHERE task_id = ?1 OR target_id = ?1",
+            )
+            .bind(t.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+            if n > i64::from(req.max_links) {
+                return Ok(Related::TooMany(t));
+            }
+        }
+        // A re-added duplicate link changes no link, only the cancellation below.
+        if !added.is_empty() || !removed.is_empty() {
+            task = sqlx::query(concat!(
+                "UPDATE tasks SET version = version + 1, updated_at = ? WHERE id = ? RETURNING ",
+                task_cols!()
+            ))
+            .bind(ts::enc(req.event.at))
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(StoreError::from)
+            .and_then(|row| task_from(&row))?;
+            let mut event = req.event.clone();
+            event.payload = Some(related_payload(&added, &removed));
+            insert_event(&mut tx, &event, req.token).await?;
+        }
+        let cancelled = match &req.cancel {
+            Some(cancel) if task.status != TaskStatus::Cancelled => {
+                let done = transition_in(&mut tx, cancel).await?.ok_or_else(|| {
+                    StoreError::Corrupt(format!("task {} did not cancel under its lock", req.task))
+                })?;
+                task = done.task.clone();
+                Some(done)
+            }
+            _ => None,
+        };
+        tx.commit().await?;
+        Ok(Related::Applied {
+            task,
+            added,
+            removed,
+            cancelled,
+        })
+    }
+
+    async fn move_task(&self, req: &MoveRequest) -> StoreResult<Moved> {
+        let (agent, session) = match req.editor {
+            Some((a, s)) => (Some(a.to_string()), Some(s.to_string())),
+            None => (None, None),
+        };
+        let id = req.task.to_string();
+        let parent = req.parent.to_string();
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        // The whole guard as one read under the write lock; the ancestor walk rules out
+        // cycles (the task is top-level, so it can only be the parent or an ancestor of it).
+        let allowed: Option<i64> = sqlx::query(
+            "WITH RECURSIVE ancestors(id, parent_id) AS (
+                 SELECT id, parent_id FROM tasks WHERE id = ?4
+                 UNION
+                 SELECT t.id, t.parent_id FROM tasks t JOIN ancestors a ON t.id = a.parent_id
+             )
+             SELECT 1 AS ok FROM tasks t, tasks p
+             WHERE t.id = ?1 AND p.id = ?4 AND t.parent_id IS NULL
+               AND NOT EXISTS (SELECT 1 FROM task_projects x WHERE x.task_id = t.id)
+               AND (?2 IS NULL OR t.created_by_agent_id = ?2
+                    OR (t.owner_session_id = ?3
+                        AND t.status IN ('planning', 'claimed', 'blocked', 'review')))
+               AND p.status NOT IN ('planning', 'done', 'cancelled')
+               AND (p.project_id = t.project_id
+                    OR EXISTS (SELECT 1 FROM task_projects x
+                               WHERE x.task_id = p.id AND x.project_id = t.project_id))
+               AND NOT EXISTS (SELECT 1 FROM ancestors a WHERE a.id = t.id)",
+        )
+        .bind(&id)
+        .bind(&agent)
+        .bind(&session)
+        .bind(&parent)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| row.try_get("ok"))
+        .transpose()?;
+        if allowed.is_none() {
+            tx.commit().await?;
+            return Ok(Moved::Refused);
+        }
+        // The new ancestors of the moved subtree are the parent and its ancestors: no task in
+        // the subtree may be waiting on one of them.
+        let waiting: Option<String> = sqlx::query_scalar(
+            "WITH RECURSIVE
+                 up(id, parent_id) AS (
+                     SELECT id, parent_id FROM tasks WHERE id = ?2
+                     UNION
+                     SELECT t.id, t.parent_id FROM tasks t JOIN up ON t.id = up.parent_id),
+                 down(id) AS (
+                     SELECT id FROM tasks WHERE id = ?1
+                     UNION
+                     SELECT t.id FROM tasks t JOIN down ON t.parent_id = down.id)
+             SELECT CAST(w.id AS TEXT) FROM down d JOIN tasks w ON w.id = d.id
+              WHERE w.status = 'blocked' AND w.waiting_kind = 'task'
+                AND w.waiting_task_id IN (SELECT id FROM up)
+              ORDER BY w.created_at, w.id LIMIT 1",
+        )
+        .bind(req.task.to_string())
+        .bind(&parent)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(w) = waiting {
+            tx.commit().await?;
+            let w: uuid::Uuid = w
+                .parse()
+                .map_err(|e| StoreError::Corrupt(format!("task id {w:?}: {e}")))?;
+            return Ok(Moved::WaitOnAncestor(w.into()));
+        }
+        let task = sqlx::query(concat!(
+            "UPDATE tasks SET parent_id = ?, version = version + 1, updated_at = ? WHERE id = ?
+             RETURNING ",
+            task_cols!()
+        ))
+        .bind(&parent)
+        .bind(ts::enc(req.event.at))
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(StoreError::from)
+        .and_then(|row| task_from(&row))?;
+        insert_event(&mut tx, &req.event, req.token).await?;
+        tx.commit().await?;
+        Ok(Moved::Moved(task))
+    }
+
+    async fn task_links(&self, task: TaskId) -> StoreResult<Vec<TaskLink>> {
+        sqlx::query(
+            "SELECT task_id, target_id, kind, created_at FROM task_links
+             WHERE task_id = ?1 OR target_id = ?1 ORDER BY created_at, task_id, target_id",
+        )
+        .bind(task.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|row| {
+            Ok(TaskLink {
+                task_id: uuid_of(&row.try_get::<String, _>("task_id")?)?,
+                target_id: uuid_of(&row.try_get::<String, _>("target_id")?)?,
+                kind: row
+                    .try_get::<String, _>("kind")?
+                    .parse()
+                    .map_err(StoreError::Corrupt)?,
+                created_at: ts::dec(&row.try_get::<String, _>("created_at")?)?,
+            })
+        })
+        .collect()
+    }
+
     async fn get_task(&self, id: TaskId) -> StoreResult<Option<Task>> {
         sqlx::query(concat!("SELECT ", task_cols!(), " FROM tasks WHERE id = ?"))
             .bind(id.to_string())
@@ -1643,168 +2062,10 @@ impl Store for SqliteStore {
     }
 
     async fn transition_task(&self, req: &TransitionRequest) -> StoreResult<Option<Transitioned>> {
-        let from = format!(
-            ",{},",
-            req.from
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        let (keep_lease, lease) = match req.lease {
-            LeaseUpdate::Keep => (true, None),
-            LeaseUpdate::Clear => (false, None),
-            LeaseUpdate::Set(t) => (false, Some(ts::enc(t))),
-        };
-        let owner = req.owner.map(|s| s.to_string());
-        let plan_from = req.plan_from.as_ref().map(|states| {
-            format!(
-                ",{},",
-                states
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        });
-        let block = req.block.clone().unwrap_or_default();
-        let set_waiting = block.waiting_on.is_some();
-        let waiting = block.waiting_on.as_ref();
         let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
-        if let Some(target) = waiting.and_then(|w| w.task())
-            && !wait_allowed(&mut tx, req.task, target).await?
-        {
-            tx.commit().await?;
-            return Ok(None);
-        }
-        // The values an update replaces, read under the write lock.
-        let mut event = req.event.clone();
-        if block.record_previous {
-            let previous =
-                sqlx::query(concat!("SELECT ", task_cols!(), " FROM tasks WHERE id = ?"))
-                    .bind(req.task.to_string())
-                    .fetch_optional(&mut *tx)
-                    .await?
-                    .as_ref()
-                    .map(task_from)
-                    .transpose()?
-                    .and_then(|t| t.block);
-            event.payload = Some(block_previous_payload(
-                event.payload.as_ref(),
-                previous.as_ref(),
-            ));
-        }
-        let to = req.to.map(|s| s.as_str());
-        let updated = sqlx::query(concat!(
-            "UPDATE tasks
-                SET status = COALESCE(?, status),
-                    plan_state = COALESCE(?, plan_state),
-                    lease_expires_at = CASE WHEN ? THEN lease_expires_at ELSE ? END,
-                    owner_session_id = CASE WHEN ? THEN NULL ELSE owner_session_id END,
-                    owner_agent_id = CASE WHEN ? THEN NULL ELSE owner_agent_id END,
-                    done_at = CASE WHEN COALESCE(?, status) = 'done' AND status <> 'done' THEN ?
-                                   WHEN COALESCE(?, status) = 'done' THEN done_at
-                                   ELSE NULL END,
-                    acked_at = CASE WHEN COALESCE(?, status) = 'done' THEN acked_at
-                                    ELSE NULL END,
-                    block_reason = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
-                                        ELSE COALESCE(?, block_reason) END,
-                    blocked_at = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
-                                      WHEN status <> 'blocked' THEN ?
-                                      ELSE blocked_at END,
-                    waiting_kind = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
-                                        WHEN ? THEN ? ELSE waiting_kind END,
-                    waiting_task_id = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
-                                           WHEN ? THEN ? ELSE waiting_task_id END,
-                    waiting_text = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
-                                        WHEN ? THEN ? ELSE waiting_text END,
-                    unblock_text = CASE WHEN COALESCE(?, status) <> 'blocked' THEN NULL
-                                        ELSE COALESCE(?, unblock_text) END,
-                    version = version + 1, updated_at = ?
-              WHERE id = ?
-                AND instr(?, ',' || status || ',') > 0
-                AND (? IS NULL OR instr(?, ',' || plan_state || ',') > 0)
-                AND (? IS NULL OR owner_session_id = ?)
-                AND (? IS NULL
-                     OR ? = (SELECT p.id FROM messages p
-                              WHERE p.task_id = tasks.id AND p.kind = 'plan'
-                              ORDER BY p.seq DESC LIMIT 1))
-              RETURNING ",
-            task_cols!()
-        ))
-        .bind(req.to.map(|s| s.as_str()))
-        .bind(req.plan_to.map(|s| s.as_str()))
-        .bind(keep_lease)
-        .bind(lease)
-        .bind(req.clear_owner)
-        .bind(req.clear_owner)
-        .bind(req.to.map(|s| s.as_str()))
-        .bind(ts::enc(req.now))
-        .bind(req.to.map(|s| s.as_str()))
-        .bind(req.to.map(|s| s.as_str()))
-        .bind(to)
-        .bind(&block.reason)
-        .bind(to)
-        .bind(ts::enc(req.now))
-        .bind(to)
-        .bind(set_waiting)
-        .bind(waiting.map(|w| w.kind()))
-        .bind(to)
-        .bind(set_waiting)
-        .bind(waiting.and_then(|w| w.task()).map(|t| t.to_string()))
-        .bind(to)
-        .bind(set_waiting)
-        .bind(waiting.and_then(|w| w.text()))
-        .bind(to)
-        .bind(&block.unblock)
-        .bind(ts::enc(req.now))
-        .bind(req.task.to_string())
-        .bind(from)
-        .bind(&plan_from)
-        .bind(&plan_from)
-        .bind(&owner)
-        .bind(&owner)
-        .bind(req.latest_plan.map(|m| m.to_string()))
-        .bind(req.latest_plan.map(|m| m.to_string()))
-        .fetch_optional(&mut *tx)
-        .await?
-        .as_ref()
-        .map(task_from)
-        .transpose()?;
-        let Some(task) = updated else {
-            tx.commit().await?;
-            return Ok(None);
-        };
-        let children_complete = record_event(&mut tx, &task, &event, req.token).await?;
-        if req.archive_plans {
-            sqlx::query(
-                "UPDATE message_recipients
-                    SET acked_at = ?1, delivered_at = COALESCE(delivered_at, ?1)
-                  WHERE recipient_agent_id IS NULL AND recipient_session_id IS NULL
-                    AND acked_at IS NULL
-                    AND message_id IN (SELECT id FROM messages
-                                        WHERE task_id = ?2 AND kind = 'plan')",
-            )
-            .bind(ts::enc(req.now))
-            .bind(req.task.to_string())
-            .execute(&mut *tx)
-            .await?;
-        }
-        if let Some(message) = &req.message {
-            insert_message(&mut tx, message, req.token).await?;
-        }
-        let unblocked = match req.unblock {
-            Some(rule) if req.to == Some(TaskStatus::Done) && task.status == TaskStatus::Done => {
-                unblock_waiting(&mut tx, &task, req, rule).await?
-            }
-            _ => Vec::new(),
-        };
+        let done = transition_in(&mut tx, req).await?;
         tx.commit().await?;
-        Ok(Some(Transitioned {
-            task,
-            children_complete,
-            unblocked,
-        }))
+        Ok(done)
     }
 
     async fn edit_task(&self, req: &EditRequest<'_>) -> StoreResult<Option<Task>> {
@@ -2147,7 +2408,8 @@ impl Store for SqliteStore {
             "SELECT ",
             message_cols!(),
             " FROM messages m
-             WHERE m.importance IN ('high', 'urgent') AND m.kind <> 'plan'
+             WHERE (m.importance IN ('high', 'urgent') OR m.options IS NOT NULL)
+               AND m.kind <> 'plan'
                AND (EXISTS (SELECT 1 FROM message_recipients r
                             WHERE r.message_id = m.id AND r.recipient_agent_id IS NULL
                               AND r.recipient_session_id IS NULL AND r.acked_at IS NULL)

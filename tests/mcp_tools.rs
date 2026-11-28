@@ -1271,3 +1271,266 @@ store_matrix!(
         b.cancel().await.unwrap();
     }
 );
+
+store_matrix!(related_links_via_mcp, |store: Arc<dyn Store>| async move {
+    let server = start(store).await;
+    let creator = server.agent("mac", "claude-code").await;
+    let stranger = server.agent("linux", "codex").await;
+    let a = ok(
+        &creator,
+        "task_create",
+        json!({"title": "Original", "body": ""}),
+    )
+    .await;
+    let b = ok(
+        &creator,
+        "task_create",
+        json!({"title": "Again", "body": ""}),
+    )
+    .await;
+    let c = ok(
+        &stranger,
+        "task_create",
+        json!({"title": "Later", "body": ""}),
+    )
+    .await;
+    let (a, b, c) = (
+        a["id"].as_str().unwrap().to_string(),
+        b["id"].as_str().unwrap().to_string(),
+        c["id"].as_str().unwrap().to_string(),
+    );
+
+    // Only the creator or owner links; bad input is refused.
+    let (is_error, text) = call(
+        &stranger,
+        "task_update",
+        json!({"id": a, "related": [{"id": b, "kind": "relates"}]}),
+    )
+    .await;
+    assert!(is_error && text.contains("not the owner"), "{text}");
+    let (is_error, text) = call(
+        &creator,
+        "task_update",
+        json!({"id": a, "related": [{"id": a, "kind": "relates"}]}),
+    )
+    .await;
+    assert!(is_error && text.contains("itself"), "{text}");
+    let (is_error, _) = call(
+        &creator,
+        "task_update",
+        json!({"id": a, "related": [{"id": b, "kind": "blocks"}]}),
+    )
+    .await;
+    assert!(is_error, "unknown kinds are refused");
+
+    // The stranger's own task follows up on a; both sides show it.
+    ok(
+        &stranger,
+        "task_update",
+        json!({"id": c, "related": [{"id": a, "kind": "follow-up"}]}),
+    )
+    .await;
+    let detail = ok(&creator, "task_get", json!({"id": a})).await;
+    let related = detail["related"].as_array().unwrap();
+    assert_eq!(related.len(), 1, "{detail}");
+    assert_eq!(related[0]["id"], c);
+    assert_eq!(related[0]["kind"], "follow-up");
+    assert_eq!(related[0]["direction"], "incoming");
+    assert_eq!(related[0]["label"], "follow-up");
+    assert_eq!(related[0]["status"], "open");
+    let title = related[0]["title"].as_str().unwrap();
+    assert!(
+        title.contains("Later") && title.contains("information"),
+        "{title}"
+    );
+    let detail = ok(&stranger, "task_get", json!({"id": c})).await;
+    assert_eq!(detail["related"][0]["label"], "follow-up of");
+
+    // A duplicate is cancelled.
+    let t = ok(
+        &creator,
+        "task_update",
+        json!({"id": b, "related": [{"id": a, "kind": "duplicate"}]}),
+    )
+    .await;
+    assert_eq!(t["status"], "cancelled");
+    let detail = ok(&creator, "task_get", json!({"id": a})).await;
+    assert!(
+        detail["related"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == b && r["label"] == "duplicated by"),
+        "{detail}"
+    );
+
+    // Removal.
+    ok(&stranger, "task_update", json!({"id": c, "unrelate": [a]})).await;
+    let detail = ok(&stranger, "task_get", json!({"id": c})).await;
+    assert!(detail["related"].as_array().unwrap().is_empty(), "{detail}");
+    for cl in [creator, stranger] {
+        cl.cancel().await.unwrap();
+    }
+});
+
+store_matrix!(
+    move_under_a_parent_via_mcp,
+    |store: Arc<dyn Store>| async move {
+        let server = start(store).await;
+        let creator = server.agent("mac", "claude-code").await;
+        let stranger = server.agent("linux", "codex").await;
+        let id = |v: Value| v["id"].as_str().unwrap().to_string();
+        let parent = id(ok(
+            &creator,
+            "task_create",
+            json!({"title": "Parent", "body": ""}),
+        )
+        .await);
+        let loose = id(ok(
+            &creator,
+            "task_create",
+            json!({"title": "Loose", "body": ""}),
+        )
+        .await);
+
+        let (is_error, text) = call(
+            &stranger,
+            "task_update",
+            json!({"id": loose, "parent": parent}),
+        )
+        .await;
+        assert!(is_error && text.contains("not the owner"), "{text}");
+        let (is_error, text) = call(
+            &creator,
+            "task_update",
+            json!({"id": loose, "parent": loose}),
+        )
+        .await;
+        assert!(is_error && text.contains("own parent"), "{text}");
+
+        let moved = ok(
+            &creator,
+            "task_update",
+            json!({"id": loose, "parent": parent}),
+        )
+        .await;
+        assert_eq!(moved["parent"], parent);
+        let detail = ok(&creator, "task_get", json!({"id": parent})).await;
+        assert_eq!(detail["progress"]["total"], 1, "{detail}");
+        assert_eq!(detail["children"][0]["id"], loose);
+        let detail = ok(&creator, "task_get", json!({"id": loose})).await;
+        assert!(
+            detail["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["kind"] == "moved_under"),
+            "{detail}"
+        );
+
+        // Moving a subtask again is out of scope; a cycle is refused.
+        let other = id(ok(
+            &creator,
+            "task_create",
+            json!({"title": "Other", "body": ""}),
+        )
+        .await);
+        let (is_error, text) = call(
+            &creator,
+            "task_update",
+            json!({"id": loose, "parent": other}),
+        )
+        .await;
+        assert!(is_error && text.contains("not supported"), "{text}");
+        let (is_error, text) = call(
+            &creator,
+            "task_update",
+            json!({"id": parent, "parent": loose}),
+        )
+        .await;
+        assert!(is_error && text.contains("cycle"), "{text}");
+        for cl in [creator, stranger] {
+            cl.cancel().await.unwrap();
+        }
+    }
+);
+
+store_matrix!(
+    a_refused_relationship_leaves_the_whole_update_unwritten,
+    |store: Arc<dyn Store>| async move {
+        let server = start(store).await;
+        let creator = server.agent("mac", "claude-code").await;
+        let id = |v: Value| v["id"].as_str().unwrap().to_string();
+        let t = id(ok(
+            &creator,
+            "task_create",
+            json!({"title": "Before", "body": "old"}),
+        )
+        .await);
+        let a = id(ok(&creator, "task_create", json!({"title": "A", "body": ""})).await);
+        let b = id(ok(&creator, "task_create", json!({"title": "B", "body": ""})).await);
+        let parent = id(ok(
+            &creator,
+            "task_create",
+            json!({"title": "Parent", "body": ""}),
+        )
+        .await);
+        let child = id(ok(
+            &creator,
+            "task_create",
+            json!({"title": "Child", "body": "", "parent": t}),
+        )
+        .await);
+        let refused = [
+            (
+                json!({"id": t, "title": "After", "body": "new",
+                       "related": [{"id": a, "kind": "duplicate"}, {"id": b, "kind": "duplicate"}]}),
+                "one task only",
+            ),
+            (
+                json!({"id": t, "title": "After",
+                       "related": [{"id": uuid::Uuid::now_v7().to_string(), "kind": "relates"}]}),
+                "not found",
+            ),
+            (json!({"id": t, "title": "After", "parent": child}), "cycle"),
+            (
+                json!({"id": t, "title": "After", "add_projects": ["github.com/acme/web-app"],
+                       "parent": parent}),
+                "one project",
+            ),
+        ];
+        // The project named above must exist for the last case to reach the move check.
+        let session = uuid::Uuid::now_v7().to_string();
+        let web = server
+            .connect(&[
+                ("x-axl-project", "github.com/acme/web-app"),
+                ("x-axl-host", "mac"),
+                ("x-axl-harness", "claude-code"),
+                ("x-axl-session", &session),
+            ])
+            .await;
+        ok(&web, "whoami", json!({})).await;
+        for (args, want) in refused {
+            let (is_error, text) = call(&creator, "task_update", args.clone()).await;
+            assert!(is_error && text.contains(want), "{args}: {text}");
+            let detail = ok(&creator, "task_get", json!({"id": t})).await;
+            let title = detail["task"]["title"].as_str().unwrap();
+            assert!(
+                title.contains("Before"),
+                "{args}: the title changed: {title}"
+            );
+            assert!(detail["related"].as_array().unwrap().is_empty(), "{args}");
+            assert!(
+                !detail["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["kind"] == "edited" || e["kind"] == "projects_added"),
+                "{args}: {detail}"
+            );
+        }
+        for cl in [creator, web] {
+            cl.cancel().await.unwrap();
+        }
+    }
+);

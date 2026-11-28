@@ -852,3 +852,43 @@ store_matrix!(
         assert!(env.inbox_ids(&other).await.is_empty());
     }
 );
+
+store_matrix!(
+    questions_need_the_human_whatever_their_importance,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let agent = env.session(INFRA, "mac").await;
+        let mut asked = Vec::new();
+        for body in ["Merge now?", "Tag a release?"] {
+            env.clock.advance(Duration::seconds(1));
+            let m = env
+                .msgs
+                .send_with_options(
+                    &actor(&agent),
+                    msg(Address::Human, body),
+                    &["Yes".into(), "No".into()],
+                )
+                .await
+                .unwrap();
+            asked.push(m.id);
+        }
+        // Plain normal mail still waits in the inbox only.
+        env.send(&agent, Address::Human, "fyi").await;
+        let attention = |v: Vec<axle::domain::Message>| v.into_iter().map(|m| m.id).collect();
+        let got: Vec<MessageId> = attention(env.store.human_attention(10).await.unwrap());
+        assert_eq!(got, asked, "a normal-importance question needs the human");
+
+        // Answered or acked, it leaves.
+        env.msgs
+            .send_as_human(NewMessage {
+                reply_to: Some(asked[0]),
+                ..msg(Address::Agent(agent.agent.id), "Yes")
+            })
+            .await
+            .unwrap();
+        let got: Vec<MessageId> = attention(env.store.human_attention(10).await.unwrap());
+        assert_eq!(got, vec![asked[1]]);
+        env.msgs.ack(Caller::Human, &[asked[1]]).await.unwrap();
+        assert!(env.store.human_attention(10).await.unwrap().is_empty());
+    }
+);

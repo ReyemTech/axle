@@ -8,16 +8,18 @@ use uuid::Uuid;
 
 use super::{
     AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate,
-    MessageReceipt, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, Store,
-    StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, UnblockRule,
-    Unblocked, block_previous_payload, child_event, children_complete_event, claim_event,
-    closes_child, edit_payload, enrollment_token_label, like_pattern, options_from, options_to,
-    projects_added_note, projects_added_payload, send_time_recipient, unblocked_records,
+    MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome, ProjectsAdded,
+    Recipient, RelateRequest, Related, Store, StoreError, StoreResult, TaskFilter, TaskOrder,
+    TransitionRequest, Transitioned, UnblockRule, Unblocked, block_previous_payload, child_event,
+    children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label,
+    like_pattern, options_from, options_to, projects_added_note, projects_added_payload,
+    related_payload, send_time_recipient, unblocked_records,
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId,
     EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId, Session,
-    SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId, TokenInfo, WaitingOn,
+    SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo,
+    WaitingOn,
 };
 
 pub struct PostgresStore {
@@ -297,8 +299,11 @@ async fn task_lock(conn: &mut PgConnection) -> StoreResult<()> {
     Ok(())
 }
 
-/// Whether `task` is a subtask (its writes lock its parent too). `parent_id` never changes
-/// after creation, so an unlocked read is exact.
+/// Whether `task` is a subtask (its writes lock its parent too). `parent_id` only ever changes
+/// from NULL to a parent, in `move_task` under `TASK_LOCK`; a write that read "top-level"
+/// just before a move commits and then follows the new parent can lock the parent without
+/// `TASK_LOCK`. That narrow window can at worst make Postgres abort one of two deadlocked
+/// writes (an error the caller may retry), never corrupt state.
 async fn is_subtask(conn: &mut PgConnection, task: TaskId) -> StoreResult<bool> {
     Ok(
         sqlx::query_scalar::<_, Option<Uuid>>("SELECT parent_id FROM tasks WHERE id = $1")
@@ -762,6 +767,171 @@ async fn consume_row(
         .await?;
     e.token_id = Some(token.id);
     Ok(Some(e))
+}
+
+/// The guarded state change behind `Store::transition_task`, inside the caller's
+/// transaction (which commits it, also when the guard did not match).
+async fn transition_in(
+    conn: &mut PgConnection,
+    req: &TransitionRequest,
+) -> StoreResult<Option<Transitioned>> {
+    let from: Vec<&str> = req.from.iter().map(|s| s.as_str()).collect();
+    let (keep_lease, lease) = match req.lease {
+        LeaseUpdate::Keep => (true, None),
+        LeaseUpdate::Clear => (false, None),
+        LeaseUpdate::Set(t) => (false, Some(t)),
+    };
+    let plan_from: Option<Vec<&str>> = req
+        .plan_from
+        .as_ref()
+        .map(|states| states.iter().map(|s| s.as_str()).collect());
+    let block = req.block.clone().unwrap_or_default();
+    let waiting = block.waiting_on.as_ref();
+    let finishing = req.unblock.is_some() && req.to == Some(TaskStatus::Done);
+    // The lock order (see `TASK_LOCK`): before any row lock.
+    if finishing || waiting.and_then(|w| w.task()).is_some() || is_subtask(conn, req.task).await? {
+        task_lock(conn).await?;
+    }
+    // A decision on a named plan: lock the row first, then read the newest plan in a
+    // statement of its own. Under READ COMMITTED a guard subquery inside the UPDATE would
+    // keep the snapshot taken before it queued on the row lock, so a resubmission that
+    // held the lock (and wrote a newer plan) would go unseen. The UPDATE then also
+    // requires the version read under the lock, a guard on the row itself.
+    let mut locked_version: Option<i64> = None;
+    if let Some(plan) = req.latest_plan {
+        let version: Option<i64> =
+            sqlx::query_scalar("SELECT version FROM tasks WHERE id = $1 FOR UPDATE")
+                .bind(req.task.as_uuid())
+                .fetch_optional(&mut *conn)
+                .await?;
+        let latest: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM messages WHERE task_id = $1 AND kind = 'plan'
+              ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(req.task.as_uuid())
+        .fetch_optional(&mut *conn)
+        .await?;
+        if version.is_none() || latest != Some(plan.as_uuid()) {
+            return Ok(None);
+        }
+        locked_version = version;
+    }
+    // Under the wait lock, this check sees every committed wait and every committed `done`.
+    if let Some(target) = waiting.and_then(|w| w.task())
+        && !wait_allowed(conn, req.task, target).await?
+    {
+        return Ok(None);
+    }
+    // The values an update replaces, read under the row lock the UPDATE then holds.
+    let mut event = req.event.clone();
+    if block.record_previous {
+        let previous = sqlx::query(concat!(
+            "SELECT ",
+            task_cols!(),
+            " FROM tasks WHERE id = $1 FOR UPDATE"
+        ))
+        .bind(req.task.as_uuid())
+        .fetch_optional(&mut *conn)
+        .await?
+        .as_ref()
+        .map(task_from)
+        .transpose()?
+        .and_then(|t| t.block);
+        event.payload = Some(block_previous_payload(
+            event.payload.as_ref(),
+            previous.as_ref(),
+        ));
+    }
+    let updated = sqlx::query(concat!(
+        "UPDATE tasks
+            SET status = COALESCE($1::text, status),
+                plan_state = COALESCE($9::text, plan_state),
+                lease_expires_at = CASE WHEN $2 THEN lease_expires_at
+                                        ELSE $3::timestamptz END,
+                owner_session_id = CASE WHEN $4 THEN NULL ELSE owner_session_id END,
+                owner_agent_id = CASE WHEN $4 THEN NULL ELSE owner_agent_id END,
+                done_at = CASE WHEN COALESCE($1::text, status) = 'done' AND status <> 'done'
+                               THEN $5
+                               WHEN COALESCE($1::text, status) = 'done' THEN done_at
+                               ELSE NULL END,
+                acked_at = CASE WHEN COALESCE($1::text, status) = 'done' THEN acked_at
+                                ELSE NULL END,
+                block_reason = CASE WHEN COALESCE($1::text, status) <> 'blocked' THEN NULL
+                                    ELSE COALESCE($12::text, block_reason) END,
+                blocked_at = CASE WHEN COALESCE($1::text, status) <> 'blocked' THEN NULL
+                                  WHEN status <> 'blocked' THEN $5
+                                  ELSE blocked_at END,
+                waiting_kind = CASE WHEN COALESCE($1::text, status) <> 'blocked' THEN NULL
+                                    WHEN $13 THEN $14::text ELSE waiting_kind END,
+                waiting_task_id = CASE WHEN COALESCE($1::text, status) <> 'blocked' THEN NULL
+                                       WHEN $13 THEN $15::uuid ELSE waiting_task_id END,
+                waiting_text = CASE WHEN COALESCE($1::text, status) <> 'blocked' THEN NULL
+                                    WHEN $13 THEN $16::text ELSE waiting_text END,
+                unblock_text = CASE WHEN COALESCE($1::text, status) <> 'blocked' THEN NULL
+                                    ELSE COALESCE($17::text, unblock_text) END,
+                version = version + 1, updated_at = $5
+          WHERE id = $6
+            AND status = ANY($7::text[])
+            AND ($8::uuid IS NULL OR owner_session_id = $8)
+            AND ($10::text[] IS NULL OR plan_state = ANY($10::text[]))
+            AND ($11::bigint IS NULL OR version = $11)
+          RETURNING ",
+        task_cols!()
+    ))
+    .bind(req.to.map(|s| s.as_str()))
+    .bind(keep_lease)
+    .bind(lease)
+    .bind(req.clear_owner)
+    .bind(req.now)
+    .bind(req.task.as_uuid())
+    .bind(&from)
+    .bind(req.owner.map(|s| s.as_uuid()))
+    .bind(req.plan_to.map(|s| s.as_str()))
+    .bind(&plan_from)
+    .bind(locked_version)
+    .bind(&block.reason)
+    .bind(waiting.is_some())
+    .bind(waiting.map(|w| w.kind()))
+    .bind(waiting.and_then(|w| w.task()).map(|t| t.as_uuid()))
+    .bind(waiting.and_then(|w| w.text()))
+    .bind(&block.unblock)
+    .fetch_optional(&mut *conn)
+    .await?
+    .as_ref()
+    .map(task_from)
+    .transpose()?;
+    let Some(task) = updated else {
+        return Ok(None);
+    };
+    let children_complete = record_event(conn, &task, &event, req.token).await?;
+    if req.archive_plans {
+        sqlx::query(
+            "UPDATE message_recipients
+                SET acked_at = $1, delivered_at = COALESCE(delivered_at, $1)
+              WHERE recipient_agent_id IS NULL AND recipient_session_id IS NULL
+                AND acked_at IS NULL
+                AND message_id IN (SELECT id FROM messages
+                                    WHERE task_id = $2 AND kind = 'plan')",
+        )
+        .bind(req.now)
+        .bind(req.task.as_uuid())
+        .execute(&mut *conn)
+        .await?;
+    }
+    if let Some(message) = &req.message {
+        insert_message(conn, message, req.token).await?;
+    }
+    let unblocked = match req.unblock {
+        Some(rule) if req.to == Some(TaskStatus::Done) && task.status == TaskStatus::Done => {
+            unblock_waiting(conn, &task, req, rule).await?
+        }
+        _ => Vec::new(),
+    };
+    Ok(Some(Transitioned {
+        task,
+        children_complete,
+        unblocked,
+    }))
 }
 
 #[async_trait]
@@ -1374,6 +1544,270 @@ impl Store for PostgresStore {
         Ok(Some(ProjectsAdded { task, added }))
     }
 
+    async fn relate_tasks(&self, req: &RelateRequest<'_>) -> StoreResult<Related> {
+        let (agent, session) = match req.editor {
+            Some((a, s)) => (Some(a.as_uuid()), Some(s.as_uuid())),
+            None => (None, None),
+        };
+        let id = req.task.as_uuid();
+        let mut tx = self.pool.begin().await?;
+        // The lock order (see `TASK_LOCK`): link writes count and lock other tasks' rows
+        // (a duplicate's cancellation may lock its parent), so they take it first and run one
+        // at a time.
+        task_lock(&mut tx).await?;
+        // The guard, as a locking read (a no-op change writes nothing).
+        let guarded = sqlx::query(concat!(
+            "SELECT ",
+            task_cols!(),
+            " FROM tasks
+             WHERE id = $1
+               AND ($2::uuid IS NULL OR created_by_agent_id = $2
+                    OR (owner_session_id = $3::uuid
+                        AND status IN ('planning', 'claimed', 'blocked', 'review')))
+             FOR UPDATE"
+        ))
+        .bind(id)
+        .bind(agent)
+        .bind(session)
+        .fetch_optional(&mut *tx)
+        .await?
+        .as_ref()
+        .map(task_from)
+        .transpose()?;
+        let Some(mut task) = guarded else {
+            tx.commit().await?;
+            return Ok(Related::Denied);
+        };
+        if req.cancel.is_some() && task.status == TaskStatus::Done {
+            return Ok(Related::DuplicateOfDone);
+        }
+        const UNLINK: &str = "DELETE FROM task_links
+             WHERE (task_id = $1 AND target_id = $2) OR (task_id = $2 AND target_id = $1)";
+        let mut removed = Vec::new();
+        for other in req.remove {
+            let gone = sqlx::query(UNLINK)
+                .bind(id)
+                .bind(other.as_uuid())
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            if gone > 0 {
+                removed.push(*other);
+            }
+        }
+        let mut added = Vec::new();
+        for (target, kind) in req.add {
+            let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM tasks WHERE id = $1")
+                .bind(target.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await?;
+            if exists.is_none() {
+                return Ok(Related::UnknownTarget(*target));
+            }
+            let same: Option<i32> = sqlx::query_scalar(
+                "SELECT 1 FROM task_links WHERE task_id = $1 AND target_id = $2 AND kind = $3",
+            )
+            .bind(id)
+            .bind(target.as_uuid())
+            .bind(kind.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if same.is_some() {
+                continue;
+            }
+            sqlx::query(UNLINK)
+                .bind(id)
+                .bind(target.as_uuid())
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO task_links (task_id, target_id, kind, created_at)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(id)
+            .bind(target.as_uuid())
+            .bind(kind.as_str())
+            .bind(req.event.at)
+            .execute(&mut *tx)
+            .await?;
+            added.push(TaskLink {
+                task_id: req.task,
+                target_id: *target,
+                kind: *kind,
+                created_at: req.event.at,
+            });
+        }
+        if added.is_empty() && removed.is_empty() && req.cancel.is_none() {
+            tx.commit().await?;
+            return Ok(Related::Applied {
+                task,
+                added,
+                removed,
+                cancelled: None,
+            });
+        }
+        let touched = std::iter::once(req.task).chain(added.iter().map(|l| l.target_id));
+        for t in touched {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM task_links WHERE task_id = $1 OR target_id = $1",
+            )
+            .bind(t.as_uuid())
+            .fetch_one(&mut *tx)
+            .await?;
+            if n > i64::from(req.max_links) {
+                return Ok(Related::TooMany(t));
+            }
+        }
+        // A re-added duplicate link changes no link, only the cancellation below.
+        if !added.is_empty() || !removed.is_empty() {
+            task = sqlx::query(concat!(
+                "UPDATE tasks SET version = version + 1, updated_at = $1 WHERE id = $2 RETURNING ",
+                task_cols!()
+            ))
+            .bind(req.event.at)
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(StoreError::from)
+            .and_then(|row| task_from(&row))?;
+            let mut event = req.event.clone();
+            event.payload = Some(related_payload(&added, &removed));
+            insert_event(&mut tx, &event, req.token).await?;
+        }
+        let cancelled = match &req.cancel {
+            Some(cancel) if task.status != TaskStatus::Cancelled => {
+                let done = transition_in(&mut tx, cancel).await?.ok_or_else(|| {
+                    StoreError::Corrupt(format!("task {} did not cancel under its lock", req.task))
+                })?;
+                task = done.task.clone();
+                Some(done)
+            }
+            _ => None,
+        };
+        tx.commit().await?;
+        Ok(Related::Applied {
+            task,
+            added,
+            removed,
+            cancelled,
+        })
+    }
+
+    async fn move_task(&self, req: &MoveRequest) -> StoreResult<Moved> {
+        let (agent, session) = match req.editor {
+            Some((a, s)) => (Some(a.as_uuid()), Some(s.as_uuid())),
+            None => (None, None),
+        };
+        let id = req.task.as_uuid();
+        let parent = req.parent.as_uuid();
+        let mut tx = self.pool.begin().await?;
+        // The lock order (see `TASK_LOCK`): a move changes the hierarchy every other check
+        // walks, so moves run one at a time and the guard below (read after the lock) sees
+        // every committed move. Then the moved row, then the parent.
+        task_lock(&mut tx).await?;
+        for row in [id, parent] {
+            sqlx::query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE")
+                .bind(row)
+                .fetch_optional(&mut *tx)
+                .await?;
+        }
+        // The ancestor walk rules out cycles (the task is top-level, so it can only be the
+        // parent or an ancestor of it).
+        let allowed: Option<i32> = sqlx::query(
+            "WITH RECURSIVE ancestors(id, parent_id) AS (
+                 SELECT id, parent_id FROM tasks WHERE id = $4
+                 UNION
+                 SELECT t.id, t.parent_id FROM tasks t JOIN ancestors a ON t.id = a.parent_id
+             )
+             SELECT 1 AS ok FROM tasks t, tasks p
+             WHERE t.id = $1 AND p.id = $4 AND t.parent_id IS NULL
+               AND NOT EXISTS (SELECT 1 FROM task_projects x WHERE x.task_id = t.id)
+               AND ($2::uuid IS NULL OR t.created_by_agent_id = $2
+                    OR (t.owner_session_id = $3::uuid
+                        AND t.status IN ('planning', 'claimed', 'blocked', 'review')))
+               AND p.status NOT IN ('planning', 'done', 'cancelled')
+               AND (p.project_id = t.project_id
+                    OR EXISTS (SELECT 1 FROM task_projects x
+                               WHERE x.task_id = p.id AND x.project_id = t.project_id))
+               AND NOT EXISTS (SELECT 1 FROM ancestors a WHERE a.id = t.id)",
+        )
+        .bind(id)
+        .bind(agent)
+        .bind(session)
+        .bind(parent)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| row.try_get("ok"))
+        .transpose()?;
+        if allowed.is_none() {
+            tx.commit().await?;
+            return Ok(Moved::Refused);
+        }
+        // The new ancestors of the moved subtree are the parent and its ancestors: no task in
+        // the subtree may be waiting on one of them.
+        let waiting: Option<String> = sqlx::query_scalar(
+            "WITH RECURSIVE
+                 up(id, parent_id) AS (
+                     SELECT id, parent_id FROM tasks WHERE id = $2
+                     UNION
+                     SELECT t.id, t.parent_id FROM tasks t JOIN up ON t.id = up.parent_id),
+                 down(id) AS (
+                     SELECT id FROM tasks WHERE id = $1
+                     UNION
+                     SELECT t.id FROM tasks t JOIN down ON t.parent_id = down.id)
+             SELECT CAST(w.id AS TEXT) FROM down d JOIN tasks w ON w.id = d.id
+              WHERE w.status = 'blocked' AND w.waiting_kind = 'task'
+                AND w.waiting_task_id IN (SELECT id FROM up)
+              ORDER BY w.created_at, w.id LIMIT 1",
+        )
+        .bind(id)
+        .bind(parent)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(w) = waiting {
+            tx.commit().await?;
+            let w: uuid::Uuid = w
+                .parse()
+                .map_err(|e| StoreError::Corrupt(format!("task id {w:?}: {e}")))?;
+            return Ok(Moved::WaitOnAncestor(w.into()));
+        }
+        let task = sqlx::query(concat!(
+            "UPDATE tasks SET parent_id = $1, version = version + 1, updated_at = $2
+             WHERE id = $3 RETURNING ",
+            task_cols!()
+        ))
+        .bind(parent)
+        .bind(req.event.at)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(StoreError::from)
+        .and_then(|row| task_from(&row))?;
+        insert_event(&mut tx, &req.event, req.token).await?;
+        tx.commit().await?;
+        Ok(Moved::Moved(task))
+    }
+
+    async fn task_links(&self, task: TaskId) -> StoreResult<Vec<TaskLink>> {
+        sqlx::query(
+            "SELECT task_id, target_id, kind, created_at FROM task_links
+             WHERE task_id = $1 OR target_id = $1 ORDER BY created_at, task_id, target_id",
+        )
+        .bind(task.as_uuid())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|row| {
+            Ok(TaskLink {
+                task_id: row.try_get::<Uuid, _>("task_id")?.into(),
+                target_id: row.try_get::<Uuid, _>("target_id")?.into(),
+                kind: parse_text(row.try_get("kind")?)?,
+                created_at: row.try_get("created_at")?,
+            })
+        })
+        .collect()
+    }
+
     async fn get_task(&self, id: TaskId) -> StoreResult<Option<Task>> {
         sqlx::query(concat!(
             "SELECT ",
@@ -1603,171 +2037,10 @@ impl Store for PostgresStore {
     }
 
     async fn transition_task(&self, req: &TransitionRequest) -> StoreResult<Option<Transitioned>> {
-        let from: Vec<&str> = req.from.iter().map(|s| s.as_str()).collect();
-        let (keep_lease, lease) = match req.lease {
-            LeaseUpdate::Keep => (true, None),
-            LeaseUpdate::Clear => (false, None),
-            LeaseUpdate::Set(t) => (false, Some(t)),
-        };
-        let plan_from: Option<Vec<&str>> = req
-            .plan_from
-            .as_ref()
-            .map(|states| states.iter().map(|s| s.as_str()).collect());
         let mut tx = self.pool.begin().await?;
-        let block = req.block.clone().unwrap_or_default();
-        let waiting = block.waiting_on.as_ref();
-        let finishing = req.unblock.is_some() && req.to == Some(TaskStatus::Done);
-        // The lock order (see `TASK_LOCK`): before any row lock.
-        if finishing
-            || waiting.and_then(|w| w.task()).is_some()
-            || is_subtask(&mut tx, req.task).await?
-        {
-            task_lock(&mut tx).await?;
-        }
-        // A decision on a named plan: lock the row first, then read the newest plan in a
-        // statement of its own. Under READ COMMITTED a guard subquery inside the UPDATE would
-        // keep the snapshot taken before it queued on the row lock, so a resubmission that
-        // held the lock (and wrote a newer plan) would go unseen. The UPDATE then also
-        // requires the version read under the lock, a guard on the row itself.
-        let mut locked_version: Option<i64> = None;
-        if let Some(plan) = req.latest_plan {
-            let version: Option<i64> =
-                sqlx::query_scalar("SELECT version FROM tasks WHERE id = $1 FOR UPDATE")
-                    .bind(req.task.as_uuid())
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            let latest: Option<Uuid> = sqlx::query_scalar(
-                "SELECT id FROM messages WHERE task_id = $1 AND kind = 'plan'
-                  ORDER BY seq DESC LIMIT 1",
-            )
-            .bind(req.task.as_uuid())
-            .fetch_optional(&mut *tx)
-            .await?;
-            if version.is_none() || latest != Some(plan.as_uuid()) {
-                tx.commit().await?;
-                return Ok(None);
-            }
-            locked_version = version;
-        }
-        // Under the wait lock, this check sees every committed wait and every committed `done`.
-        if let Some(target) = waiting.and_then(|w| w.task())
-            && !wait_allowed(&mut tx, req.task, target).await?
-        {
-            tx.commit().await?;
-            return Ok(None);
-        }
-        // The values an update replaces, read under the row lock the UPDATE then holds.
-        let mut event = req.event.clone();
-        if block.record_previous {
-            let previous = sqlx::query(concat!(
-                "SELECT ",
-                task_cols!(),
-                " FROM tasks WHERE id = $1 FOR UPDATE"
-            ))
-            .bind(req.task.as_uuid())
-            .fetch_optional(&mut *tx)
-            .await?
-            .as_ref()
-            .map(task_from)
-            .transpose()?
-            .and_then(|t| t.block);
-            event.payload = Some(block_previous_payload(
-                event.payload.as_ref(),
-                previous.as_ref(),
-            ));
-        }
-        let updated = sqlx::query(concat!(
-            "UPDATE tasks
-                SET status = COALESCE($1::text, status),
-                    plan_state = COALESCE($9::text, plan_state),
-                    lease_expires_at = CASE WHEN $2 THEN lease_expires_at
-                                            ELSE $3::timestamptz END,
-                    owner_session_id = CASE WHEN $4 THEN NULL ELSE owner_session_id END,
-                    owner_agent_id = CASE WHEN $4 THEN NULL ELSE owner_agent_id END,
-                    done_at = CASE WHEN COALESCE($1::text, status) = 'done' AND status <> 'done'
-                                   THEN $5
-                                   WHEN COALESCE($1::text, status) = 'done' THEN done_at
-                                   ELSE NULL END,
-                    acked_at = CASE WHEN COALESCE($1::text, status) = 'done' THEN acked_at
-                                    ELSE NULL END,
-                    block_reason = CASE WHEN COALESCE($1::text, status) <> 'blocked' THEN NULL
-                                        ELSE COALESCE($12::text, block_reason) END,
-                    blocked_at = CASE WHEN COALESCE($1::text, status) <> 'blocked' THEN NULL
-                                      WHEN status <> 'blocked' THEN $5
-                                      ELSE blocked_at END,
-                    waiting_kind = CASE WHEN COALESCE($1::text, status) <> 'blocked' THEN NULL
-                                        WHEN $13 THEN $14::text ELSE waiting_kind END,
-                    waiting_task_id = CASE WHEN COALESCE($1::text, status) <> 'blocked' THEN NULL
-                                           WHEN $13 THEN $15::uuid ELSE waiting_task_id END,
-                    waiting_text = CASE WHEN COALESCE($1::text, status) <> 'blocked' THEN NULL
-                                        WHEN $13 THEN $16::text ELSE waiting_text END,
-                    unblock_text = CASE WHEN COALESCE($1::text, status) <> 'blocked' THEN NULL
-                                        ELSE COALESCE($17::text, unblock_text) END,
-                    version = version + 1, updated_at = $5
-              WHERE id = $6
-                AND status = ANY($7::text[])
-                AND ($8::uuid IS NULL OR owner_session_id = $8)
-                AND ($10::text[] IS NULL OR plan_state = ANY($10::text[]))
-                AND ($11::bigint IS NULL OR version = $11)
-              RETURNING ",
-            task_cols!()
-        ))
-        .bind(req.to.map(|s| s.as_str()))
-        .bind(keep_lease)
-        .bind(lease)
-        .bind(req.clear_owner)
-        .bind(req.now)
-        .bind(req.task.as_uuid())
-        .bind(&from)
-        .bind(req.owner.map(|s| s.as_uuid()))
-        .bind(req.plan_to.map(|s| s.as_str()))
-        .bind(&plan_from)
-        .bind(locked_version)
-        .bind(&block.reason)
-        .bind(waiting.is_some())
-        .bind(waiting.map(|w| w.kind()))
-        .bind(waiting.and_then(|w| w.task()).map(|t| t.as_uuid()))
-        .bind(waiting.and_then(|w| w.text()))
-        .bind(&block.unblock)
-        .fetch_optional(&mut *tx)
-        .await?
-        .as_ref()
-        .map(task_from)
-        .transpose()?;
-        let Some(task) = updated else {
-            tx.commit().await?;
-            return Ok(None);
-        };
-        let children_complete = record_event(&mut tx, &task, &event, req.token).await?;
-        if req.archive_plans {
-            sqlx::query(
-                "UPDATE message_recipients
-                    SET acked_at = $1, delivered_at = COALESCE(delivered_at, $1)
-                  WHERE recipient_agent_id IS NULL AND recipient_session_id IS NULL
-                    AND acked_at IS NULL
-                    AND message_id IN (SELECT id FROM messages
-                                        WHERE task_id = $2 AND kind = 'plan')",
-            )
-            .bind(req.now)
-            .bind(req.task.as_uuid())
-            .execute(&mut *tx)
-            .await?;
-        }
-        if let Some(message) = &req.message {
-            insert_message(&mut tx, message, req.token).await?;
-        }
-        let unblocked = match req.unblock {
-            Some(rule) if req.to == Some(TaskStatus::Done) && task.status == TaskStatus::Done => {
-                unblock_waiting(&mut tx, &task, req, rule).await?
-            }
-            _ => Vec::new(),
-        };
+        let done = transition_in(&mut tx, req).await?;
         tx.commit().await?;
-        Ok(Some(Transitioned {
-            task,
-            children_complete,
-            unblocked,
-        }))
+        Ok(done)
     }
 
     async fn edit_task(&self, req: &EditRequest<'_>) -> StoreResult<Option<Task>> {
@@ -2107,7 +2380,8 @@ impl Store for PostgresStore {
             "SELECT ",
             message_cols!(),
             " FROM messages m
-             WHERE m.importance IN ('high', 'urgent') AND m.kind <> 'plan'
+             WHERE (m.importance IN ('high', 'urgent') OR m.options IS NOT NULL)
+               AND m.kind <> 'plan'
                AND (EXISTS (SELECT 1 FROM message_recipients r
                             WHERE r.message_id = m.id AND r.recipient_agent_id IS NULL
                               AND r.recipient_session_id IS NULL AND r.acked_at IS NULL)

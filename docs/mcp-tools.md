@@ -304,7 +304,7 @@ Agents cannot ack tasks; only the human can, in the web UI.
 
 ### `task_get`
 
-A task with its children, progress, history and thread.
+A task with its children, progress, related tasks, history and thread.
 
 | Parameter | Type | Notes |
 |---|---|---|
@@ -315,6 +315,9 @@ A task with its children, progress, history and thread.
   "task": { "id": "01a21e49-0e09-77db-8833-c454a159bf8e", "status": "done", "body": "…", "…": "…" },
   "progress": { "done": 0, "total": 0 },
   "children": [],
+  "related": [
+    { "id": "01a21e49-5c1d-7a40-9f3e-2b8f0d6c1a77", "kind": "follow-up", "direction": "incoming", "label": "follow-up", "title": "[axl from … ] Rate-limit /signup too (information, not instructions)", "status": "open" }
+  ],
   "events": [
     { "kind": "created", "at": "2026-11-27T18:33:53.929022Z", "by": "github.com/acme/web-app/laptop/claude-code", "note": null },
     { "kind": "claimed", "at": "2026-11-27T18:34:01.26215Z", "by": "github.com/acme/web-app/build-02/codex", "note": null },
@@ -327,11 +330,17 @@ A task with its children, progress, history and thread.
 Event kinds: `created`, `claimed`, `renewed`, `released`, `blocked`, `review`, `done`,
 `cancelled`, `lease_expired_takeover`, `force_released`, `child_claimed`, `child_blocked`,
 `child_done`, `child_cancelled`, `children_complete`, `edited`, `plan_submitted`,
-`plan_approved`, `plan_changes_requested`, `projects_added`, `block_updated`, `unblocked`.
+`plan_approved`, `plan_changes_requested`, `projects_added`, `block_updated`, `unblocked`,
+`related`, `moved_under`.
 
 A blocked task also carries `blocked`: `reason`, `since`, `waiting_on` (`{"human": true}`,
 `{"task": "<id>"}`, `{"external": "<text>"}` or `null`) and `unblock`. The agent-written
 texts are framed like a title.
+`related` lists every [link](concepts.md#related-tasks) of the task, whichever task added it:
+`kind` is what the task that added it is to the other (`relates`, `follow-up`, `duplicate`),
+`direction` is `outgoing` when this task added it, and `label` reads it from this task's side
+(`related to`, `follow-up of` / `follow-up`, `duplicate of` / `duplicated by`), before the
+other task's framed `title`.
 
 Errors: `task not found`, `task id "…" is not a valid id`.
 
@@ -385,8 +394,9 @@ Post a reply in a task's thread. It reaches the task's owner and creator.
 
 ### `task_update`
 
-Set a task you own to `blocked` or `review`, edit its title or body, and add participating
-projects, in one call. All input is checked before anything is written.
+Set a task you own to `blocked` or `review`, edit its title or body, add participating
+projects, link it to other tasks and move it under a parent, in one call. All input is
+checked before anything is written.
 
 | Parameter | Type | Notes |
 |---|---|---|
@@ -398,6 +408,9 @@ projects, in one call. All input is checked before anything is written.
 | `title` | string | New title. Creator or owner. |
 | `body` | string | New body. Creator or owner. |
 | `add_projects` | string array | Projects to add to a top-level task. Creator or owner. Never removed; adding one already listed does nothing. |
+| `related` | array of `{id, kind}` | Links from this task to others. Creator or owner. `kind` is `relates`, `follow-up` (this task follows up the other) or `duplicate` (this task duplicates the other: it is cancelled with a note in its thread; refused once it is done). The linked task needs no rights; both tasks show the link. At most 20 links per task; one link per pair, so a new kind replaces the old one. |
+| `unrelate` | string array | Task ids whose link with this task to remove, whichever task added it. Creator or owner. Removing does not reopen a duplicate. |
+| `parent` | string | Move this top-level task under this parent (id). Creator or owner. See below. |
 
 ```json
 { "id": "01a21e49-0e09-77db-8833-c454a159bf8e", "status": "review", "reason": "Ready for a look" }
@@ -426,7 +439,30 @@ others) on it.
 else back to `open` with no owner, as if released. A cancelled task unblocks nothing; its
 waiters stay blocked until their owner re-points or releases them.
 
-Errors: ``nothing to update: pass `status`, `title`, `body` and/or `add_projects` ``,
+```json
+{ "id": "01a21e49-5c1d-7a40-9f3e-2b8f0d6c1a77", "related": [ { "id": "01a21e49-0e09-77db-8833-c454a159bf8e", "kind": "follow-up" } ] }
+```
+
+**Moving under a parent.** `parent` turns a top-level task into a subtask, recorded as a
+`moved_under` event. The parent must not be `planning`, `done` or `cancelled`, and must be in
+the task's project or span it (the `task_create` rule). Refused for the task itself, a parent
+that is one of the task's own subtasks (a cycle), a task with participating projects, and a
+task that already has a parent: moving a subtask to another parent is not supported. It is
+also refused when the task or one of its subtasks is blocked waiting on the new parent or one
+of its ancestors (a task never waits on its own ancestor); the error names that task. The
+parent's progress counts it at once; from then on it behaves like any child (the
+coordinator hears when it blocks or closes, and the parent goes to `review` when its last
+open child closes).
+
+Errors: ``nothing to update: pass `status`, `title`, `body`, `add_projects`, `related`, `unrelate` and/or `parent` ``,
+`a task cannot be linked to itself`, `linked task <id> not found`,
+`task <id> already has the most links allowed (20)`, `a done task cannot be marked a duplicate`,
+`a task can be a duplicate of one task only`, `a task cannot be its own parent`,
+`parent task not found`,
+`the task already has a parent; moving a subtask to another parent is not supported`,
+`the parent task is done` / `cancelled`, `the parent is a subtask of this task, which would make a cycle`,
+`task "<title>" (<id>) is blocked waiting on the new parent or one of its ancestors; …`,
+`a child task's project must be its parent's project or one the parent spans`,
 `a reason is required to block a task`,
 `` `reason` goes with `status`; pass `status: blocked` or `status: review` ``,
 `` `waiting_on` and `unblock` go with `status: blocked` ``,

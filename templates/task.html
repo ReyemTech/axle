@@ -110,6 +110,28 @@
     {% endif %}
   </section>
 
+  <section class="panel" aria-label="Related">
+    <h2 class="panel-title">Related <span class="count">{{ related.len() }}</span></h2>
+    {% if related.is_empty() %}<p class="empty">No related tasks. Link follow-ups and duplicates from Actions.</p>{% else %}
+    <ul class="child-list related-list">
+    {% for r in related %}
+      <li class="child related" data-status="{{ r.status }}" data-kind="{{ r.kind }}">
+        <span class="station" data-status="{{ r.status }}" title="{{ r.status }}" aria-hidden="true"></span>
+        <span class="related-kind">{{ r.label }}</span>
+        <a class="child-title" href="/ui/tasks/{{ r.id }}"><span class="project" data-line="{{ r.project.line }}" title="{{ r.project.key }}">{{ r.project.name }}</span> {{ r.title }}</a>
+        <span class="child-owner"><span class="child-state">{{ r.status }}</span></span>
+        {% if let Some(token) = csrf %}
+        <form class="related-remove" method="post" action="/ui/tasks/{{ task.id }}/related/{{ r.id }}/remove" data-confirm="Remove the link to this task?">
+          <input type="hidden" name="csrf" value="{{ token }}">
+          <button type="submit" class="link" title="Remove this link (both tasks stop showing it)">Unlink</button>
+        </form>
+        {% endif %}
+      </li>
+    {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+
   <section class="panel" aria-label="Thread">
     <h2 class="panel-title">Thread{% if thread_paged %} <span class="muted">(earlier)</span>{% endif %}</h2>
     {% if let Some(href) = earlier %}<p><a class="earlier" href="{{ href }}">Earlier messages</a></p>{% endif %}
@@ -200,6 +222,33 @@
     </form>
     <p class="hint">Projects are never removed, so subtasks already made stay valid.</p>
     {% endif %}
+  </section>
+  {% endif %}
+  <section class="panel">
+    <h2 class="panel-title">Link a task</h2>
+    <form class="stack" method="post" action="/ui/tasks/{{ task.id }}/related">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <label for="related-kind">This task is</label>
+      <select id="related-kind" name="kind">
+        <option value="relates">related to</option>
+        <option value="follow-up">a follow-up of</option>
+        {% if task.status != "done" %}<option value="duplicate">a duplicate of (cancels this task)</option>{% endif %}
+      </select>
+      <label for="related-task">Other task <span class="muted">(id or link)</span></label>
+      <input id="related-task" name="task" required autocomplete="off">
+      <button type="submit" class="secondary">+ Link task</button>
+    </form>
+  </section>
+  {% if task.can_move %}
+  <section class="panel">
+    <h2 class="panel-title">Move under a parent</h2>
+    <form class="stack" method="post" action="/ui/tasks/{{ task.id }}/parent">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <label for="move-parent">Parent task <span class="muted">(id or link)</span></label>
+      <input id="move-parent" name="parent" required autocomplete="off">
+      <button type="submit" class="secondary">Make it a subtask</button>
+    </form>
+    <p class="hint">The parent must be open for subtasks, in this task's project or one it spans.</p>
   </section>
   {% endif %}
   {% if task.can_cancel && task.status != "planning" %}
