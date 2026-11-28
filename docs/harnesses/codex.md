@@ -1,6 +1,6 @@
 # Codex
 
-Codex gets the stdio bridge, so it has all [17 tools](../mcp-tools.md), and hooks that
+Codex gets the stdio bridge, so it has all [18 tools](../mcp-tools.md), and hooks that
 surface new mail while it works.
 
 ## Set up
