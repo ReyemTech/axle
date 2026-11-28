@@ -228,6 +228,8 @@ pub struct ServerConfig {
     pub rate_limit_per_sec: u32,
     /// Per-token burst size (`AXL_RATE_LIMIT_BURST`, default 100).
     pub rate_limit_burst: u32,
+    /// `AXL_DONE_AUTO_ACK_DAYS` (default 7 days).
+    pub done_auto_ack: Duration,
     /// Mark the UI session cookie `Secure` (`AXL_COOKIE_SECURE`, default false). Set it
     /// whenever the UI is reached over https, e.g. behind a TLS ingress.
     pub cookie_secure: bool,
@@ -389,6 +391,7 @@ impl ServerConfig {
             idle_renew_cap: Duration::hours(2),
             rate_limit_per_sec: positive(&get, "AXL_RATE_LIMIT_PER_SEC", 20)?,
             rate_limit_burst: positive(&get, "AXL_RATE_LIMIT_BURST", 100)?,
+            done_auto_ack: Duration::days(i64::from(positive(&get, "AXL_DONE_AUTO_ACK_DAYS", 7)?)),
             cookie_secure: boolean(&get, "AXL_COOKIE_SECURE", false)?,
             public_url,
             trusted_proxy_header,
@@ -482,8 +485,41 @@ mod tests {
         assert_eq!(c.bind.to_string(), "127.0.0.1:7420");
         assert_eq!(c.rate_limit_per_sec, 20);
         assert_eq!(c.rate_limit_burst, 100);
+        assert_eq!(c.done_auto_ack, Duration::days(7));
         assert!(!c.cookie_secure);
         assert_eq!(c.ui_auth, UiAuth::Secret("s3cret-s3cret-s3cret".into()));
+    }
+
+    #[test]
+    fn done_auto_ack_days() {
+        let base = [
+            ("DATABASE_URL", "sqlite://./axl.db"),
+            ("AXL_ADMIN_SECRET", "s3cret-s3cret-s3cret"),
+        ];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let vars: Vec<(&str, &str)> = base.iter().chain(extra).copied().collect();
+            ServerConfig::from_lookup(lookup(&vars))
+        };
+        assert_eq!(
+            with(&[("AXL_DONE_AUTO_ACK_DAYS", "3")])
+                .unwrap()
+                .done_auto_ack,
+            Duration::days(3)
+        );
+        assert_eq!(
+            with(&[("AXL_DONE_AUTO_ACK_DAYS", "1")])
+                .unwrap()
+                .done_auto_ack,
+            Duration::days(1)
+        );
+        for bad in ["0", "-1", "week", "1.5", ""] {
+            let e = with(&[("AXL_DONE_AUTO_ACK_DAYS", bad)]).unwrap_err();
+            assert!(
+                matches!(e, ConfigError::BadNumber("AXL_DONE_AUTO_ACK_DAYS", _)),
+                "{bad}: {e}"
+            );
+            assert!(e.to_string().contains("AXL_DONE_AUTO_ACK_DAYS"));
+        }
     }
 
     #[test]

@@ -329,6 +329,70 @@ pub async fn cancel(State(state): State<AppState>, Path(id): Path<String>) -> Ui
     Ok(see_other(&format!("/ui/tasks/{id}")))
 }
 
+// ---------------------------------------------------------------- ack
+
+#[derive(Deserialize)]
+pub struct AckForm {
+    /// The page to return to (see `ack_back`).
+    #[serde(default)]
+    back: String,
+}
+
+/// Where an ack returns to: the board or History (with any query), else the board. `//`,
+/// `/\`, absolute URLs, non-ASCII text and other UI pages all fall back, so the redirect never leaves the UI.
+fn ack_back(back: &str) -> &str {
+    let ok = |page: &str| {
+        back == page
+            || back
+                .strip_prefix(page)
+                .is_some_and(|rest| rest.starts_with('?'))
+    };
+    if (ok("/ui/board") || ok("/ui/history"))
+        && back.is_ascii()
+        && !back.chars().any(char::is_control)
+    {
+        back
+    } else {
+        "/ui/board"
+    }
+}
+
+/// `POST /ui/tasks/{id}/ack`: marks one finished task as seen. An unknown or not-done id is
+/// a no-op.
+pub async fn ack_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<AckForm>,
+) -> UiResult<Response> {
+    let id = task_id(&id)?;
+    state.tasks.ack_done(&[id]).await.map_err(task_error)?;
+    Ok(see_other(ack_back(&form.back)))
+}
+
+/// `POST /ui/done/ack` (`csrf`, `back`, repeated `id`): marks exactly the listed finished
+/// tasks as seen (the board's Ack all and History's Ack these). One unparsable id refuses the
+/// whole batch.
+pub async fn ack_done(State(state): State<AppState>, RawForm(raw): RawForm) -> UiResult<Response> {
+    let fields: Vec<(String, String)> =
+        serde_urlencoded::from_bytes(&raw).map_err(|_| UiError::Invalid("Bad form.".into()))?;
+    let mut ids = Vec::new();
+    let mut back = "";
+    for (k, v) in &fields {
+        match k.as_str() {
+            "id" => ids.push(
+                v.parse::<TaskId>()
+                    .map_err(|_| UiError::Invalid("Bad task id.".into()))?,
+            ),
+            "back" => back = v,
+            _ => {}
+        }
+    }
+    if !ids.is_empty() {
+        state.tasks.ack_done(&ids).await.map_err(task_error)?;
+    }
+    Ok(see_other(ack_back(back)))
+}
+
 // ---------------------------------------------------------------- messages
 
 #[derive(Deserialize)]

@@ -10,7 +10,7 @@ none.
 
 ## The top bar
 
-Every page shares a bar with the sections (**Overview**, **Board**, **Inbox**, **Projects**,
+Every page shares a bar with the sections (**Overview**, **Board**, **History**, **Inbox**, **Projects**,
 **Tokens**), a **Filter this page** box, and live counts: sessions **live**, tasks
 **blocked**, and items that **need you**. The last links to the Needs you strip.
 
@@ -22,10 +22,17 @@ Every page shares a bar with the sections (**Overview**, **Board**, **Inbox**, *
 </picture>
 
 The board has five columns: **open**, **claimed** (which also holds `planning` tasks),
-**blocked**, **review** and **done** (the last 7 days). Each card shows the title, its
+**blocked**, **review** and **done** (finished work you have not acked yet). Each card shows the title, its
 status glyph and label, the project, the holder and whether its session is live, and a
 lease bar. A parent task shows its subtasks as a row of stops. Filter by project with the
 chips above the columns.
+
+The done column holds finished top-level tasks you have not seen, newest first, at most 50.
+Its head reads "N unseen". **Ack** under a card hides that task from the board; **Ack all**
+hides exactly the cards shown. Acking a parent also acks its done subtasks. Acking changes nothing about the task: it stays done and
+stays in [History](#history). Work finished more than `AXL_DONE_AUTO_ACK_DAYS`
+days ago (default 7) leaves the column by itself; a muted line, "N auto-acked, unseen",
+links to the History list of those tasks. Acking is a human action: agents cannot ack.
 
 ### Key
 
@@ -41,7 +48,7 @@ Click **Key** for the legend.
 | claimed | One agent holds it under a lease. |
 | blocked | Stuck; waiting on someone. |
 | review | Finished work awaiting a check. |
-| done | Finished in the last 7 days. |
+| done | Finished; on the board until you ack it or it auto-acks. |
 | lease | Bar length is the time left on the claim; amber when under a fifth remains. |
 | subtasks | One stop per subtask, in order; hover a stop for its title. |
 | live / stale | The holder's session sent a heartbeat in the last 90 seconds, or has not. |
@@ -55,6 +62,22 @@ first — I approve before work starts**, ticked by default. See
 [the plan gate](concepts.md#the-plan-gate).
 
 <img src="images/new-task-form.webp" width="1440" alt="The New task form on the board: lead project select, Also involves checkboxes for other projects, title, details and a ticked Plan first checkbox, above the task columns.">
+
+## History
+
+**History** lists every finished task, subtasks included, newest first, 50 to a page;
+**Older** loads the next page. Each row shows the title, project, the parent for a subtask,
+when it finished, and its state in words:
+
+- **unseen**: finished recently and not acked yet; it is on the board.
+- **acked**: you acked it.
+- **auto-acked**: it finished more than `AXL_DONE_AUTO_ACK_DAYS` days ago without an ack, so
+  it left the board by itself.
+
+Filter by project, or search titles (case-insensitive for ASCII letters, and Postgres folds other letters too; `%` and `_` match literally), then
+press **Show**. **Show only auto-acked, unseen** lists the tasks behind the board's
+"N auto-acked, unseen" line, respecting the project filter. There, **Ack these** acks exactly
+the rows on the page (up to 50) and returns to the same list.
 
 ## Needs you
 

@@ -100,7 +100,8 @@ pub async fn sqlite_store() -> (Arc<dyn Store>, TempDb) {
 }
 
 #[cfg(feature = "pg-tests")]
-pub use pg::pg_store;
+#[allow(unused_imports)]
+pub use pg::{pg_bare_schema, pg_store};
 
 #[cfg(feature = "pg-tests")]
 mod pg {
@@ -150,7 +151,8 @@ mod pg {
         }
     }
 
-    pub async fn pg_store() -> (Arc<dyn Store>, TestSchema) {
+    /// A fresh, empty schema: created, but no migrations run.
+    pub async fn pg_bare_schema() -> TestSchema {
         let url = std::env::var("AXL_TEST_PG_URL")
             .expect("AXL_TEST_PG_URL must be set when running with --features pg-tests");
         let admin = PgConnectOptions::from_str(&url).expect("parse AXL_TEST_PG_URL");
@@ -166,8 +168,15 @@ mod pg {
             .await
             .expect("create test schema");
         pool.close().await;
+        TestSchema { admin, name }
+    }
 
-        let scoped = admin.clone().options([("search_path", name.as_str())]);
+    pub async fn pg_store() -> (Arc<dyn Store>, TestSchema) {
+        let schema = pg_bare_schema().await;
+        let scoped = schema
+            .admin
+            .clone()
+            .options([("search_path", schema.name.as_str())]);
         let pool = PgPoolOptions::new()
             .max_connections(8)
             .connect_with(scoped)
@@ -176,6 +185,6 @@ mod pg {
         let store = PostgresStore::from_pool(pool)
             .await
             .expect("migrate test schema");
-        (Arc::new(store), TestSchema { admin, name })
+        (Arc::new(store), schema)
     }
 }

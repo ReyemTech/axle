@@ -108,7 +108,50 @@
     document.querySelectorAll("[data-nav]").forEach(function (el) {
       el.hidden = q !== "" && el.textContent.toLowerCase().indexOf(q) < 0;
     });
+    // Per-card Ack forms sit beside their card (outside the article so live swaps keep their
+    // CSRF token); they hide and show together with it.
+    document.querySelectorAll("form.ack[data-ack-for]").forEach(function (form) {
+      var card = document.getElementById("task-" + form.getAttribute("data-ack-for"));
+      form.hidden = !!card && card.hidden;
+    });
+    updateBulkAck(q !== "");
   }
+
+  // Bulk-ack forms (Ack all, Ack these) post every rendered id; while the filter hides cards
+  // they must only post the visible ones, and the button says how many that is.
+  function visibleAckInputs(form) {
+    return Array.prototype.filter.call(
+      form.querySelectorAll("input[data-ack-for]"),
+      function (i) {
+        var card = document.getElementById("task-" + i.getAttribute("data-ack-for"));
+        return !card || !card.hidden;
+      }
+    );
+  }
+  function updateBulkAck(filtering) {
+    document.querySelectorAll("form[data-bulk-ack]").forEach(function (form) {
+      var btn = form.querySelector("button[type=submit]");
+      if (!btn) return;
+      if (btn.getAttribute("data-label") === null) {
+        btn.setAttribute("data-label", btn.textContent);
+      }
+      btn.textContent = filtering
+        ? "Ack " + visibleAckInputs(form).length + " shown"
+        : btn.getAttribute("data-label");
+    });
+  }
+  document.addEventListener("submit", function (e) {
+    var form = e.target;
+    if (!(form instanceof HTMLFormElement) || !form.hasAttribute("data-bulk-ack")) return;
+    var shown = visibleAckInputs(form);
+    if (shown.length === 0) {
+      e.preventDefault();
+      return;
+    }
+    form.querySelectorAll("input[data-ack-for]").forEach(function (i) {
+      i.disabled = shown.indexOf(i) < 0;
+    });
+  });
   document.addEventListener("input", function (e) {
     if (e.target && e.target.id === "search") applySearch();
   });
@@ -293,6 +336,8 @@
 
   document.addEventListener("htmx:afterSettle", afterSwap);
   document.addEventListener("htmx:sseMessage", afterSwap);
+  document.addEventListener("htmx:afterSwap", afterSwap);
+  document.addEventListener("htmx:oobAfterSwap", afterSwap);
 
   // Destructive forms ask first (`data-confirm` holds the question).
   document.addEventListener("submit", function (e) {

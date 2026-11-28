@@ -9,14 +9,14 @@ use uuid::Uuid;
 use super::{
     AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate,
     MessageReceipt, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, Store,
-    StoreError, StoreResult, TaskFilter, TransitionRequest, Transitioned, child_event,
+    StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, child_event,
     children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label,
-    projects_added_note, projects_added_payload, send_time_recipient,
+    like_pattern, projects_added_note, projects_added_payload, send_time_recipient,
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, Eligibility, Enrollment, EnrollmentId, EnrollmentStatus,
     Importance, InboxItem, Message, MessageId, Project, ProjectId, Session, SessionId, Task,
-    TaskEvent, TaskEventKind, TaskId, TokenId, TokenInfo,
+    TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId, TokenInfo,
 };
 
 pub struct PostgresStore {
@@ -102,6 +102,8 @@ fn task_from(row: &PgRow) -> StoreResult<Task> {
         ),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+        done_at: row.try_get("done_at")?,
+        acked_at: row.try_get("acked_at")?,
         version: row.try_get("version")?,
         requires_plan: row.try_get("requires_plan")?,
         plan_state: parse_text(row.try_get("plan_state")?)?,
@@ -192,6 +194,7 @@ async fn record_event(
         return Ok(false);
     }
     match status.as_deref() {
+        // Never a `done` row, so `done_at` / `acked_at` need no handling here.
         Some("claimed") => {
             sqlx::query(
                 "UPDATE tasks SET status = 'review', lease_expires_at = NULL,
@@ -210,13 +213,33 @@ async fn record_event(
     Ok(true)
 }
 
+/// The `WHERE` shared by `list_tasks` and `count_tasks` (everything but the `after` cursor).
+/// `$5` is top_level, `$6` the done mode (`any`/`unseen`/`auto`), `$7` its `since`, `$8` the
+/// title LIKE pattern (backslash escapes).
+macro_rules! task_where {
+    () => {
+        "($1::uuid IS NULL OR project_id = $1
+                    OR EXISTS (SELECT 1 FROM task_projects tp
+                               WHERE tp.task_id = tasks.id AND tp.project_id = $1))
+               AND ($2::text IS NULL OR status = $2)
+               AND ($3::uuid IS NULL OR owner_agent_id = $3)
+               AND ($4::uuid IS NULL OR parent_id = $4)
+               AND (NOT $5::bool OR parent_id IS NULL)
+               AND (status <> 'done' OR $6::text = 'any'
+                    OR (acked_at IS NULL
+                        AND (($6::text = 'unseen' AND done_at >= $7::timestamptz)
+                             OR ($6::text = 'auto' AND done_at < $7::timestamptz))))
+               AND ($8::text IS NULL OR title ILIKE $8 ESCAPE '\\')"
+    };
+}
+
 /// Task columns as a literal, so queries stay static SQL.
 macro_rules! task_cols {
     () => {
         "id, project_id, parent_id, title, body, status, owner_session_id, owner_agent_id,
          lease_expires_at, lease_epoch, lease_ttl_secs, eligible_harness, eligible_host,
          created_by_agent_id, created_by_session_id, created_at, updated_at, version,
-         requires_plan, plan_state"
+         requires_plan, plan_state, done_at, acked_at"
     };
 }
 
@@ -1206,32 +1229,110 @@ impl Store for PostgresStore {
     }
 
     async fn list_tasks(&self, filter: &TaskFilter) -> StoreResult<Vec<Task>> {
-        sqlx::query(concat!(
-            "SELECT ",
-            task_cols!(),
-            " FROM tasks
-             WHERE ($1::uuid IS NULL OR project_id = $1
-                    OR EXISTS (SELECT 1 FROM task_projects tp
-                               WHERE tp.task_id = tasks.id AND tp.project_id = $1))
-               AND ($2::text IS NULL OR status = $2)
-               AND ($3::uuid IS NULL OR owner_agent_id = $3)
-               AND ($4::uuid IS NULL OR parent_id = $4)
-               AND ($5::uuid IS NULL
-                    OR (created_at, id) > (SELECT created_at, id FROM tasks WHERE id = $5))
-             ORDER BY created_at, id
-             LIMIT $6"
-        ))
-        .bind(filter.project.map(|p| p.as_uuid()))
-        .bind(filter.status.map(|s| s.as_str()))
-        .bind(filter.owner.map(|a| a.as_uuid()))
-        .bind(filter.parent.map(|p| p.as_uuid()))
-        .bind(filter.after.map(|t| t.as_uuid()))
-        .bind(filter.limit.map(i64::from))
+        let (mode, since) = filter.done.parts();
+        // A literal `status = 'done'` lets the planner use the partial index `tasks_done`;
+        // `DoneNewest` is only meaningful for done rows, so it always carries it.
+        macro_rules! list_sql {
+            ($done_only:literal, $tail:expr) => {
+                concat!(
+                    "SELECT ",
+                    task_cols!(),
+                    " FROM tasks WHERE ",
+                    $done_only,
+                    task_where!(),
+                    $tail
+                )
+            };
+        }
+        let done_only = filter.status == Some(TaskStatus::Done);
+        let sql = match (filter.order, done_only) {
+            (TaskOrder::Created, false) => list_sql!(
+                "",
+                " AND ($9::uuid IS NULL
+                    OR (created_at, id) > (SELECT created_at, id FROM tasks WHERE id = $9))
+                 ORDER BY created_at, id
+                 LIMIT $10"
+            ),
+            (TaskOrder::Created, true) => list_sql!(
+                "status = 'done' AND ",
+                " AND ($9::uuid IS NULL
+                    OR (created_at, id) > (SELECT created_at, id FROM tasks WHERE id = $9))
+                 ORDER BY created_at, id
+                 LIMIT $10"
+            ),
+            (TaskOrder::DoneNewest, _) => list_sql!(
+                "status = 'done' AND ",
+                " AND ($9::uuid IS NULL
+                    OR (done_at, id) < (SELECT done_at, id FROM tasks WHERE id = $9))
+                 ORDER BY done_at DESC, id DESC
+                 LIMIT $10"
+            ),
+        };
+        sqlx::query(sql)
+            .bind(filter.project.map(|p| p.as_uuid()))
+            .bind(filter.status.map(|s| s.as_str()))
+            .bind(filter.owner.map(|a| a.as_uuid()))
+            .bind(filter.parent.map(|p| p.as_uuid()))
+            .bind(filter.top_level)
+            .bind(mode)
+            .bind(since)
+            .bind(filter.title.as_deref().map(like_pattern))
+            .bind(filter.after.map(|t| t.as_uuid()))
+            .bind(filter.limit.map(i64::from))
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(task_from)
+            .collect()
+    }
+
+    async fn ack_done_tasks(
+        &self,
+        ids: &[TaskId],
+        now: OffsetDateTime,
+    ) -> StoreResult<Vec<TaskId>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let listed: Vec<uuid::Uuid> = ids.iter().map(|i| i.as_uuid()).collect();
+        let rows: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "WITH RECURSIVE sub(id) AS (
+                 SELECT id FROM tasks WHERE id = ANY($1) AND status = 'done'
+                 UNION
+                 SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id)
+             UPDATE tasks SET acked_at = $2
+              WHERE id IN (SELECT id FROM sub) AND status = 'done' AND acked_at IS NULL
+              RETURNING id",
+        )
+        .bind(listed)
+        .bind(now)
         .fetch_all(&self.pool)
-        .await?
-        .iter()
-        .map(task_from)
-        .collect()
+        .await?;
+        Ok(rows.into_iter().map(TaskId::from).collect())
+    }
+
+    async fn count_tasks(&self, filter: &TaskFilter) -> StoreResult<u64> {
+        let (mode, since) = filter.done.parts();
+        let sql = if filter.status == Some(TaskStatus::Done) {
+            concat!(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'done' AND ",
+                task_where!()
+            )
+        } else {
+            concat!("SELECT COUNT(*) FROM tasks WHERE ", task_where!())
+        };
+        let n: i64 = sqlx::query_scalar(sql)
+            .bind(filter.project.map(|p| p.as_uuid()))
+            .bind(filter.status.map(|s| s.as_str()))
+            .bind(filter.owner.map(|a| a.as_uuid()))
+            .bind(filter.parent.map(|p| p.as_uuid()))
+            .bind(filter.top_level)
+            .bind(mode)
+            .bind(since)
+            .bind(filter.title.as_deref().map(like_pattern))
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n as u64)
     }
 
     async fn task_events(&self, id: TaskId) -> StoreResult<Vec<TaskEvent>> {
@@ -1364,6 +1465,12 @@ impl Store for PostgresStore {
                                             ELSE $3::timestamptz END,
                     owner_session_id = CASE WHEN $4 THEN NULL ELSE owner_session_id END,
                     owner_agent_id = CASE WHEN $4 THEN NULL ELSE owner_agent_id END,
+                    done_at = CASE WHEN COALESCE($1::text, status) = 'done' AND status <> 'done'
+                                   THEN $5
+                                   WHEN COALESCE($1::text, status) = 'done' THEN done_at
+                                   ELSE NULL END,
+                    acked_at = CASE WHEN COALESCE($1::text, status) = 'done' THEN acked_at
+                                    ELSE NULL END,
                     version = version + 1, updated_at = $5
               WHERE id = $6
                 AND status = ANY($7::text[])

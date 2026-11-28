@@ -12,14 +12,14 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 use super::{
     AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate,
     MessageReceipt, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, Store,
-    StoreError, StoreResult, TaskFilter, TransitionRequest, Transitioned, child_event,
+    StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, child_event,
     children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label,
-    projects_added_note, projects_added_payload, send_time_recipient,
+    like_pattern, projects_added_note, projects_added_payload, send_time_recipient,
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, Eligibility, Enrollment, EnrollmentId, EnrollmentStatus,
     Importance, InboxItem, Message, MessageId, Project, ProjectId, Session, SessionId, Task,
-    TaskEvent, TaskEventKind, TaskId, TokenId, TokenInfo,
+    TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId, TokenInfo,
 };
 
 /// The columns `enrollment_from` reads (a macro so queries can `concat!` it statically).
@@ -137,6 +137,8 @@ fn session_from(row: &SqliteRow) -> StoreResult<Session> {
 
 fn task_from(row: &SqliteRow) -> StoreResult<Task> {
     let lease: Option<&str> = row.try_get("lease_expires_at")?;
+    let done: Option<&str> = row.try_get("done_at")?;
+    let acked: Option<&str> = row.try_get("acked_at")?;
     Ok(Task {
         id: uuid_of(row.try_get("id")?)?,
         project_id: uuid_of(row.try_get("project_id")?)?,
@@ -161,6 +163,8 @@ fn task_from(row: &SqliteRow) -> StoreResult<Task> {
         ),
         created_at: ts::dec(row.try_get("created_at")?)?,
         updated_at: ts::dec(row.try_get("updated_at")?)?,
+        done_at: done.map(ts::dec).transpose()?,
+        acked_at: acked.map(ts::dec).transpose()?,
         version: row.try_get("version")?,
         requires_plan: row.try_get("requires_plan")?,
         plan_state: parse_text(row.try_get("plan_state")?)?,
@@ -246,6 +250,7 @@ async fn record_event(
         .fetch_optional(&mut *conn)
         .await?;
     match status.as_deref() {
+        // Never a `done` row, so `done_at` / `acked_at` need no handling here.
         Some("claimed") => {
             sqlx::query(
                 "UPDATE tasks SET status = 'review', lease_expires_at = NULL,
@@ -264,14 +269,85 @@ async fn record_event(
     Ok(true)
 }
 
+/// The `WHERE` shared by `list_tasks` and `count_tasks` (everything but the `after` cursor).
+/// `?5` is top_level, `?6` the done mode (`any`/`unseen`/`auto`), `?7` its `since`, `?8` the
+/// title LIKE pattern (backslash escapes).
+macro_rules! task_where {
+    () => {
+        "(?1 IS NULL OR project_id = ?1
+                    OR EXISTS (SELECT 1 FROM task_projects tp
+                               WHERE tp.task_id = tasks.id AND tp.project_id = ?1))
+               AND (?2 IS NULL OR status = ?2)
+               AND (?3 IS NULL OR owner_agent_id = ?3)
+               AND (?4 IS NULL OR parent_id = ?4)
+               AND (?5 = 0 OR parent_id IS NULL)
+               AND (status <> 'done' OR ?6 = 'any'
+                    OR (acked_at IS NULL
+                        AND ((?6 = 'unseen' AND done_at >= ?7)
+                             OR (?6 = 'auto' AND done_at < ?7))))
+               AND (?8 IS NULL OR title LIKE ?8 ESCAPE '\\')"
+    };
+}
+
 /// Task columns as a literal, so queries stay static SQL.
 macro_rules! task_cols {
     () => {
         "id, project_id, parent_id, title, body, status, owner_session_id, owner_agent_id,
          lease_expires_at, lease_epoch, lease_ttl_secs, eligible_harness, eligible_host,
          created_by_agent_id, created_by_session_id, created_at, updated_at, version,
-         requires_plan, plan_state"
+         requires_plan, plan_state, done_at, acked_at"
     };
+}
+
+/// The statement `list_tasks` runs for `filter`. A literal `status = 'done'` lets the planner
+/// use the partial index `tasks_done`; `TaskOrder::DoneNewest` is only meaningful for done
+/// rows, so it always carries the literal. Public (hidden) so a test can `EXPLAIN` it.
+#[doc(hidden)]
+pub fn list_tasks_sql(filter: &TaskFilter) -> &'static str {
+    macro_rules! list_sql {
+        ($done_only:literal, $tail:expr) => {
+            concat!(
+                "SELECT ",
+                task_cols!(),
+                " FROM tasks WHERE ",
+                $done_only,
+                task_where!(),
+                $tail
+            )
+        };
+    }
+    macro_rules! created {
+        () => {
+            " AND (?9 IS NULL
+                    OR (created_at, id) > (SELECT created_at, id FROM tasks WHERE id = ?9))
+                 ORDER BY created_at, id
+                 LIMIT ?10"
+        };
+    }
+    match (filter.order, filter.status == Some(TaskStatus::Done)) {
+        (TaskOrder::Created, false) => list_sql!("", created!()),
+        (TaskOrder::Created, true) => list_sql!("status = 'done' AND ", created!()),
+        (TaskOrder::DoneNewest, _) => list_sql!(
+            "status = 'done' AND ",
+            " AND (?9 IS NULL
+                    OR (done_at, id) < (SELECT done_at, id FROM tasks WHERE id = ?9))
+                 ORDER BY done_at DESC, id DESC
+                 LIMIT ?10"
+        ),
+    }
+}
+
+/// The statement `count_tasks` runs for `filter` (same `status = 'done'` literal rule).
+#[doc(hidden)]
+pub fn count_tasks_sql(filter: &TaskFilter) -> &'static str {
+    if filter.status == Some(TaskStatus::Done) {
+        concat!(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'done' AND ",
+            task_where!()
+        )
+    } else {
+        concat!("SELECT COUNT(*) FROM tasks WHERE ", task_where!())
+    }
 }
 
 /// Whether the claimant may claim the `tasks` row in scope. Binds, in order:
@@ -1281,36 +1357,68 @@ impl Store for SqliteStore {
     }
 
     async fn list_tasks(&self, filter: &TaskFilter) -> StoreResult<Vec<Task>> {
-        let project = filter.project.map(|p| p.to_string());
-        let status = filter.status.map(|s| s.as_str());
-        let owner = filter.owner.map(|a| a.to_string());
-        let parent = filter.parent.map(|p| p.to_string());
-        sqlx::query(concat!(
-            "SELECT ",
-            task_cols!(),
-            " FROM tasks
-             WHERE (?1 IS NULL OR project_id = ?1
-                    OR EXISTS (SELECT 1 FROM task_projects tp
-                               WHERE tp.task_id = tasks.id AND tp.project_id = ?1))
-               AND (?2 IS NULL OR status = ?2)
-               AND (?3 IS NULL OR owner_agent_id = ?3)
-               AND (?4 IS NULL OR parent_id = ?4)
-               AND (?5 IS NULL
-                    OR (created_at, id) > (SELECT created_at, id FROM tasks WHERE id = ?5))
-             ORDER BY created_at, id
-             LIMIT ?6"
-        ))
-        .bind(project)
-        .bind(status)
-        .bind(owner)
-        .bind(parent)
-        .bind(filter.after.map(|t| t.to_string()))
-        .bind(filter.limit.map_or(-1, i64::from))
+        let (mode, since) = filter.done.parts();
+        let sql = list_tasks_sql(filter);
+        sqlx::query(sql)
+            .bind(filter.project.map(|p| p.to_string()))
+            .bind(filter.status.map(|s| s.as_str()))
+            .bind(filter.owner.map(|a| a.to_string()))
+            .bind(filter.parent.map(|p| p.to_string()))
+            .bind(filter.top_level)
+            .bind(mode)
+            .bind(since.map(ts::enc))
+            .bind(filter.title.as_deref().map(like_pattern))
+            .bind(filter.after.map(|t| t.to_string()))
+            .bind(filter.limit.map_or(-1, i64::from))
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(task_from)
+            .collect()
+    }
+
+    async fn ack_done_tasks(
+        &self,
+        ids: &[TaskId],
+        now: OffsetDateTime,
+    ) -> StoreResult<Vec<TaskId>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let listed = serde_json::to_string(&ids.iter().map(|i| i.to_string()).collect::<Vec<_>>())
+            .expect("strings serialize");
+        let rows: Vec<String> = sqlx::query_scalar(
+            "WITH RECURSIVE sub(id) AS (
+                 SELECT id FROM tasks
+                  WHERE id IN (SELECT value FROM json_each(?1)) AND status = 'done'
+                 UNION
+                 SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id)
+             UPDATE tasks SET acked_at = ?2
+              WHERE id IN (SELECT id FROM sub) AND status = 'done' AND acked_at IS NULL
+              RETURNING id",
+        )
+        .bind(listed)
+        .bind(ts::enc(now))
         .fetch_all(&self.pool)
-        .await?
-        .iter()
-        .map(task_from)
-        .collect()
+        .await?;
+        rows.iter().map(|s| uuid_of(s)).collect()
+    }
+
+    async fn count_tasks(&self, filter: &TaskFilter) -> StoreResult<u64> {
+        let (mode, since) = filter.done.parts();
+        let sql = count_tasks_sql(filter);
+        let n: i64 = sqlx::query_scalar(sql)
+            .bind(filter.project.map(|p| p.to_string()))
+            .bind(filter.status.map(|s| s.as_str()))
+            .bind(filter.owner.map(|a| a.to_string()))
+            .bind(filter.parent.map(|p| p.to_string()))
+            .bind(filter.top_level)
+            .bind(mode)
+            .bind(since.map(ts::enc))
+            .bind(filter.title.as_deref().map(like_pattern))
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n as u64)
     }
 
     async fn task_events(&self, id: TaskId) -> StoreResult<Vec<TaskEvent>> {
@@ -1430,6 +1538,11 @@ impl Store for SqliteStore {
                     lease_expires_at = CASE WHEN ? THEN lease_expires_at ELSE ? END,
                     owner_session_id = CASE WHEN ? THEN NULL ELSE owner_session_id END,
                     owner_agent_id = CASE WHEN ? THEN NULL ELSE owner_agent_id END,
+                    done_at = CASE WHEN COALESCE(?, status) = 'done' AND status <> 'done' THEN ?
+                                   WHEN COALESCE(?, status) = 'done' THEN done_at
+                                   ELSE NULL END,
+                    acked_at = CASE WHEN COALESCE(?, status) = 'done' THEN acked_at
+                                    ELSE NULL END,
                     version = version + 1, updated_at = ?
               WHERE id = ?
                 AND instr(?, ',' || status || ',') > 0
@@ -1448,6 +1561,10 @@ impl Store for SqliteStore {
         .bind(lease)
         .bind(req.clear_owner)
         .bind(req.clear_owner)
+        .bind(req.to.map(|s| s.as_str()))
+        .bind(ts::enc(req.now))
+        .bind(req.to.map(|s| s.as_str()))
+        .bind(req.to.map(|s| s.as_str()))
         .bind(ts::enc(req.now))
         .bind(req.task.to_string())
         .bind(from)

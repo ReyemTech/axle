@@ -267,7 +267,9 @@ gate error when the parent is still planning.
 
 ### `task_list`
 
-List tasks, oldest first.
+List tasks, oldest first. Done tasks the human has acked, or that finished more than the
+auto-ack window ago (`AXL_DONE_AUTO_ACK_DAYS`), are left out unless `include_acked` is true.
+Agents cannot ack tasks; only the human can, in the web UI.
 
 | Parameter | Type | Notes |
 |---|---|---|
@@ -275,6 +277,7 @@ List tasks, oldest first.
 | `status` | string | One status. |
 | `owner` | string | Owning agent label. |
 | `parent` | string | List this task's children. |
+| `include_acked` | boolean | Also return acked and auto-acked done tasks. Default `false`. |
 | `limit` | integer | Page size. |
 | `after` | string | A task id: the previous page's `next`. |
 

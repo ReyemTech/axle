@@ -370,6 +370,8 @@ impl TaskService {
             created_by: by.actor(),
             created_at: now,
             updated_at: now,
+            done_at: None,
+            acked_at: None,
             version: 0,
             requires_plan: new.requires_plan,
             plan_state: PlanState::None,
@@ -878,6 +880,25 @@ impl TaskService {
 
     pub async fn list(&self, filter: TaskFilter) -> Result<Vec<Task>, TaskError> {
         Ok(self.store.list_tasks(&filter).await?)
+    }
+
+    /// The human's ack. Publishes `Event::TaskChanged { kind: TaskEventKind::Acked, .. }` once
+    /// for each listed id that is in the newly-acked set. Writes no task_events row.
+    pub async fn ack_done(&self, ids: &[TaskId]) -> Result<Vec<TaskId>, TaskError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let acked = self.store.ack_done_tasks(ids, self.clock.now()).await?;
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            if acked.contains(id)
+                && seen.insert(*id)
+                && let Some(task) = self.store.get_task(*id).await?
+            {
+                self.changed(&task, TaskEventKind::Acked).await;
+            }
+        }
+        Ok(acked)
     }
 
     // ---------------------------------------------------------------- internals
