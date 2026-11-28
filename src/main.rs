@@ -284,12 +284,13 @@ async fn hook(event: axle::hook::Event, harness: axle::hook::Harness) {
     };
     // Hard ceiling on total runtime, including a stdin that never closes.
     match tokio::time::timeout(std::time::Duration::from_secs(5), tokio::spawn(work)).await {
-        Ok(Ok(Ok(Some(out)))) => {
-            let _ = writeln!(std::io::stdout(), "{out}");
-        }
-        Ok(Ok(Ok(None))) => {}
-        Ok(Ok(Err(e))) => {
-            let _ = writeln!(std::io::stderr(), "axl hook: {e}");
+        Ok(Ok(out)) => {
+            if let Some(stdout) = out.stdout {
+                let _ = writeln!(std::io::stdout(), "{stdout}");
+            }
+            if let Some(e) = out.stderr {
+                let _ = writeln!(std::io::stderr(), "axl hook: {e}");
+            }
         }
         Ok(Err(_)) => {} // the panic hook already wrote the one line
         Err(_) => {

@@ -64,10 +64,13 @@ The hooks are silent on purpose when there is nothing new, and on any error. To 
 by hand from inside a Claude Code session's shell:
 
 ```sh
-echo '{}' | axl hook session-start
+echo '{}' | axl hook user-prompt-submit
 ```
 
-No output and no stderr means no unread mail. Common causes otherwise:
+No output and no stderr means no unread mail. `axl hook session-start` always prints the
+Axle rules; when it reaches the server it adds a `You hold …` status line, so the rules
+alone mean it found no session or could not reach the server (the stderr line says which).
+Common causes otherwise:
 
 - No bridge in this Claude Code session, so there is no `~/.axl/sessions/<pid>.json`. Check
   `/mcp` in Claude Code.

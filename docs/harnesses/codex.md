@@ -33,6 +33,13 @@ Start Codex in a repository and ask it to call `whoami`. The agent shows up as
 - Presence and lease renewal through the bridge's heartbeat.
 - Project detection from `AXL_PROJECT`, a `.axl` file or the git origin.
 - Mail at session start, after tool calls and before stopping, through the hooks.
+- At session start, the Axle rules and a status line of what the session holds
+  (`You hold no axle task.` or `You hold: <title> (<id>), …`), before any mail. With the
+  server down or no token, the rules alone.
+- Once per session, after a `Bash` or `apply_patch` tool call while the session holds no
+  task, a reminder to create or claim one (`task_create` / `task_claim`). It is added
+  context, never a `decision: block`. These are the tool names in Codex's PostToolUse
+  payloads; other tools never trigger it.
 
 ## Manual setup
 
