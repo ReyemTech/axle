@@ -33,6 +33,10 @@ Start Codex in a repository and ask it to call `whoami`. The agent shows up as
 - Presence and lease renewal through the bridge's heartbeat.
 - Project detection from `AXL_PROJECT`, a `.axl` file or the git origin.
 - Mail at session start, after tool calls and before stopping, through the hooks.
+- Turn state for the wake router: `post-tool-use` reports the session `busy`, and `stop`
+  reports it `idle` when it does not block (`POST /v1/turn`, 2-second timeout, errors
+  ignored). Each report is also written to `~/.axl/sessions/<pid>.turn`, which the bridge
+  sends with its next heartbeat, so a lost report heals within 30 seconds.
 - At session start, the Axle rules and a status line of what the session holds
   (`You hold no axle task.` or `You hold: <title> (<id>), …`), before any mail. With the
   server down or no token, the rules alone.

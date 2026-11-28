@@ -171,12 +171,19 @@ struct Inner {
     upstream: Mutex<Option<Arc<Upstream>>>,
     /// The last problem logged, so each distinct one is logged once.
     last_problem: StdMutex<Option<String>>,
+    /// Where this harness's hooks record their last turn report (`<harness-pid>.turn`).
+    turn_file: Option<PathBuf>,
 }
 
 impl Bridge {
     pub fn new(config: Config) -> Self {
+        let turn_file = config
+            .home
+            .as_deref()
+            .map(|h| session_file::turn_path(h, std::os::unix::process::parent_id()));
         Self {
             inner: Arc::new(Inner {
+                turn_file,
                 config,
                 upstream: Mutex::new(None),
                 last_problem: StdMutex::new(None),
@@ -312,10 +319,17 @@ impl Bridge {
     async fn presence_round(&self, http: &reqwest::Client, registered: bool) -> bool {
         let c = &self.inner.config;
         if registered {
-            match self
-                .post(http, "heartbeat", json!({ "session_id": c.session_id }))
-                .await
-            {
+            // The hooks' last turn report rides along, so one the server missed heals here.
+            let turn = self
+                .inner
+                .turn_file
+                .as_deref()
+                .and_then(session_file::read_turn);
+            let mut body = json!({ "session_id": c.session_id });
+            if let Some(turn) = turn {
+                body["turn_state"] = json!(turn);
+            }
+            match self.post(http, "heartbeat", body).await {
                 Ok(()) => return true,
                 // The server forgot the session (e.g. a fresh database): register again.
                 Err(Rejected::NotFound) => {}

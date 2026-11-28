@@ -20,6 +20,7 @@ use tokio::sync::broadcast::error::RecvError;
 use super::{ApiError, AppState, AuthToken};
 use crate::domain::{
     Actor, Address, AgentId, Importance, MessageId, ProjectId, SessionId, TaskId, TaskStatus,
+    TurnState, WakeChannel,
 };
 use crate::events::Event;
 use crate::service::identity::{IdentityError, IdentityInput, IdentityService, Resolved};
@@ -36,6 +37,8 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/register", post(register))
         .route("/heartbeat", post(heartbeat))
+        .route("/turn", post(turn))
+        .route("/session", get(session_state))
         .route("/events", get(events))
         .route("/inbox/summary", get(inbox_summary))
         .route("/leases", get(leases))
@@ -162,6 +165,12 @@ async fn session_for(
 #[derive(Debug, Deserialize)]
 pub struct HeartbeatRequest {
     pub session_id: SessionId,
+    /// The bridge's view of the turn (from the hooks' turn file); older bridges omit it.
+    #[serde(default)]
+    pub turn_state: Option<TurnState>,
+    /// How Axle can wake this session, as the bridge last checked; older bridges omit it.
+    #[serde(default)]
+    pub wake_channel: Option<WakeChannel>,
 }
 
 #[derive(Debug, Serialize)]
@@ -187,6 +196,12 @@ async fn heartbeat(
         .renew_by_heartbeat(r.session.id)
         .await
         .map_err(ApiError::internal)?;
+    // After the touch, so an idle report can place queued work on this (now live) session.
+    state
+        .wake
+        .on_turn_report(r.session.id, req.turn_state, req.wake_channel)
+        .await
+        .map_err(ApiError::internal)?;
     let unread = state
         .messages
         .unread_count(&r)
@@ -194,6 +209,51 @@ async fn heartbeat(
         .map_err(ApiError::internal)?;
     let leases = held(&state, &r).await?.into_iter().map(|t| t.id).collect();
     Ok(Json(HeartbeatResponse { unread, leases }))
+}
+
+// ---------------------------------------------------------------- turn
+
+#[derive(Debug, Deserialize)]
+pub struct TurnRequest {
+    pub session_id: SessionId,
+    pub state: TurnState,
+}
+
+/// A hook's turn report: records the state and, going idle, tries to place queued work
+/// (going busy marks a delivered wake). `204` with no body.
+async fn turn(
+    State(state): State<AppState>,
+    Extension(AuthToken(token)): Extension<AuthToken>,
+    Json(req): Json<TurnRequest>,
+) -> Result<StatusCode, ApiError> {
+    let r = session_for(&state, token, req.session_id).await?;
+    state
+        .wake
+        .on_turn(r.session.id, req.state)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionState {
+    pub session_id: SessionId,
+    pub wake_channel: WakeChannel,
+    pub turn_state: TurnState,
+}
+
+/// One session's wake channel and turn state, for `axl status`.
+async fn session_state(
+    State(state): State<AppState>,
+    Extension(AuthToken(token)): Extension<AuthToken>,
+    Query(q): Query<SessionQuery>,
+) -> Result<Json<SessionState>, ApiError> {
+    let r = session_for(&state, token, q.session).await?;
+    Ok(Json(SessionState {
+        session_id: r.session.id,
+        wake_channel: r.session.wake_channel,
+        turn_state: r.session.turn_state,
+    }))
 }
 
 /// The tasks this session holds (`planning`, `claimed`, `blocked` or `review`).

@@ -63,6 +63,13 @@ impl fmt::Debug for PollStatus {
     }
 }
 
+/// `GET /v1/session`: what Axle knows about one session's turn and how to wake it.
+#[derive(Deserialize, Debug)]
+pub struct SessionState {
+    pub wake_channel: crate::domain::WakeChannel,
+    pub turn_state: crate::domain::TurnState,
+}
+
 #[derive(Deserialize, Debug)]
 pub struct WhoAmI {
     pub label: String,
@@ -192,6 +199,24 @@ impl Api {
         let body = ok_body(res).await?;
         serde_json::from_value(body)
             .map_err(|_| ClientError::Server("malformed whoami reply".into()))
+    }
+
+    /// One of this token's sessions: its wake channel and turn state.
+    pub async fn session_state(
+        &self,
+        token: &str,
+        session: crate::domain::SessionId,
+    ) -> Result<SessionState, ClientError> {
+        let res = self
+            .send(
+                self.client
+                    .get(self.url(&format!("/v1/session?session={session}")))
+                    .bearer_auth(token),
+            )
+            .await?;
+        let body = ok_body(res).await?;
+        serde_json::from_value(body)
+            .map_err(|_| ClientError::Server("malformed session reply".into()))
     }
 
     /// Revokes the calling token on the server.

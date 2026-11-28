@@ -48,6 +48,18 @@
           }
         ]
       }
+    ],
+    "Notification": [
+      {
+        "matcher": "idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{AXL}} hook notification",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }

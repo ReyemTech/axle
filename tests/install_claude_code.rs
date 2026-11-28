@@ -416,7 +416,7 @@ fn userscope_has_no_plugin_and_runs_things_once() {
     install(home.path(), &mut m, ClaudeMode::UserScope).unwrap();
     assert!(!AxlDir::new(home.path()).integrations_dir().exists());
     let st = std::fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
-    assert_eq!(st.matches("axl hook").count(), 4);
+    assert_eq!(st.matches("axl hook").count(), 5);
     let cj = std::fs::read_to_string(home.path().join(".claude.json")).unwrap();
     assert_eq!(cj.matches("\"axle\"").count(), 1);
     assert!(!cj.contains("env"));

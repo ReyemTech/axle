@@ -6,6 +6,12 @@
 //! holds and its unread mail. PostToolUse reminds a session once when it edits or runs a
 //! shell command without holding a task (a reminder, never a block).
 //!
+//! Every hook but SessionStart also reports the session's turn state (`POST /v1/turn`, best
+//! effort, errors dropped): UserPromptSubmit and PostToolUse report `busy`; Stop reports
+//! `idle` when it does not block, and so does Notification (`idle_prompt`). Each report is
+//! first written to `~/.axl/sessions/<harness-pid>.turn`, which the bridge sends with its
+//! next heartbeat, so a lost report heals.
+//!
 //! Strictly fail-open: any problem (no session, no token, server down, bad input) yields at
 //! most one stderr line and exit 0; stdout is empty, except that SessionStart still prints
 //! the rules alone. A hook can never block or loop the harness. The stop hook blocks at most
@@ -23,6 +29,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::bridge::session_file::{self, SessionInfo};
+use crate::domain::TurnState;
 
 /// The whole HTTP exchange (connect included) gives up after this.
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -50,6 +57,9 @@ pub enum Event {
     UserPromptSubmit,
     PostToolUse,
     Stop,
+    /// Claude Code's `Notification`, registered for `idle_prompt` only: it reports idle and
+    /// prints nothing.
+    Notification,
 }
 
 impl Event {
@@ -60,6 +70,7 @@ impl Event {
             Event::UserPromptSubmit => "UserPromptSubmit",
             Event::PostToolUse => "PostToolUse",
             Event::Stop => "Stop",
+            Event::Notification => "Notification",
         }
     }
 }
@@ -108,6 +119,13 @@ impl Harness {
 struct HookInput {
     #[serde(default)]
     stop_hook_active: bool,
+}
+
+/// The Notification field that says what the harness is waiting for.
+#[derive(Debug, Default, Deserialize)]
+struct NotificationInput {
+    #[serde(default)]
+    notification_type: Option<String>,
 }
 
 /// The PostToolUse fields the nudge needs; anything unreadable counts as "no tool".
@@ -178,6 +196,15 @@ pub async fn run(
 ) -> Output {
     if event == Event::SessionStart {
         return session_start(harness, home, env_token).await;
+    }
+    if event == Event::Notification {
+        // Installed with the `idle_prompt` matcher; any other notification (a permission
+        // prompt) is not an idle session. An unreadable payload is taken at the matcher's word.
+        let input: NotificationInput = serde_json::from_str(stdin).unwrap_or_default();
+        if input.notification_type.is_none_or(|t| t == "idle_prompt") {
+            report_idle(harness, home, env_token).await;
+        }
+        return Output::default();
     }
     match run_mail(event, harness, stdin, home, env_token).await {
         Ok(stdout) => Output {
@@ -309,10 +336,12 @@ async fn run_mail(
     env_token: Option<&str>,
 ) -> Result<Option<String>, String> {
     // Loop guard first: a stop hook already continuing the turn must never block again.
+    // That continued turn is now ending, so the session is idle.
     if event == Event::Stop {
         let input: HookInput =
             serde_json::from_str(stdin).map_err(|e| format!("bad hook input: {e}"))?;
         if input.stop_hook_active {
+            report_idle(harness, home, env_token).await;
             return Ok(None);
         }
     }
@@ -322,25 +351,68 @@ async fn run_mail(
     let Some((pid, info)) = find_session(home, harness) else {
         return Ok(None);
     };
-    let token = token(home, env_token)?;
-    let file = session_file::path(home, pid);
-    let nudged_path = session_file::nudged_path(&file, info.session_id);
-    let cache_path = session_file::lease_cache_path(&file, info.session_id);
+    let turn_file = session_file::turn_path(home, pid);
+    let busy = matches!(event, Event::UserPromptSubmit | Event::PostToolUse);
+    if busy {
+        record_turn(&turn_file, TurnState::Busy);
+    }
+    let started = std::time::Instant::now();
+    let found = token(home, env_token).and_then(|t| Ok((t, client()?)));
+    let result = match &found {
+        Ok((token, client)) => {
+            let file = session_file::path(home, pid);
+            mail(event, stdin, &file, &info, token, client, busy).await
+        }
+        Err(e) => Err(e.clone()),
+    };
+    // A stop that does not block ends the turn. The file is the record; the report is sent
+    // only when the server answered, in what is left of the budget.
+    if event == Event::Stop && !matches!(result, Ok(Some(_))) {
+        record_turn(&turn_file, TurnState::Idle);
+        if let (Ok(_), Ok((token, client))) = (&result, &found) {
+            let left = NETWORK_BUDGET.saturating_sub(started.elapsed());
+            let _ = tokio::time::timeout(left, report_turn(client, &info, token, TurnState::Idle))
+                .await;
+        }
+    }
+    result
+}
+
+/// The mail part of UserPromptSubmit, PostToolUse and Stop, with `busy`'s turn report sent
+/// alongside the inbox fetch.
+async fn mail(
+    event: Event,
+    stdin: &str,
+    file: &Path,
+    info: &SessionInfo,
+    token: &str,
+    client: &reqwest::Client,
+    busy: bool,
+) -> Result<Option<String>, String> {
+    let nudged_path = session_file::nudged_path(file, info.session_id);
+    let cache_path = session_file::lease_cache_path(file, info.session_id);
     // Only a work tool in a session not nudged yet, and not recently seen holding a lease,
     // needs to know about leases.
     let may_nudge = event == Event::PostToolUse
         && is_work_tool(stdin)
         && !nudged_path.exists()
         && !fresh(&cache_path);
-    let client = client()?;
-    let (items, leases) = budget(async {
-        tokio::join!(fetch(&client, &info, &token), async {
-            if may_nudge {
-                Some(fetch_leases(&client, &info, &token).await)
-            } else {
-                None
+    let (items, leases, ()) = budget(async {
+        tokio::join!(
+            fetch(client, info, token),
+            async {
+                if may_nudge {
+                    Some(fetch_leases(client, info, token).await)
+                } else {
+                    None
+                }
+            },
+            async {
+                if busy {
+                    report_turn(client, info, token, TurnState::Busy).await;
+                }
             }
-        })
+        )
     })
     .await?;
     let items = items?;
@@ -348,17 +420,20 @@ async fn run_mail(
         Some(Ok(Some(l))) if l.is_empty() => true,
         // Holding a lease, or a server with no lease list: ask again only after a while.
         Some(Ok(_)) => {
-            let _ = mark(&cache_path, &info, true);
+            let _ = mark(&cache_path, info, true);
             false
         }
         // A lease lookup that failed is not a reason to nudge (nor to stop asking).
         Some(Err(_)) | None => false,
     };
-    let seen_path = session_file::seen_path(&file);
+    let seen_path = session_file::seen_path(file);
     let mut seen = read_seen(&seen_path);
 
     let (output, surfaced): (Option<Value>, Vec<&Item>) = match event {
-        Event::SessionStart | Event::UserPromptSubmit | Event::PostToolUse => {
+        Event::SessionStart
+        | Event::UserPromptSubmit
+        | Event::PostToolUse
+        | Event::Notification => {
             // UserPromptSubmit shows what was not shown yet; PostToolUse, being frequent,
             // only high and urgent not shown yet.
             let picked: Vec<&Item> = items
@@ -378,7 +453,7 @@ async fn run_mail(
             }
             // Claim the nudge before printing it: the flag is created exclusively, so of
             // two concurrent hooks only one wins; if it cannot be created, leave it out.
-            if nudge && mark(&nudged_path, &info, false).is_ok() {
+            if nudge && mark(&nudged_path, info, false).is_ok() {
                 parts.push(NUDGE.to_string());
             }
             if parts.is_empty() {
@@ -537,6 +612,36 @@ fn rank(importance: &str) -> u8 {
 
 fn token(home: &Path, env_token: Option<&str>) -> Result<String, String> {
     crate::client::read_token(env_token, &crate::client::AxlDir::new(home))
+}
+
+/// Writes the turn file the bridge sends with its heartbeat; a failure is dropped (the
+/// report itself may still arrive).
+fn record_turn(path: &Path, state: TurnState) {
+    let _ = session_file::write_turn(path, state, time::OffsetDateTime::now_utc());
+}
+
+/// `POST /v1/turn`, best effort: under the client's `HTTP_TIMEOUT`, every outcome dropped.
+async fn report_turn(client: &reqwest::Client, info: &SessionInfo, token: &str, state: TurnState) {
+    let url = format!("{}/v1/turn", info.server_url.trim_end_matches('/'));
+    let _ = client
+        .post(url)
+        .bearer_auth(token)
+        .json(&json!({ "session_id": info.session_id, "state": state }))
+        .send()
+        .await;
+}
+
+/// Records and reports that this harness's session is idle, printing nothing either way.
+async fn report_idle(harness: Harness, home: Option<&Path>, env_token: Option<&str>) {
+    let Some(home) = home else { return };
+    let Some((pid, info)) = find_session(home, harness) else {
+        return;
+    };
+    record_turn(&session_file::turn_path(home, pid), TurnState::Idle);
+    let (Ok(token), Ok(client)) = (token(home, env_token), client()) else {
+        return;
+    };
+    let _ = budget(report_turn(&client, &info, &token, TurnState::Idle)).await;
 }
 
 /// The session's unread mail, oldest first: the server's first page, plus any high or

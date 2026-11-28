@@ -1241,6 +1241,7 @@ fn bridge_session_file_removal_takes_the_hook_files_with_it() {
         dir.join("4242.seen"),
         dir.join(format!("4242.{sid}.nudged")),
         dir.join(format!("4242.{sid}.leases")),
+        dir.join("4242.turn"),
     ];
     let others = [
         dir.join("42420.seen"),
@@ -1270,4 +1271,260 @@ fn bridge_session_file_removal_takes_the_hook_files_with_it() {
     drop(file);
     assert!(path.exists());
     assert!(mine[0].exists());
+}
+
+// ---- Turn state reports.
+
+/// How a stand-in server answers `POST /v1/turn`.
+#[derive(Clone, Copy)]
+enum TurnAnswer {
+    Ok,
+    Missing,
+    Hang,
+}
+
+type Reports = Arc<std::sync::Mutex<Vec<Value>>>;
+
+/// A stand-in server: `/v1/inbox/summary` answers `inbox` (both pages), `/v1/leases` holds
+/// one task (so no nudge), and `POST /v1/turn` is recorded and answered per `turn`.
+async fn turn_server(inbox: Value, turn: TurnAnswer) -> (String, Reports) {
+    use axum::http::StatusCode;
+    use axum::routing::{get, post};
+    let reports: Reports = Arc::default();
+    let log = reports.clone();
+    let lease = json!([{"id": "t1", "title": "x", "status": "claimed",
+        "created_by": "human", "edited_by": null, "project": "p"}]);
+    let app = axum::Router::new()
+        .route(
+            "/v1/inbox/summary",
+            get(move || {
+                let inbox = inbox.clone();
+                async move { axum::Json(inbox) }
+            }),
+        )
+        .route(
+            "/v1/leases",
+            get(move || {
+                let lease = lease.clone();
+                async move { axum::Json(lease) }
+            }),
+        )
+        .route(
+            "/v1/turn",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let log = log.clone();
+                async move {
+                    log.lock().unwrap().push(body);
+                    match turn {
+                        TurnAnswer::Ok => StatusCode::NO_CONTENT,
+                        TurnAnswer::Missing => StatusCode::NOT_FOUND,
+                        TurnAnswer::Hang => {
+                            std::future::pending::<()>().await;
+                            unreachable!()
+                        }
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(axum::serve(listener, app).into_future());
+    (server, reports)
+}
+
+fn urgent_item() -> Value {
+    json!([{"id": "m1", "from": "human", "subject": "prod down", "project": "p",
+        "importance": "urgent", "preview": "check the db"}])
+}
+
+/// Runs `axl hook <args>` off the async runtime.
+async fn hook_async(home: &Path, args: &[&str], stdin: &str) -> Out {
+    let h = home.to_path_buf();
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let stdin = stdin.to_string();
+    tokio::task::spawn_blocking(move || {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        hook_with(&h, &args, &stdin, Some("tok"))
+    })
+    .await
+    .unwrap()
+}
+
+fn states(reports: &Reports, session: SessionId) -> Vec<String> {
+    reports
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            assert_eq!(r["session_id"], json!(session), "{r}");
+            r["state"].as_str().unwrap().to_string()
+        })
+        .collect()
+}
+
+fn turn_file(home: &Path) -> PathBuf {
+    axle::bridge::session_file::turn_path(home, std::process::id())
+}
+
+#[tokio::test]
+async fn prompt_and_tool_report_busy() {
+    let (server, reports) = turn_server(json!([]), TurnAnswer::Ok).await;
+    let home = TempDir::new();
+    let session = SessionId::new();
+    write_session(&home.0, session, &server, "p");
+    for event in ["user-prompt-submit", "post-tool-use"] {
+        let o = hook_async(&home.0, &[event], EDIT).await;
+        assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+    }
+    assert_eq!(states(&reports, session), ["busy", "busy"]);
+
+    // Codex: PostToolUse reports busy, Stop reports idle.
+    let (server, reports) = turn_server(json!([]), TurnAnswer::Ok).await;
+    let home = TempDir::new();
+    write_session_for(&home.0, session, &server, "p", "codex");
+    let o = hook_async(&home.0, &["post-tool-use", "--harness", "codex"], EDIT).await;
+    assert_eq!((o.code, o.stdout.as_str()), (0, ""));
+    let o = hook_async(&home.0, &["stop", "--harness", "codex"], "{}").await;
+    assert_eq!((o.code, o.stdout.as_str()), (0, ""));
+    assert_eq!(states(&reports, session), ["busy", "idle"]);
+}
+
+#[tokio::test]
+async fn stop_reports_idle_only_without_block() {
+    let (server, reports) = turn_server(urgent_item(), TurnAnswer::Ok).await;
+    let home = TempDir::new();
+    let session = SessionId::new();
+    write_session(&home.0, session, &server, "p");
+
+    // The urgent message blocks the stop: the turn goes on, so nothing is reported.
+    let o = hook_async(&home.0, &["stop"], "{}").await;
+    let v: Value = serde_json::from_str(&o.stdout).unwrap_or_else(|e| panic!("{e}: {o:?}"));
+    assert_eq!(v["decision"], "block");
+    assert!(states(&reports, session).is_empty());
+    assert!(!turn_file(&home.0).exists());
+
+    // The continued turn ends: the loop guard wins first, and the session is idle.
+    let o = hook_async(&home.0, &["stop"], r#"{"stop_hook_active":true}"#).await;
+    assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+    assert_eq!(states(&reports, session), ["idle"]);
+
+    // A stop with nothing left to block on reports idle.
+    let o = hook_async(&home.0, &["stop"], "{}").await;
+    assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+    assert_eq!(states(&reports, session), ["idle", "idle"]);
+}
+
+#[tokio::test]
+async fn notification_reports_idle() {
+    let (server, reports) = turn_server(urgent_item(), TurnAnswer::Ok).await;
+    let home = TempDir::new();
+    let session = SessionId::new();
+    write_session(&home.0, session, &server, "p");
+    let idle = r#"{"session_id":"s1","hook_event_name":"Notification","notification_type":"idle_prompt","message":"Claude is waiting for your input"}"#;
+    let o = hook_async(&home.0, &["notification"], idle).await;
+    assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+    assert_eq!(states(&reports, session), ["idle"]);
+
+    // Any other notification (a permission prompt) is not an idle session.
+    let ask = r#"{"hook_event_name":"Notification","notification_type":"permission_prompt"}"#;
+    let o = hook_async(&home.0, &["notification"], ask).await;
+    assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+    assert_eq!(states(&reports, session), ["idle"]);
+
+    // No session file: silent, nothing sent.
+    let other = TempDir::new();
+    let o = hook_async(&other.0, &["notification"], idle).await;
+    assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+    assert_eq!(states(&reports, session), ["idle"]);
+}
+
+#[tokio::test]
+async fn turn_file_written_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = TempDir::new();
+    // The server is down: the report is lost, the file is still written for the bridge.
+    write_session(&home.0, SessionId::new(), "http://127.0.0.1:9", "p");
+    let o = hook_async(&home.0, &["user-prompt-submit"], "{}").await;
+    assert_eq!(o.code, 0);
+    assert_eq!(o.stderr.lines().count(), 1, "only the inbox error: {o:?}");
+    let path = turn_file(&home.0);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    let (state, at) = text.trim_end().split_once(' ').unwrap();
+    assert_eq!(state, "busy");
+    time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|e| panic!("{e}: {text:?}"));
+
+    let o = hook_async(&home.0, &["stop"], "{}").await;
+    assert_eq!(o.code, 0);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with("idle "), "{text:?}");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        axle::bridge::session_file::read_turn(&path),
+        Some(axle::domain::TurnState::Idle)
+    );
+}
+
+#[tokio::test]
+async fn turn_report_is_fail_open() {
+    let budget = std::time::Duration::from_millis(2500);
+
+    // A server that accepts connections and never answers anything.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((conn, _)) = listener.accept().await {
+            held.push(conn);
+        }
+    });
+    let home = TempDir::new();
+    write_session(&home.0, SessionId::new(), &silent, "p");
+    for (event, stdin) in [
+        ("user-prompt-submit", "{}"),
+        ("post-tool-use", EDIT),
+        ("stop", "{}"),
+        ("notification", r#"{"notification_type":"idle_prompt"}"#),
+    ] {
+        let started = std::time::Instant::now();
+        let o = hook_async(&home.0, &[event], stdin).await;
+        assert!(
+            started.elapsed() < budget,
+            "{event}: {:?}",
+            started.elapsed()
+        );
+        assert_eq!((o.code, o.stdout.as_str()), (0, ""), "{event}");
+    }
+
+    // The inbox answers but the turn report hangs: same stdout as a server without
+    // `/v1/turn`, inside the same time.
+    let high = json!([{"id": "m1", "from": "human", "subject": "prod down", "project": "p",
+        "importance": "high", "preview": "check the db"}]);
+    let mut outputs = Vec::new();
+    for answer in [TurnAnswer::Missing, TurnAnswer::Hang] {
+        let (server, reports) = turn_server(high.clone(), answer).await;
+        let home = TempDir::new();
+        let session = SessionId::new();
+        write_session(&home.0, session, &server, "p");
+        let started = std::time::Instant::now();
+        let o = hook_async(&home.0, &["user-prompt-submit"], "{}").await;
+        assert!(started.elapsed() < budget, "{:?}", started.elapsed());
+        assert_eq!((o.code, o.stderr.as_str()), (0, ""));
+        assert!(o.stdout.contains("prod down"), "{o:?}");
+        assert_eq!(states(&reports, session), ["busy"]);
+        outputs.push(o.stdout);
+        // A stop that cannot report still ends quietly, never blocking.
+        let started = std::time::Instant::now();
+        let o = hook_async(&home.0, &["stop"], "{}").await;
+        assert!(started.elapsed() < budget, "{:?}", started.elapsed());
+        assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+    }
+    assert_eq!(outputs[0], outputs[1]);
 }

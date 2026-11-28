@@ -17,7 +17,7 @@ use crate::clock::Clock;
 use crate::config::ServerConfig;
 use crate::domain::{
     Actor, AgentId, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TurnState, WakeAttempt,
-    WakeKind, WakeOutcome, WakeTrigger,
+    WakeChannel, WakeKind, WakeOutcome, WakeTrigger,
 };
 use crate::events::{Event, EventBus};
 use crate::http::Shutdown;
@@ -273,22 +273,34 @@ impl WakeService {
     /// Records `session`'s turn state. Going busy clears a task-less reservation (the wake
     /// was delivered, recorded as such); going idle tries to place queued work.
     pub async fn on_turn(&self, session: SessionId, state: TurnState) -> StoreResult<()> {
+        self.on_turn_report(session, Some(state), None).await
+    }
+
+    /// Records whichever of `session`'s turn state and wake channel are given (one store
+    /// write), then acts on the turn state as [`Self::on_turn`] does. A heartbeat's report.
+    pub async fn on_turn_report(
+        &self,
+        session: SessionId,
+        state: Option<TurnState>,
+        channel: Option<WakeChannel>,
+    ) -> StoreResult<()> {
+        if state.is_none() && channel.is_none() {
+            return Ok(());
+        }
         let now = self.clock.now();
-        let cleared = self
-            .store
-            .report_turn(session, Some(state), None, now)
-            .await?;
+        let cleared = self.store.report_turn(session, state, channel, now).await?;
         match state {
-            TurnState::Busy => {
+            None => {}
+            Some(TurnState::Busy) => {
                 if let Some(s) = cleared {
                     self.follow_up(s, None, WakeOutcome::Delivered, None, now)
                         .await?;
                 }
             }
-            TurnState::Idle => {
+            Some(TurnState::Idle) => {
                 self.place_queued().await?;
             }
-            TurnState::Unknown => {}
+            Some(TurnState::Unknown) => {}
         }
         Ok(())
     }

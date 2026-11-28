@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::SessionId;
+use crate::domain::{SessionId, TurnState};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -39,6 +39,45 @@ pub fn nudged_path(session_file: &Path, session: SessionId) -> PathBuf {
 /// server has no lease list); the hooks skip the lookup while it is fresh.
 pub fn lease_cache_path(session_file: &Path, session: SessionId) -> PathBuf {
     session_file.with_extension(format!("{session}.leases"))
+}
+
+/// `<home>/.axl/sessions/<harness_pid>.turn`: the hooks' last turn report for this pid,
+/// `busy|idle <rfc3339>`. The bridge sends it with each heartbeat, so a lost report heals.
+pub fn turn_path(home: &Path, harness_pid: u32) -> PathBuf {
+    path(home, harness_pid).with_extension("turn")
+}
+
+/// Replaces the turn file at `path` (mode 0600) with `state` reported at `at`, atomically,
+/// so a reader never sees half a line.
+pub fn write_turn(path: &Path, state: TurnState, at: time::OffsetDateTime) -> std::io::Result<()> {
+    let at = at
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(std::io::Error::other)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("turn file path has no name"))?
+        .to_string_lossy();
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.write_all(format!("{state} {at}\n").as_bytes())?;
+    drop(file);
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// The state in the turn file at `path`; missing, unreadable or malformed is `None`.
+pub fn read_turn(path: &Path) -> Option<TurnState> {
+    let text = std::fs::read_to_string(path).ok()?;
+    match text.split_whitespace().next()?.parse().ok()? {
+        TurnState::Unknown => None,
+        state => Some(state),
+    }
 }
 
 /// A written session file; `remove` (or drop) deletes it, and the hooks' files for it, if
@@ -89,6 +128,7 @@ impl SessionFile {
             seen_path(&self.path),
             nudged_path(&self.path, self.session_id),
             lease_cache_path(&self.path, self.session_id),
+            self.path.with_extension("turn"),
         ] {
             // Absent is the common case; a leftover is harmless, so no line for it.
             let _ = std::fs::remove_file(companion);

@@ -116,6 +116,17 @@ Prints one line each for the server, the token, the local service (when there is
 every harness, with a `fix:` line under anything that needs attention. It is the first
 thing to run when an agent cannot reach Axle.
 
+When the server is reachable, each live session on this machine (a bridge whose harness is
+still running) gets a `session` line with what the server knows about it:
+
+```text
+session  claude-code · github.com/acme/web-app · wake: claude-socket · turn: idle
+```
+
+`wake` is how Axle can wake the session when it is idle (`none` means it cannot); `turn`
+is `busy`, `idle` or `unknown`, as the hooks last reported it. These lines are information
+only and never carry a fix.
+
 ## `axl service`
 
 ```sh

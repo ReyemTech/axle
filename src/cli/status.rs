@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use super::install::{InstallEnv, display_name, redact};
+use crate::bridge::session_file::SessionInfo;
 use crate::client::{Api, AxlDir, ClientError, read_token, resolve_server_url_with_warning};
 use crate::daemon::ServiceState;
 use crate::install::{EditError, Harness, Manifest, Plan, axl_path, claude_code, codex, opencode};
@@ -95,14 +96,14 @@ pub async fn status_with(
     lines.push(line("server", url.clone(), None));
     let service = service_line(env);
     let stopped = service.as_ref().is_some_and(|l| l.fix.is_some());
-    server_lines(
-        &mut lines,
-        &url,
-        read_token(env_token, &dir),
-        service,
-        stopped,
-    )
-    .await;
+    let token = read_token(env_token, &dir);
+    server_lines(&mut lines, &url, token.clone(), service, stopped).await;
+    let reachable = lines
+        .iter()
+        .any(|l| l.label == "reachable" && l.fix.is_none() && l.value.starts_with("yes"));
+    if let (Ok(token), true) = (&token, reachable) {
+        session_lines(&mut lines, &env.home, token).await;
+    }
     harness_lines(&mut lines, env, &dir);
 
     let ok = lines.iter().all(|l| l.fix.is_none());
@@ -239,6 +240,55 @@ async fn server_lines(
         }
     }
     lines.extend(service);
+}
+
+/// One `session` line per live bridge on this machine (a session file whose harness process
+/// still runs): `<harness> · <project> · wake: <channel> · turn: <state>`, as its server
+/// knows them. Informational only; a session the server cannot describe says so.
+async fn session_lines(lines: &mut Vec<StatusLine>, home: &Path, token: &str) {
+    let dir = home.join(".axl").join("sessions");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut live: Vec<(u32, SessionInfo)> = entries
+        .filter_map(|e| {
+            let path = e.ok()?.path();
+            if path.extension()? != "json" {
+                return None;
+            }
+            let pid: u32 = path.file_stem()?.to_str()?.parse().ok()?;
+            let info = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            alive(pid).then_some((pid, info))
+        })
+        .collect();
+    live.sort_by_key(|(pid, _)| *pid);
+    for (_, info) in live {
+        let project = info.project_key.as_deref().unwrap_or("no project");
+        let state = Api::new(&info.server_url)
+            .session_state(token, info.session_id)
+            .await;
+        let value = match state {
+            Ok(s) => format!(
+                "{} · {project} · wake: {} · turn: {}",
+                info.harness, s.wake_channel, s.turn_state
+            ),
+            Err(e) => format!("{} · {project} · could not check ({e})", info.harness),
+        };
+        lines.push(line("session", value, None));
+    }
+}
+
+/// Whether process `pid` exists (a process of another user counts).
+fn alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 1 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks that the process exists; nothing is sent.
+    let found = unsafe { libc::kill(pid, 0) } == 0;
+    found || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 fn service_line(env: &InstallEnv<'_>) -> Option<StatusLine> {

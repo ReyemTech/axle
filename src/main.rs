@@ -42,7 +42,8 @@ enum Command {
     /// Always exits 0 (fail-open); problems are one line on stderr. Codex's commands add
     /// `--harness codex`.
     Hook {
-        /// session-start | user-prompt-submit | post-tool-use | stop (anything else is ignored)
+        /// session-start | user-prompt-submit | post-tool-use | stop | notification (anything
+        /// else is ignored)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },

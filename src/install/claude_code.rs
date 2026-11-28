@@ -40,12 +40,14 @@ pub enum ClaudeMode {
 /// `strictKnownMarketplaces`) can silently skip it. Claude Code version: not run.
 pub const MODE: ClaudeMode = ClaudeMode::Plugin;
 
-/// Settings key and `axl hook` argument for each event the hooks cover.
-const EVENTS: [(&str, &str); 4] = [
-    ("SessionStart", "session-start"),
-    ("UserPromptSubmit", "user-prompt-submit"),
-    ("PostToolUse", "post-tool-use"),
-    ("Stop", "stop"),
+/// Settings key, `axl hook` argument and group matcher for each event the hooks cover.
+/// `Notification` runs only for `idle_prompt` (the session waits for input: it is idle).
+const EVENTS: [(&str, &str, Option<&str>); 5] = [
+    ("SessionStart", "session-start", None),
+    ("UserPromptSubmit", "user-prompt-submit", None),
+    ("PostToolUse", "post-tool-use", None),
+    ("Stop", "stop", None),
+    ("Notification", "notification", Some("idle_prompt")),
 ];
 
 const PLUGIN_FILES: [&str; 4] = [
@@ -121,11 +123,13 @@ fn handler(command: &str) -> CstInputValue {
     ])
 }
 
-fn hook_group(command: &str) -> CstInputValue {
-    object(vec![(
-        "hooks",
-        CstInputValue::Array(vec![handler(command)]),
-    )])
+fn hook_group(command: &str, matcher: Option<&str>) -> CstInputValue {
+    let mut props = Vec::new();
+    if let Some(m) = matcher {
+        props.push(("matcher", string(m)));
+    }
+    props.push(("hooks", CstInputValue::Array(vec![handler(command)])));
+    object(props)
 }
 
 fn hooks_snippet(axl: &str) -> String {
@@ -134,10 +138,10 @@ fn hooks_snippet(axl: &str) -> String {
         object(
             EVENTS
                 .iter()
-                .map(|(e, a)| {
+                .map(|(e, a, m)| {
                     (
                         *e,
-                        CstInputValue::Array(vec![hook_group(&hook_command(axl, a))]),
+                        CstInputValue::Array(vec![hook_group(&hook_command(axl, a), *m)]),
                     )
                 })
                 .collect(),
@@ -367,6 +371,8 @@ struct Found {
     event: String,
     command: String,
     value: Value,
+    /// The enclosing group's `matcher`, if it has one.
+    matcher: Option<String>,
 }
 
 /// Visits every `axl hook <event>` handler under `hooks`; `visit` returns true to remove it.
@@ -382,6 +388,12 @@ fn walk_handlers(hooks: &CstObject, visit: &mut dyn FnMut(Found) -> bool) -> boo
             let Some(handlers) = group.as_object().and_then(|g| g.array_value("hooks")) else {
                 continue;
             };
+            let matcher = group
+                .as_object()
+                .and_then(|g| g.get("matcher"))
+                .and_then(|p| p.value())
+                .and_then(|n| n.as_string_lit())
+                .and_then(|s| s.decoded_value().ok());
             let mut removed_group = false;
             for h in handlers.elements() {
                 let Some(ho) = h.as_object() else { continue };
@@ -401,6 +413,7 @@ fn walk_handlers(hooks: &CstObject, visit: &mut dyn FnMut(Found) -> bool) -> boo
                     event: event.clone(),
                     command,
                     value,
+                    matcher: matcher.clone(),
                 }) {
                     h.remove();
                     removed_group = true;
@@ -442,11 +455,11 @@ fn edit_settings(cx: &mut Ctx, mode: ClaudeMode) -> Result<Option<FileEdit>, Edi
         return Err(manual("`hooks` is not an object"));
     }
     let axl = cx.axl.clone();
-    let desired = |event: &str| -> Option<(String, Value)> {
-        let (_, arg) = EVENTS.iter().find(|(e, _)| *e == event)?;
+    let desired = |event: &str| -> Option<(String, Value, Option<&str>)> {
+        let (_, arg, matcher) = EVENTS.iter().find(|(e, _, _)| *e == event)?;
         let cmd = hook_command(&axl, arg);
         let value = jsonc::to_value(&handler(&cmd));
-        Some((cmd, value))
+        Some((cmd, value, *matcher))
     };
 
     // Which events already hold exactly the managed handler and nothing else of ours.
@@ -460,11 +473,14 @@ fn edit_settings(cx: &mut Ctx, mode: ClaudeMode) -> Result<Option<FileEdit>, Edi
     let kept: HashSet<&str> = if mode == ClaudeMode::UserScope {
         EVENTS
             .iter()
-            .map(|(e, _)| *e)
+            .map(|(e, _, _)| *e)
             .filter(|e| {
                 let mine: Vec<&Found> = seen.iter().filter(|f| f.event == *e).collect();
-                let (cmd, value) = desired(e).expect("known event");
-                mine.len() == 1 && mine[0].command == cmd && mine[0].value == value
+                let (cmd, value, matcher) = desired(e).expect("known event");
+                mine.len() == 1
+                    && mine[0].command == cmd
+                    && mine[0].value == value
+                    && mine[0].matcher.as_deref() == matcher
             })
             .collect()
     } else {
@@ -509,7 +525,7 @@ fn edit_settings(cx: &mut Ctx, mode: ClaudeMode) -> Result<Option<FileEdit>, Edi
             p.remove();
         }
     } else {
-        for (event, arg) in EVENTS {
+        for (event, arg, matcher) in EVENTS {
             let key = format!("hooks.{event}");
             if !kept.contains(event) {
                 let hooks = obj
@@ -518,7 +534,7 @@ fn edit_settings(cx: &mut Ctx, mode: ClaudeMode) -> Result<Option<FileEdit>, Edi
                 let arr = hooks
                     .array_value_or_create(event)
                     .ok_or_else(|| manual(&format!("`hooks.{event}` is not an array")))?;
-                arr.append(hook_group(&hook_command(&cx.axl, arg)));
+                arr.append(hook_group(&hook_command(&cx.axl, arg), matcher));
             }
             // An adoption above already recorded this key; the dedup keeps its original.
             cx.push(&file, EntryKind::Added, &key, None);
@@ -688,7 +704,7 @@ pub fn plan_uninstall(home: &Path, manifest: &Manifest) -> Result<Plan, EditErro
     // ~/.claude/settings.json: every `axl hook <event>` handler.
     let event_keys: Vec<&str> = EVENTS
         .iter()
-        .map(|(e, _)| *e)
+        .map(|(e, _, _)| *e)
         .filter(|e| has(&paths.settings, &format!("hooks.{e}")))
         .collect();
     if !event_keys.is_empty()

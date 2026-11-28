@@ -12,6 +12,8 @@ treat `/v1` as internal: it may change between releases.
 | `POST /mcp` (and `GET`, `DELETE`) | bearer token | MCP over Streamable HTTP |
 | `POST /v1/register` | bearer token | Register a session |
 | `POST /v1/heartbeat` | bearer token | Presence and lease renewal |
+| `POST /v1/turn` | bearer token | A hook's turn report (busy or idle) |
+| `GET /v1/session` | bearer token | One session's wake channel and turn state, for `axl status` |
 | `GET /v1/events` | bearer token | Server-sent events for one session |
 | `GET /v1/inbox/summary` | bearer token | Unread mail, for hooks |
 | `GET /v1/leases` | bearer token | Tasks the session holds, for hooks |
@@ -164,6 +166,44 @@ curl -s http://127.0.0.1:7420/v1/heartbeat \
 `leases` lists the ids of tasks this session holds (`planning`, `claimed`, `blocked` or
 `review`). An unknown session is 404 `{"error":"unknown session"}`; the bridge then
 registers again.
+
+Two optional fields carry the bridge's view of the session; older bridges send neither,
+and a missing field leaves the stored value as it is:
+
+| Field | Values | Notes |
+|---|---|---|
+| `turn_state` | `busy`, `idle` | The hooks' last turn report, read from `~/.axl/sessions/<harness-pid>.turn`, so a report the server missed heals within 30 seconds. |
+| `wake_channel` | `none`, `claude-socket`, `claude-monitor`, `codex-app-server`, `opencode-api` | How Axle can wake the session when it is idle. |
+
+```json
+{ "session_id": "0199a000-0000-7000-8000-000000000003", "turn_state": "idle", "wake_channel": "claude-socket" }
+```
+
+## `POST /v1/turn`
+
+A hook's report of the session's turn state: `busy` while the model works, `idle` when it
+waits for input. Going idle lets the wake router place queued work on the session (once it
+has been idle for 5 seconds); going busy marks a delivered wake. Returns 204 with no body.
+
+```sh
+curl -s -X POST http://127.0.0.1:7420/v1/turn \
+  -H "Authorization: Bearer $AXL_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"session_id":"0199a000-0000-7000-8000-000000000003","state":"idle"}'
+```
+
+`state` is `unknown`, `busy` or `idle`; anything else is a 4xx. An unknown session is 404,
+another token's session 403. The hooks send it with a 2 second timeout and ignore every
+error: a lost report is healed by the next heartbeat.
+
+## `GET /v1/session`
+
+One of the calling token's sessions (`?session=<id>`): `{"session_id", "wake_channel",
+"turn_state"}`. `axl status` uses it for each live session on the machine. Errors as for
+`/v1/turn`.
+
+```json
+{ "session_id": "0199a000-0000-7000-8000-000000000003", "wake_channel": "none", "turn_state": "busy" }
+```
 
 ## `GET /v1/inbox/summary`
 

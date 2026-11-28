@@ -471,3 +471,63 @@ async fn bridge_heartbeats_and_reregisters_when_forgotten() {
     assert!(stderr.contains("heartbeat rejected (500"), "{stderr}");
     assert!(!stderr.contains("tok-123"), "token must never be logged");
 }
+
+#[tokio::test]
+async fn bridge_heartbeat_carries_the_hooks_turn_state() {
+    let seen: Seen = Arc::default();
+    let server = fake_v1(seen.clone()).await;
+    let home = TempDir::new();
+    let work = TempDir::new();
+    let bridge = spawn_bridge(
+        &work.0,
+        &[
+            ("HOME", home.0.to_str().unwrap()),
+            ("AXL_SERVER_URL", server.as_str()),
+            ("AXL_TOKEN", "tok-123"),
+            ("AXL_HEARTBEAT_MS", "50"),
+        ],
+    )
+    .await;
+    let beats = |seen: &Seen| -> Vec<Value> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(w, _, _)| *w == "heartbeat")
+            .map(|(_, _, b)| b.clone())
+            .collect()
+    };
+    for _ in 0..200 {
+        if !beats(&seen).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // No turn file yet: the old shape.
+    assert!(
+        beats(&seen)[0].get("turn_state").is_none(),
+        "{:?}",
+        beats(&seen)
+    );
+
+    // A hook records idle; a later heartbeat carries it.
+    let turn = axle::bridge::session_file::turn_path(&home.0, std::process::id());
+    axle::bridge::session_file::write_turn(
+        &turn,
+        axle::domain::TurnState::Idle,
+        time::OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let mut carried = false;
+    for _ in 0..200 {
+        if beats(&seen).iter().any(|b| b["turn_state"] == "idle") {
+            carried = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(carried, "{:?}", beats(&seen));
+
+    let (ok, _) = bridge.close().await;
+    assert!(ok);
+    assert!(!turn.exists(), "the turn file goes with the session file");
+}
