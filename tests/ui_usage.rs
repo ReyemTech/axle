@@ -519,10 +519,9 @@ async fn task_line_shows_and_links() {
     assert_eq!(page.status, StatusCode::OK, "{}", page.body);
     let text = page.texts(USAGE_CSS);
     assert_eq!(text.len(), 1, "{text:?}");
-    assert!(
-        text[0].starts_with("Usage 52.2k tokens \u{b7} $0.")
-            && text[0].ends_with("API-equivalent est. \u{b7} 1 session"),
-        "{text:?}"
+    assert_eq!(
+        text[0],
+        "Usage 52.2k tokens \u{b7} $0.26 API-equivalent est. \u{b7} 1 session"
     );
     let sel = format!(
         "p.usage-line a[href=\"/ui/usage?task={}&group=agent&range=all\"]",
@@ -587,4 +586,28 @@ async fn no_usage_no_line() {
     let page = app.get(&format!("/ui/tasks/{}", t.id)).await;
     assert_eq!(page.status, StatusCode::OK);
     assert!(page.texts("p.usage-line").is_empty());
+}
+
+#[tokio::test]
+async fn unknown_model_line_says_no_price() {
+    let app = app().await;
+    let a = app
+        .agent("github.com/acme/infra", "mac", "claude-code")
+        .await;
+    let t = app.task(&a, "Mystery").await;
+    app.claim(&a, &t).await;
+    app.report(
+        &a,
+        "k1",
+        "mystery-1",
+        "api",
+        (12_000, 0),
+        "2026-11-27T09:00:00Z",
+    )
+    .await;
+    let page = app.get(&format!("/ui/tasks/{}", t.id)).await;
+    assert_eq!(
+        page.texts(USAGE_CSS),
+        ["Usage 12.0k tokens \u{b7} no price \u{b7} 1 session"]
+    );
 }

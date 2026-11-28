@@ -102,7 +102,7 @@ fn tokens_exact(n: f64) -> String {
     thousands(n.max(0.0).round() as u64)
 }
 
-fn tokens(r: &UsageRow) -> f64 {
+pub(super) fn tokens(r: &UsageRow) -> f64 {
     r.input + r.output + r.cache_write + r.cache_read
 }
 
@@ -113,7 +113,7 @@ fn priced(r: &UsageRow) -> bool {
 
 /// "no price"; "$3.40", plus " est." when any record was not billed per token and
 /// " + N no price" when some had no price.
-fn cost_text(r: &UsageRow) -> String {
+pub(super) fn cost_text(r: &UsageRow) -> String {
     if !priced(r) {
         return "no price".into();
     }

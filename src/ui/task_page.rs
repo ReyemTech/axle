@@ -11,7 +11,7 @@ use time::format_description::well_known::Rfc3339;
 
 use super::SessionCtx;
 use super::needs::latest_plan;
-use super::usage::{compact, usd};
+use super::usage::{compact, cost_text, tokens};
 use super::views::{
     Labels, LeaseView, ProjectLabel, ProjectOption, Pulse, UiError, UiResult, ago, html,
     lease_view, project_options, pulse_counts, state_mark,
@@ -307,12 +307,20 @@ async fn usage_line(state: &AppState, id: TaskId) -> StoreResult<Option<UsageLin
     let Some(row) = rows.into_iter().find(|r| r.requests > 0) else {
         return Ok(None);
     };
-    let tokens = row.input + row.output + row.cache_write + row.cache_read;
+    // "$3.40 est. + 2 no price" reads "$3.40 API-equivalent est. + 2 no price"; an all-unpriced
+    // task is just "no price".
+    let mut cost = cost_text(&row);
+    if cost != "no price" {
+        let at = cost
+            .find(" est.")
+            .or_else(|| cost.find(" + "))
+            .unwrap_or(cost.len());
+        cost.insert_str(at, " API-equivalent");
+    }
     let mut text = format!(
-        "Usage {} tokens \u{b7} {} API-equivalent{} \u{b7} {} session{}",
-        compact(tokens),
-        usd(row.cost_micros),
-        if row.estimated > 0 { " est." } else { "" },
+        "Usage {} tokens \u{b7} {} \u{b7} {} session{}",
+        compact(tokens(&row)),
+        cost,
         row.sessions,
         if row.sessions == 1 { "" } else { "s" },
     );
