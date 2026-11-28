@@ -172,6 +172,10 @@ fn task_from(row: &SqliteRow) -> StoreResult<Task> {
         requires_plan: row.try_get("requires_plan")?,
         plan_state: parse_text(row.try_get("plan_state")?)?,
         block: block_from(row)?,
+        delivery_stage: row
+            .try_get::<Option<String>, _>("delivery_stage")?
+            .map(|s| parse_text(&s))
+            .transpose()?,
     })
 }
 
@@ -317,7 +321,7 @@ macro_rules! task_cols {
          lease_expires_at, lease_epoch, lease_ttl_secs, eligible_harness, eligible_host,
          created_by_agent_id, created_by_session_id, created_at, updated_at, version,
          requires_plan, plan_state, done_at, acked_at, block_reason, blocked_at, waiting_kind,
-         waiting_task_id, waiting_text, unblock_text"
+         waiting_task_id, waiting_text, unblock_text, delivery_stage"
     };
 }
 
@@ -1516,8 +1520,8 @@ impl Store for SqliteStore {
                  (id, project_id, parent_id, title, body, status, owner_session_id,
                   owner_agent_id, lease_expires_at, lease_epoch, lease_ttl_secs,
                   eligible_harness, eligible_host, created_by_agent_id, created_by_session_id,
-                  token_id, created_at, updated_at, version, requires_plan, plan_state)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  token_id, created_at, updated_at, version, requires_plan, plan_state, delivery_stage)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(task.id.to_string())
         .bind(task.project_id.to_string())
@@ -1540,6 +1544,7 @@ impl Store for SqliteStore {
         .bind(task.version)
         .bind(task.requires_plan)
         .bind(task.plan_state.as_str())
+        .bind(task.delivery_stage.map(|s| s.as_str()))
         .execute(&mut *tx)
         .await?;
         for project in extra_projects {

@@ -111,6 +111,10 @@ fn task_from(row: &PgRow) -> StoreResult<Task> {
         requires_plan: row.try_get("requires_plan")?,
         plan_state: parse_text(row.try_get("plan_state")?)?,
         block: block_from(row)?,
+        delivery_stage: row
+            .try_get::<Option<String>, _>("delivery_stage")?
+            .map(|s| parse_text(&s))
+            .transpose()?,
     })
 }
 
@@ -260,7 +264,7 @@ macro_rules! task_cols {
          lease_expires_at, lease_epoch, lease_ttl_secs, eligible_harness, eligible_host,
          created_by_agent_id, created_by_session_id, created_at, updated_at, version,
          requires_plan, plan_state, done_at, acked_at, block_reason, blocked_at, waiting_kind,
-         waiting_task_id, waiting_text, unblock_text"
+         waiting_task_id, waiting_text, unblock_text, delivery_stage"
     };
 }
 
@@ -1421,9 +1425,9 @@ impl Store for PostgresStore {
                  (id, project_id, parent_id, title, body, status, owner_session_id,
                   owner_agent_id, lease_expires_at, lease_epoch, lease_ttl_secs,
                   eligible_harness, eligible_host, created_by_agent_id, created_by_session_id,
-                  token_id, created_at, updated_at, version, requires_plan, plan_state)
+                  token_id, created_at, updated_at, version, requires_plan, plan_state, delivery_stage)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                     $17, $18, $19, $20, $21)",
+                     $17, $18, $19, $20, $21, $22)",
         )
         .bind(task.id.as_uuid())
         .bind(task.project_id.as_uuid())
@@ -1446,6 +1450,7 @@ impl Store for PostgresStore {
         .bind(task.version)
         .bind(task.requires_plan)
         .bind(task.plan_state.as_str())
+        .bind(task.delivery_stage.map(|s| s.as_str()))
         .execute(&mut *tx)
         .await?;
         for project in extra_projects {

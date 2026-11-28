@@ -362,6 +362,9 @@ fn lease_text(now: OffsetDateTime, task: &Task, owner: Option<&str>) -> String {
             "Held by {owner}; the lease does not expire while {}.",
             task.status
         ),
+        TaskStatus::Delivering => {
+            format!("Finished by {owner}; the lease does not expire while delivery is tracked.")
+        }
         TaskStatus::Done => format!("Finished by {owner}."),
         TaskStatus::Cancelled => "Cancelled.".into(),
     }

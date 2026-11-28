@@ -535,6 +535,7 @@ impl TaskService {
             requires_plan: new.requires_plan,
             plan_state: PlanState::None,
             block: None,
+            delivery_stage: None,
         };
         let event = self.event(task.id, by.actor(), TaskEventKind::Created, None, None);
         let first = Message {
