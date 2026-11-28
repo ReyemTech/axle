@@ -102,7 +102,7 @@ pub async fn status_with(
         .iter()
         .any(|l| l.label == "reachable" && l.fix.is_none() && l.value.starts_with("yes"));
     if let (Ok(token), true) = (&token, reachable) {
-        session_lines(&mut lines, &env.home, token).await;
+        session_lines(&mut lines, &env.home, &url, token).await;
     }
     harness_lines(&mut lines, env, &dir);
 
@@ -244,8 +244,9 @@ async fn server_lines(
 
 /// One `session` line per live bridge on this machine (a session file whose harness process
 /// still runs): `<harness> · <project> · wake: <channel> · turn: <state>`, as its server
-/// knows them. Informational only; a session the server cannot describe says so.
-async fn session_lines(lines: &mut Vec<StatusLine>, home: &Path, token: &str) {
+/// knows them. Informational only; a session the server cannot describe says so. Only
+/// sessions of the configured `server` are asked; another server's are listed unqueried.
+async fn session_lines(lines: &mut Vec<StatusLine>, home: &Path, server: &str, token: &str) {
     let dir = home.join(".axl").join("sessions");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
@@ -264,6 +265,15 @@ async fn session_lines(lines: &mut Vec<StatusLine>, home: &Path, token: &str) {
     live.sort_by_key(|(pid, _)| *pid);
     for (_, info) in live {
         let project = info.project_key.as_deref().unwrap_or("no project");
+        // The token belongs to the configured server: never send it anywhere else.
+        if !same_server(&info.server_url, server) {
+            let value = format!(
+                "{} · {project} · another server ({})",
+                info.harness, info.server_url
+            );
+            lines.push(line("session", value, None));
+            continue;
+        }
         let state = Api::new(&info.server_url)
             .session_state(token, info.session_id)
             .await;
@@ -276,6 +286,13 @@ async fn session_lines(lines: &mut Vec<StatusLine>, home: &Path, token: &str) {
         };
         lines.push(line("session", value, None));
     }
+}
+
+/// Whether two server URLs name the same server: compared without surrounding whitespace
+/// or trailing slashes, ignoring ASCII case.
+fn same_server(a: &str, b: &str) -> bool {
+    let norm = |u: &str| u.trim().trim_end_matches('/').to_ascii_lowercase();
+    norm(a) == norm(b)
 }
 
 /// Whether process `pid` exists (a process of another user counts).

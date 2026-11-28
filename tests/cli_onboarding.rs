@@ -2087,3 +2087,45 @@ async fn status_shows_wake_channel_and_turn() {
     );
     assert!(sessions[0].fix.is_none());
 }
+
+#[tokio::test]
+async fn status_never_sends_the_token_to_another_server() {
+    let srv = server().await;
+    let home = full_home(&srv).await;
+    let service = FakeService::default();
+    let (installed, _) = run(&home, args(), &NoPrompt, false, &service, T1).await;
+    installed.unwrap();
+
+    // Another server that records every request it gets.
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counted = hits.clone();
+    let app = axum::Router::new().fallback(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        async { "{}" }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let other = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(axum::serve(listener, app).into_future());
+
+    // A live session (this process is its harness) whose bridge talks to the other server.
+    let info = serde_json::json!({"session_id": axle::domain::SessionId::new(),
+        "project_key": "github.com/acme/elsewhere",
+        "server_url": other, "harness": "codex"})
+    .to_string();
+    home.write(&format!(".axl/sessions/{}.json", std::process::id()), &info);
+
+    let (report, text) = run_status(&home, &service, home.exe("bin/axl")).await;
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "{text}");
+    let sessions: Vec<_> = report
+        .lines
+        .iter()
+        .filter(|l| l.label == "session")
+        .collect();
+    assert_eq!(sessions.len(), 1, "{text}");
+    assert_eq!(
+        sessions[0].value,
+        format!("codex · github.com/acme/elsewhere · another server ({other})"),
+        "{text}"
+    );
+    assert!(sessions[0].fix.is_none());
+}

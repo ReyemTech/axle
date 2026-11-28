@@ -124,8 +124,10 @@ session  claude-code · github.com/acme/web-app · wake: claude-socket · turn: 
 ```
 
 `wake` is how Axle can wake the session when it is idle (`none` means it cannot); `turn`
-is `busy`, `idle` or `unknown`, as the hooks last reported it. These lines are information
-only and never carry a fix.
+is `busy`, `idle` or `unknown`, as the hooks last reported it. A session whose bridge talks
+to a different server is listed as `another server (<url>)` and not asked about, so your
+token only ever goes to the configured server. These lines are information only and never
+carry a fix.
 
 ## `axl service`
 
