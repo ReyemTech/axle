@@ -13,10 +13,10 @@ use time::{Duration, OffsetDateTime};
 
 use crate::config::Backend;
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, Enrollment, EnrollmentId, EnrollmentKind,
+    Actor, Address, Agent, AgentId, Billing, BlockDetail, Enrollment, EnrollmentId, EnrollmentKind,
     Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState, Project,
     ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus,
-    TokenId, TokenInfo, WaitingOn,
+    TokenId, TokenInfo, UsageId, WaitingOn,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -390,6 +390,20 @@ pub trait Store: Send + Sync {
     /// The tasks whose thread holds urgent mail waiting on the human (the same messages
     /// `human_attention` would list, urgent only, with no page limit), each once, by id.
     async fn urgent_attention_tasks(&self) -> StoreResult<Vec<TaskId>>;
+
+    // ---- usage ----
+
+    /// In one transaction, for each record: upserts by `(agent.harness, key)`. A new row takes
+    /// the batch's session/agent/project/token, `pricer`'s price and one allocation row per task
+    /// `session` held at `occurred_at` (`parts` = how many), or one `(NULL, 1)` row. An existing
+    /// row keeps its session, model, billing, times and allocations, takes the larger value of
+    /// each count, and is re-priced from the merged counts.
+    async fn insert_usage(
+        &self,
+        batch: &UsageBatch<'_>,
+        pricer: &dyn Pricer,
+    ) -> StoreResult<UsageWritten>;
+    async fn get_usage(&self, harness: &str, key: &str) -> StoreResult<Option<StoredUsage>>;
 }
 
 /// How far a message has got, from its recipient rows (spec §9 receipts).
@@ -417,6 +431,84 @@ impl MessageReceipt {
             "sent"
         }
     }
+}
+
+/// Token counts of one model response. `input` is uncached input only; `output` includes
+/// `reasoning`, which is informational and never priced twice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageCounts {
+    pub input: i64,
+    pub output: i64,
+    pub cache_write_5m: i64,
+    pub cache_write_1h: i64,
+    pub cache_read: i64,
+    pub reasoning: i64,
+}
+
+/// One reported usage record, keyed by the harness's own id for the response.
+#[derive(Debug, Clone)]
+pub struct NewUsage {
+    pub key: String,
+    pub model: String,
+    pub counts: UsageCounts,
+    pub speed: Option<String>,
+    pub billing: Billing,
+    pub occurred_at: OffsetDateTime,
+}
+
+/// Records reported by one session in one request (see `Store::insert_usage`).
+#[derive(Debug, Clone)]
+pub struct UsageBatch<'a> {
+    pub session: SessionId,
+    /// The session's agent: its harness keys the records, its home project is theirs.
+    pub agent: &'a Agent,
+    pub token: TokenId,
+    pub parser: &'a str,
+    pub harness_session_id: Option<&'a str>,
+    pub records: &'a [NewUsage],
+    pub now: OffsetDateTime,
+}
+
+/// An API-equivalent price: micro-USD and the price-table entry it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Priced {
+    pub cost_micros: i64,
+    pub price_ref: String,
+}
+
+/// Prices a record's counts; the store calls it inside the write so a merged row is priced
+/// from its merged counts.
+pub trait Pricer: Send + Sync {
+    fn price(&self, model: &str, speed: Option<&str>, counts: &UsageCounts) -> Option<Priced>;
+}
+
+/// What `insert_usage` did: new rows, and records whose key was already stored (merged).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageWritten {
+    pub inserted: u32,
+    pub duplicate: u32,
+}
+
+/// A stored usage record with its allocation rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredUsage {
+    pub id: UsageId,
+    pub harness: String,
+    pub session: SessionId,
+    pub agent: AgentId,
+    pub project: Option<ProjectId>,
+    pub model: String,
+    pub counts: UsageCounts,
+    pub speed: Option<String>,
+    pub billing: Billing,
+    pub cost_micros: Option<i64>,
+    pub price_ref: Option<String>,
+    pub parser: String,
+    pub harness_session_id: Option<String>,
+    pub occurred_at: OffsetDateTime,
+    pub received_at: OffsetDateTime,
+    /// `(task, parts)`, `None` = "no task"; ordered by task id text, `None` first.
+    pub allocations: Vec<(Option<TaskId>, i64)>,
 }
 
 /// Whose inbox an operation works on.
