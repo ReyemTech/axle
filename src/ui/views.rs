@@ -32,8 +32,6 @@ pub const COLUMN_CAP: usize = 12;
 pub const DENSITY_COOKIE: &str = "axl_density";
 /// The overview shows agents seen within this window.
 pub const AGENT_WINDOW: Duration = Duration::hours(24);
-/// How many attention messages the board scans for urgent mail in task threads.
-const URGENT_SCAN: u32 = 200;
 /// The deepest parent chain the live stream walks up to find a card.
 const MAX_DEPTH: usize = 16;
 
@@ -806,11 +804,9 @@ async fn columns(
     // Tasks whose thread holds unarchived urgent mail for the human.
     let urgent: HashSet<TaskId> = state
         .store
-        .human_attention(URGENT_SCAN)
+        .urgent_attention_tasks()
         .await?
         .into_iter()
-        .filter(|m| m.importance == Importance::Urgent)
-        .filter_map(|m| m.task_id)
         .collect();
     let mut out = Vec::with_capacity(COLUMNS.len());
     for (status, label) in COLUMNS {

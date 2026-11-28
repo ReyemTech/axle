@@ -364,6 +364,9 @@ pub trait Store: Send + Sync {
     /// human-due messages (their own rows, and thread posts not yet materialised) of high or
     /// urgent importance that are not plans. Read-only: nothing is marked delivered.
     async fn human_attention(&self, limit: u32) -> StoreResult<Vec<Message>>;
+    /// The tasks whose thread holds urgent mail waiting on the human (the same messages
+    /// `human_attention` would list, urgent only, with no page limit), each once, by id.
+    async fn urgent_attention_tasks(&self) -> StoreResult<Vec<TaskId>>;
 }
 
 /// How far a message has got, from its recipient rows (spec §9 receipts).
