@@ -7,6 +7,50 @@ include breaking changes.
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/ReyemTech/axle/compare/v0.1.1...v0.1.2) - 2026-11-28
+
+### Added
+
+- *(cli)* axl install --force and --port; UI connect command runs axl install
+- *(cli)* axl status with one fix per problem
+- *(cli)* axl uninstall from the install manifest
+- *(cli)* axl install with login, local mode and dry run
+- *(cli)* axl service with launchd and systemd user units
+- *(install)* OpenCode config editor with manual-step fallback
+- *(install)* Codex config editor with hooks block; axl hook learns Codex
+- *(install)* Claude Code plugin editor with adoption
+- *(install)* binary path rules, backups, marker blocks and manifest
+- *(cli)* axl login (code and device flow) and axl logout
+- *(server)* serve install.sh pinned to the server version; helm publicUrl
+- *(ui)* connect a machine, pending enrollments and device approval
+- *(http)* enroll and device-login endpoints with per-IP limit, whoami
+- *(enroll)* enrollment service with one-time codes and device flow
+- *(store)* enrollments table and guarded consume for both backends
+- *(client)* ~/.axl/config.toml with server URL precedence
+
+### Fixed
+
+- *(service)* check a changed port before restarting a running service
+- *(onboarding)* keep remote server URL, fail status on unchecked token, revalidate saved token on install
+- install.sh status is advisory, clear redirect error, Codex hook timeout 10, redacting Debug
+- *(cli)* axl status separates 401 from server errors and lists the root cause first
+- *(cli)* record partial installs, redact secrets, positional login URL
+- *(cli)* wait for launchd unload before bootstrap, scope dollar escaping, narrow purge
+- *(install)* fail loudly on corrupt manifest and orphan markers, back up replaced links, ignore relative PATH
+- *(cli)* read config before redeeming; clamp server-supplied login timings
+- *(server)* install.sh treats backslash as a URL path delimiter
+- *(server)* install.sh tty probe safe under dash, strip query/fragment before userinfo
+- *(server)* install.sh stdin isolation, exact loopback match, hostless ingress entries
+- *(ui)* connect code countdown, copy labels and CSRF/escaping tests
+- *(http)* key per-IP limits by IpAddr and evict refilled buckets
+- *(client)* warn on stderr when config.toml is ignored
+- *(release)* build arm64 Linux on Ubuntu 22.04 for older glibc, restore Homebrew homepage
+
+### Other
+
+- cargo fmt
+- onboarding (install, login, enrollment, status, service)
+
 ### Added
 
 - One-command onboarding: `axl install` connects a machine (local service or team server)
