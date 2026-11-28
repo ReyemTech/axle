@@ -80,9 +80,20 @@ impl AxlDir {
 pub struct UsageConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
-    /// Harness name -> billing kind; always wins over detection.
+    /// Harness name -> billing kind as written; a known kind always wins over detection. Kept
+    /// as text and parsed per entry ([`UsageConfig::billing_for`]) so a typo here is ignored
+    /// rather than failing the whole of config.toml (which would also lose `enabled = false`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub billing: std::collections::BTreeMap<String, Billing>,
+    pub billing: std::collections::BTreeMap<String, String>,
+}
+
+impl UsageConfig {
+    /// The configured billing kind for `harness`, or None when unset or not a billing kind.
+    pub fn billing_for(&self, harness: &str) -> Option<Billing> {
+        self.billing
+            .get(harness)
+            .and_then(|v| v.trim().parse().ok())
+    }
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, PartialEq)]

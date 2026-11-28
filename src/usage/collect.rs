@@ -16,7 +16,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::bridge::session_file::SessionInfo;
-use crate::client::{AxlDir, load_config, read_token, usage_off};
+use crate::client::{AxlDir, ClientConfig, load_config, read_token, usage_off};
 use crate::hook::Harness;
 use crate::store::UsageCounts;
 use crate::usage::billing;
@@ -70,8 +70,15 @@ pub async fn collect(c: Collect<'_>) -> Option<String> {
 
 /// [`collect`] with explicit caps.
 pub async fn collect_with(c: Collect<'_>, limits: Limits) -> Option<String> {
-    let cfg = load_config(&AxlDir::new(c.home)).unwrap_or_default();
-    if usage_off((c.env)("AXL_USAGE").as_deref(), &cfg).is_some() {
+    let axl_usage = (c.env)("AXL_USAGE");
+    if usage_off(axl_usage.as_deref(), &ClientConfig::default()).is_some() {
+        return None;
+    }
+    // A config that does not parse may hold `enabled = false`: never guess it is on.
+    let Ok(cfg) = load_config(&AxlDir::new(c.home)) else {
+        return Some("config.toml unreadable; usage off".to_string());
+    };
+    if usage_off(axl_usage.as_deref(), &cfg).is_some() {
         return None;
     }
     let (home, session_end) = (c.home, c.session_end);
@@ -106,9 +113,7 @@ async fn run(c: Collect<'_>, cfg: &crate::client::UsageConfig, limits: Limits) -
     };
     let token = read_token((c.env)("AXL_TOKEN").as_deref(), &AxlDir::new(c.home)).ok()?;
     let billing = cfg
-        .billing
-        .get(c.harness.name())
-        .copied()
+        .billing_for(c.harness.name())
         .or_else(|| main.as_ref().and_then(|m| m.billing))
         .unwrap_or_else(|| billing::detect(c.harness, c.home, c.env));
 

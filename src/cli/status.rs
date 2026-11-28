@@ -117,8 +117,13 @@ pub async fn status_with(
     )
     .await;
     harness_lines(&mut lines, env, &dir);
-    let cfg = load_config(&dir).unwrap_or_default();
-    usage_lines(&mut lines, &env.home, &cfg, env_usage);
+    let cfg = load_config(&dir).map_err(|e| {
+        (
+            e.to_string(),
+            format!("fix or remove {}", dir.config_path().display()),
+        )
+    });
+    usage_lines(&mut lines, &env.home, cfg.as_ref(), env_usage);
 
     let ok = lines.iter().all(|l| l.fix.is_none());
     StatusReport { lines, ok }
@@ -341,19 +346,29 @@ fn harness_lines(lines: &mut Vec<StatusLine>, env: &InstallEnv<'_>, dir: &AxlDir
     }
 }
 
-/// Information only (no `fix`): whether usage reporting is on, the billing kind per harness
-/// (the config wins over what the collector last recorded) and the last successful report.
+/// Whether usage reporting is on, the billing kind per harness (the config wins over what the
+/// collector last recorded) and the last successful report. Information only, except when
+/// config.toml does not parse: the collector then sends nothing, and the line says how to fix it.
 fn usage_lines(
     lines: &mut Vec<StatusLine>,
     home: &Path,
-    cfg: &ClientConfig,
+    cfg: Result<&ClientConfig, &(String, String)>,
     env_usage: Option<&str>,
 ) {
-    let value = match usage_off(env_usage, cfg) {
-        Some(why) => format!("off ({why})"),
-        None => "on".to_string(),
+    let default = ClientConfig::default();
+    let (value, fix) = match (usage_off(env_usage, &default), cfg) {
+        (Some(why), _) => (format!("off ({why})"), None),
+        (None, Err((e, fix))) => (
+            format!("off (config.toml unreadable: {e})"),
+            Some(fix.clone()),
+        ),
+        (None, Ok(cfg)) => match usage_off(env_usage, cfg) {
+            Some(why) => (format!("off ({why})"), None),
+            None => ("on".to_string(), None),
+        },
     };
-    lines.push(line("usage", value, None));
+    lines.push(line("usage", value, fix));
+    let cfg = cfg.unwrap_or(&default);
 
     let status = cursor::load_status(home);
     let mut billing: BTreeMap<String, String> = status
@@ -362,8 +377,12 @@ fn usage_lines(
         .map(|(h, b)| (h.clone(), b.to_string()))
         .collect();
     if let Some(u) = &cfg.usage {
-        for (h, b) in &u.billing {
-            billing.insert(h.clone(), format!("{b} (from config)"));
+        for (h, raw) in &u.billing {
+            let shown = match u.billing_for(h) {
+                Some(b) => format!("{b} (from config)"),
+                None => format!("{raw:?} (not a billing kind; ignored)"),
+            };
+            billing.insert(h.clone(), shown);
         }
     }
     let value = if billing.is_empty() {

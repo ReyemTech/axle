@@ -1753,7 +1753,7 @@ async fn status_shows_usage_lines() {
     let dir = AxlDir::new(home.path());
     let mut cfg = load_config(&dir).unwrap();
     let mut usage = UsageConfig::default();
-    usage.billing.insert("codex".into(), Billing::Api);
+    usage.billing.insert("codex".into(), "api".into());
     cfg.usage = Some(usage.clone());
     save_config(&dir, &cfg).unwrap();
     let (report, text) = run_status(&home, &service, home.exe("bin/axl")).await;
@@ -1776,6 +1776,33 @@ async fn status_shows_usage_lines() {
         "off ([usage] enabled = false)"
     );
     assert!(report.ok);
+
+    // A billing typo is ignored (and said so); it never hides `enabled = false`.
+    std::fs::write(
+        dir.config_path(),
+        "[usage]\nenabled = false\n[usage.billing]\ncodex = \"apii\"\n",
+    )
+    .unwrap();
+    let (report, _) = run_status(&home, &service, home.exe("bin/axl")).await;
+    assert_eq!(
+        value_of(&report, "usage").value,
+        "off ([usage] enabled = false)"
+    );
+    assert_eq!(
+        value_of(&report, "usage billing").value,
+        "claude-code subscription, codex \"apii\" (not a billing kind; ignored)"
+    );
+
+    // A config that does not parse turns usage off, and status says why.
+    std::fs::write(dir.config_path(), "server_url = [not toml\n").unwrap();
+    let (report, _) = run_status(&home, &service, home.exe("bin/axl")).await;
+    let usage = value_of(&report, "usage");
+    assert!(
+        usage.value.starts_with("off (config.toml unreadable: "),
+        "{}",
+        usage.value
+    );
+    assert!(usage.fix.is_some());
 }
 
 #[tokio::test]

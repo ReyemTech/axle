@@ -510,6 +510,34 @@ async fn off_sends_nothing() {
 }
 
 #[tokio::test]
+async fn a_bad_billing_value_keeps_the_off_switch() {
+    let h = TempHome::new();
+    h.write(&h.transcript(), &lines(&["r1"]));
+    let (url, bodies) = fake_usage(200).await;
+    h.write(
+        &h.path().join(".axl").join("config.toml"),
+        "[usage]\nenabled = false\n[usage.billing]\ncodex = \"apii\"\n",
+    );
+    assert_eq!(run(&h, &h.stdin(), session(&url), &env(&[])).await, None);
+    assert_eq!(count(&bodies), 0);
+}
+
+#[tokio::test]
+async fn an_unreadable_config_turns_usage_off() {
+    let h = TempHome::new();
+    h.write(&h.transcript(), &lines(&["r1"]));
+    let (url, bodies) = fake_usage(200).await;
+    h.write(
+        &h.path().join(".axl").join("config.toml"),
+        "server_url = [not toml\n",
+    );
+    let line = run(&h, &h.stdin(), session(&url), &env(&[])).await;
+    assert_eq!(line.as_deref(), Some("config.toml unreadable; usage off"));
+    assert_eq!(count(&bodies), 0);
+    assert!(cursor::load(h.path(), &h.transcript()).is_none());
+}
+
+#[tokio::test]
 async fn no_session_or_token_is_silent() {
     let h = TempHome::new();
     h.write(&h.transcript(), &lines(&["r1"]));

@@ -91,7 +91,7 @@ fn claude_billing_order() {
 
     let mut cfg = UsageConfig::default();
     cfg.billing
-        .insert("claude-code".into(), Billing::Subscription);
+        .insert("claude-code".into(), "subscription".into());
     let e = env(&[("ANTHROPIC_API_KEY", "k")]);
     assert_eq!(
         resolve(Harness::ClaudeCode, h.path(), &e, &cfg),
@@ -145,6 +145,31 @@ fn usage_off_switches() {
 }
 
 #[test]
+fn a_bad_billing_value_does_not_break_the_config() {
+    let h = TempHome::new();
+    let dir = AxlDir::new(h.path());
+    dir.ensure().unwrap();
+    std::fs::write(
+        dir.config_path(),
+        "server_url = \"http://example.test\"\n[usage]\nenabled = false\n\
+         [usage.billing]\ncodex = \"apii\"\nclaude-code = \"subscription\"\n",
+    )
+    .unwrap();
+    let cfg = load_config(&dir).unwrap();
+    assert_eq!(cfg.server_url.as_deref(), Some("http://example.test"));
+    assert_eq!(usage_off(None, &cfg), Some("[usage] enabled = false"));
+    let u = cfg.usage.unwrap();
+    assert_eq!(u.billing_for("codex"), None);
+    assert_eq!(u.billing_for("claude-code"), Some(Billing::Subscription));
+    let e = env(&[]);
+    assert_eq!(
+        resolve(Harness::Codex, h.path(), &e, &u).1,
+        Source::Detected,
+        "a value that is not a billing kind falls back to detection"
+    );
+}
+
+#[test]
 fn config_round_trip() {
     let h = TempHome::new();
     let dir = AxlDir::new(h.path());
@@ -157,7 +182,7 @@ fn config_round_trip() {
     let cfg = load_config(&dir).unwrap();
     let u = cfg.usage.clone().unwrap();
     assert_eq!(u.enabled, Some(false));
-    assert_eq!(u.billing.get("codex"), Some(&Billing::Api));
+    assert_eq!(u.billing_for("codex"), Some(Billing::Api));
     save_config(&dir, &cfg).unwrap();
     assert_eq!(load_config(&dir).unwrap(), cfg);
     let text = std::fs::read_to_string(dir.config_path()).unwrap();

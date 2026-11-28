@@ -80,6 +80,10 @@ registered with `timeout = 3`.
   codex = "api"   # or "subscription", "unknown"
   ```
 
+  Any other value is ignored (detection decides, and `axl status` shows it as ignored). If
+  `config.toml` does not parse at all, the collector sends nothing and prints
+  `config.toml unreadable; usage off`.
+
 A problem is at most one stderr line, after any mail error; the hook still exits 0.
 
 ## Manual setup

@@ -186,6 +186,10 @@ prices it at API rates.
   claude-code = "subscription"   # or "api", "unknown"
   ```
 
+  Any other value is ignored (detection decides, and `axl status` shows it as ignored). If
+  `config.toml` does not parse at all, the collector sends nothing and prints
+  `config.toml unreadable; usage off`.
+
 A problem (an unreadable transcript, a log the parser does not recognise, a server that
 does not answer) is at most one stderr line, after any mail error; the hook still exits 0.
 

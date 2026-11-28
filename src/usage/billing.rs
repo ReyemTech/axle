@@ -31,8 +31,8 @@ pub fn resolve(
     env: &dyn Fn(&str) -> Option<String>,
     cfg: &UsageConfig,
 ) -> (Billing, Source) {
-    match cfg.billing.get(h.name()) {
-        Some(b) => (*b, Source::Config),
+    match cfg.billing_for(h.name()) {
+        Some(b) => (b, Source::Config),
         None => (detect(h, home, env), Source::Detected),
     }
 }
