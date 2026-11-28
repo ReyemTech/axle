@@ -2809,3 +2809,51 @@ async fn live_refresh_updates_task_actions() {
         actions(&done)
     );
 }
+
+#[tokio::test]
+async fn cmd_enter_sends_message_forms() {
+    let app = app().await;
+    let cookie = app.login().await;
+
+    // app.js carries the one delegated handler, and the CSP is unchanged.
+    let js = app.get("/ui/static/app.js", None).await;
+    assert!(js.body.contains("requestSubmit") && js.body.contains("isComposing"));
+    assert!(js.body.contains("metaKey") && js.body.contains("ctrlKey"));
+    let res = app
+        .router
+        .clone()
+        .oneshot(
+            Request::get("/ui/board")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let csp = res.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(csp.contains("script-src 'self'") && !csp.contains("unsafe-inline"));
+
+    // Every page with a textarea names the shortcut in words next to its send button.
+    let agent = app.agent("proj", "host", "claude-code").await;
+    let task = app.task(&agent, "Hinted", None).await;
+    for path in [
+        "/ui/board".to_string(),
+        "/ui/inbox".to_string(),
+        format!("/ui/tasks/{}", task.id),
+    ] {
+        let page = app.get(&path, Some(&cookie)).await;
+        let textareas = page
+            .html()
+            .select(&Selector::parse("textarea").unwrap())
+            .count();
+        let hints = select_texts(&page, "[data-send-hint]");
+        assert!(textareas > 0, "{path}: no textarea");
+        assert!(
+            !hints.is_empty() && hints.iter().all(|h| h.contains("Enter to send")),
+            "{path}: {hints:?}"
+        );
+    }
+}
