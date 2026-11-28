@@ -297,14 +297,15 @@ async fn insert_event(
 }
 
 /// Appends `event` to the task's history, then runs the parent rule up the tree (see
-/// `parent_step`). Runs inside the write transaction of the task's change. Returns whether
-/// this change closed its parent's last open child (`children_complete` was recorded).
+/// `parent_step`). Runs inside the write transaction of the task's change. Returns the task
+/// on which this change recorded `children_complete` (it closed that task's last open
+/// child): the parent, or an ancestor the parent rule finished its way up to.
 async fn record_event(
     conn: &mut SqliteConnection,
     task: &Task,
     event: &TaskEvent,
     token: Option<TokenId>,
-) -> StoreResult<bool> {
+) -> StoreResult<Option<TaskId>> {
     record_event_into(conn, task, event, token, &mut Vec::new()).await
 }
 
@@ -316,10 +317,9 @@ async fn record_event_into(
     event: &TaskEvent,
     token: Option<TokenId>,
     moved: &mut Vec<Task>,
-) -> StoreResult<bool> {
+) -> StoreResult<Option<TaskId>> {
     insert_event(conn, event, token).await?;
     let (mut child, mut source) = (task.clone(), event.clone());
-    let mut first = true;
     while let Some(parent) = child.parent_id {
         match parent_step(conn, &child, parent, &source, token).await? {
             ParentStep::Unchanged => break,
@@ -327,7 +327,7 @@ async fn record_event_into(
                 if let Some(p) = updated {
                     push_moved(moved, p);
                 }
-                return Ok(first);
+                return Ok(Some(parent));
             }
             ParentStep::Moved(p, ev) => {
                 insert_event(conn, &ev, token).await?;
@@ -335,9 +335,8 @@ async fn record_event_into(
                 (child, source) = (p, ev);
             }
         }
-        first = false;
     }
-    Ok(false)
+    Ok(None)
 }
 
 /// The parent rule for one change (`source`) of `child`: bubbles the event into the parent's
@@ -802,7 +801,7 @@ async fn advance_locked(
     let reached = stage_reached_event(m);
     let delivered = updated.status == TaskStatus::Done;
     let mut moved = Vec::new();
-    let children_complete = if delivered {
+    let mut children_complete = if delivered {
         insert_event(conn, &reached, m.token).await?;
         record_event_into(
             conn,
@@ -825,7 +824,8 @@ async fn advance_locked(
         )
         .await?;
         if let Some((p, ev)) = own {
-            record_event_into(conn, &p, &ev, m.token, &mut moved).await?;
+            let closed = record_event_into(conn, &p, &ev, m.token, &mut moved).await?;
+            children_complete = children_complete.or(closed);
             updated = p;
         }
     }

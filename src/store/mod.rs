@@ -992,9 +992,9 @@ pub struct StageMoved {
     pub task: Task,
     /// Whether the move finished the task (`delivering → done`).
     pub delivered: bool,
-    /// Whether that closed the parent's last open child (the store recorded
-    /// `children_complete` on it).
-    pub children_complete: bool,
+    /// The task on which the move recorded `children_complete` (it closed that task's last
+    /// open child): the parent, or an ancestor the parent rule finished its way up to.
+    pub children_complete: Option<TaskId>,
     /// Tasks unblocked because the move made a task `done` (see `StageMove::unblock`).
     pub unblocked: Vec<Unblocked>,
 }
@@ -1264,9 +1264,10 @@ pub(crate) fn push_moved(moved: &mut Vec<Task>, task: Task) {
 #[derive(Debug, Clone)]
 pub struct Transitioned {
     pub task: Task,
-    /// Whether this transition closed its parent's last open child, so the store recorded
-    /// `children_complete` on the parent (and moved a `claimed` parent to `review`).
-    pub children_complete: bool,
+    /// The task on which this transition recorded `children_complete` (it closed that
+    /// task's last open child, and a `claimed` one moved to `review`): the parent, or an
+    /// ancestor the parent rule finished its way up to.
+    pub children_complete: Option<TaskId>,
     /// Tasks this transition unblocked (it made the task `done`; see `UnblockRule`).
     pub unblocked: Vec<Unblocked>,
 }

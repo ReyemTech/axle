@@ -109,6 +109,11 @@ The parent's thread gets one `child_done` per child, when that child reaches `do
 delivery, not when its agent completes it into `delivering`. **Mark done** on a parent
 finishes only the parent; its delivering children stay `delivering`.
 
+This carries up the tree. When a child's delivery finishes its parent, the grandparent's
+thread hears that the parent is done, and if that closed the grandparent's last open child,
+its coordinator gets the high-importance "child tasks complete" note and a `claimed`
+grandparent moves to `review`.
+
 ## Turning stages off
 
 Unticking stages recomputes every delivering task. One at or past the new last stage goes to

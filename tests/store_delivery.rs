@@ -2510,6 +2510,87 @@ store_matrix!(
     |store: Arc<dyn Store>| async move { last_child_through_delivery(store, true).await }
 );
 
+/// Delivery finishing a leaf can finish its `delivering` parent and close the grandparent's
+/// last open child: the grandparent's coordinator is told both, and its move is published.
+async fn cascade_notifies_grandparent(store: Arc<dyn Store>, mark_done: bool) {
+    let clock = Arc::new(TestClock::new(T1));
+    let bus = axle::events::EventBus::new(store.clone(), clock.clone());
+    let mut rx = bus.subscribe();
+    let svc = DeliveryService::new(store.clone(), clock).with_events(bus);
+    let dx = Dx {
+        fx: Fx::new(store).await,
+        svc,
+    };
+    dx.stages(&[DeliveryStage::InPr, DeliveryStage::Merged])
+        .await;
+    let grandparent = dx.fx.claimed("grandparent", None).await;
+    let parent = dx.fx.claimed("parent", Some(grandparent.id)).await;
+    let leaf = dx.fx.delivering("leaf", Some(parent.id), 7).await;
+    let (parent, target) = dx.fx.complete(parent.id, T1).await;
+    assert!(matches!(target, CompletionTarget::Delivering(_)));
+    assert_eq!(parent.status, TaskStatus::Delivering);
+    while rx.try_recv().is_ok() {}
+
+    if mark_done {
+        dx.svc.mark_done(leaf.id).await.unwrap();
+    } else {
+        dx.svc.advance(leaf.id).await.unwrap();
+    }
+    assert_eq!(dx.fx.get(parent.id).await.status, TaskStatus::Done);
+    assert_eq!(dx.fx.get(grandparent.id).await.status, TaskStatus::Review);
+    let subjects: Vec<_> = dx
+        .fx
+        .store
+        .task_thread(grandparent.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|m| m.subject)
+        .collect();
+    assert!(
+        subjects.contains(&"child task done".to_string()),
+        "{subjects:?}"
+    );
+    assert!(
+        subjects.contains(&"child tasks complete".to_string()),
+        "{subjects:?}"
+    );
+    let mut changes = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        if let axle::events::Event::TaskChanged {
+            id, status, kind, ..
+        } = e
+            && (id == parent.id || id == grandparent.id)
+        {
+            changes.push((id, status, kind));
+        }
+    }
+    assert!(
+        changes.contains(&(parent.id, TaskStatus::Done, TaskEventKind::Delivered)),
+        "{changes:?}"
+    );
+    assert!(
+        changes.contains(&(
+            grandparent.id,
+            TaskStatus::Review,
+            TaskEventKind::ChildrenComplete
+        )),
+        "{changes:?}"
+    );
+}
+
+store_matrix!(cascade_mark_done_notifies_grandparent, |store: Arc<
+    dyn Store,
+>| async move {
+    cascade_notifies_grandparent(store, true).await
+});
+
+store_matrix!(cascade_advance_notifies_grandparent, |store: Arc<
+    dyn Store,
+>| async move {
+    cascade_notifies_grandparent(store, false).await
+});
+
 // ---- a task delivery finishes unblocks the tasks waiting on it ----
 
 /// How the waited-on task is finished in `unblock_through_delivery`.

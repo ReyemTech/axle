@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use crate::clock::Clock;
 use crate::domain::{
-    Actor, Address, Importance, Message, MessageId, MessageKind, Task, TaskEventKind, TaskStatus,
-    TokenId,
+    Actor, Address, Importance, Message, MessageId, MessageKind, Task, TaskEventKind, TaskId,
+    TaskStatus, TokenId,
 };
 use crate::events::{Event, EventBus};
 use crate::store::Store;
@@ -60,8 +60,10 @@ impl Notifier {
     /// it and, for a child, tells the coordinator (spec section 8). A child that is blocked,
     /// done (also through delivery) or cancelled posts a message into the parent's thread
     /// (delivered to the parent's owner and creator), as does the closing of the last open
-    /// child (`children_complete`, written by the store). A parent the store moved in the
-    /// same change (to `review`, `delivering` or `done`) is published too.
+    /// child (`children_complete`: the task the store recorded it on). A parent the store
+    /// moved in the same change (to `review`, `delivering` or `done`) is published too, and a
+    /// parent it moved to `delivering` or `done` is announced to its own parent in turn, up
+    /// the tree as far as the change reached.
     pub(crate) async fn announce(
         &self,
         task: &Task,
@@ -69,33 +71,87 @@ impl Notifier {
         note: Option<&str>,
         actor: Actor,
         token: Option<TokenId>,
-        children_complete: bool,
+        children_complete: Option<TaskId>,
     ) {
         self.changed(task, kind).await;
-        let Some(parent_id) = task.parent_id else {
-            return;
-        };
-        if !matches!(
-            kind,
-            TaskEventKind::Blocked
-                | TaskEventKind::Done
-                | TaskEventKind::Delivered
-                | TaskEventKind::Cancelled
-        ) {
-            return;
-        }
-        let parent = match self.store.get_task(parent_id).await {
-            Ok(Some(p)) => p,
-            Ok(None) => return,
-            Err(e) => {
-                eprintln!("axl: failed to read parent task {parent_id}: {e}");
+        let (mut child, mut kind, mut note) = (task.clone(), kind, note);
+        while let Some(parent_id) = child.parent_id {
+            let parent = match self.store.get_task(parent_id).await {
+                Ok(Some(p)) => p,
+                Ok(None) => return,
+                Err(e) => {
+                    eprintln!("axl: failed to read parent task {parent_id}: {e}");
+                    return;
+                }
+            };
+            if matches!(
+                kind,
+                TaskEventKind::Blocked
+                    | TaskEventKind::Done
+                    | TaskEventKind::Delivered
+                    | TaskEventKind::Cancelled
+            ) {
+                self.child_status(&child, &parent, kind, note, actor, token)
+                    .await;
+            }
+            let closed = children_complete == Some(parent.id);
+            // A parent the store moved in this change carries the child's `updated_at`.
+            let moved = parent.updated_at >= child.updated_at;
+            if moved {
+                match parent.status {
+                    TaskStatus::Review if closed => {
+                        self.changed(&parent, TaskEventKind::ChildrenComplete).await;
+                    }
+                    TaskStatus::Delivering => {
+                        self.changed(&parent, TaskEventKind::StageReached).await;
+                    }
+                    TaskStatus::Done => {
+                        self.changed(&parent, TaskEventKind::Delivered).await;
+                    }
+                    _ => {}
+                }
+            }
+            if closed {
+                let body = format!(
+                    "All child tasks are done or cancelled; the parent task is {}.",
+                    parent.status
+                );
+                self.notify_parent(
+                    &parent,
+                    actor,
+                    token,
+                    "child tasks complete",
+                    body,
+                    Importance::High,
+                )
+                .await;
                 return;
             }
-        };
+            // Only a parent the parent rule moved carries the change further up.
+            kind = match parent.status {
+                TaskStatus::Done if moved => TaskEventKind::Delivered,
+                TaskStatus::Delivering if moved => TaskEventKind::StageReached,
+                _ => return,
+            };
+            child = parent;
+            note = None;
+        }
+    }
+
+    /// Tells `parent`'s thread that `child` is blocked, delivering, done or cancelled.
+    async fn child_status(
+        &self,
+        child: &Task,
+        parent: &Task,
+        kind: TaskEventKind,
+        note: Option<&str>,
+        actor: Actor,
+        token: Option<TokenId>,
+    ) {
         let status = match kind {
             TaskEventKind::Blocked => "blocked",
             TaskEventKind::Done | TaskEventKind::Delivered => {
-                if task.status == TaskStatus::Delivering {
+                if child.status == TaskStatus::Delivering {
                     "delivering"
                 } else {
                     "done"
@@ -111,9 +167,9 @@ impl Notifier {
         let body = match detail.map(str::trim).filter(|d| !d.is_empty()) {
             Some(d) => format!(
                 "Child task \"{}\" ({}) is {status}: {d}",
-                task.title, task.id
+                child.title, child.id
             ),
-            None => format!("Child task \"{}\" ({}) is {status}.", task.title, task.id),
+            None => format!("Child task \"{}\" ({}) is {status}.", child.title, child.id),
         };
         let importance = if kind == TaskEventKind::Blocked {
             Importance::High
@@ -121,43 +177,12 @@ impl Notifier {
             Importance::Normal
         };
         self.notify_parent(
-            &parent,
+            parent,
             actor,
             token,
             &format!("child task {status}"),
             body,
             importance,
-        )
-        .await;
-        // A parent the store moved in this change carries the child's `updated_at`.
-        if parent.updated_at >= task.updated_at {
-            match parent.status {
-                TaskStatus::Review if children_complete => {
-                    self.changed(&parent, TaskEventKind::ChildrenComplete).await;
-                }
-                TaskStatus::Delivering => {
-                    self.changed(&parent, TaskEventKind::StageReached).await;
-                }
-                TaskStatus::Done => {
-                    self.changed(&parent, TaskEventKind::Delivered).await;
-                }
-                _ => {}
-            }
-        }
-        if !children_complete {
-            return;
-        }
-        let body = format!(
-            "All child tasks are done or cancelled; the parent task is {}.",
-            parent.status
-        );
-        self.notify_parent(
-            &parent,
-            actor,
-            token,
-            "child tasks complete",
-            body,
-            Importance::High,
         )
         .await;
     }
