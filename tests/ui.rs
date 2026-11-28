@@ -5235,6 +5235,12 @@ mod delivery_panel {
             )
             .await;
         assert_eq!(denied.status, StatusCode::FORBIDDEN);
+        for action in ["pr/unlink", "advance", "mark-done"] {
+            let denied = app
+                .post_form(&format!("{path}/{action}"), Some(&cookie), "")
+                .await;
+            assert_eq!(denied.status, StatusCode::FORBIDDEN, "{action}");
+        }
 
         // A bad URL shows the exact message in the panel.
         let bad = app
@@ -5326,14 +5332,33 @@ mod delivery_panel {
     #[tokio::test]
     async fn unlink_hidden_after_merge() {
         let (app, cookie, _csrf, web) = setup(&[InPr, Merged]).await;
+        let unlink = "Unlink PR".to_string();
+
+        // Delivering: the store refuses an unlink, so the button is not offered.
         let task = delivering(&app, &web).await;
         let path = format!("/ui/tasks/{}", task.id);
-        // Delivering: the store refuses an unlink, so the button is not offered.
         let page = app.get(&path, Some(&cookie)).await;
-        assert!(!buttons(&page).contains(&"Unlink PR".to_string()));
+        assert!(!buttons(&page).contains(&unlink));
 
-        move_to(&app, &task, Merged, vec![]).await;
+        // Force release reopens it, keeping its stage: open, PR linked, stage In PR.
+        app.state.tasks.force_release(task.id).await.unwrap();
+        let t = app.state.store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Open);
+        assert_eq!(t.delivery_stage, Some(InPr));
         let page = app.get(&path, Some(&cookie)).await;
-        assert!(!buttons(&page).contains(&"Unlink PR".to_string()));
+        assert!(buttons(&page).contains(&unlink), "positive control");
+
+        // The same open task once its stage is Merged: the store would refuse, so no button.
+        let (app, cookie, _csrf, web) = setup(&[InPr, Merged, Released]).await;
+        let task = delivering(&app, &web).await;
+        move_to(&app, &task, Merged, vec![]).await;
+        app.state.tasks.force_release(task.id).await.unwrap();
+        let t = app.state.store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Open);
+        assert_eq!(t.delivery_stage, Some(Merged));
+        let page = app
+            .get(&format!("/ui/tasks/{}", task.id), Some(&cookie))
+            .await;
+        assert!(!buttons(&page).contains(&unlink));
     }
 }
