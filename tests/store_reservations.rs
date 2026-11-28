@@ -627,3 +627,71 @@ store_matrix!(wake_candidates_least_recently_woken_first, |store: Arc<
     assert_eq!(agent.id, longer.agent.id);
     assert_eq!(agent.host, "longer");
 });
+
+/// Cancels the open task `id` through the store.
+async fn cancel_task(store: &Arc<dyn Store>, id: TaskId) {
+    let req = TransitionRequest {
+        task: id,
+        from: vec![TaskStatus::Open],
+        to: Some(TaskStatus::Cancelled),
+        owner: None,
+        lease: LeaseUpdate::Clear,
+        clear_owner: true,
+        now: T0,
+        token: None,
+        event: TaskEvent {
+            id: uuid::Uuid::now_v7(),
+            task_id: id,
+            at: T0,
+            actor: Actor::Human,
+            kind: TaskEventKind::Cancelled,
+            note: None,
+            payload: None,
+        },
+        plan_from: None,
+        plan_to: None,
+        message: None,
+        latest_plan: None,
+        archive_plans: false,
+        version: None,
+        sanctioned: None,
+        block: None,
+        unblock: None,
+    };
+    assert!(store.transition_task(&req).await.unwrap().is_some());
+}
+
+store_matrix!(
+    a_new_job_reserves_only_for_a_still_routable_task,
+    |store: Arc<dyn Store>| async move {
+        let s = session(&store).await;
+        let other = session_on(&store, "other").await;
+        let project = s.project.as_ref().unwrap().id;
+        idle(&store, s.session.id, T0 - Duration::minutes(1), T0).await;
+        let claimed = insert(&store, project, "claimed meanwhile", true).await;
+        claim(&store, &other, claimed.id, T0 - Duration::seconds(30)).await;
+        let cancelled = insert(&store, project, "cancelled meanwhile", true).await;
+        cancel_task(&store, cancelled.id).await;
+        let unsanctioned = insert(&store, project, "not sanctioned", false).await;
+        for (task, what) in [
+            (claimed.id, "claimed"),
+            (cancelled.id, "cancelled"),
+            (unsanctioned.id, "unsanctioned"),
+        ] {
+            assert!(
+                !store
+                    .reserve_session(&reservation(s.session.id, Some(task), T0))
+                    .await
+                    .unwrap(),
+                "{what} task reserved a session"
+            );
+        }
+        let open = insert(&store, project, "open", true).await;
+        assert!(
+            store
+                .reserve_session(&reservation(s.session.id, Some(open.id), T0))
+                .await
+                .unwrap()
+        );
+    }
+);

@@ -617,6 +617,29 @@ async fn expired_reservation_is_replaced() {
 }
 
 #[tokio::test]
+async fn a_stale_snapshot_of_a_claimed_task_neither_reserves_nor_wakes() {
+    let mut env = Env::new().await;
+    let a = env.session("a").await;
+    let taker = env.session("taker").await;
+    env.idle(&a).await;
+    let stale = env.task("taken meanwhile").await;
+    env.claim(&taker, stale.id).await;
+    let outcome = env
+        .wake
+        .route(&stale, WakeTrigger::StartNow, None)
+        .await
+        .unwrap();
+    assert!(
+        !matches!(outcome, RouteOutcome::Routed { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(env.reserved_task(&a).await, None);
+    assert_eq!(env.attempts(WakeOutcome::Sent, None).await, 0);
+    assert_eq!(env.count_kind(stale.id, TaskEventKind::Routed).await, 0);
+    assert!(env.wakes().is_empty());
+}
+
+#[tokio::test]
 async fn claim_clears_reservation_as_claimed() {
     let env = Env::new().await;
     let a = env.session("a").await;

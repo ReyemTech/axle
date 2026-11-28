@@ -2212,7 +2212,11 @@ impl Store for SqliteStore {
 
     async fn reserve_session(&self, r: &Reservation) -> StoreResult<bool> {
         // One statement: SQLite takes the write lock before it evaluates the guard, so
-        // concurrent reservers are serialised and exactly one sees the session free.
+        // concurrent reservers are serialised and exactly one sees the session free. The
+        // same write lock orders it against claims and cancels: a new job's task must still
+        // be routable by `list_queued`'s rule (sanctioned; open, or a lapsed claim; no other
+        // live reservation), so a stale snapshot cannot reserve for a taken task.
+        let task = r.task.map(|t| t.to_string());
         let done = sqlx::query(
             "UPDATE sessions
                 SET wake_task_id = ?, wake_until = ?, last_woken_at = ?
@@ -2224,9 +2228,19 @@ impl Store for SqliteStore {
                 AND (NOT ? OR NOT EXISTS (
                         SELECT 1 FROM tasks t
                          WHERE t.owner_session_id = sessions.id
-                           AND t.status IN ('planning', 'claimed', 'blocked', 'review')))",
+                           AND t.status IN ('planning', 'claimed', 'blocked', 'review')))
+                AND (NOT ? OR ? IS NULL OR EXISTS (
+                        SELECT 1 FROM tasks t
+                         WHERE t.id = ?
+                           AND t.sanctioned = 1
+                           AND (t.status = 'open'
+                                OR (t.status IN ('claimed', 'planning')
+                                    AND t.lease_expires_at <= ?))
+                           AND NOT EXISTS (SELECT 1 FROM sessions o
+                                            WHERE o.wake_task_id = t.id AND o.wake_until > ?
+                                              AND o.id <> sessions.id)))",
         )
-        .bind(r.task.map(|t| t.to_string()))
+        .bind(&task)
         .bind(ts::enc(r.until))
         .bind(ts::enc(r.now))
         .bind(r.session.to_string())
@@ -2234,6 +2248,11 @@ impl Store for SqliteStore {
         .bind(ts::enc(r.live_since))
         .bind(ts::enc(r.now))
         .bind(r.new_job)
+        .bind(r.new_job)
+        .bind(&task)
+        .bind(&task)
+        .bind(ts::enc(r.now))
+        .bind(ts::enc(r.now))
         .execute(&self.pool)
         .await?;
         Ok(done.rows_affected() == 1)

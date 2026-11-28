@@ -2116,7 +2116,35 @@ impl Store for PostgresStore {
 
     async fn reserve_session(&self, r: &Reservation) -> StoreResult<bool> {
         // The guarded UPDATE is the lock: a concurrent reserver waits on the row lock, then
-        // re-checks the guard against the committed row and finds it reserved.
+        // re-checks the guard against the committed row and finds it reserved. A new job's
+        // task must also still be routable by `list_queued`'s rule (sanctioned; open, or a
+        // lapsed claim; no other live reservation): under `TASK_LOCK`, its row is locked and
+        // re-read first, so a claim or cancel either commits before (and the task is not
+        // routable) or waits until this reservation commits (and then clears it).
+        let mut tx = self.pool.begin().await?;
+        if let (Some(task), true) = (r.task, r.new_job) {
+            task_lock(&mut tx).await?;
+            let routable = sqlx::query_scalar::<_, i32>(
+                "SELECT 1 FROM tasks t
+                  WHERE t.id = $1
+                    AND t.sanctioned
+                    AND (t.status = 'open'
+                         OR (t.status IN ('claimed', 'planning') AND t.lease_expires_at <= $2))
+                    AND NOT EXISTS (SELECT 1 FROM sessions o
+                                     WHERE o.wake_task_id = t.id AND o.wake_until > $2
+                                       AND o.id <> $3)
+                  FOR UPDATE OF t",
+            )
+            .bind(task.as_uuid())
+            .bind(r.now)
+            .bind(r.session.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+            if !routable {
+                return Ok(false);
+            }
+        }
         let done = sqlx::query(
             "UPDATE sessions
                 SET wake_task_id = $1, wake_until = $2, last_woken_at = $3
@@ -2137,8 +2165,9 @@ impl Store for PostgresStore {
         .bind(r.idle_before)
         .bind(r.live_since)
         .bind(r.new_job)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(done.rows_affected() == 1)
     }
 
