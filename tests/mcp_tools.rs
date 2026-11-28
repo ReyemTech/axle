@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use axle::clock::TestClock;
 use axle::config::ServerConfig;
-use axle::domain::DeliveryStage;
+use axle::domain::{DeliveryStage, TaskEventKind, TaskId};
 use axle::http::{AppState, router};
 use axle::store::Store;
 use axum::http::{HeaderName, HeaderValue};
@@ -1752,6 +1752,43 @@ store_matrix!(task_object_shape, |store: Arc<dyn Store>| async move {
     .await;
     assert_eq!(done["status"], "done");
     assert!(done.get("next_step").is_none());
+    client.cancel().await.unwrap();
+});
+
+store_matrix!(stageless_project_has_no_delivery, |store: Arc<
+    dyn Store,
+>| async move {
+    let server = start(store).await;
+    let client = server.agent_in(WEB, "mac", "claude-code").await;
+
+    // An explicit link still applies offline, but `delivery` stays null without stages.
+    let task = claimed_task(&client).await;
+    let updated = ok(
+        &client,
+        "task_update",
+        json!({"id": task["id"], "pr": "https://github.com/acme/web-app/pull/12"}),
+    )
+    .await;
+    assert!(updated["delivery"].is_null(), "{updated}");
+    let id: TaskId = task["id"].as_str().unwrap().parse().unwrap();
+    assert!(server.store.task_pr(id).await.unwrap().is_some());
+
+    // `task_complete` does not link from `links`: the result is exactly as without stages.
+    let other = claimed_task(&client).await;
+    let done = ok(
+        &client,
+        "task_complete",
+        json!({"id": other["id"], "summary": "Done.",
+               "links": ["https://github.com/acme/web-app/pull/13"]}),
+    )
+    .await;
+    assert_eq!(done["status"], "done");
+    assert!(done["delivery"].is_null());
+    assert!(done.get("next_step").is_none());
+    let other: TaskId = other["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(server.store.task_pr(other).await.unwrap(), None);
+    let events = server.store.task_events(other).await.unwrap();
+    assert!(!events.iter().any(|e| e.kind == TaskEventKind::PrLinked));
     client.cancel().await.unwrap();
 });
 

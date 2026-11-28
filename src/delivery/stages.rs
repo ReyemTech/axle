@@ -26,20 +26,24 @@ pub struct ChildState {
 }
 
 /// The `task_complete` decision, with the parent rule: a task with a PR delivers at its
-/// furthest stage (at least `in_pr`), a parent at the minimum over itself and its delivering
-/// children; either is `done` once that minimum reaches the last enabled stage.
+/// furthest stage (at least `in_pr`) until that reaches the last enabled stage. A parent with
+/// any `delivering` child delivers at the minimum over itself and those children, whatever
+/// its own project's stages (a child in another project may run past them, and a parent
+/// is `done` only once every non-cancelled child is); this is `recompute_parent`'s rule.
 pub fn completion_target(
     enabled: &[DeliveryStage],
     own: Option<DeliveryStage>,
     has_pr: bool,
     children: &[ChildState],
 ) -> CompletionTarget {
-    let Some(last) = last_enabled(enabled) else {
-        return CompletionTarget::Done;
-    };
+    let last = last_enabled(enabled);
     let own = has_pr.then(|| own.map_or(DeliveryStage::InPr, |s| s.max(DeliveryStage::InPr)));
-    match parent_stage(own, children) {
-        Some(m) if m.rank() < last.rank() => CompletionTarget::Delivering(m),
+    let child_delivering = children.iter().any(|c| c.status == TaskStatus::Delivering);
+    if child_delivering && let Some(m) = parent_stage(own, children) {
+        return CompletionTarget::Delivering(m);
+    }
+    match (own, last) {
+        (Some(o), Some(l)) if o < l => CompletionTarget::Delivering(o),
         _ => CompletionTarget::Done,
     }
 }
@@ -159,6 +163,39 @@ mod tests {
             CompletionTarget::Done
         );
         assert_eq!(parent_stage(None, &finished), None);
+    }
+
+    #[test]
+    fn delivering_child_holds_the_parent() {
+        // A child in another project is past this project's last stage but still delivering.
+        let children = [delivering(Released), closed(TaskStatus::Done)];
+        assert_eq!(
+            completion_target(&[InPr, Merged], None, false, &children),
+            CompletionTarget::Delivering(Released)
+        );
+        assert_eq!(
+            completion_target(&[InPr, Merged], Some(Merged), true, &children),
+            CompletionTarget::Delivering(Merged)
+        );
+        // The parent's project has no stages: it still waits for its delivering child.
+        assert_eq!(
+            completion_target(&[], None, false, &children),
+            CompletionTarget::Delivering(Released)
+        );
+        assert_eq!(
+            completion_target(&[], Some(InPr), true, &[delivering(Merged)]),
+            CompletionTarget::Delivering(InPr)
+        );
+        // No child delivering: the parent's own PR decides, as for any task.
+        let finished = [closed(TaskStatus::Done)];
+        assert_eq!(
+            completion_target(&[InPr, Merged], Some(InPr), true, &finished),
+            CompletionTarget::Delivering(InPr)
+        );
+        assert_eq!(
+            completion_target(&[InPr, Merged], Some(Merged), true, &finished),
+            CompletionTarget::Done
+        );
     }
 
     #[test]

@@ -2153,9 +2153,14 @@ impl Store for SqliteStore {
             tx.rollback().await?;
             return Ok(None);
         };
+        let stages = project_stages(&mut tx, task.project_id).await?;
         let mut has_pr = pr_of(&mut tx, task.id).await?.is_some();
         let mut linked = None;
-        if !has_pr && let Some(link) = &req.link {
+        // `links` is only linked in a project with stages; without, completion is as today.
+        if !has_pr
+            && !stages.is_empty()
+            && let Some(link) = &req.link
+        {
             has_pr = insert_pr(&mut tx, &task, link).await?;
             linked = has_pr.then_some(link);
         }
@@ -2165,7 +2170,6 @@ impl Store for SqliteStore {
         if linked.is_some() {
             own = own.max(Some(DeliveryStage::InPr));
         }
-        let stages = project_stages(&mut tx, task.project_id).await?;
         let children = child_states(&mut tx, task.id).await?;
         let target = completion_target(&stages, own, has_pr, &children);
         let (to, stage) = match target {

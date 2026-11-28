@@ -173,9 +173,40 @@ async fn migration_keeps_earlier_columns_sqlite() {
     .execute(&pool)
     .await
     .unwrap();
+    // History referencing the task must survive the table rebuild.
+    let event_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO task_events (id, task_id, kind, note, created_at)
+         VALUES (?, ?, 'done', 'shipped', '2026-11-26T09:00:00.000000Z')",
+    )
+    .bind(&event_id)
+    .bind(done_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
 
     // Opening the store runs 0008 (0006 and 0007 are reserved gaps).
     let store = SqliteStore::from_pool(pool.clone()).await.unwrap();
+    let events = store.task_events(done_id).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id.to_string(), event_id);
+    assert_eq!(events[0].note.as_deref(), Some("shipped"));
+    let dangling = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(
+        dangling.is_empty(),
+        "{} foreign key violations",
+        dangling.len()
+    );
+    let done_index: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'tasks_done'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(done_index.contains("WHERE status = 'done'"), "{done_index}");
     let task = store.get_task(done_id).await.unwrap().unwrap();
     assert_eq!(task.status, TaskStatus::Done);
     assert_eq!(task.done_at, Some(datetime!(2026-11-26 9:00 UTC)));
@@ -1348,6 +1379,100 @@ store_matrix!(parent_with_pr_is_held_by_its_own_stage, |store: Arc<
     assert_eq!(p.status, TaskStatus::Delivering);
     assert_eq!(p.delivery_stage, Some(InPr));
 });
+
+store_matrix_raw!(
+    parent_waits_for_child_in_other_project,
+    |store: Arc<dyn Store>, raw: common::RawDb| async move {
+        use DeliveryStage::*;
+        let fx = Fx::new(store).await;
+        fx.stages(&[InPr, Merged]).await;
+        let other = fx
+            .store
+            .upsert_project("github.com/reyemtech/other", "other", T0)
+            .await
+            .unwrap();
+        settings(&*fx.store, &other, &DeliveryStage::ALL, T0).await;
+        let parent = fx.claimed("parent", None).await;
+        let child = fx.claimed("child", Some(parent.id)).await;
+        fx.link(child.id, 60).await;
+        // The child lives in the other project, which delivers up to Deployed.
+        raw.execute(&format!(
+            "UPDATE tasks SET project_id = '{}' WHERE id = '{}'",
+            other.id, child.id
+        ))
+        .await;
+        fx.complete(child.id, T1).await;
+        set_stage(&raw, child.id, Released).await;
+
+        // Released is past the parent project's last stage, but the child still delivers.
+        let (p, target) = fx.complete(parent.id, T2).await;
+        assert_eq!(target, CompletionTarget::Delivering(Released));
+        assert_eq!(p.status, TaskStatus::Delivering);
+        assert_eq!(p.done_at, None);
+
+        // The child reaching done finishes the parent.
+        fx.deliver(child.id, T3).await;
+        let p = fx.get(parent.id).await;
+        assert_eq!(p.status, TaskStatus::Done);
+        assert_eq!(p.done_at, Some(T3));
+    }
+);
+
+store_matrix!(complete_without_stages_ignores_links, |store: Arc<
+    dyn Store,
+>| async move {
+    let fx = Fx::new(store).await;
+    let task = fx.claimed("ship", None).await;
+    let done = fx
+        .store
+        .complete_task(&fx.complete_req(task.id, T2, Some(pr(70, PrLinkedBy::CompleteLinks))))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(done.target, CompletionTarget::Done);
+    assert_eq!(done.transitioned.task.status, TaskStatus::Done);
+    assert_eq!(done.transitioned.task.delivery_stage, None);
+    assert_eq!(fx.store.task_pr(task.id).await.unwrap(), None);
+    assert!(fx.store.task_stages(task.id).await.unwrap().is_empty());
+    assert!(!fx.kinds(task.id).await.contains(&TaskEventKind::PrLinked));
+});
+
+store_matrix!(
+    complete_checks_latest_plan,
+    |store: Arc<dyn Store>| async move {
+        let fx = Fx::new(store).await;
+        fx.stages(&[DeliveryStage::InPr]).await;
+        let task = fx.claimed("ship", None).await;
+        let mut stale = fx.complete_req(task.id, T2, None);
+        stale.transition.latest_plan = Some(MessageId::new());
+        assert!(fx.store.complete_task(&stale).await.unwrap().is_none());
+        assert_eq!(fx.get(task.id).await, task);
+    }
+);
+
+store_matrix!(
+    concurrent_unlinks_record_once,
+    |store: Arc<dyn Store>| async move {
+        let fx = Fx::new(store).await;
+        fx.stages(&[DeliveryStage::InPr, DeliveryStage::Merged])
+            .await;
+        for round in 0..5 {
+            let task = fx.claimed("ship", None).await;
+            fx.link(task.id, 80 + round).await;
+            let unlink = || fx.store.unlink_pr(task.id, Actor::Human, None, T2);
+            let (a, b) = tokio::join!(unlink(), unlink());
+            let removed = [a.unwrap(), b.unwrap()];
+            assert_eq!(removed.iter().filter(|r| r.is_some()).count(), 1);
+            let unlinked = fx
+                .kinds(task.id)
+                .await
+                .into_iter()
+                .filter(|k| *k == TaskEventKind::PrUnlinked)
+                .count();
+            assert_eq!(unlinked, 1);
+        }
+    }
+);
 
 store_matrix!(stage_change_moves_parent_of_finished_child, |store: Arc<
     dyn Store,

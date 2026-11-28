@@ -1052,8 +1052,9 @@ impl TaskService {
     }
 
     /// `claimed | review → done`, or `→ delivering` when the project has delivery stages and
-    /// the task has a PR. The owner is kept as the record of who did it. The first of `links`
-    /// that is a PR in the project's repo is linked first when the task has none.
+    /// the task has a PR. The owner is kept as the record of who did it. In a project with
+    /// stages, the first of `links` that is a PR in the project's repo is linked first when
+    /// the task has none (the store decides under its lock; without stages nothing is linked).
     pub async fn complete(
         &self,
         caller: &Resolved,

@@ -225,8 +225,9 @@ pub trait Store: Send + Sync {
     async fn task_stages(&self, task: TaskId) -> StoreResult<Vec<TaskStageRow>>;
     /// `task_complete`'s write: the guarded transition of `req.transition` (its `from`,
     /// `owner`, plan, lease and message fields; its `to` is replaced by the target) and, in
-    /// the same transaction: links `req.link` (`complete_links`) when the task has no PR and
-    /// the PR is not taken (skipped silently otherwise), then decides with
+    /// the same transaction: links `req.link` (`complete_links`) when the project has enabled
+    /// stages, the task has no PR and the PR is not taken (skipped silently otherwise; a
+    /// project without stages completes exactly as before delivery), then decides with
     /// `completion_target` from the project's stages, the PR, the task's stage and its
     /// children. `done` sets `done_at`; `delivering` leaves it null and sets `delivery_stage`
     /// to the target stage. The `done` event is appended either way; for `delivering` its

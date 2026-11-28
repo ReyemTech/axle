@@ -330,10 +330,11 @@ async fn delivery_panel(
         .view(task)
         .await
         .map_err(|e| UiError::Internal(e.to_string()))?;
-    let (enabled, pr, timeline) = view.map_or_else(
-        || (Vec::new(), None, Vec::new()),
-        |v| (v.stages_enabled, v.pr, v.timeline),
-    );
+    let (enabled, pr, timeline) = match view {
+        Some(v) => (v.stages_enabled, v.pr, v.timeline),
+        // No stages: the panel still shows a PR linked by hand (`task_update` / Link PR).
+        None => (Vec::new(), state.store.task_pr(task.id).await?, Vec::new()),
+    };
     let rows = enabled
         .iter()
         .map(|stage| {

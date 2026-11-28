@@ -320,7 +320,8 @@ impl DeliveryService {
         Ok(done.task)
     }
 
-    /// The task's delivery state; `None` when its project has no stages and it has no PR.
+    /// The task's delivery state; `None` when its project has no enabled stages, even with a
+    /// PR linked (the MCP `delivery` object is null there).
     pub async fn view(&self, task: &Task) -> Result<Option<DeliveryView>, DeliveryError> {
         let project = self
             .store
@@ -328,10 +329,10 @@ impl DeliveryService {
             .await?
             .ok_or(TaskError::UnknownProject)?;
         let stages_enabled = self.settings(&project).await?.stages;
-        let pr = self.store.task_pr(task.id).await?;
-        if stages_enabled.is_empty() && pr.is_none() {
+        if stages_enabled.is_empty() {
             return Ok(None);
         }
+        let pr = self.store.task_pr(task.id).await?;
         Ok(Some(DeliveryView {
             stage: task.delivery_stage,
             column: column(&stages_enabled, task.delivery_stage),

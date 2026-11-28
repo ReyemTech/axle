@@ -536,6 +536,7 @@ const UNLINK_SQL: &str = concat!(
         AND NOT EXISTS (SELECT 1 FROM task_stages s
                          WHERE s.task_id = tasks.id
                            AND s.stage IN ('merged', 'released', 'deployed'))
+        AND EXISTS (SELECT 1 FROM task_prs p WHERE p.task_id = tasks.id)
       RETURNING ",
     task_cols!()
 );
@@ -2109,10 +2110,27 @@ impl Store for PostgresStore {
         // The lock order (see `TASK_LOCK`): the wait lock before any row lock, since the
         // completion may unblock waiting tasks or lock a parent.
         task_lock(&mut tx).await?;
-        // Lock the task first: the PR, the stages and the children are then read in
-        // statements of their own, and a child changing concurrently either committed before
-        // (and is read here) or queues on this row and runs the parent rule after this
-        // commit.
+        // The project's settings row first, shared: `set_project_delivery` takes it
+        // exclusively (its upsert) before it locks any task, so a save either committed
+        // before these stages are read or waits for this commit and then recomputes the
+        // task. Same order as that save (settings row, then tasks), so no deadlock. With no
+        // settings row there is nothing to lock: stages are off, and what completion
+        // decides then (`done`, or `delivering` behind a delivering child) is also what a
+        // concurrent first save's recompute would leave, so no task is stranded.
+        let project: Option<Uuid> =
+            sqlx::query_scalar("SELECT project_id FROM tasks WHERE id = $1")
+                .bind(t.task.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some(project) = project {
+            sqlx::query("SELECT 1 FROM project_delivery WHERE project_id = $1 FOR SHARE")
+                .bind(project)
+                .fetch_optional(&mut *tx)
+                .await?;
+        }
+        // Then the task: the PR, the stages and the children are read in statements of
+        // their own, and a child changing concurrently either committed before (and is read
+        // here) or queues on this row and runs the parent rule after this commit.
         let Some(task) = task_locked(&mut tx, t.task).await? else {
             tx.rollback().await?;
             return Ok(None);
@@ -2123,9 +2141,14 @@ impl Store for PostgresStore {
             tx.rollback().await?;
             return Ok(None);
         }
+        let stages = project_stages(&mut tx, task.project_id).await?;
         let mut has_pr = pr_of(&mut tx, task.id).await?.is_some();
         let mut linked = None;
-        if !has_pr && let Some(link) = &req.link {
+        // `links` is only linked in a project with stages; without, completion is as today.
+        if !has_pr
+            && !stages.is_empty()
+            && let Some(link) = &req.link
+        {
             has_pr = insert_pr(&mut tx, &task, link).await?;
             linked = has_pr.then_some(link);
         }
@@ -2135,7 +2158,6 @@ impl Store for PostgresStore {
         if linked.is_some() {
             own = own.max(Some(DeliveryStage::InPr));
         }
-        let stages = project_stages(&mut tx, task.project_id).await?;
         let children = child_states(&mut tx, task.id).await?;
         let target = completion_target(&stages, own, has_pr, &children);
         let (to, stage) = match target {
