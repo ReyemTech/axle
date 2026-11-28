@@ -1089,6 +1089,44 @@ impl TaskService {
         if !duplicates.is_empty() && task.status == TaskStatus::Done {
             return Err(TaskError::DuplicateOfDone);
         }
+        // A duplicate is cancelled in the same transaction as its link (the store re-checks
+        // that it is not done under the lock).
+        let cancel = match duplicates.first() {
+            Some(target) => {
+                let title = self
+                    .store
+                    .get_task(*target)
+                    .await?
+                    .map(|t| t.title)
+                    .unwrap_or_default();
+                let note = format!("Duplicate of \"{title}\" ({target}).");
+                let message = Message {
+                    id: MessageId::new(),
+                    project_id: Some(task.project_id),
+                    from: by.actor(),
+                    to: Address::Task(id),
+                    subject: Some("duplicate".into()),
+                    body: note.clone(),
+                    importance: Importance::Normal,
+                    task_id: Some(id),
+                    reply_to: None,
+                    created_at: self.clock.now(),
+                    kind: MessageKind::System,
+                    options: Vec::new(),
+                };
+                Some(self.unowned_request(
+                    id,
+                    by.actor(),
+                    by.token(),
+                    &CANCELLABLE,
+                    TaskStatus::Cancelled,
+                    false,
+                    TaskEventKind::Cancelled,
+                    Some((note, message)),
+                ))
+            }
+            None => None,
+        };
         let req = RelateRequest {
             task: id,
             add: &adds,
@@ -1100,13 +1138,16 @@ impl TaskService {
             token: by.token(),
             max_links: MAX_LINKS,
             event: self.event(id, by.actor(), TaskEventKind::Related, None, None),
+            cancel,
         };
-        let (mut task, added, removed) = match self.store.relate_tasks(&req).await? {
+        let (task, added, removed, cancelled) = match self.store.relate_tasks(&req).await? {
             Related::Applied {
                 task,
                 added,
                 removed,
-            } => (task, added, removed),
+                cancelled,
+            } => (task, added, removed, cancelled),
+            Related::DuplicateOfDone => return Err(TaskError::DuplicateOfDone),
             Related::Denied => {
                 self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
                 return Err(TaskError::NotOwner);
@@ -1128,42 +1169,12 @@ impl TaskService {
                 }
             }
         }
-        if let Some(target) = duplicates.first()
-            && !matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled)
-        {
-            let title = self
-                .store
-                .get_task(*target)
-                .await?
-                .map(|t| t.title)
-                .unwrap_or_default();
-            let note = format!("Duplicate of \"{title}\" ({target}).");
-            let message = Message {
-                id: MessageId::new(),
-                project_id: Some(task.project_id),
-                from: by.actor(),
-                to: Address::Task(id),
-                subject: Some("duplicate".into()),
-                body: note.clone(),
-                importance: Importance::Normal,
-                task_id: Some(id),
-                reply_to: None,
-                created_at: self.clock.now(),
-                kind: MessageKind::System,
-                options: Vec::new(),
-            };
-            task = self
-                .unowned_transition(
-                    id,
-                    by.actor(),
-                    by.token(),
-                    &CANCELLABLE,
-                    TaskStatus::Cancelled,
-                    false,
-                    TaskEventKind::Cancelled,
-                    Some((note, message)),
-                )
-                .await?;
+        if let (Some(done), Some(cancel)) = (&cancelled, &req.cancel) {
+            self.after_transition(done, &cancel.event, cancel.token)
+                .await;
+            if let Some(m) = &cancel.message {
+                self.message_created(m).await;
+            }
         }
         Ok(task)
     }
@@ -1231,8 +1242,10 @@ impl TaskService {
             }
             _ => {}
         }
+        // Bounded, so a corrupt hierarchy cannot hang the explanation.
         let mut up = p.parent_id;
-        while let Some(a) = up {
+        for _ in 0..MAX_CHAIN {
+            let Some(a) = up else { break };
             if a == id {
                 return Err(TaskError::ParentIsDescendant);
             }
@@ -1769,28 +1782,8 @@ impl TaskService {
         kind: TaskEventKind,
         noted: Option<(String, Message)>,
     ) -> Result<Task, TaskError> {
-        let (note, message) = match noted {
-            Some((n, m)) => (Some(n), Some(m)),
-            None => (None, None),
-        };
-        let req = TransitionRequest {
-            task: id,
-            from: from.to_vec(),
-            to: Some(to),
-            owner: None,
-            lease: LeaseUpdate::Clear,
-            clear_owner,
-            now: self.clock.now(),
-            token,
-            event: self.event(id, actor, kind, note, None),
-            plan_from: None,
-            plan_to: (to == TaskStatus::Open).then_some(PlanState::None),
-            message: message.clone(),
-            latest_plan: None,
-            archive_plans: false,
-            block: None,
-            unblock: None,
-        };
+        let req = self.unowned_request(id, actor, token, from, to, clear_owner, kind, noted);
+        let message = req.message.clone();
         match self.store.transition_task(&req).await? {
             Some(done) => {
                 self.after_transition(&done, &req.event, req.token).await;
@@ -1806,6 +1799,43 @@ impl TaskService {
                     to,
                 })
             }
+        }
+    }
+
+    /// The request behind `unowned_transition`.
+    #[allow(clippy::too_many_arguments)]
+    fn unowned_request(
+        &self,
+        id: TaskId,
+        actor: Actor,
+        token: Option<TokenId>,
+        from: &[TaskStatus],
+        to: TaskStatus,
+        clear_owner: bool,
+        kind: TaskEventKind,
+        noted: Option<(String, Message)>,
+    ) -> TransitionRequest {
+        let (note, message) = match noted {
+            Some((n, m)) => (Some(n), Some(m)),
+            None => (None, None),
+        };
+        TransitionRequest {
+            task: id,
+            from: from.to_vec(),
+            to: Some(to),
+            owner: None,
+            lease: LeaseUpdate::Clear,
+            clear_owner,
+            now: self.clock.now(),
+            token,
+            event: self.event(id, actor, kind, note, None),
+            plan_from: None,
+            plan_to: (to == TaskStatus::Open).then_some(PlanState::None),
+            message,
+            latest_plan: None,
+            archive_plans: false,
+            block: None,
+            unblock: None,
         }
     }
 }

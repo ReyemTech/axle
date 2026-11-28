@@ -545,3 +545,169 @@ store_matrix!(a_top_level_task_moves_under_a_parent, |store: Arc<
         Err(TaskError::ChildExtraProjects)
     ));
 });
+
+/// Rounds of each race below; every round starts from fresh tasks.
+const RACES: usize = 25;
+
+impl Env {
+    /// A child of `parent`, created by the human.
+    async fn child(&self, parent: &Task, title: &str) -> Task {
+        self.svc
+            .create(
+                Caller::Human,
+                NewTask {
+                    project_id: parent.project_id,
+                    parent_id: Some(parent.id),
+                    title: title.into(),
+                    ..NewTask::default()
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Ancestors of `t`, nearest first, stopping after `limit` (a cycle never ends).
+    async fn ancestors(&self, t: &Task, limit: usize) -> Vec<TaskId> {
+        let mut out = Vec::new();
+        let mut up = t.parent_id;
+        while let Some(p) = up {
+            out.push(p);
+            if out.len() >= limit {
+                break;
+            }
+            up = self.store.get_task(p).await.unwrap().unwrap().parent_id;
+        }
+        out
+    }
+}
+
+store_matrix!(
+    crossed_moves_never_make_a_cycle,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        env.session("mac").await;
+        for round in 0..RACES {
+            let a_top = env.task(Caller::Human, &format!("A {round}")).await;
+            let a = env.child(&a_top, "a").await;
+            let b_top = env.task(Caller::Human, &format!("B {round}")).await;
+            let b = env.child(&b_top, "b").await;
+            // A under b while B under a: both at once would close A → b → B → a → A.
+            let (one, two) = tokio::join!(
+                env.svc.move_under(Caller::Human, a_top.id, b.id),
+                env.svc.move_under(Caller::Human, b_top.id, a.id),
+            );
+            assert!(
+                one.is_ok() != two.is_ok(),
+                "round {round}: exactly one move wins ({one:?}, {two:?})"
+            );
+            let refused = if one.is_ok() { two } else { one };
+            assert!(
+                matches!(refused, Err(TaskError::ParentIsDescendant)),
+                "round {round}: {refused:?}"
+            );
+            for t in [&a_top, &b_top] {
+                let t = env.store.get_task(t.id).await.unwrap().unwrap();
+                let up = env.ancestors(&t, 10).await;
+                assert!(
+                    up.len() < 10 && !up.contains(&t.id),
+                    "round {round}: a cycle"
+                );
+            }
+        }
+    }
+);
+
+store_matrix!(
+    racing_links_keep_the_target_under_the_limit,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        env.session("mac").await;
+        for round in 0..RACES {
+            let target = env.task(Caller::Human, &format!("target {round}")).await;
+            let mut add = Vec::new();
+            for i in 0..MAX_LINKS - 1 {
+                add.push((
+                    env.task(Caller::Human, &format!("old {i}")).await.id,
+                    LinkKind::Relates,
+                ));
+            }
+            env.svc
+                .relate(Caller::Human, target.id, &add, &[])
+                .await
+                .unwrap();
+            let x = env.task(Caller::Human, "x").await;
+            let y = env.task(Caller::Human, "y").await;
+            // Two different tasks each take the target's last free link.
+            let link = [(target.id, LinkKind::Relates)];
+            let (one, two) = tokio::join!(
+                env.svc.relate(Caller::Human, x.id, &link, &[]),
+                env.svc.relate(Caller::Human, y.id, &link, &[]),
+            );
+            assert!(
+                one.is_ok() != two.is_ok(),
+                "round {round}: exactly one link fits ({one:?}, {two:?})"
+            );
+            let refused = if one.is_ok() { two } else { one };
+            assert!(
+                matches!(refused, Err(TaskError::TooManyLinks(t)) if t == target.id),
+                "round {round}: {refused:?}"
+            );
+            assert_eq!(
+                env.store.task_links(target.id).await.unwrap().len(),
+                MAX_LINKS as usize,
+                "round {round}"
+            );
+        }
+    }
+);
+
+store_matrix!(
+    a_duplicate_racing_completion_is_all_or_nothing,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let worker = env.session("linux").await;
+        let original = env.task(Caller::Human, "original").await;
+        for round in 0..RACES {
+            let t = env.task(Caller::Human, &format!("racing {round}")).await;
+            env.svc.claim(&worker, t.id).await.unwrap();
+            let dup = [(original.id, LinkKind::Duplicate)];
+            let (marked, finished) = tokio::join!(
+                env.svc.relate(Caller::Human, t.id, &dup, &[]),
+                env.svc.complete(
+                    &worker,
+                    t.id,
+                    Completion {
+                        summary: "done".into(),
+                        ..Completion::default()
+                    },
+                ),
+            );
+            let now = env.store.get_task(t.id).await.unwrap().unwrap();
+            let linked = !env.store.task_links(t.id).await.unwrap().is_empty();
+            match now.status {
+                TaskStatus::Done => {
+                    assert!(finished.is_ok(), "round {round}: {finished:?}");
+                    assert!(
+                        matches!(marked, Err(TaskError::DuplicateOfDone)),
+                        "round {round}: {marked:?}"
+                    );
+                    assert!(
+                        !linked,
+                        "round {round}: a done task was linked as a duplicate"
+                    );
+                }
+                TaskStatus::Cancelled => {
+                    assert!(marked.is_ok(), "round {round}: {marked:?}");
+                    assert!(finished.is_err(), "round {round}");
+                    assert!(linked, "round {round}: cancelled without its link");
+                    let thread = env.store.task_thread(t.id).await.unwrap();
+                    assert!(
+                        thread.iter().any(|m| m.body.starts_with("Duplicate of")),
+                        "round {round}: no note"
+                    );
+                }
+                other => panic!("round {round}: unexpected status {other}"),
+            }
+        }
+    }
+);

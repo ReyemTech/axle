@@ -232,8 +232,9 @@ pub trait Store: Send + Sync {
         &self,
         req: &AddProjectsRequest<'_>,
     ) -> StoreResult<Option<ProjectsAdded>>;
-    /// Adds and removes links between `req.task` and other tasks, in one transaction: locks
-    /// the task and applies only if `req.editor` is `None` (the human), its creator or the
+    /// Adds and removes links between `req.task` and other tasks, in one transaction (on
+    /// Postgres under `TASK_LOCK`, so link counts are exact): locks the task and applies only
+    /// if `req.editor` is `None` (the human), its creator or the
     /// session holding it (`planning`, `claimed`, `blocked` or `review`). Removals run first and
     /// drop the pair's link whichever way it points; an addition replaces the pair's link
     /// unless it is the same one. Afterwards no task touched may have more than
@@ -710,6 +711,10 @@ pub struct RelateRequest<'a> {
     pub token: Option<TokenId>,
     /// The most links any one task may have.
     pub max_links: u32,
+    /// Set when an addition is a `duplicate`: the cancellation of `task`, applied in the same
+    /// transaction after the links unless the task is already cancelled. A `done` task is
+    /// refused (`Related::DuplicateOfDone`) and nothing is written.
+    pub cancel: Option<TransitionRequest>,
     /// Appended when something changed (`at` is also the links' `created_at` and the task's
     /// new `updated_at`); its payload is filled in.
     pub event: TaskEvent,
@@ -725,12 +730,16 @@ pub enum Related {
     UnknownTarget(TaskId),
     /// This task would have more than `max_links` links.
     TooMany(TaskId),
+    /// `cancel` was set and the task is `done` (read under the lock).
+    DuplicateOfDone,
     Applied {
         task: Task,
         /// The links written (empty when every addition was already there).
         added: Vec<TaskLink>,
         /// The tasks whose link was removed.
         removed: Vec<TaskId>,
+        /// The duplicate's cancellation, when `cancel` applied.
+        cancelled: Option<Transitioned>,
     },
 }
 

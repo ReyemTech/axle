@@ -19,12 +19,14 @@ urgent, so a plain-importance question waits unseen in the inbox.
 - One link per pair, whichever way it points (unique index on the ordered pair); adding a
   new kind replaces it, re-adding the same link is a no-op. No self-links. At most 20 links
   per task, counting both directions, checked inside the write transaction for the task and
-  every target, so a refused change writes nothing.
+  every target, so a refused change writes nothing. On Postgres every link write takes
+  `TASK_LOCK` first (the lock order from #17), so two writers can never both see a free slot.
 - Both tasks show the link. Labels, from the adding task / the other task:
   `related to` / `related to`, `follow-up of` / `follow-up`, `duplicate of` / `duplicated by`.
 - `duplicate` cancels the adding task through the existing cancel transition, with a system
   note in its thread ("Duplicate of "<title>" (<id>).") and the same note on the `cancelled`
-  event. Refused on a done task; on an already cancelled task it only records the link. Only
+  event. The status check, the link, the cancellation and the note are one store transaction,
+  so a duplicate racing a completion is all or nothing. Refused on a done task; on an already cancelled task it only records the link. Only
   one duplicate target per call.
 - Removal (`unrelate`, or **Unlink** in the UI) drops the pair's link from either side; it
   does not reopen a duplicate.
@@ -45,9 +47,10 @@ urgent, so a plain-importance question waits unseen in the inbox.
   out of scope and refused with a message saying so.
 - The parent must exist, not be `planning`, `done` or `cancelled`, and be in the task's
   project or span it (the `task_create` rule). Self and cycles (the parent is a descendant of
-  the task) are refused. The whole guard, including an ancestor walk, runs in the store
-  transaction with both rows locked (Postgres locks them in id order), so concurrent moves of
-  the same pair cannot form a cycle.
+  the task) are refused. On Postgres a move takes `TASK_LOCK` first, then the moved row and
+  the parent, and the whole guard, including an ancestor walk, is read after that, so crossed
+  concurrent moves (A under b while B under a) cannot form a cycle. The service's explanation
+  walk is bounded as a safety net.
 - A `moved_under` event on the task (note `moved under "<parent title>"`, payload the parent
   id). Progress is computed from children, so it counts at once; the usual child rules apply
   from then on (coordinator notes, parent to `review` when the last open child closes).
