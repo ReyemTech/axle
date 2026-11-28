@@ -69,6 +69,13 @@ fn session_from(row: &PgRow) -> StoreResult<Session> {
         started_at: row.try_get("started_at")?,
         last_heartbeat_at: row.try_get("last_heartbeat_at")?,
         last_tool_call_at: row.try_get("last_tool_call_at")?,
+        turn_state: parse_text(row.try_get("turn_state")?)?,
+        turn_state_at: row.try_get("turn_state_at")?,
+        wake_channel: parse_text(row.try_get("wake_channel")?)?,
+        wake_task_id: opt_id(row, "wake_task_id")?,
+        wake_until: row.try_get("wake_until")?,
+        last_woken_at: row.try_get("last_woken_at")?,
+        run_id: row.try_get("run_id")?,
     })
 }
 
@@ -111,6 +118,17 @@ fn task_from(row: &PgRow) -> StoreResult<Task> {
         requires_plan: row.try_get("requires_plan")?,
         plan_state: parse_text(row.try_get("plan_state")?)?,
         block: block_from(row)?,
+        sanctioned: row.try_get("sanctioned")?,
+        request_depth: u32::try_from(row.try_get::<i64, _>("request_depth")?)
+            .map_err(|e| StoreError::Corrupt(format!("request_depth: {e}")))?,
+        origin_task_id: opt_id(row, "origin_task_id")?,
+        request_chain: {
+            let chain: Vec<Uuid> =
+                serde_json::from_value(row.try_get::<serde_json::Value, _>("request_chain")?)
+                    .map_err(|e| StoreError::Corrupt(format!("request_chain: {e}")))?;
+            chain.into_iter().map(Into::into).collect()
+        },
+        request_dedupe_key: row.try_get("request_dedupe_key")?,
     })
 }
 
@@ -260,7 +278,8 @@ macro_rules! task_cols {
          lease_expires_at, lease_epoch, lease_ttl_secs, eligible_harness, eligible_host,
          created_by_agent_id, created_by_session_id, created_at, updated_at, version,
          requires_plan, plan_state, done_at, acked_at, block_reason, blocked_at, waiting_kind,
-         waiting_task_id, waiting_text, unblock_text"
+         waiting_task_id, waiting_text, unblock_text, sanctioned, request_depth,
+         origin_task_id, request_chain, request_dedupe_key"
     };
 }
 
@@ -677,7 +696,9 @@ async fn update_owned(
 /// Session columns (alias `s`) as a literal, so queries stay static SQL.
 macro_rules! session_cols {
     () => {
-        "s.id, s.agent_id, s.token_id, s.started_at, s.last_heartbeat_at, s.last_tool_call_at"
+        "s.id, s.agent_id, s.token_id, s.started_at, s.last_heartbeat_at, s.last_tool_call_at,
+         s.turn_state, s.turn_state_at, s.wake_channel, s.wake_task_id, s.wake_until,
+         s.last_woken_at, s.run_id"
     };
 }
 
@@ -1421,9 +1442,11 @@ impl Store for PostgresStore {
                  (id, project_id, parent_id, title, body, status, owner_session_id,
                   owner_agent_id, lease_expires_at, lease_epoch, lease_ttl_secs,
                   eligible_harness, eligible_host, created_by_agent_id, created_by_session_id,
-                  token_id, created_at, updated_at, version, requires_plan, plan_state)
+                  token_id, created_at, updated_at, version, requires_plan, plan_state,
+                  sanctioned, request_depth, origin_task_id, request_chain,
+                  request_dedupe_key)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                     $17, $18, $19, $20, $21)",
+                     $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)",
         )
         .bind(task.id.as_uuid())
         .bind(task.project_id.as_uuid())
@@ -1446,6 +1469,16 @@ impl Store for PostgresStore {
         .bind(task.version)
         .bind(task.requires_plan)
         .bind(task.plan_state.as_str())
+        .bind(task.sanctioned)
+        .bind(i64::from(task.request_depth))
+        .bind(task.origin_task_id.map(|t| t.as_uuid()))
+        .bind(sqlx::types::Json(
+            task.request_chain
+                .iter()
+                .map(|p| p.as_uuid())
+                .collect::<Vec<_>>(),
+        ))
+        .bind(&task.request_dedupe_key)
         .execute(&mut *tx)
         .await?;
         for project in extra_projects {

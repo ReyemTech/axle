@@ -363,6 +363,9 @@ fn lease_text(now: OffsetDateTime, task: &Task, owner: Option<&str>) -> String {
             task.status
         ),
         TaskStatus::Done => format!("Finished by {owner}."),
+        TaskStatus::Requested => {
+            "Asked of this project; waiting for the human to approve it.".into()
+        }
         TaskStatus::Cancelled => "Cancelled.".into(),
     }
 }
