@@ -1183,7 +1183,7 @@ impl AxleMcp {
             check_body(reason).map_err(ToolError::from)?;
         }
         // Links and the move are checked as far as they can be without a lock, so a request
-        // they would refuse changes nothing (the status and edit below run first).
+        // they would refuse changes nothing (the PR link, status and edit below run first).
         if !related.is_empty() || !unrelate.is_empty() {
             self.state
                 .tasks
@@ -1207,8 +1207,19 @@ impl AxleMcp {
                 .check_move(Caller::Agent(me), id, parent, &ctx)
                 .await?;
         }
-        let mut task = match p.status {
-            // A first block needs a reason; the service says so (an update may omit it).
+        // The PR link is the one write with refusals the checks above cannot predict (wrong
+        // repo, taken by another task, already merged), so it is the first write: a refusal
+        // leaves the task untouched.
+        let mut task = match &p.pr {
+            Some(url) => Some(
+                self.state
+                    .delivery
+                    .link_pr(Caller::Agent(me), id, url)
+                    .await?,
+            ),
+            None => None,
+        };
+        task = match p.status {
             Some(UpdateStatusParam::Blocked) => Some(
                 self.state
                     .tasks
@@ -1226,7 +1237,7 @@ impl AxleMcp {
             Some(UpdateStatusParam::Review) => {
                 Some(self.state.tasks.to_review(me, id, reason).await?)
             }
-            None => None,
+            None => task,
         };
         if p.title.is_some() || p.body.is_some() {
             task = Some(self.state.tasks.edit(me, id, p.title, p.body).await?);
@@ -1252,14 +1263,6 @@ impl AxleMcp {
                 self.state
                     .tasks
                     .relate(Caller::Agent(me), id, &related, &unrelate)
-                    .await?,
-            );
-        }
-        if let Some(url) = &p.pr {
-            task = Some(
-                self.state
-                    .delivery
-                    .link_pr(Caller::Agent(me), id, url)
                     .await?,
             );
         }
@@ -1417,7 +1420,6 @@ impl AxleMcp {
     }
 }
 
-/// A claimed `planning` task tells the agent what the plan gate expects of it.
 /// A claimed task's summary with the branch hint (its short id) and, in `planning`, the plan
 /// step.
 fn with_claim_step(mut v: Value, task: &crate::domain::Task) -> ToolResult {
@@ -1425,6 +1427,7 @@ fn with_claim_step(mut v: Value, task: &crate::domain::Task) -> ToolResult {
     with_plan_step(v, task)
 }
 
+/// A claimed `planning` task tells the agent what the plan gate expects of it.
 fn with_plan_step(mut v: Value, task: &crate::domain::Task) -> ToolResult {
     if task.status == TaskStatus::Planning {
         v["next_step"] = json!(

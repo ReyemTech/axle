@@ -1682,6 +1682,32 @@ store_matrix!(
     }
 );
 
+store_matrix!(task_update_bad_pr_changes_nothing, |store: Arc<
+    dyn Store,
+>| async move {
+    let server = start(store).await;
+    let client = delivering_agent(&server, &[DeliveryStage::InPr]).await;
+    let task = claimed_task(&client).await;
+    let (is_error, text) = call(
+        &client,
+        "task_update",
+        json!({"id": task["id"], "status": "review", "title": "Changed",
+                   "pr": "https://github.com/other/repo/pull/3"}),
+    )
+    .await;
+    assert!(is_error);
+    assert_eq!(text, "pr must be a pull request in github.com/acme/web-app");
+    let got = ok(&client, "task_get", json!({"id": task["id"]})).await;
+    assert_eq!(got["task"]["status"], "claimed");
+    assert!(
+        got["task"]["title"]
+            .as_str()
+            .unwrap()
+            .contains("Rate limit")
+    );
+    client.cancel().await.unwrap();
+});
+
 store_matrix!(
     task_complete_next_step,
     |store: Arc<dyn Store>| async move {
