@@ -22,7 +22,7 @@ use crate::domain::{
 use crate::service::identity::Resolved;
 use crate::service::messages::{InboxFilter, NewMessage, check_body, check_subject};
 use crate::service::tasks::{Caller, ClaimOutcome, Completion, NewTask};
-use crate::store::TaskFilter;
+use crate::store::{DoneFilter, TaskFilter};
 
 /// Page size for inbox and search results when none is asked for, and the most allowed.
 const PAGE: u32 = 20;
@@ -209,6 +209,8 @@ pub struct TaskListParams {
     pub limit: Option<u32>,
     /// Page cursor: the `next` value of the previous page.
     pub after: Option<String>,
+    /// Also return done tasks the human acked or that auto-acked (default false).
+    pub include_acked: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -389,7 +391,9 @@ impl AxleMcp {
 
     #[tool(description = described!(
         "List tasks, oldest first, filtered by project, status, owner and parent; paged \
-         (`limit`, `after` = the previous page's `next`)."
+         (`limit`, `after` = the previous page's `next`). Done tasks the human has acked, or \
+         that finished more than the auto-ack window ago, are left out unless `include_acked` \
+         is true."
     ))]
     async fn task_list(
         &self,
@@ -831,6 +835,13 @@ impl AxleMcp {
                 .transpose()?,
             // One extra row says whether there is another page.
             limit: Some(limit + 1),
+            done: if p.include_acked.unwrap_or(false) {
+                DoneFilter::Any
+            } else {
+                DoneFilter::Unseen {
+                    since: self.state.clock.now() - self.state.config.done_auto_ack,
+                }
+            },
             ..TaskFilter::default()
         };
         let mut tasks = self.state.tasks.list(filter).await?;

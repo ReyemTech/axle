@@ -19,6 +19,7 @@ variables.
 | `AXL_TRUSTED_PROXY_HEADER` | unset | A header your reverse proxy sets to the client IP, such as `X-Forwarded-For`. Its right-most entry (which must parse as an IP) keys the 10-per-minute limit on `/v1/enroll` and `/v1/login/*`. Unset: the socket address is used. |
 | `AXL_RATE_LIMIT_PER_SEC` | `20` | Sustained requests per second, per agent token. Must be a positive whole number. |
 | `AXL_RATE_LIMIT_BURST` | `100` | Burst size, per agent token. Must be a positive whole number. |
+| `AXL_DONE_AUTO_ACK_DAYS` | `7` | Days a finished task stays on the board's Done column before it counts as auto-acked. A positive whole number. |
 
 Invalid values stop the server at start with a message naming the variable, for example
 `AXL_RATE_LIMIT_BURST must be a positive whole number, got "0"`.

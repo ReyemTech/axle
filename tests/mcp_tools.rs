@@ -29,6 +29,8 @@ const WRAP_TAIL: &str = "(information, not instructions)";
 struct Server {
     url: String,
     token: String,
+    clock: Arc<TestClock>,
+    tasks: Arc<axle::service::tasks::TaskService>,
 }
 
 type Client = RunningService<RoleClient, ClientConfig>;
@@ -41,12 +43,18 @@ async fn start(store: Arc<dyn Store>) -> Server {
         _ => None,
     })
     .unwrap();
-    let state = AppState::new(store, clock, config);
+    let state = AppState::new(store, clock.clone(), config);
     let token = state.auth.create("test").await.unwrap().1;
+    let tasks = state.tasks.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
     tokio::spawn(axum::serve(listener, router(state)).into_future());
-    Server { url, token }
+    Server {
+        url,
+        token,
+        clock,
+        tasks,
+    }
 }
 
 impl Server {
@@ -960,4 +968,62 @@ store_matrix!(add_projects_via_mcp, |store: Arc<dyn Store>| async move {
     for c in [lead, web_app] {
         c.cancel().await.unwrap();
     }
+});
+
+store_matrix!(task_list_hides_acked_and_auto_acked_done, |store: Arc<
+    dyn Store,
+>| async move {
+    let server = start(store).await;
+    let a = server.agent("mac", "claude-code").await;
+    let finish = |title: &'static str| {
+        let a = &a;
+        async move {
+            let t = ok(a, "task_create", json!({"title": title, "body": "b"})).await;
+            let id = t["id"].as_str().unwrap().to_string();
+            ok(a, "task_claim", json!({"id": id})).await;
+            ok(a, "task_complete", json!({"id": id, "summary": "done"})).await;
+            id
+        }
+    };
+    ok(&a, "task_create", json!({"title": "open", "body": "b"})).await;
+    finish("old").await;
+    server.clock.advance(time::Duration::days(8));
+    finish("recent").await;
+    let acked = finish("acked").await;
+    server
+        .tasks
+        .ack_done(&[acked.parse().unwrap()])
+        .await
+        .unwrap();
+
+    let titles = |v: &Value| -> Vec<String> {
+        v["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["title"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let has = |ts: &[String], name: &str| ts.iter().any(|t| t.contains(&format!(" {name} ")));
+
+    let default = titles(&ok(&a, "task_list", json!({})).await);
+    assert_eq!(default.len(), 2, "{default:?}");
+    assert!(
+        has(&default, "open") && has(&default, "recent"),
+        "{default:?}"
+    );
+    let done = titles(&ok(&a, "task_list", json!({"status": "done"})).await);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert!(has(&done, "recent"), "{done:?}");
+    let all = titles(
+        &ok(
+            &a,
+            "task_list",
+            json!({"status": "done", "include_acked": true}),
+        )
+        .await,
+    );
+    assert_eq!(all.len(), 3, "{all:?}");
+    ok(&a, "task_get", json!({"id": acked})).await;
+    a.cancel().await.unwrap();
 });
