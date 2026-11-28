@@ -12,7 +12,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use axle::bridge::project::{Env, normalize_origin, resolve_project};
+use axle::bridge::project::{
+    Detected, Env, describe, detect, folder_hash, is_folder_hash, local_segment, normalize_origin,
+    pin, resolve_project,
+};
 use axle::clock::SystemClock;
 use axle::config::ServerConfig;
 use axle::http::{AppState, router};
@@ -114,7 +117,7 @@ fn resolution_order() {
 
     // git origin, from a nested directory
     assert_eq!(
-        resolve_project(&nested, &none).as_deref(),
+        resolve_project(&nested, &none, "mac").as_deref(),
         Some("github.com/acme/platform-infra")
     );
     // nearest .axl beats git
@@ -124,24 +127,154 @@ fn resolution_order() {
     )
     .unwrap();
     assert_eq!(
-        resolve_project(&nested, &none).as_deref(),
+        resolve_project(&nested, &none, "mac").as_deref(),
         Some("acme/platform-infra-file")
     );
     std::fs::write(nested.join(".axl"), "project = \"nearest\"\n").unwrap();
-    assert_eq!(resolve_project(&nested, &none).as_deref(), Some("nearest"));
+    assert_eq!(
+        resolve_project(&nested, &none, "mac").as_deref(),
+        Some("nearest")
+    );
     // env beats the file
     assert_eq!(
-        resolve_project(&nested, &env).as_deref(),
+        resolve_project(&nested, &env, "mac").as_deref(),
         Some("env/project")
     );
     // a value outside the safe charset is no project, never an error
     let bad = Env::from_pairs([("AXL_PROJECT", "has spaces")]);
-    assert_eq!(resolve_project(&nested, &bad), None);
+    assert_eq!(resolve_project(&nested, &bad, "mac"), None);
 
-    // no git, no file
+    // no git, no file: a local project for the folder
     let bare = root.0.join("bare");
     std::fs::create_dir_all(&bare).unwrap();
-    assert_eq!(resolve_project(&bare, &none), None);
+    assert_eq!(
+        resolve_project(&bare, &none, "mac").as_deref(),
+        Some("local/mac/bare")
+    );
+}
+
+#[test]
+fn local_projects_for_folders_without_a_remote() {
+    let root = TempDir::new();
+    let none = Env::default();
+
+    // No git at all: the working directory's name, and its hash.
+    let plain = root.0.join("Axl SaaS");
+    let deep = plain.join("notes");
+    std::fs::create_dir_all(&deep).unwrap();
+    let d = detect(&plain, &none, "Mac-Mini");
+    assert_eq!(d.key.as_deref(), Some("local/mac-mini/axl-saas"));
+    assert_eq!(d.folder, Some(folder_hash(&plain)));
+    assert!(is_folder_hash(d.folder.as_deref().unwrap()));
+    // Outside a repository, each directory is its own folder.
+    assert_eq!(
+        detect(&deep, &none, "mac").key.as_deref(),
+        Some("local/mac/notes")
+    );
+
+    // A git repository without a remote: the top level's name, from any subdirectory.
+    let repo = root.0.join("brainstorm");
+    let sub = repo.join("docs").join("ideas");
+    std::fs::create_dir_all(&sub).unwrap();
+    git(&repo, &["init", "-q"]);
+    let d = detect(&sub, &none, "mac");
+    assert_eq!(d.key.as_deref(), Some("local/mac/brainstorm"));
+    assert_eq!(d.folder, Some(folder_hash(&repo)));
+
+    // The same repository with a remote: the git key, and still the folder's hash (which is
+    // how the server finds the local project to offer for adoption).
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/axle-saas.git",
+        ],
+    );
+    let d = detect(&sub, &none, "mac");
+    assert_eq!(d.key.as_deref(), Some("github.com/acme/axle-saas"));
+    assert_eq!(d.folder, Some(folder_hash(&repo)));
+
+    // A pin wins over everything and sends no folder.
+    std::fs::write(repo.join(".axl"), "project = \"pinned/key\"\n").unwrap();
+    assert_eq!(
+        detect(&sub, &none, "mac"),
+        Detected {
+            key: Some("pinned/key".into()),
+            folder: None
+        }
+    );
+    let env = Env::from_pairs([("AXL_PROJECT", "env/key")]);
+    assert_eq!(detect(&plain, &env, "mac").folder, None);
+
+    // Two same-named folders on one host get the same key from the bridge, but different
+    // hashes; the server gives the second one a suffixed key.
+    let a = root.0.join("a").join("web");
+    let b = root.0.join("b").join("web");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let (da, db) = (detect(&a, &none, "mac"), detect(&b, &none, "mac"));
+    assert_eq!(da.key, db.key);
+    assert_ne!(da.folder, db.folder);
+}
+
+#[test]
+fn folder_names_normalise_like_keys() {
+    for (raw, want) in [
+        ("Axl SaaS", "axl-saas"),
+        ("my_project.v2", "my_project.v2"),
+        ("--weird!!name--", "weird-name"),
+        ("Ünïcødé", "n-c-d"),
+        ("...", "folder"),
+        ("", "folder"),
+        ("a   b", "a-b"),
+    ] {
+        assert_eq!(local_segment(raw, "folder"), want, "{raw:?}");
+    }
+    let long = "x".repeat(100);
+    assert_eq!(local_segment(&long, "folder").len(), 64);
+}
+
+#[test]
+fn pin_writes_and_updates_the_axl_file() {
+    let root = TempDir::new();
+    let repo = root.0.join("repo");
+    let sub = repo.join("src");
+    std::fs::create_dir_all(&sub).unwrap();
+    git(&repo, &["init", "-q"]);
+    let none = Env::default();
+    assert!(describe(&sub, &none, "mac").contains("local/mac/repo"));
+
+    // Written at the git top level, from a subdirectory.
+    let file = pin(&sub, "github.com/acme/web").unwrap();
+    assert_eq!(file, repo.join(".axl"));
+    assert_eq!(
+        resolve_project(&sub, &none, "mac").as_deref(),
+        Some("github.com/acme/web")
+    );
+    assert!(describe(&sub, &none, "mac").contains("pinned by"));
+
+    // Updating keeps the rest of the file.
+    std::fs::write(
+        &file,
+        "# keep me\nproject = \"old\"\ndisplay_name = \"Web\"\n",
+    )
+    .unwrap();
+    pin(&sub, "github.com/acme/web2").unwrap();
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("# keep me") && text.contains("display_name = \"Web\""));
+    assert_eq!(
+        resolve_project(&sub, &none, "mac").as_deref(),
+        Some("github.com/acme/web2")
+    );
+
+    // Outside a repository: the working directory.
+    let plain = root.0.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    assert_eq!(pin(&plain, "x/y").unwrap(), plain.join(".axl"));
+    assert!(pin(&plain, "has spaces").is_err());
+    assert!(pin(&plain, "  ").is_err());
 }
 
 // ---------------------------------------------------------------- the binary
@@ -256,7 +389,9 @@ async fn bridge_without_token_fails_open() {
     let file = session_file(&home.0);
     let saved: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     assert_eq!(saved["harness"], "test-harness");
-    assert_eq!(saved["project_key"], Value::Null);
+    // The home dir is no repository: a local project for that folder.
+    let key = saved["project_key"].as_str().unwrap();
+    assert!(key.starts_with("local/"), "{key}");
     assert_eq!(saved["server_url"], "http://127.0.0.1:9");
     assert_eq!(mode(&file), 0o600);
     assert_eq!(mode(&home.0.join(".axl").join("sessions")), 0o700);

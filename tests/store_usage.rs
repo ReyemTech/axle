@@ -60,6 +60,7 @@ impl Env {
             &*self.clock,
             IdentityInput {
                 project_key: Some(project.to_string()),
+                folder: None,
                 host: host.into(),
                 harness: harness.into(),
                 session: SessionId::new(),
@@ -884,3 +885,92 @@ store_matrix!(usage_reprice_pages, |store: Arc<dyn Store>| async move {
     );
     assert_eq!(u3.cost_micros, Some(13), "untouched");
 });
+
+store_matrix!(
+    usage_follows_a_folded_agent_to_its_survivor,
+    |store: Arc<dyn Store>| async move {
+        use axle::domain::Adoption;
+        const FOLDER: &str = "0123456789abcdef";
+        const GIT: &str = "github.com/acme/axle-saas";
+        let env = Env::new(store);
+        let token = common::token(&*env.store).await;
+        let open = |key: &'static str, folder: Option<&'static str>| {
+            let env = &env;
+            async move {
+                IdentityService::resolve(
+                    &*env.store,
+                    &*env.clock,
+                    IdentityInput {
+                        project_key: Some(key.into()),
+                        folder: folder.map(str::to_string),
+                        host: "mac".into(),
+                        harness: "claude-code".into(),
+                        session: SessionId::new(),
+                        token,
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        };
+        // The git project already has a mac agent; the local one will fold into it.
+        let twin = open(GIT, None).await;
+        let target = twin.project.clone().unwrap();
+        let stale = open("local/mac/axl-saas", Some(FOLDER)).await;
+        let local = stale.project.clone().unwrap();
+        assert_ne!(stale.agent.id, twin.agent.id);
+
+        report(&env, &stale, &[rec("before", T0, 5)], &PerToken).await;
+        // The folder gains the remote, and the owner adopts it.
+        open(GIT, Some(FOLDER)).await;
+        let out = IdentityService::adopt(&*env.store, &*env.clock, local.id)
+            .await
+            .unwrap();
+        assert!(matches!(out, Adoption::Merged(_)), "got {out:?}");
+
+        // A report from the session resolved before the merge lands on the survivor.
+        report(&env, &stale, &[rec("after", T0, 7)], &PerToken).await;
+        for key in ["before", "after"] {
+            let u = env
+                .store
+                .get_usage("claude-code", key)
+                .await
+                .unwrap()
+                .unwrap();
+            if key == "after" {
+                assert_eq!(u.agent, twin.agent.id, "stored against the survivor");
+                assert_eq!(u.project, Some(target.id));
+            }
+        }
+        // Reads resolve the earlier record too: one agent, one project, both records.
+        let all = UsageFilter::default();
+        for group in [UsageGroup::Agent, UsageGroup::Project] {
+            let rows = env.store.usage_summary(&all, group).await.unwrap();
+            assert_eq!(rows.len(), 1, "{group:?}: {rows:?}");
+            assert_eq!(rows[0].requests, 2);
+        }
+        let rows = env
+            .store
+            .usage_summary(&all, UsageGroup::Agent)
+            .await
+            .unwrap();
+        assert_eq!(rows[0].key.as_deref(), Some(&*twin.agent.id.to_string()));
+        for filter in [
+            UsageFilter {
+                agent: Some(twin.agent.id),
+                ..UsageFilter::default()
+            },
+            UsageFilter {
+                project: Some(target.id),
+                ..UsageFilter::default()
+            },
+        ] {
+            let rows = env
+                .store
+                .usage_summary(&filter, UsageGroup::Total)
+                .await
+                .unwrap();
+            assert_eq!(rows[0].requests, 2, "{filter:?}");
+        }
+    }
+);

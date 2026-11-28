@@ -131,6 +131,7 @@ impl App {
             &*self.state.clock,
             IdentityInput {
                 project_key: Some(project.into()),
+                folder: None,
                 host: host.into(),
                 harness: harness.into(),
                 session: SessionId::new(),

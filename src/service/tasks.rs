@@ -474,12 +474,21 @@ impl TaskService {
         self.insert(by, new, Some(source)).await
     }
 
+    /// `id`, or the project it was merged into (a local project adopted into an existing one).
+    async fn live_project(&self, id: ProjectId) -> Result<ProjectId, TaskError> {
+        Ok(self.store.get_project(id).await?.map_or(id, |p| p.id))
+    }
+
     async fn insert(
         &self,
         by: Caller<'_>,
-        new: NewTask,
+        mut new: NewTask,
         reply_to: Option<MessageId>,
     ) -> Result<Task, TaskError> {
+        new.project_id = self.live_project(new.project_id).await?;
+        for p in &mut new.extra_projects {
+            *p = self.live_project(*p).await?;
+        }
         check_body(&new.body)?;
         check_subject("title", &new.title)?;
         check_eligibility(&new.eligibility)?;
@@ -762,11 +771,14 @@ impl TaskService {
         id: TaskId,
         projects: &[ProjectId],
     ) -> Result<Task, TaskError> {
+        let mut live = Vec::with_capacity(projects.len());
         for p in projects {
-            if self.store.get_project(*p).await?.is_none() {
-                return Err(TaskError::UnknownProject);
+            match self.store.get_project(*p).await? {
+                Some(project) => live.push(project.id),
+                None => return Err(TaskError::UnknownProject),
             }
         }
+        let projects = live.as_slice();
         let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
         if task.parent_id.is_some() {
             return Err(TaskError::ChildExtraProjects);

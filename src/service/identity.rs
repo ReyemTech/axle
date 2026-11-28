@@ -1,13 +1,16 @@
 //! Projects, agents and sessions: first-contact resolution of a caller's identity.
 
 use crate::clock::Clock;
-use crate::domain::{Agent, Project, Session, SessionId, TokenId};
+use crate::domain::{Adoption, Agent, Project, ProjectId, Session, SessionId, TokenId};
 use crate::store::{Store, StoreError};
 
 /// What a caller presents (from the bridge or `X-Axl-*` headers plus its token).
 #[derive(Debug, Clone)]
 pub struct IdentityInput {
     pub project_key: Option<String>,
+    /// The bridge's hash of the session's folder (`bridge::project::folder_hash`), when the
+    /// project came from the folder rather than a pin. Anything not shaped like one is ignored.
+    pub folder: Option<String>,
     pub host: String,
     pub harness: String,
     pub session: SessionId,
@@ -72,21 +75,63 @@ impl IdentityService {
         if let Some(key) = key {
             check_label("project key", key, PROJECT_KEY_MAX, true)?;
         }
-        let project = match key {
-            Some(key) => Some(
+        let folder = input
+            .folder
+            .as_deref()
+            .map(str::trim)
+            .filter(|f| crate::bridge::project::is_folder_hash(f));
+        let project = match (key, folder) {
+            (None, _) => None,
+            // A folder without a git remote: its own local project, found by folder.
+            (Some(key), Some(folder)) if key.starts_with(LOCAL_PREFIX) => Some(
+                store
+                    .local_project(host, folder, key, &default_display_name(key), now)
+                    .await?,
+            ),
+            // A folder that now has a remote but still has its local project: stay on the
+            // local project and record the git key; only the human moves it (Projects page).
+            (Some(key), Some(folder)) => match store.find_local_project(host, folder).await? {
+                Some(local) => {
+                    store.note_adoption(local.id, key).await?;
+                    Some(
+                        store
+                            .get_project(local.id)
+                            .await?
+                            .ok_or(StoreError::NotFound("project"))?,
+                    )
+                }
+                None => Some(
+                    store
+                        .upsert_project(key, &default_display_name(key), now)
+                        .await?,
+                ),
+            },
+            (Some(key), None) => Some(
                 store
                     .upsert_project(key, &default_display_name(key), now)
                     .await?,
             ),
-            None => None,
         };
 
-        let agent = store
+        let mut project = project;
+        let mut agent = store
             .upsert_agent(project.as_ref().map(|p| p.id), host, harness, now)
             .await?;
         let session = store
             .create_session(input.session, agent.id, input.token, now)
             .await?;
+        // A project merge can fold `agent` between the lookup and the insert; the store then
+        // put the session on the survivor, whose identity this caller now is.
+        if session.agent_id != agent.id
+            && let Some(canonical) = store.get_agent(agent.id).await?
+            && canonical.id == session.agent_id
+        {
+            project = match canonical.project_id {
+                Some(p) => store.get_project(p).await?,
+                None => None,
+            };
+            agent = canonical;
+        }
         if session.token_id != input.token {
             return Err(IdentityError::SessionTokenMismatch {
                 session: session.id,
@@ -102,6 +147,31 @@ impl IdentityService {
             agent,
             session,
         })
+    }
+
+    /// The human's "Move tasks and history" action: moves local project `id` to the git key
+    /// recorded for its folder (see `Store::adopt_project`). A display name still at its
+    /// default follows the new key; a renamed one is kept.
+    pub async fn adopt(
+        store: &dyn Store,
+        clock: &dyn Clock,
+        id: ProjectId,
+    ) -> Result<Adoption, StoreError> {
+        let project = store
+            .get_project(id)
+            .await?
+            .filter(|p| p.id == id)
+            .ok_or(StoreError::NotFound("project"))?;
+        let new_key = project
+            .adopt_key
+            .as_deref()
+            .ok_or(StoreError::NotFound("project"))?;
+        let name = if project.display_name == default_display_name(&project.key) {
+            default_display_name(new_key)
+        } else {
+            project.display_name.clone()
+        };
+        store.adopt_project(id, &name, clock.now()).await
     }
 
     /// The identity of an already-registered session; `None` if the session is unknown.
@@ -165,8 +235,21 @@ pub fn check_label(
     Ok(())
 }
 
-/// The last two path segments of a project key: `github.com/acme/platform-infra` → `acme/platform-infra`.
+/// The first segment of every local project key (`local/<host>/<folder>`).
+pub const LOCAL_PREFIX: &str = "local/";
+
+/// The host and folder of a local project key: `local/mac/axl-saas` → `("mac", "axl-saas")`.
+pub fn local_parts(key: &str) -> Option<(&str, &str)> {
+    let (host, folder) = key.strip_prefix(LOCAL_PREFIX)?.split_once('/')?;
+    (!host.is_empty() && !folder.is_empty() && !folder.contains('/')).then_some((host, folder))
+}
+
+/// The last two path segments of a project key: `github.com/acme/platform-infra` →
+/// `acme/platform-infra`; for a local key, the folder: `local/mac/axl-saas` → `axl-saas`.
 pub fn default_display_name(key: &str) -> String {
+    if let Some((_, folder)) = local_parts(key) {
+        return folder.to_string();
+    }
     let segments: Vec<&str> = key.split('/').filter(|s| !s.is_empty()).collect();
     match segments.as_slice() {
         [] => key.to_string(),

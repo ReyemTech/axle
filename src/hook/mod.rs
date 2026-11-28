@@ -159,6 +159,26 @@ struct Lease {
     project: Option<String>,
 }
 
+/// The session's home project, from `/v1/project`.
+#[derive(Debug, Deserialize)]
+struct SessionProject {
+    key: String,
+    #[serde(default)]
+    adopt_key: Option<String>,
+}
+
+/// The SessionStart notice for a local project whose folder now has a git remote.
+fn adopt_line(p: &SessionProject) -> Option<String> {
+    let max = crate::service::identity::PROJECT_KEY_MAX;
+    let remote = clean(p.adopt_key.as_deref()?, max);
+    Some(format!(
+        "This folder now has a git remote ({remote}), but its axle project is still the local \
+         one ({}). Keep working as before: the owner can move its tasks and history to the git \
+         project on the Projects page, and your session follows.",
+        clean(&p.key, max)
+    ))
+}
+
 /// How long a "this session holds a lease" (or "no lease list here") answer is trusted.
 const LEASE_CACHE_TTL: Duration = Duration::from_secs(300);
 
@@ -308,10 +328,18 @@ async fn session_start_extra(
     };
     let token = token(home, env_token)?;
     let client = client()?;
-    let (items, leases) = budget(async {
+    let project_path = format!("project?session={}", info.session_id);
+    let (items, leases, project) = budget(async {
         tokio::join!(
             fetch(&client, &info, &token),
-            fetch_leases(&client, &info, &token)
+            fetch_leases(&client, &info, &token),
+            get_or_missing::<Option<SessionProject>>(
+                &client,
+                &info,
+                &token,
+                &project_path,
+                "session project",
+            )
         )
     })
     .await?;
@@ -322,6 +350,12 @@ async fn session_start_extra(
         Ok(Some(leases)) => parts.push(status_line(&leases)),
         Ok(None) => stderr = Some("axle server has no lease list".to_string()),
         Err(e) => stderr = Some(e),
+    }
+    // An older server has no /v1/project; a failure here only drops the notice.
+    if let Ok(Some(Some(p))) = project
+        && let Some(line) = adopt_line(&p)
+    {
+        parts.push(line);
     }
     if !items.is_empty() {
         let seen_path = session_file::seen_path(&session_file::path(home, pid));
@@ -762,7 +796,23 @@ fn write_seen(path: &PathBuf, seen: &[String]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Harness, clean};
+    use super::{Harness, SessionProject, adopt_line, clean};
+
+    #[test]
+    fn adopt_notice_only_with_a_waiting_remote() {
+        let p = |adopt: Option<&str>| SessionProject {
+            key: "local/mac/axl-saas".into(),
+            adopt_key: adopt.map(str::to_string),
+        };
+        assert_eq!(adopt_line(&p(None)), None);
+        let line = adopt_line(&p(Some("github.com/acme/axle-saas"))).unwrap();
+        assert!(
+            line.contains("git remote (github.com/acme/axle-saas)"),
+            "{line}"
+        );
+        assert!(line.contains("(local/mac/axl-saas)"), "{line}");
+        assert!(line.contains("Projects page"), "{line}");
+    }
 
     #[test]
     fn harness_flag_parsing() {

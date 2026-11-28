@@ -1375,6 +1375,8 @@ async fn task_frames(state: &AppState, event: &Event) -> UiResult<Frames> {
         Event::EnrollmentChanged { .. } => {
             return Ok(vec![("tokens".to_string(), PING.to_string())]);
         }
+        // Tasks, messages and agents changed project: every view re-reads.
+        Event::ProjectMerged { .. } => return Ok(refresh_frames()),
         Event::MessageCreated { id, to, .. } => {
             let mut frames = vec![("inbox".to_string(), PING.to_string())];
             if let Address::Task(t) = to {

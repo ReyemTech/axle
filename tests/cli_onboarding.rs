@@ -1197,24 +1197,43 @@ fn e2e_serve_login_install_dry_run() {
     let db = format!("sqlite://{}/server.db", srv_dir.path().display());
     let port = free_port();
     let base = format!("http://127.0.0.1:{port}");
-    let _server = Child(
+    let mut server = Child(
         axl(srv_dir.path())
             .args(["serve", "--bind", &format!("127.0.0.1:{port}")])
             .env("DATABASE_URL", &db)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap(),
     );
-    rt.block_on(async {
-        for _ in 0..200 {
-            if Api::new(&base).readyz().await.is_ok() {
-                return;
+    // Wait for *this* server's "listening" line, which it prints only after its migrations
+    // ran and it bound the port. Polling /readyz is not enough: `free_port` releases the
+    // port, and a stand-in server of a parallel test can get it and answer first, so the
+    // store below would migrate the database while the real server still is.
+    let stderr = server.0.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut seen = Vec::new();
+        let mut sent = false;
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if !sent && line.starts_with("axl: listening on") {
+                let _ = tx.send(Ok(()));
+                sent = true;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            seen.push(line);
         }
-        panic!("axl serve did not become ready");
+        if !sent {
+            let _ = tx.send(Err(seen.join("\n")));
+        }
     });
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(())) => {}
+        Ok(Err(stderr)) => panic!("axl serve exited before listening:\n{stderr}"),
+        Err(_) => panic!("axl serve did not start listening within 10 s"),
+    }
+    let _server = server;
     let code = rt.block_on(async {
         let store: Arc<dyn Store> = Arc::new(SqliteStore::connect(&db).await.unwrap());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);

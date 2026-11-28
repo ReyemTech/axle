@@ -17,6 +17,10 @@ use crate::http::AppState;
 /// Keys are agent-supplied, so this is the security boundary for the link: a strict
 /// allow-list of host and path characters, no scheme, userinfo, query, fragment or `..`.
 pub fn repo_url(key: &str) -> Option<String> {
+    // Local projects (`local/<host>/<folder>`) have no repository to link to.
+    if key.starts_with(crate::service::identity::LOCAL_PREFIX) {
+        return None;
+    }
     let (host, path) = key.split_once('/')?;
     let (name, port) = match host.split_once(':') {
         Some((n, p)) => (n, Some(p)),
@@ -58,6 +62,12 @@ pub struct ProjectRow {
     /// The project's line colour (see `views::line_colours`).
     pub line: u8,
     pub created: Stamp,
+    /// The machine of a local project (a folder without a git remote).
+    pub local_host: Option<String>,
+    /// The git key this local project's folder now has, waiting to be adopted.
+    pub adopt_key: Option<String>,
+    /// Whether a project with `adopt_key` exists already (adopting merges into it).
+    pub adopt_exists: bool,
 }
 
 #[derive(Template)]
@@ -79,6 +89,7 @@ pub async fn projects(
     let now = state.clock.now();
     let all = state.store.list_projects().await?;
     let lines = line_colours(&all);
+    let keys: std::collections::HashSet<String> = all.iter().map(|p| p.key.clone()).collect();
     let mut projects: Vec<ProjectRow> = all
         .into_iter()
         .map(|p| ProjectRow {
@@ -88,6 +99,9 @@ pub async fn projects(
             repo_url: repo_url(&p.key),
             key: p.key,
             created: Stamp::new(now, p.created_at),
+            adopt_exists: p.adopt_key.as_ref().is_some_and(|k| keys.contains(k)),
+            local_host: p.local_host,
+            adopt_key: p.adopt_key,
         })
         .collect();
     projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.key.cmp(&b.key)));
@@ -206,6 +220,8 @@ mod tests {
             "github.com:/a",
             "github.com:80a/a",
             "https://github.com/a",
+            "local/mac/axl-saas",
+            "local/build.example.com/web",
         ] {
             assert_eq!(repo_url(k), None, "{k}");
         }

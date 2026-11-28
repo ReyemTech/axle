@@ -46,6 +46,7 @@ impl Env {
             &*self.clock,
             IdentityInput {
                 project_key: Some(project.to_string()),
+                folder: None,
                 host: host.into(),
                 harness: "claude-code".into(),
                 session: SessionId::new(),

@@ -58,6 +58,7 @@ async fn session(store: &Arc<dyn Store>, clock: &TestClock) -> Resolved {
         clock,
         IdentityInput {
             project_key: Some("github.com/reyemtech/axle".to_string()),
+            folder: None,
             host: "mac".into(),
             harness: "claude-code".into(),
             session: SessionId::new(),

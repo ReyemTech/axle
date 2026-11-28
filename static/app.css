@@ -1008,6 +1008,22 @@ label.check:has(input:disabled) { color: var(--muted); cursor: default; }
 .row-title { display: inline-flex; gap: 8px; align-items: center; font-weight: 600; }
 .row-key { color: var(--muted); }
 .row-main .muted { font-size: 12.5px; }
+.row-local { font-weight: 400; color: var(--muted); }
+/* A local project whose folder gained a git remote: waits on the human, so it takes the
+   Needs-you treatment (warn soft fill, amber border). */
+.adopt {
+  flex: 1 1 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  align-items: center;
+  padding: 8px 10px;
+  background: var(--warn-soft);
+  border: 1px solid var(--sig-amber);
+  border-radius: 6px;
+  overflow-wrap: anywhere;
+}
+.adopt-label { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--warn); }
 .row.is-revoked .row-title { color: var(--muted); text-decoration: line-through; text-decoration-thickness: 1px; }
 .token-state { display: inline-flex; gap: 6px; align-items: center; font-size: 12.5px; }
 .inline-form { display: flex; gap: 6px; align-items: center; flex: 1 1 240px; max-width: 420px; }

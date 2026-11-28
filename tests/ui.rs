@@ -134,12 +134,24 @@ impl App {
 
     /// An agent session in `project` that heartbeats at the current clock.
     async fn agent(&self, project: &str, host: &str, harness: &str) -> Resolved {
+        self.agent_in(project, None, host, harness).await
+    }
+
+    /// `agent`, from a folder with the bridge's folder hash `folder`.
+    async fn agent_in(
+        &self,
+        project: &str,
+        folder: Option<&str>,
+        host: &str,
+        harness: &str,
+    ) -> Resolved {
         let (token, _) = self.state.auth.create("test").await.unwrap();
         IdentityService::resolve(
             &*self.state.store,
             &*self.state.clock,
             IdentityInput {
                 project_key: Some(project.into()),
+                folder: folder.map(str::to_string),
                 host: host.into(),
                 harness: harness.into(),
                 session: SessionId::new(),
@@ -2091,6 +2103,97 @@ async fn post_into_thread_as_human() {
         )
         .await;
     assert_eq!(page.status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn adopt_a_git_remote_from_the_projects_page() {
+    const FOLDER: &str = "0123456789abcdef";
+    const OTHER: &str = "fedcba9876543210";
+    let app = app().await;
+    let cookie = app.login().await;
+    let csrf = csrf_for(&app, &cookie).await;
+
+    let local = app
+        .agent_in("local/mac/axl-saas", Some(FOLDER), "mac", "claude-code")
+        .await;
+    let other = app
+        .agent_in("local/mac/notes", Some(OTHER), "mac", "claude-code")
+        .await;
+    app.task(&local, "sketch the pricing page", None).await;
+    let id = local.agent.project_id.unwrap();
+    let other_id = other.agent.project_id.unwrap();
+
+    // Local projects say where they live, link nowhere, and offer nothing yet.
+    let page = app.get("/ui/projects", Some(&cookie)).await;
+    let text = page.text();
+    let title = Selector::parse(&format!("#project-{id} .row-title")).unwrap();
+    let title: String = page.html().select(&title).next().unwrap().text().collect();
+    assert_eq!(title.trim(), "axl-saas · local to mac");
+    assert!(!text.contains("Move tasks and history"), "{text}");
+    assert!(!page.body.contains("https://local/"), "no repo link");
+
+    // The folder gains a remote: only that project gets the banner.
+    app.agent_in(
+        "github.com/acme/axle-saas",
+        Some(FOLDER),
+        "mac",
+        "claude-code",
+    )
+    .await;
+    let page = app.get("/ui/projects", Some(&cookie)).await;
+    let html = page.html();
+    let banner = |pid: &str| {
+        let sel = Selector::parse(&format!("#project-{pid} .adopt")).unwrap();
+        html.select(&sel)
+            .next()
+            .map(|e| e.text().collect::<String>())
+    };
+    let shown = banner(&id.to_string()).expect("banner on the matching project");
+    assert!(
+        shown.contains("now has a git remote") && shown.contains("github.com/acme/axle-saas"),
+        "{shown}"
+    );
+    assert!(shown.contains("Move tasks and history to it"), "{shown}");
+    assert_eq!(
+        banner(&other_id.to_string()),
+        None,
+        "other folder untouched"
+    );
+
+    // The action is a CSRF-checked POST.
+    let path = format!("/ui/projects/{id}/adopt");
+    for body in ["", "csrf=wrong"] {
+        let page = app.post_form(&path, Some(&cookie), body).await;
+        assert_eq!(page.status, StatusCode::FORBIDDEN, "{body:?}");
+    }
+    assert_eq!(
+        app.state.store.get_project(id).await.unwrap().unwrap().key,
+        "local/mac/axl-saas"
+    );
+    let page = app.post_form(&path, Some(&cookie), &form(&csrf, &[])).await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    let moved = app.state.store.get_project(id).await.unwrap().unwrap();
+    assert_eq!(moved.key, "github.com/acme/axle-saas");
+
+    // The board now shows the task under the git project.
+    let board = app.get("/ui/board", Some(&cookie)).await.text();
+    assert!(board.contains("sketch the pricing page"), "{board}");
+    assert!(board.contains("acme/axle-saas"), "{board}");
+    assert!(!board.contains("local to mac · axl-saas"), "{board}");
+    let page = app.get("/ui/projects", Some(&cookie)).await.text();
+    assert!(!page.contains("Move tasks and history"), "{page}");
+
+    // Adopting again (or a project without a remote) is a 404.
+    let page = app.post_form(&path, Some(&cookie), &form(&csrf, &[])).await;
+    assert_eq!(page.status, StatusCode::NOT_FOUND);
+    let page = app
+        .post_form(
+            &format!("/ui/projects/{other_id}/adopt"),
+            Some(&cookie),
+            &form(&csrf, &[]),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

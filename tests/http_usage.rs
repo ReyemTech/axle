@@ -77,6 +77,7 @@ impl App {
             &*self.state.clock,
             IdentityInput {
                 project_key: Some("github.com/reyemtech/axle".into()),
+                folder: None,
                 host: "mac".into(),
                 harness: "claude-code".into(),
                 session,

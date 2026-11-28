@@ -850,6 +850,7 @@ async fn end_to_end_against_the_server() {
         &*state.clock,
         IdentityInput {
             project_key: Some("github.com/reyemtech/axle".into()),
+            folder: None,
             host: "mac".into(),
             harness: "claude-code".into(),
             session: sid,

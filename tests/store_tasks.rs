@@ -49,6 +49,7 @@ impl Env {
             &*self.clock,
             IdentityInput {
                 project_key: project.map(str::to_string),
+                folder: None,
                 host: host.into(),
                 harness: harness.into(),
                 session: SessionId::new(),
