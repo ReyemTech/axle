@@ -66,6 +66,8 @@ pub struct NeedCard {
     /// For a message in a thread, the task it belongs to.
     pub task_title: Option<String>,
     pub preview: Option<String>,
+    /// For plan cards: the plan rendered from markdown (safe HTML), shown clipped.
+    pub plan_html: Option<String>,
     /// How long it has waited, e.g. `12m`.
     pub waited: String,
     pub since: String,
@@ -149,7 +151,10 @@ pub(super) async fn needs_you(
             project: Some(labels.project(t.project_id)),
             agent,
             task_title: None,
-            preview: plan.as_ref().map(|p| clip(&p.body)),
+            preview: None,
+            plan_html: plan
+                .as_ref()
+                .map(|p| super::markdown::render(&p.body, None)),
             waited: waited(now, at),
             since: since(at),
             task_id: Some(t.id.to_string()),
@@ -181,6 +186,7 @@ pub(super) async fn needs_you(
             agent,
             task_title: None,
             preview: None,
+            plan_html: None,
             waited: waited(now, t.updated_at),
             since: since(t.updated_at),
             task_id: None,
@@ -216,6 +222,7 @@ pub(super) async fn needs_you(
             agent,
             task_title,
             preview: Some(clip(&m.body)),
+            plan_html: None,
             waited: waited(now, m.created_at),
             since: since(m.created_at),
             task_id: None,

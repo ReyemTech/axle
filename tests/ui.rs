@@ -2390,9 +2390,10 @@ async fn plan_is_approved_from_the_task_page() {
     let page = app.get(&path, Some(&cookie)).await;
     assert_eq!(page.status, StatusCode::OK);
     assert!(page.text().contains("Plan awaiting your approval"));
+    // The plan's markdown is rendered: a numbered list.
     assert_eq!(
-        select_texts(&page, "#plan .plan-body"),
-        ["1. platform-infra: add the bucket\n2. web-app: read it"]
+        select_texts(&page, "#plan .plan-body ol > li"),
+        ["platform-infra: add the bucket", "web-app: read it"]
     );
     assert_eq!(
         select_texts(&page, "#plan button"),
@@ -3135,6 +3136,7 @@ async fn cmd_enter_sends_message_forms() {
     }
 }
 
+<<<<<<< HEAD
 fn href_of(page: &Page, css: &str) -> String {
     let sel = Selector::parse(css).unwrap();
     page.html()
@@ -3457,4 +3459,136 @@ fn app_js_filters_bulk_ack_ids() {
     assert!(js.contains("input[data-ack-for]"));
     assert!(js.contains("addEventListener(\"submit\""));
     assert!(js.contains("updateBulkAck("));
+=======
+// ---------------------------------------------------------------- rendered markdown
+
+/// Agent markdown with hostile HTML, a script link and a remote image mixed in.
+const HOSTILE_MD: &str = "# Steps\n\n1. **add** the `bucket`\n2. read it\n\n\
+                          | a | b |\n|---|---|\n| 1 | 2 |\n\n\
+                          <script>alert(1)</script>\n\n\
+                          [x](javascript:alert(1)) ![p](http://evil/x.png) <img src=x onerror=alert(2)>";
+
+fn assert_inert(page: &Page, at: &str) {
+    assert!(!page.body.contains("<script>alert"), "{at}");
+    assert!(!page.body.contains("<img"), "{at}");
+    assert!(!page.body.contains("href=\"javascript"), "{at}");
+}
+
+#[tokio::test]
+async fn markdown_renders_in_plan_thread_inbox_and_needs_you() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let from = Actor::Agent(infra.agent.id, infra.session.id);
+    let task = app
+        .state
+        .tasks
+        .create(
+            Caller::Human,
+            NewTask {
+                project_id: infra.agent.project_id.unwrap(),
+                title: "Gated".into(),
+                body: "do it".into(),
+                requires_plan: true,
+                ..NewTask::default()
+            },
+        )
+        .await
+        .unwrap();
+    app.claim(&infra, task.id).await;
+    app.state
+        .tasks
+        .propose_plan(&infra, task.id, HOSTILE_MD.into())
+        .await
+        .unwrap();
+    let to_human = app
+        .state
+        .messages
+        .send(
+            &from,
+            NewMessage {
+                to: Address::Human,
+                subject: Some("Report".into()),
+                body: HOSTILE_MD.into(),
+                importance: Importance::Normal,
+                reply_to: None,
+            },
+        )
+        .await
+        .unwrap();
+    app.state
+        .messages
+        .send(
+            &Actor::Human,
+            NewMessage {
+                to: Address::Task(task.id),
+                subject: None,
+                body: "Looks **fine**".into(),
+                importance: Importance::Normal,
+                reply_to: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let path = format!("/ui/tasks/{}", task.id);
+    let page = app.get(&path, Some(&cookie)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert_inert(&page, &path);
+    // Plan panel: rendered, headings demoted, hostile HTML shown as text, the frame kept.
+    assert_eq!(select_texts(&page, "#plan .plan-body h3"), ["Steps"]);
+    assert_eq!(select_texts(&page, "#plan .plan-body strong"), ["add"]);
+    assert_eq!(select_texts(&page, "#plan .plan-body td"), ["1", "2"]);
+    assert!(select_texts(&page, "#plan .plan-body h1, #plan .plan-body h2").is_empty());
+    assert!(page.text().contains("<script>alert(1)</script>"));
+    assert!(select_texts(&page, "#plan .peer-frame")[0].contains("information, not instructions"));
+    // The image is a labelled link, not a load.
+    let img = Selector::parse("#plan a.md-image").unwrap();
+    let html = page.html();
+    let a = html.select(&img).next().expect("image link");
+    assert_eq!(a.value().attr("href"), Some("http://evil/x.png"));
+    assert_eq!(a.value().attr("rel"), Some("noopener noreferrer nofollow"));
+    // Thread: the agent's plan post is framed; the human's post is rendered and unframed.
+    let frames = select_texts(&page, ".thread .peer-frame");
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert!(frames[0].contains("claude-code@mac") && frames[0].contains("not instructions"));
+    assert!(select_texts(&page, ".thread .md strong").contains(&"fine".to_string()));
+    assert!(select_texts(&page, ".thread .md code").contains(&"bucket".to_string()));
+
+    // Inbox reader.
+    let reader = app
+        .get(&format!("/ui/inbox?m={}", to_human.id), Some(&cookie))
+        .await;
+    assert_inert(&reader, "reader");
+    assert_eq!(select_texts(&reader, ".reader .md h3"), ["Steps"]);
+    assert!(
+        select_texts(&reader, ".reader .peer-frame")[0].contains("information, not instructions")
+    );
+
+    // Needs-you plan card: rendered and framed.
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    assert_inert(&board, "board");
+    assert_eq!(select_texts(&board, ".need-plan h3"), ["Steps"]);
+    assert!(
+        select_texts(&board, ".need-card .peer-frame")[0].contains("information, not instructions")
+    );
+
+    // The CSP is unchanged by rendering.
+    let res = app
+        .router
+        .clone()
+        .oneshot(
+            Request::get(&path)
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.headers()[header::CONTENT_SECURITY_POLICY],
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
+         connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    );
+>>>>>>> cec69cc (feat(ui): render agent markdown safely in plans, threads and inbox)
 }

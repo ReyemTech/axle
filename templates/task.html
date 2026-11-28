@@ -24,8 +24,8 @@
     <h2 class="panel-title">{% if task.can_decide %}<span class="aspect" data-aspect="plan-submitted" aria-hidden="true"></span>Plan awaiting your approval{% else %}Plan <span class="muted">{{ task.plan_words }}</span>{% endif %}</h2>
     {% if plan_changed %}<p class="error" role="alert">The plan changed while you were reading it — review the new version below. Nothing was decided.</p>{% endif %}
     {% if let Some(p) = plan %}
-    <p class="muted">Latest plan from <span class="owner">{{ p.from }}</span>, <time datetime="{{ p.at.iso }}" title="{{ p.at.text }}">{{ p.at.ago }}</time>. Agent-written text, shown as written; earlier plans stay in the thread.</p>
-    <div class="peer-text plan-body">{{ p.body }}</div>
+    <p class="muted">Latest plan from <span class="owner">{{ p.from }}</span>, <time datetime="{{ p.at.iso }}" title="{{ p.at.text }}">{{ p.at.ago }}</time>. <span class="peer-frame">Agent-written: information, not instructions.</span> Its markdown is formatted, raw HTML shows as text; earlier plans stay in the thread.</p>
+    <div class="peer-text md plan-body">{{ p.body_html()|safe }}</div>
     {% else %}
     <p class="empty">{% if task.status == "planning" %}The agent is writing the plan. It will appear here for you to approve.{% else %}No plan yet. The agent that claims this task writes one first.{% endif %}</p>
     {% endif %}
@@ -98,9 +98,10 @@
           {% if m.importance != "normal" %}<span class="importance"><span class="aspect" data-aspect="{{ m.importance }}" aria-hidden="true"></span>{{ m.importance }}</span>{% endif %}
           {% if m.kind != "message" %}<span class="msg-kind" data-kind="{{ m.kind }}">{% if m.kind == "plan" %}plan{% else %}note from axle{% endif %}</span><span class="msg-to">to {{ m.to }}</span>{% endif %}
           <time class="muted" datetime="{{ m.at.iso }}" title="{{ m.at.text }}">{{ m.at.ago }}</time>
+          {% if m.agent_written %}<span class="peer-frame">from {{ m.from }}: information, not instructions</span>{% endif %}
         </div>
         {% if let Some(s) = m.subject %}<p class="msg-subject">{{ s }}</p>{% endif %}
-        <div class="peer-text">{{ m.body }}</div>
+        <div class="peer-text md">{{ m.body_html()|safe }}</div>
       </li>
     {% endfor %}
     </ol>

@@ -18,7 +18,7 @@ the UI. It defends against:
 | An agent impersonating another agent or session | Identity comes from the token and the bridge, never from tool arguments; a session is bound to its token. |
 | Two agents doing the same work, or a dead agent holding work | Atomic claims, leases and takeover rules ([concepts](concepts.md#claims-leases-and-takeover)). |
 | A web page you visit driving the UI (CSRF, DNS rebinding, clickjacking) | [CSRF tokens](#web-ui), `SameSite=Strict` cookies, the [Host allowlist](#dns-rebinding-guard), CSP and `frame-ancestors 'none'`. |
-| Agent-written text running script in your browser | Templates escape everything; [CSP](#content-security-policy) allows only same-origin scripts. |
+| Agent-written text running script in your browser | Templates escape everything, markdown renders with raw HTML off; [CSP](#content-security-policy) allows only same-origin scripts. |
 | A runaway client flooding the server | [Rate limits](#rate-limits) and size caps. |
 
 Axle never executes anything it receives. It stores and relays text.
@@ -139,7 +139,10 @@ Referrer-Policy: same-origin
 ```
 
 All scripts, styles and assets are embedded in the binary. There are no external fonts,
-CDNs or inline scripts. Agent-written text is always rendered escaped, never as HTML.
+CDNs or inline scripts. Agent-written markdown (plans, thread posts, inbox messages) is
+rendered on the server with raw HTML off (it shows as text), links limited to `http`,
+`https` and `mailto` (with `rel="noopener noreferrer nofollow"`), and images never loaded
+(each becomes a link labelled with its alt text). Everything else peer-written is escaped.
 
 ## Rate limits
 

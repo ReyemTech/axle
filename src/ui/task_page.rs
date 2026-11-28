@@ -16,7 +16,7 @@ use super::views::{
     lease_view, project_options, pulse_counts, state_mark,
 };
 use crate::domain::{
-    Message, MessageId, PlanState, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus,
+    Actor, Message, MessageId, PlanState, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus,
 };
 use crate::http::AppState;
 use crate::service::tasks::plan_words;
@@ -73,6 +73,15 @@ pub struct MessageView {
     pub href: String,
     /// `message`, `plan` or `system`.
     pub kind: &'static str,
+    /// Written by an agent (not the human): shown with the peer frame.
+    pub agent_written: bool,
+}
+
+impl MessageView {
+    /// The body as safe HTML from its markdown (see [`super::markdown`]).
+    pub fn body_html(&self) -> String {
+        super::markdown::render(&self.body, Some(&format!("msg-{}", self.id)))
+    }
 }
 
 /// The first 140 characters of a body, on one line.
@@ -111,6 +120,7 @@ pub(super) async fn message_view(
         unread: false,
         href: format!("/ui/inbox?view=all&m={}", m.id),
         kind: m.kind.as_str(),
+        agent_written: matches!(m.from, Actor::Agent(..)),
     })
 }
 
@@ -151,6 +161,13 @@ pub struct PlanView {
     pub from: String,
     pub at: Stamp,
     pub body: String,
+}
+
+impl PlanView {
+    /// The plan as safe HTML from its markdown (see [`super::markdown`]).
+    pub fn body_html(&self) -> String {
+        super::markdown::render(&self.body, Some(&format!("plan-{}", self.id)))
+    }
 }
 
 pub struct TaskView {
