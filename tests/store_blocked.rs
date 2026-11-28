@@ -335,6 +335,7 @@ store_matrix!(waits_that_could_never_end_are_refused, |store: Arc<
                 reason: Some("raw".into()),
                 waiting_on: Some(WaitingOn::Task(x.id)),
                 unblock: None,
+                record_previous: false,
             }),
             unblock: None,
         })
@@ -536,3 +537,109 @@ store_matrix!(a_cancelled_dependency_does_not_unblock, |store: Arc<
         .await
         .unwrap();
 });
+
+// Completing the last child locks the parent row (it moves to review) and then takes the
+// wait lock; blocking the parent on a task takes the wait lock and then the parent row. Both
+// at once must never deadlock.
+store_matrix!(
+    completing_a_child_while_its_parent_blocks_on_a_task,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let a = env.session("mac").await;
+        let b = env.session("linux").await;
+        for i in 0..20 {
+            let parent = env.claimed(&a, &format!("parent {i}"), None).await;
+            let child = env.claimed(&b, &format!("child {i}"), Some(&parent)).await;
+            let other = env.task(&b, &format!("other {i}"), None).await;
+            let (svc, by) = (env.svc.clone(), b.clone());
+            let complete =
+                tokio::spawn(
+                    async move { svc.complete(&by, child.id, Completion::default()).await },
+                );
+            let (svc, by) = (env.svc.clone(), a.clone());
+            let block = tokio::spawn(async move {
+                svc.block_with(
+                    &by,
+                    parent.id,
+                    BlockInput {
+                        reason: Some("waiting".into()),
+                        waiting_on: Some(WaitingOn::Task(other.id)),
+                        unblock: None,
+                    },
+                )
+                .await
+            });
+            complete.await.unwrap().expect("the child completes");
+            match block.await.unwrap() {
+                Ok(_) => {}
+                // The child finished first and moved the parent to review.
+                Err(TaskError::InvalidTransition {
+                    from: TaskStatus::Review,
+                    ..
+                }) => {}
+                Err(e) => panic!("iteration {i}: {e:?}"),
+            }
+        }
+    }
+);
+
+// Each `block_updated` event records the values it actually replaced, even when two updates
+// race.
+store_matrix!(
+    concurrent_block_updates_record_what_they_replaced,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let a = env.session("mac").await;
+        for i in 0..10 {
+            let t = env.claimed(&a, &format!("t {i}"), None).await;
+            env.svc.block(&a, t.id, "r0").await.unwrap();
+            let mut handles = Vec::new();
+            for reason in ["r1", "r2"] {
+                let (svc, by) = (env.svc.clone(), a.clone());
+                handles.push(tokio::spawn(async move {
+                    svc.block_with(
+                        &by,
+                        t.id,
+                        BlockInput {
+                            reason: Some(reason.into()),
+                            ..BlockInput::default()
+                        },
+                    )
+                    .await
+                }));
+            }
+            for h in handles {
+                h.await.unwrap().unwrap();
+            }
+            let updates: Vec<(String, String)> = env
+                .svc
+                .get(t.id)
+                .await
+                .unwrap()
+                .events
+                .into_iter()
+                .filter(|e| e.kind == TaskEventKind::BlockUpdated)
+                .map(|e| {
+                    (
+                        e.note.unwrap(),
+                        e.payload.unwrap()["previous_reason"]
+                            .as_str()
+                            .unwrap()
+                            .to_string(),
+                    )
+                })
+                .collect();
+            assert_eq!(updates.len(), 2, "{updates:?}");
+            let current = env.get(&t).await.block.unwrap().reason;
+            // One replaced r0; the other replaced what the first wrote, and is what is stored.
+            let first = updates.iter().find(|(_, prev)| prev == "r0");
+            let (first_new, _) = first.unwrap_or_else(|| panic!("iteration {i}: {updates:?}"));
+            let second = updates
+                .iter()
+                .find(|(new, _)| new != first_new)
+                .unwrap_or_else(|| panic!("iteration {i}: {updates:?}"));
+            assert_eq!(&second.1, first_new, "iteration {i}: {updates:?}");
+            assert_eq!(second.0, current, "iteration {i}: {updates:?}");
+        }
+    }
+);

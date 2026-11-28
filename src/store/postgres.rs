@@ -10,9 +10,9 @@ use super::{
     AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate,
     MessageReceipt, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, Store,
     StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, UnblockRule,
-    Unblocked, child_event, children_complete_event, claim_event, closes_child, edit_payload,
-    enrollment_token_label, like_pattern, options_from, options_to, projects_added_note,
-    projects_added_payload, send_time_recipient, unblocked_records,
+    Unblocked, block_previous_payload, child_event, children_complete_event, claim_event,
+    closes_child, edit_payload, enrollment_token_label, like_pattern, options_from, options_to,
+    projects_added_note, projects_added_payload, send_time_recipient, unblocked_records,
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId,
@@ -272,7 +272,8 @@ macro_rules! clear_block {
 
 /// The transaction-scoped advisory lock that serialises writes of waits on tasks with the
 /// `done` transitions that release them: without it, under READ COMMITTED, a task could start
-/// waiting on another that finished concurrently and never be unblocked.
+/// waiting on another that finished concurrently and never be unblocked. A transaction takes
+/// it before any task row lock (see `transition_task`), so it never deadlocks with them.
 const WAIT_LOCK: i64 = 0x6178_6c5f_7761_6974; // "axl_wait"
 
 async fn wait_lock(conn: &mut PgConnection) -> StoreResult<()> {
@@ -311,14 +312,14 @@ async fn wait_allowed(conn: &mut PgConnection, task: TaskId, target: TaskId) -> 
     .await?)
 }
 
-/// `done` just became done: applies `rule` to every blocked task waiting on it.
+/// `done` just became done: applies `rule` to every blocked task waiting on it. The caller
+/// holds `WAIT_LOCK`, taken before its first row lock.
 async fn unblock_waiting(
     conn: &mut PgConnection,
     done: &Task,
     req: &TransitionRequest,
     rule: UnblockRule,
 ) -> StoreResult<Vec<Unblocked>> {
-    wait_lock(&mut *conn).await?;
     let waiting: Vec<Task> = sqlx::query(concat!(
         "SELECT ",
         task_cols!(),
@@ -1577,6 +1578,16 @@ impl Store for PostgresStore {
             .as_ref()
             .map(|states| states.iter().map(|s| s.as_str()).collect());
         let mut tx = self.pool.begin().await?;
+        let block = req.block.clone().unwrap_or_default();
+        let waiting = block.waiting_on.as_ref();
+        let finishing = req.unblock.is_some() && req.to == Some(TaskStatus::Done);
+        // Writes of waits on tasks and the `done` transitions that release them are serialised
+        // by `WAIT_LOCK`. It is always taken first, before any task row lock: a completion
+        // locks its row and its parent's, and blocking that parent on a task locks the parent
+        // after the wait lock, so the other order deadlocks.
+        if finishing || waiting.and_then(|w| w.task()).is_some() {
+            wait_lock(&mut tx).await?;
+        }
         // A decision on a named plan: lock the row first, then read the newest plan in a
         // statement of its own. Under READ COMMITTED a guard subquery inside the UPDATE would
         // keep the snapshot taken before it queued on the row lock, so a resubmission that
@@ -1602,16 +1613,32 @@ impl Store for PostgresStore {
             }
             locked_version = version;
         }
-        let block = req.block.clone().unwrap_or_default();
-        let waiting = block.waiting_on.as_ref();
-        if let Some(target) = waiting.and_then(|w| w.task()) {
-            // Waits on tasks are written one at a time (see `WAIT_LOCK`), so the check below
-            // sees every committed wait and every committed `done`.
-            wait_lock(&mut tx).await?;
-            if !wait_allowed(&mut tx, req.task, target).await? {
-                tx.commit().await?;
-                return Ok(None);
-            }
+        // Under the wait lock, this check sees every committed wait and every committed `done`.
+        if let Some(target) = waiting.and_then(|w| w.task())
+            && !wait_allowed(&mut tx, req.task, target).await?
+        {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        // The values an update replaces, read under the row lock the UPDATE then holds.
+        let mut event = req.event.clone();
+        if block.record_previous {
+            let previous = sqlx::query(concat!(
+                "SELECT ",
+                task_cols!(),
+                " FROM tasks WHERE id = $1 FOR UPDATE"
+            ))
+            .bind(req.task.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await?
+            .as_ref()
+            .map(task_from)
+            .transpose()?
+            .and_then(|t| t.block);
+            event.payload = Some(block_previous_payload(
+                event.payload.as_ref(),
+                previous.as_ref(),
+            ));
         }
         let updated = sqlx::query(concat!(
             "UPDATE tasks
@@ -1675,7 +1702,7 @@ impl Store for PostgresStore {
             tx.commit().await?;
             return Ok(None);
         };
-        let children_complete = record_event(&mut tx, &task, &req.event, req.token).await?;
+        let children_complete = record_event(&mut tx, &task, &event, req.token).await?;
         if req.archive_plans {
             sqlx::query(
                 "UPDATE message_recipients
