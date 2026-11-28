@@ -866,6 +866,8 @@ impl AxleMcp {
             },
             lease_ttl: None,
             requires_plan: p.requires_plan.unwrap_or(false),
+            // `task_create` never wakes anyone by itself.
+            start_now: false,
         };
         let task = match p.from_message {
             Some(m) => {

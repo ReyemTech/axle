@@ -125,13 +125,14 @@ fn subject(raw: &str) -> Option<String> {
 // ---------------------------------------------------------------- tasks
 
 /// The new-task form: `project` (the lead), repeated `also` (other participating projects,
-/// top-level tasks only), `plan_first` (a ticked checkbox sends `on`), `title`, `body` and
-/// `parent`. Parsed by hand because a checkbox list repeats its field name.
+/// top-level tasks only), `plan_first` and `start_now` (a ticked checkbox sends `on`; an
+/// unticked one sends nothing), `title`, `body` and `parent`. Parsed by hand because a checkbox list repeats its field name.
 #[derive(Default)]
 struct CreateTaskForm {
     project: String,
     also: Vec<String>,
     plan_first: bool,
+    start_now: bool,
     title: String,
     body: String,
     parent: String,
@@ -147,6 +148,7 @@ impl CreateTaskForm {
                 "project" => form.project = v,
                 "also" => form.also.push(v),
                 "plan_first" => form.plan_first = v == "on",
+                "start_now" => form.start_now = v == "on",
                 "title" => form.title = v,
                 "body" => form.body = v,
                 "parent" => form.parent = v,
@@ -195,6 +197,7 @@ pub async fn create_task(
                 body: form.body,
                 extra_projects,
                 requires_plan: form.plan_first,
+                start_now: form.start_now,
                 ..NewTask::default()
             },
         )

@@ -21,7 +21,7 @@ use crate::service::messages::{MessageError, SUBJECT_MAX, check_body, check_subj
 use crate::service::wake::guards::{
     self, DEDUPE_WINDOW, GuardError, Lineage, PENDING_PER_PROJECT, REQUESTS_PER_HOUR,
 };
-use crate::service::wake::{RouteOutcome, WakeService};
+use crate::service::wake::{RouteOutcome, WakeService, held_origin};
 use crate::store::{
     AddProjectsRequest, BlockWrite, ClaimRequest, Claimant, EditRequest, LeaseUpdate, MoveRequest,
     Moved, RelateRequest, Related, Store, StoreError, TaskFilter, TransitionRequest, Transitioned,
@@ -84,6 +84,9 @@ pub struct NewTask {
     /// The plan gate: claiming moves it to `planning`, and the human approves a plan before
     /// the work starts.
     pub requires_plan: bool,
+    /// The human's **Start now**: the task is sanctioned and routed at once. Only the UI's
+    /// New task form sets it; an agent's create ignores it.
+    pub start_now: bool,
 }
 
 /// A work request: a task another agent asks for in `project_id` (see `TaskService::request`).
@@ -341,13 +344,6 @@ const REQUEST_RATE_WINDOW: Duration = Duration::HOUR;
 const DEFAULT_WAKE_MAX_DEPTH: u32 = 2;
 /// The thread note when the human declines a request without a note.
 const DECLINED_NOTE: &str = "The human declined this request.";
-/// Statuses in which a session holds a task (its lineage source for requests).
-const HELD: [TaskStatus; 4] = [
-    TaskStatus::Planning,
-    TaskStatus::Claimed,
-    TaskStatus::Blocked,
-    TaskStatus::Review,
-];
 
 /// A guarded write that agents retry only when a re-read says the guard should now pass.
 const MAX_GUARD_RETRIES: usize = 3;
@@ -711,21 +707,22 @@ impl TaskService {
             Some(d) => Some(Duration::seconds(d.whole_seconds())),
             None => None,
         };
+        let mut parent = None;
         if let Some(parent_id) = new.parent_id {
             if !new.extra_projects.is_empty() {
                 return Err(TaskError::ChildExtraProjects);
             }
-            let parent = self
+            let p = self
                 .store
                 .get_task(parent_id)
                 .await?
                 .ok_or(TaskError::NotFound)?;
-            if parent.status == TaskStatus::Planning {
-                return Err(TaskError::PlanNotApproved(parent.plan_state));
+            if p.status == TaskStatus::Planning {
+                return Err(TaskError::PlanNotApproved(p.plan_state));
             }
             // A task's projects are only ever added to, so checking outside the insert is
             // safe (the store re-checks the parent's status under its lock).
-            if parent.project_id != new.project_id
+            if p.project_id != new.project_id
                 && !self
                     .store
                     .task_projects(parent_id)
@@ -734,7 +731,19 @@ impl TaskService {
             {
                 return Err(TaskError::ChildProjectMismatch);
             }
+            parent = Some(p);
         }
+        // What routes the task once it is written (spec "Trigger rules"): the human's Start
+        // now, or the covering rule for an agent's child of a sanctioned task past its plan
+        // gate. Work requests route themselves; anything else is pull-only.
+        let trigger = match (&request, by, &parent) {
+            (Some(_), _, _) => None,
+            (None, Caller::Human, _) => new.start_now.then_some(WakeTrigger::StartNow),
+            (None, Caller::Agent(_), Some(p)) if covers_children(p) => {
+                Some(WakeTrigger::ChildOfSanctioned)
+            }
+            (None, Caller::Agent(_), _) => None,
+        };
         let now = self.clock.now();
         let (kind, importance) = match &request {
             Some(r) => (TaskEventKind::RequestCreated, r.importance),
@@ -768,6 +777,12 @@ impl TaskService {
             request_chain: Vec::new(),
             request_dedupe_key: None,
         };
+        // A child is not a new request: it sits where its parent sits in a chain.
+        if let Some(p) = &parent {
+            task.request_depth = p.request_depth;
+            task.request_chain = p.request_chain.clone();
+        }
+        task.sanctioned = trigger.is_some();
         if let Some(r) = request {
             task.status = r.status;
             task.sanctioned = r.sanctioned;
@@ -805,6 +820,9 @@ impl TaskService {
             return Err(TaskError::PlanNotApproved(state));
         }
         self.changed(&task, kind).await;
+        if let Some(trigger) = trigger {
+            self.route(&task, trigger, by.actor().ids().0).await;
+        }
         Ok(task)
     }
 
@@ -948,17 +966,20 @@ impl TaskService {
              with the work as planned.",
             task.title
         );
-        self.decide_plan(
-            &task,
-            TaskStatus::Claimed,
-            PlanState::Approved,
-            LeaseUpdate::Set(until),
-            TaskEventKind::PlanApproved,
-            None,
-            plan,
-            ("plan approved", body, MessageKind::System),
-        )
-        .await
+        let task = self
+            .decide_plan(
+                &task,
+                TaskStatus::Claimed,
+                PlanState::Approved,
+                LeaseUpdate::Set(until),
+                TaskEventKind::PlanApproved,
+                None,
+                plan,
+                ("plan approved", body, MessageKind::System),
+            )
+            .await?;
+        self.wake_owner(&task, WakeTrigger::HumanDecision).await;
+        Ok(task)
     }
 
     /// The human asks for changes (a note is required): the plan state becomes
@@ -977,21 +998,24 @@ impl TaskService {
         check_body(note)?;
         let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
         let until = self.clock.now() + task.lease_ttl.unwrap_or(self.lease_ttl);
-        self.decide_plan(
-            &task,
-            TaskStatus::Planning,
-            PlanState::ChangesRequested,
-            LeaseUpdate::Set(until),
-            TaskEventKind::PlanChangesRequested,
-            Some(note.to_string()),
-            plan,
-            (
-                "plan changes requested",
-                note.to_string(),
-                MessageKind::Message,
-            ),
-        )
-        .await
+        let task = self
+            .decide_plan(
+                &task,
+                TaskStatus::Planning,
+                PlanState::ChangesRequested,
+                LeaseUpdate::Set(until),
+                TaskEventKind::PlanChangesRequested,
+                Some(note.to_string()),
+                plan,
+                (
+                    "plan changes requested",
+                    note.to_string(),
+                    MessageKind::Message,
+                ),
+            )
+            .await?;
+        self.wake_owner(&task, WakeTrigger::HumanDecision).await;
+        Ok(task)
     }
 
     /// Adds participating projects to a top-level task (append-only). Allowed for the human,
@@ -1055,31 +1079,34 @@ impl TaskService {
         }
     }
 
-    /// Gives the task back: `open`, no owner, no lease.
+    /// Gives the task back: `open`, no owner, no lease. A sanctioned task is routed again.
     pub async fn release(
         &self,
         caller: &Resolved,
         id: TaskId,
         note: Option<String>,
     ) -> Result<Task, TaskError> {
-        self.owner_transition(
-            caller,
-            id,
-            &[
-                TaskStatus::Planning,
-                TaskStatus::Claimed,
-                TaskStatus::Blocked,
-                TaskStatus::Review,
-            ],
-            TaskStatus::Open,
-            Some(TaskStatus::Open),
-            LeaseUpdate::Clear,
-            true,
-            TaskEventKind::Released,
-            note,
-            None,
-        )
-        .await
+        let task = self
+            .owner_transition(
+                caller,
+                id,
+                &[
+                    TaskStatus::Planning,
+                    TaskStatus::Claimed,
+                    TaskStatus::Blocked,
+                    TaskStatus::Review,
+                ],
+                TaskStatus::Open,
+                Some(TaskStatus::Open),
+                LeaseUpdate::Clear,
+                true,
+                TaskEventKind::Released,
+                note,
+                None,
+            )
+            .await?;
+        self.reroute(&task).await;
+        Ok(task)
     }
 
     /// `claimed → blocked` with only a reason (see `block_with`).
@@ -1720,24 +1747,28 @@ impl TaskService {
         .await
     }
 
-    /// Human only: takes the task away from its owner and reopens it.
+    /// Human only: takes the task away from its owner and reopens it. A sanctioned task is
+    /// routed again.
     pub async fn force_release(&self, id: TaskId) -> Result<Task, TaskError> {
-        self.unowned_transition(
-            id,
-            Actor::Human,
-            None,
-            &[
-                TaskStatus::Planning,
-                TaskStatus::Claimed,
-                TaskStatus::Blocked,
-                TaskStatus::Review,
-            ],
-            TaskStatus::Open,
-            true,
-            TaskEventKind::ForceReleased,
-            None,
-        )
-        .await
+        let task = self
+            .unowned_transition(
+                id,
+                Actor::Human,
+                None,
+                &[
+                    TaskStatus::Planning,
+                    TaskStatus::Claimed,
+                    TaskStatus::Blocked,
+                    TaskStatus::Review,
+                ],
+                TaskStatus::Open,
+                true,
+                TaskEventKind::ForceReleased,
+                None,
+            )
+            .await?;
+        self.reroute(&task).await;
+        Ok(task)
     }
 
     /// Heartbeat renewal: extends the session's live `claimed` leases to `now + ttl` (per
@@ -1869,8 +1900,8 @@ impl TaskService {
         }
     }
 
-    /// Routes a sanctioned request, as a request state. Without a router, or when routing
-    /// fails after the task is written, it stays queued for the ticker or a pull.
+    /// Routes a sanctioned task, as a request state. Without a router, or when routing fails
+    /// after the task is written, it stays queued for the ticker or a pull.
     async fn route(
         &self,
         task: &Task,
@@ -1887,6 +1918,23 @@ impl TaskService {
                 eprintln!("axl: failed to route request {}: {e}", task.id);
                 RequestState::Queued
             }
+        }
+    }
+
+    /// A sanctioned task given back (`open` again) is placed again, or queued.
+    async fn reroute(&self, task: &Task) {
+        if task.sanctioned && task.status == TaskStatus::Open {
+            self.route(task, WakeTrigger::Queue, None).await;
+        }
+    }
+
+    /// Wakes the session holding `task` about it. Runs after the commit: a failure is
+    /// logged, never returned.
+    async fn wake_owner(&self, task: &Task, trigger: WakeTrigger) {
+        if let Some(wake) = &self.wake
+            && let Err(e) = wake.wake_owner(task, trigger, None).await
+        {
+            eprintln!("axl: failed to wake the owner of task {}: {e}", task.id);
         }
     }
 
@@ -1930,17 +1978,7 @@ impl TaskService {
 
     /// The task the caller's session holds with the highest `request_depth`, if any.
     async fn origin_of(&self, caller: &Resolved) -> Result<Option<Task>, TaskError> {
-        let held = self
-            .store
-            .list_tasks(&TaskFilter {
-                owner: Some(caller.agent.id),
-                ..TaskFilter::default()
-            })
-            .await?;
-        Ok(held
-            .into_iter()
-            .filter(|t| t.owner_session_id == Some(caller.session.id) && HELD.contains(&t.status))
-            .max_by_key(|t| t.request_depth))
+        Ok(held_origin(&*self.store, caller.agent.id, caller.session.id).await?)
     }
 
     async fn emit(&self, event: Event) {
@@ -2080,6 +2118,8 @@ impl TaskService {
             return;
         }
         self.message_created(&message).await;
+        // Axle's own note, not a peer's post: outside the peer-wake budget.
+        self.wake_owner(parent, WakeTrigger::ChildClosed).await;
     }
 
     fn claim_request(&self, caller: &Resolved) -> ClaimRequest {
@@ -2286,7 +2326,8 @@ impl TaskService {
                 block: None,
                 unblock: None,
                 version: None,
-                sanctioned: None,
+                // Approving the plan is the human saying go: the task's children route.
+                sanctioned: (plan_to == PlanState::Approved).then_some(true),
             };
             if let Some(done) = self.store.transition_task(&req).await? {
                 self.after_transition(&done, &req.event, None).await;
@@ -2408,6 +2449,12 @@ impl TaskService {
             sanctioned: None,
         }
     }
+}
+
+/// The covering rule: a sanctioned task past its plan gate sanctions (and routes) the
+/// children an agent creates under it.
+fn covers_children(parent: &Task) -> bool {
+    parent.sanctioned && (!parent.requires_plan || parent.plan_state == PlanState::Approved)
 }
 
 /// Eligibility values are shown to models next to peer data, so they follow the same label

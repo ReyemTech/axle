@@ -125,7 +125,9 @@ impl AppState {
         Self {
             auth: Arc::new(AuthService::new(store.clone(), clock.clone())),
             messages: Arc::new(
-                MessageService::new(store.clone(), clock.clone()).with_events(bus.clone()),
+                MessageService::new(store.clone(), clock.clone())
+                    .with_events(bus.clone())
+                    .with_wake(wake.clone()),
             ),
             tasks: Arc::new(
                 TaskService::from_config(store.clone(), clock.clone(), &config)

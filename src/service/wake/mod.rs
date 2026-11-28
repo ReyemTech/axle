@@ -16,14 +16,17 @@ use tokio::sync::Mutex;
 use crate::clock::Clock;
 use crate::config::ServerConfig;
 use crate::domain::{
-    Actor, AgentId, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TurnState, WakeAttempt,
-    WakeChannel, WakeKind, WakeOutcome, WakeTrigger,
+    Actor, AgentId, ProjectId, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus,
+    TurnState, WakeAttempt, WakeChannel, WakeKind, WakeOutcome, WakeTrigger,
 };
 use crate::events::{Event, EventBus};
 use crate::http::Shutdown;
-use crate::store::{AttemptQuery, Claimant, Reservation, Store, StoreResult, eligible};
+use crate::store::{AttemptQuery, Claimant, Reservation, Store, StoreResult, TaskFilter, eligible};
 
-use guards::{SESSION_WAKES_PER_HOUR, SESSION_WAKES_PER_MINUTE, TASK_WAKE_GAP};
+use guards::{
+    GuardError, PEER_WAKES_PER_PAIR_HOUR, PEER_WAKES_PER_SESSION_HOUR, SESSION_WAKES_PER_HOUR,
+    SESSION_WAKES_PER_MINUTE, TASK_WAKE_GAP,
+};
 
 /// How long a woken session has to claim before its reservation lapses.
 pub const RESERVATION: Duration = Duration::minutes(2);
@@ -37,6 +40,34 @@ const TITLE_CHARS: usize = 80;
 const LABEL_CHARS: usize = 200;
 /// History events fetched per page when looking for the task's latest routing event.
 const EVENT_PAGE: u32 = 20;
+/// The window the peer-wake budgets count over.
+const PEER_WINDOW: Duration = Duration::HOUR;
+/// Statuses in which a session holds a task (its lineage source for requests and posts).
+const HELD: [TaskStatus; 4] = [
+    TaskStatus::Planning,
+    TaskStatus::Claimed,
+    TaskStatus::Blocked,
+    TaskStatus::Review,
+];
+
+/// The task `session` (of `agent`) holds with the highest `request_depth`, if any: where a
+/// request it raises, or a post it makes, sits in a chain of requests.
+pub async fn held_origin(
+    store: &dyn Store,
+    agent: AgentId,
+    session: SessionId,
+) -> StoreResult<Option<Task>> {
+    let held = store
+        .list_tasks(&TaskFilter {
+            owner: Some(agent),
+            ..TaskFilter::default()
+        })
+        .await?;
+    Ok(held
+        .into_iter()
+        .filter(|t| t.owner_session_id == Some(session) && HELD.contains(&t.status))
+        .max_by_key(|t| t.request_depth))
+}
 
 /// What `WakeService::route` did with a task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +86,9 @@ pub struct WakeService {
     clock: Arc<dyn Clock>,
     /// Sessions heartbeating within this are live.
     presence_stale: Duration,
+    /// Deepest allowed chain of requests (`AXL_WAKE_MAX_DEPTH`); a peer post deeper than
+    /// this wakes nobody.
+    max_depth: u32,
     events: Option<EventBus>,
     /// Serialises routing decisions in this (single-replica) server, so the check that a
     /// task has no reservation and the reservation itself cannot interleave.
@@ -67,6 +101,7 @@ impl WakeService {
             store,
             clock,
             presence_stale: cfg.presence_stale,
+            max_depth: cfg.wake_max_depth,
             events: None,
             routing: Mutex::new(()),
         }
@@ -188,7 +223,117 @@ impl WakeService {
             return Ok(None);
         }
         let _routing = self.routing.lock().await;
+        self.wake_owner_locked(task, session, trigger, from, self.clock.now())
+            .await
+    }
+
+    /// A peer's post in `task`'s thread (spec "Loop and abuse guards"): wakes the owner
+    /// (`PeerPost`, as [`Self::wake_owner`]) only when the post passes the peer guards. Its
+    /// depth is the poster session's held-task depth + 1 and must be within the limit; the
+    /// poster's home project must not be in the task's request chain; and the owner session
+    /// must be under 6 peer-triggered wakes in the last hour, the poster under 3 of the
+    /// owner's agent. A refused wake is logged `skipped` with the reason; the post itself is
+    /// delivered either way.
+    pub async fn peer_post(
+        &self,
+        task: &Task,
+        poster: AgentId,
+        poster_session: SessionId,
+    ) -> StoreResult<Option<SessionId>> {
+        let (Some(session), Some(owner)) = (task.owner_session_id, task.owner_agent_id) else {
+            return Ok(None);
+        };
+        if poster == owner {
+            return Ok(None);
+        }
+        let origin = held_origin(&*self.store, poster, poster_session).await?;
+        let lineage = guards::lineage_of(origin.as_ref());
+        let poster_project = self
+            .store
+            .get_agent(poster)
+            .await?
+            .and_then(|a| a.project_id);
+        let mut refusal = None;
+        if lineage.depth > self.max_depth {
+            refusal = Some(GuardError::DepthLimit(self.max_depth).to_string());
+        } else if let Some(p) = poster_project.filter(|p| task.request_chain.contains(p)) {
+            let key = self.project_key(Some(p)).await?;
+            refusal = Some(GuardError::Loop(key).to_string());
+        }
+        let _routing = self.routing.lock().await;
         let now = self.clock.now();
+        if refusal.is_none() {
+            refusal = self.peer_budget_spent(session, owner, poster, now).await?;
+        }
+        if let Some(detail) = refusal {
+            self.log(Attempt {
+                trigger: WakeTrigger::PeerPost,
+                task: Some(task.id),
+                session: Some(session),
+                from: Some(poster),
+                outcome: WakeOutcome::Skipped,
+                detail: Some(detail),
+                at: now,
+            })
+            .await?;
+            return Ok(None);
+        }
+        self.wake_owner_locked(task, session, WakeTrigger::PeerPost, Some(poster), now)
+            .await
+    }
+
+    /// Why a peer-triggered wake of `session` (of `owner`) by `poster` is over budget, if it
+    /// is: `sent` `PeerPost` wakes in the last hour, per session and per (poster, owner)
+    /// pair across the owner's sessions.
+    async fn peer_budget_spent(
+        &self,
+        session: SessionId,
+        owner: AgentId,
+        poster: AgentId,
+        now: OffsetDateTime,
+    ) -> StoreResult<Option<String>> {
+        let peer = |session: SessionId, from: Option<AgentId>| AttemptQuery {
+            kind: WakeKind::Wake,
+            outcome: WakeOutcome::Sent,
+            session: Some(session),
+            task: None,
+            from_agent: from,
+            triggers: Some(vec![WakeTrigger::PeerPost]),
+            since: now - PEER_WINDOW,
+        };
+        if self.store.count_wake_attempts(&peer(session, None)).await?
+            >= PEER_WAKES_PER_SESSION_HOUR
+        {
+            return Ok(Some(format!(
+                "peer wake budget: {PEER_WAKES_PER_SESSION_HOUR} per session per hour"
+            )));
+        }
+        let mut pair = 0;
+        for (agent, s) in self.store.list_sessions(None).await? {
+            if agent.id == owner {
+                pair += self
+                    .store
+                    .count_wake_attempts(&peer(s.id, Some(poster)))
+                    .await?;
+            }
+        }
+        if pair >= PEER_WAKES_PER_PAIR_HOUR {
+            return Ok(Some(format!(
+                "peer wake budget: {PEER_WAKES_PER_PAIR_HOUR} per hour from one agent to another"
+            )));
+        }
+        Ok(None)
+    }
+
+    /// `wake_owner` once the routing lock is held.
+    async fn wake_owner_locked(
+        &self,
+        task: &Task,
+        session: SessionId,
+        trigger: WakeTrigger,
+        from: Option<AgentId>,
+        now: OffsetDateTime,
+    ) -> StoreResult<Option<SessionId>> {
         if self
             .paused(trigger, Some(task.id), Some(session), from, now)
             .await?
@@ -693,7 +838,7 @@ impl WakeService {
         Ok((key, from))
     }
 
-    async fn project_key(&self, id: Option<crate::domain::ProjectId>) -> StoreResult<String> {
+    async fn project_key(&self, id: Option<ProjectId>) -> StoreResult<String> {
         Ok(match id {
             None => "no project".to_string(),
             Some(id) => self

@@ -188,6 +188,42 @@ Each session gets at most 1 wake a minute and 30 an hour, and at most 1 about th
 every 5 minutes. Every attempt is kept in the wake log. The wake prompt is a pointer (the
 task id and its framed, shortened title), never the task's body.
 
+### What wakes a session
+
+A task is **sanctioned** when the human said go: created with **Start now**, an approved or
+auto-started work request, a task whose plan the human approved, or a child covered by one
+of these (below).
+
+| What happens | Who is woken |
+|---|---|
+| The human posts in a task thread | The owner session, if idle. |
+| The human replies to an agent's message (to that agent) | One live idle session of that agent. |
+| The human approves a plan or requests changes | The owner session. Approving also sanctions the task. |
+| The human creates a task with **Start now** | Routed to a free session. Unticked, it sits `open` for a pull. |
+| An agent creates a child of a sanctioned task | Routed to a free session (never the creator's agent), with no Needs-you card. |
+| An agent posts in a task another agent owns | The owner session, within the peer-wake guards below. |
+| A child is blocked, done or cancelled (Axle's note in the parent) | The parent's owner session. |
+| A sanctioned task is released or force-released | Routed again, or queued. A lease that runs out is placed by the ticker. |
+| An agent's `send_message`, or a top-level `task_create` | Nobody. Read at the next turn, or claimed by pull. |
+
+The **covering rule:** a child an agent creates under a sanctioned parent that is past its
+plan gate (no plan required, or the plan approved) is sanctioned and routed. Its own
+children are covered the same way. A child always sits where its parent sits in a chain of
+requests (the parent's request depth and chain); it is not a new request. Children of an
+unsanctioned parent are plain `open` tasks, claimed by pull.
+
+**Peer-wake guards.** A peer's post is always delivered, but wakes the owner only when:
+
+- its depth (the deepest task the poster's session holds, plus 1) is within the request
+  depth limit (2, `AXL_WAKE_MAX_DEPTH`);
+- the poster's project is not already in the owned task's request chain;
+- the owner session has had fewer than 6 peer-triggered wakes in the last hour, and the
+  poster fewer than 3 wakes of the owner's agent in the last hour, so two agents cannot
+  ping-pong.
+
+A refused peer wake is logged `skipped` with its reason. Wakes by the human and Axle's
+child notes do not count toward these budgets. No agent is ever woken by its own posts.
+
 ## Subtasks across projects
 
 Work that spans repositories is a **parent** task with **children**:
