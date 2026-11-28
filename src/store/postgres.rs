@@ -9,12 +9,12 @@ use uuid::Uuid;
 use super::{
     AddProjectsRequest, AttemptQuery, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter,
     LeaseUpdate, MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome,
-    ProjectsAdded, Recipient, RelateRequest, Related, Reservation, Store, StoreError, StoreResult,
-    TaskFilter, TaskOrder, TransitionRequest, Transitioned, UnblockRule, Unblocked,
-    block_previous_payload, child_event, children_complete_event, claim_event, closes_child,
-    edit_payload, eligible, enrollment_token_label, like_pattern, options_from, options_to,
-    projects_added_note, projects_added_payload, related_payload, send_time_recipient, to_u32,
-    unblocked_records,
+    ProjectsAdded, Recipient, RelateRequest, Related, RequestAdmission, RequestInsert, Reservation,
+    Store, StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned,
+    UnblockRule, Unblocked, block_previous_payload, child_event, children_complete_event,
+    claim_event, closes_child, edit_payload, eligible, enrollment_token_label, like_pattern,
+    options_from, options_to, projects_added_note, projects_added_payload, related_payload,
+    send_time_recipient, to_u32, unblocked_records,
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId,
@@ -1452,7 +1452,6 @@ impl Store for PostgresStore {
         event: &TaskEvent,
         first_message: &Message,
     ) -> StoreResult<bool> {
-        let (by_agent, by_session) = task.created_by.ids();
         let mut tx = self.pool.begin().await?;
         if let Some(parent) = task.parent_id {
             // FOR SHARE holds off a concurrent claim moving the parent into `planning`.
@@ -1466,62 +1465,7 @@ impl Store for PostgresStore {
                 return Ok(false);
             }
         }
-        sqlx::query(
-            "INSERT INTO tasks
-                 (id, project_id, parent_id, title, body, status, owner_session_id,
-                  owner_agent_id, lease_expires_at, lease_epoch, lease_ttl_secs,
-                  eligible_harness, eligible_host, created_by_agent_id, created_by_session_id,
-                  token_id, created_at, updated_at, version, requires_plan, plan_state,
-                  sanctioned, request_depth, origin_task_id, request_chain,
-                  request_dedupe_key)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                     $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)",
-        )
-        .bind(task.id.as_uuid())
-        .bind(task.project_id.as_uuid())
-        .bind(task.parent_id.map(|p| p.as_uuid()))
-        .bind(&task.title)
-        .bind(&task.body)
-        .bind(task.status.as_str())
-        .bind(task.owner_session_id.map(|s| s.as_uuid()))
-        .bind(task.owner_agent_id.map(|a| a.as_uuid()))
-        .bind(task.lease_expires_at)
-        .bind(task.lease_epoch)
-        .bind(task.lease_ttl.map(|d| d.whole_seconds()))
-        .bind(&task.eligibility.harness)
-        .bind(&task.eligibility.host)
-        .bind(by_agent.map(|a| a.as_uuid()))
-        .bind(by_session.map(|s| s.as_uuid()))
-        .bind(token.map(|t| t.as_uuid()))
-        .bind(task.created_at)
-        .bind(task.updated_at)
-        .bind(task.version)
-        .bind(task.requires_plan)
-        .bind(task.plan_state.as_str())
-        .bind(task.sanctioned)
-        .bind(i64::from(task.request_depth))
-        .bind(task.origin_task_id.map(|t| t.as_uuid()))
-        .bind(sqlx::types::Json(
-            task.request_chain
-                .iter()
-                .map(|p| p.as_uuid())
-                .collect::<Vec<_>>(),
-        ))
-        .bind(&task.request_dedupe_key)
-        .execute(&mut *tx)
-        .await?;
-        for project in extra_projects {
-            sqlx::query(
-                "INSERT INTO task_projects (task_id, project_id) VALUES ($1, $2)
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(task.id.as_uuid())
-            .bind(project.as_uuid())
-            .execute(&mut *tx)
-            .await?;
-        }
-        insert_event(&mut tx, event, token).await?;
-        insert_message(&mut tx, first_message, token).await?;
+        write_task_rows(&mut tx, task, extra_projects, token, event, first_message).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -2050,36 +1994,11 @@ impl Store for PostgresStore {
         dedupe_key: &str,
         since: OffsetDateTime,
     ) -> StoreResult<Option<Task>> {
-        sqlx::query(concat!(
-            "SELECT ",
-            task_cols!(),
-            " FROM tasks
-               WHERE created_by_agent_id = $1 AND project_id = $2 AND request_dedupe_key = $3
-                 AND created_at >= $4
-               ORDER BY created_at DESC, id DESC LIMIT 1"
-        ))
-        .bind(from.as_uuid())
-        .bind(project.as_uuid())
-        .bind(dedupe_key)
-        .bind(since)
-        .fetch_optional(&self.pool)
-        .await?
-        .as_ref()
-        .map(task_from)
-        .transpose()
+        find_request_in(&self.pool, from, project, dedupe_key, since).await
     }
 
     async fn count_requests_by(&self, from: AgentId, since: OffsetDateTime) -> StoreResult<u32> {
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM tasks
-              WHERE created_by_agent_id = $1 AND request_dedupe_key IS NOT NULL
-                AND created_at >= $2",
-        )
-        .bind(from.as_uuid())
-        .bind(since)
-        .fetch_one(&self.pool)
-        .await?;
-        to_u32(n)
+        count_requests_in(&self.pool, from, since).await
     }
 
     async fn oldest_request_by(
@@ -2087,25 +2006,63 @@ impl Store for PostgresStore {
         from: AgentId,
         since: OffsetDateTime,
     ) -> StoreResult<Option<OffsetDateTime>> {
-        Ok(sqlx::query_scalar(
-            "SELECT MIN(created_at) FROM tasks
-              WHERE created_by_agent_id = $1 AND request_dedupe_key IS NOT NULL
-                AND created_at >= $2",
-        )
-        .bind(from.as_uuid())
-        .bind(since)
-        .fetch_one(&self.pool)
-        .await?)
+        oldest_request_in(&self.pool, from, since).await
     }
 
     async fn count_pending_requests(&self, project: ProjectId) -> StoreResult<u32> {
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM tasks WHERE project_id = $1 AND status = 'requested'",
-        )
-        .bind(project.as_uuid())
-        .fetch_one(&self.pool)
-        .await?;
-        to_u32(n)
+        count_pending_in(&self.pool, project).await
+    }
+
+    async fn insert_request(
+        &self,
+        task: &Task,
+        token: Option<TokenId>,
+        event: &TaskEvent,
+        first_message: &Message,
+        admit: &RequestAdmission,
+    ) -> StoreResult<RequestInsert> {
+        let from = task.created_by.ids().0.ok_or_else(|| {
+            StoreError::Corrupt(format!("request {} has no creating agent", task.id))
+        })?;
+        let key = task
+            .request_dedupe_key
+            .as_deref()
+            .ok_or_else(|| StoreError::Corrupt(format!("request {} has no dedupe key", task.id)))?;
+        let mut tx = self.pool.begin().await?;
+        // The lock order (see `TASK_LOCK`): it also serialises concurrent requests, so
+        // the dedupe lookup, the caps and the insert see one another.
+        task_lock(&mut tx).await?;
+        if let Some(existing) =
+            find_request_in(&mut *tx, from, task.project_id, key, admit.dedupe_since).await?
+        {
+            tx.commit().await?;
+            return Ok(RequestInsert::Existing(Box::new(existing)));
+        }
+        if count_requests_in(&mut *tx, from, admit.rate_since).await? >= admit.per_hour {
+            let oldest = oldest_request_in(&mut *tx, from, admit.rate_since)
+                .await?
+                .unwrap_or(task.created_at);
+            tx.commit().await?;
+            return Ok(RequestInsert::TooMany { oldest });
+        }
+        if count_pending_in(&mut *tx, task.project_id).await? >= admit.pending_cap {
+            tx.commit().await?;
+            return Ok(RequestInsert::ProjectFull);
+        }
+        if let Some(parent) = task.parent_id {
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM tasks WHERE id = $1 FOR SHARE")
+                    .bind(parent.as_uuid())
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if status.as_deref() == Some("planning") {
+                tx.commit().await?;
+                return Ok(RequestInsert::ParentPlanning);
+            }
+        }
+        write_task_rows(&mut tx, task, &[], token, event, first_message).await?;
+        tx.commit().await?;
+        Ok(RequestInsert::Inserted)
     }
 
     async fn task_projects(&self, id: TaskId) -> StoreResult<Vec<ProjectId>> {
@@ -2900,4 +2857,146 @@ impl Store for PostgresStore {
 
 fn count(n: i64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// Writes a new task's rows (the task, its extra projects, its first event and message)
+/// inside the caller's transaction.
+async fn write_task_rows(
+    tx: &mut PgConnection,
+    task: &Task,
+    extra_projects: &[ProjectId],
+    token: Option<TokenId>,
+    event: &TaskEvent,
+    first_message: &Message,
+) -> StoreResult<()> {
+    let (by_agent, by_session) = task.created_by.ids();
+    sqlx::query(
+        "INSERT INTO tasks
+             (id, project_id, parent_id, title, body, status, owner_session_id,
+              owner_agent_id, lease_expires_at, lease_epoch, lease_ttl_secs,
+              eligible_harness, eligible_host, created_by_agent_id, created_by_session_id,
+              token_id, created_at, updated_at, version, requires_plan, plan_state,
+              sanctioned, request_depth, origin_task_id, request_chain,
+              request_dedupe_key)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)",
+    )
+    .bind(task.id.as_uuid())
+    .bind(task.project_id.as_uuid())
+    .bind(task.parent_id.map(|p| p.as_uuid()))
+    .bind(&task.title)
+    .bind(&task.body)
+    .bind(task.status.as_str())
+    .bind(task.owner_session_id.map(|s| s.as_uuid()))
+    .bind(task.owner_agent_id.map(|a| a.as_uuid()))
+    .bind(task.lease_expires_at)
+    .bind(task.lease_epoch)
+    .bind(task.lease_ttl.map(|d| d.whole_seconds()))
+    .bind(&task.eligibility.harness)
+    .bind(&task.eligibility.host)
+    .bind(by_agent.map(|a| a.as_uuid()))
+    .bind(by_session.map(|s| s.as_uuid()))
+    .bind(token.map(|t| t.as_uuid()))
+    .bind(task.created_at)
+    .bind(task.updated_at)
+    .bind(task.version)
+    .bind(task.requires_plan)
+    .bind(task.plan_state.as_str())
+    .bind(task.sanctioned)
+    .bind(i64::from(task.request_depth))
+    .bind(task.origin_task_id.map(|t| t.as_uuid()))
+    .bind(sqlx::types::Json(
+        task.request_chain
+            .iter()
+            .map(|p| p.as_uuid())
+            .collect::<Vec<_>>(),
+    ))
+    .bind(&task.request_dedupe_key)
+    .execute(&mut *tx)
+    .await?;
+    for project in extra_projects {
+        sqlx::query(
+            "INSERT INTO task_projects (task_id, project_id) VALUES ($1, $2)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(task.id.as_uuid())
+        .bind(project.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+    }
+    insert_event(&mut *tx, event, token).await?;
+    insert_message(&mut *tx, first_message, token).await?;
+    Ok(())
+}
+
+async fn find_request_in<'e>(
+    ex: impl sqlx::PgExecutor<'e>,
+    from: AgentId,
+    project: ProjectId,
+    dedupe_key: &str,
+    since: OffsetDateTime,
+) -> StoreResult<Option<Task>> {
+    sqlx::query(concat!(
+        "SELECT ",
+        task_cols!(),
+        " FROM tasks
+           WHERE created_by_agent_id = $1 AND project_id = $2 AND request_dedupe_key = $3
+             AND created_at >= $4
+           ORDER BY created_at DESC, id DESC LIMIT 1"
+    ))
+    .bind(from.as_uuid())
+    .bind(project.as_uuid())
+    .bind(dedupe_key)
+    .bind(since)
+    .fetch_optional(ex)
+    .await?
+    .as_ref()
+    .map(task_from)
+    .transpose()
+}
+
+async fn count_requests_in<'e>(
+    ex: impl sqlx::PgExecutor<'e>,
+    from: AgentId,
+    since: OffsetDateTime,
+) -> StoreResult<u32> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tasks
+          WHERE created_by_agent_id = $1 AND request_dedupe_key IS NOT NULL
+            AND created_at >= $2",
+    )
+    .bind(from.as_uuid())
+    .bind(since)
+    .fetch_one(ex)
+    .await?;
+    to_u32(n)
+}
+
+async fn oldest_request_in<'e>(
+    ex: impl sqlx::PgExecutor<'e>,
+    from: AgentId,
+    since: OffsetDateTime,
+) -> StoreResult<Option<OffsetDateTime>> {
+    Ok(sqlx::query_scalar(
+        "SELECT MIN(created_at) FROM tasks
+          WHERE created_by_agent_id = $1 AND request_dedupe_key IS NOT NULL
+            AND created_at >= $2",
+    )
+    .bind(from.as_uuid())
+    .bind(since)
+    .fetch_one(ex)
+    .await?)
+}
+
+async fn count_pending_in<'e>(
+    ex: impl sqlx::PgExecutor<'e>,
+    project: ProjectId,
+) -> StoreResult<u32> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tasks WHERE project_id = $1 AND status = 'requested'",
+    )
+    .bind(project.as_uuid())
+    .fetch_one(ex)
+    .await?;
+    to_u32(n)
 }

@@ -24,8 +24,8 @@ use crate::service::wake::guards::{
 use crate::service::wake::{HELD, RouteOutcome, WakeService, held_origin};
 use crate::store::{
     AddProjectsRequest, BlockWrite, ClaimRequest, Claimant, EditRequest, LeaseUpdate, MoveRequest,
-    Moved, RelateRequest, Related, Store, StoreError, TaskFilter, TransitionRequest, Transitioned,
-    UnblockRule, claim_event,
+    Moved, RelateRequest, Related, RequestAdmission, RequestInsert, Store, StoreError, TaskFilter,
+    TransitionRequest, Transitioned, UnblockRule, claim_event,
 };
 
 /// The most links one task may have (both directions count).
@@ -115,6 +115,24 @@ struct RequestRow {
     lineage: Lineage,
     dedupe_key: String,
     importance: Importance,
+    /// The dedupe window and caps the store re-checks under its write lock.
+    admission: RequestAdmission,
+    /// The target project's key, for the pending-cap refusal.
+    project_key: String,
+}
+
+/// What [`TaskService::insert`] did: wrote the task, or found the request it duplicates.
+enum Inserted {
+    New(Task),
+    Existing(Task),
+}
+
+impl Inserted {
+    fn task(self) -> Task {
+        match self {
+            Self::New(t) | Self::Existing(t) => t,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -509,7 +527,7 @@ impl TaskService {
     /// Creates an open task; its body becomes the first message of its thread (same
     /// transaction).
     pub async fn create(&self, by: Caller<'_>, new: NewTask) -> Result<Task, TaskError> {
-        self.insert(by, new, None, None).await
+        Ok(self.insert(by, new, None, None).await?.task())
     }
 
     /// Promotes a message to a task. An empty title defaults to the message's subject (else
@@ -537,7 +555,7 @@ impl TaskService {
         if new.body.trim().is_empty() {
             new.body = message.body;
         }
-        self.insert(by, new, Some(source), None).await
+        Ok(self.insert(by, new, Some(source), None).await?.task())
     }
 
     /// Asks for work in another project as `caller` (spec "Work requests"). In order: checks
@@ -563,6 +581,8 @@ impl TaskService {
         let from = caller.agent.id;
         let now = self.clock.now();
         let key = guards::dedupe_key(from, project.id, &new.title);
+        // A fast path: `insert_request` re-runs the dedupe lookup and both caps with the
+        // insert, under the store's write lock, so overlapping requests cannot pass them.
         if let Some(task) = self
             .store
             .find_request(from, project.id, &key, now - DEDUPE_WINDOW)
@@ -599,8 +619,15 @@ impl TaskService {
             lineage,
             dedupe_key: key,
             importance: new.importance,
+            admission: RequestAdmission {
+                dedupe_since: now - DEDUPE_WINDOW,
+                rate_since: since,
+                per_hour: REQUESTS_PER_HOUR,
+                pending_cap: PENDING_PER_PROJECT,
+            },
+            project_key: project.key.clone(),
         };
-        let task = self
+        let inserted = self
             .insert(
                 Caller::Agent(caller),
                 NewTask {
@@ -615,6 +642,13 @@ impl TaskService {
                 Some(row),
             )
             .await?;
+        let task = match inserted {
+            Inserted::New(task) => task,
+            Inserted::Existing(task) => {
+                let state = self.request_state(&task).await?;
+                return Ok(RequestOutcome { task, state });
+            }
+        };
         let state = if auto_start {
             self.route(&task, WakeTrigger::AutoStart, Some(from)).await
         } else {
@@ -698,7 +732,7 @@ impl TaskService {
         new: NewTask,
         reply_to: Option<MessageId>,
         request: Option<RequestRow>,
-    ) -> Result<Task, TaskError> {
+    ) -> Result<Inserted, TaskError> {
         check_body(&new.body)?;
         check_subject("title", &new.title)?;
         check_eligibility(&new.eligibility)?;
@@ -784,6 +818,9 @@ impl TaskService {
             task.request_chain = p.request_chain.clone();
         }
         task.sanctioned = trigger.is_some();
+        let admission = request
+            .as_ref()
+            .map(|r| (r.admission, r.project_key.clone()));
         if let Some(r) = request {
             task.status = r.status;
             task.sanctioned = r.sanctioned;
@@ -807,11 +844,32 @@ impl TaskService {
             kind: MessageKind::Message,
             options: Vec::new(),
         };
-        if !self
-            .store
-            .insert_task(&task, &new.extra_projects, by.token(), &event, &first)
-            .await?
-        {
+        let written = match admission {
+            None => {
+                self.store
+                    .insert_task(&task, &new.extra_projects, by.token(), &event, &first)
+                    .await?
+            }
+            Some((admit, project_key)) => match self
+                .store
+                .insert_request(&task, by.token(), &event, &first, &admit)
+                .await?
+            {
+                RequestInsert::Inserted => true,
+                RequestInsert::ParentPlanning => false,
+                RequestInsert::Existing(existing) => return Ok(Inserted::Existing(*existing)),
+                RequestInsert::TooMany { oldest } => {
+                    return Err(GuardError::TooMany {
+                        minutes: minutes_until(oldest + REQUEST_RATE_WINDOW, now),
+                    }
+                    .into());
+                }
+                RequestInsert::ProjectFull => {
+                    return Err(GuardError::ProjectFull(project_key).into());
+                }
+            },
+        };
+        if !written {
             let parent = task.parent_id.expect("only a child insert is refused");
             let state = self
                 .store
@@ -824,7 +882,7 @@ impl TaskService {
         if let Some(trigger) = trigger {
             self.route(&task, trigger, by.actor().ids().0).await;
         }
-        Ok(task)
+        Ok(Inserted::New(task))
     }
 
     pub async fn claim(&self, caller: &Resolved, id: TaskId) -> Result<ClaimOutcome, TaskError> {

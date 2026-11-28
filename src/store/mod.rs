@@ -301,6 +301,22 @@ pub trait Store: Send + Sync {
     ) -> StoreResult<Option<OffsetDateTime>>;
     /// Tasks in `project` still waiting for approval (status `requested`).
     async fn count_pending_requests(&self, project: ProjectId) -> StoreResult<u32>;
+    /// Admits a work request in one guarded transaction (SQLite's write lock, Postgres under
+    /// `TASK_LOCK`), so concurrent requests see one another: the newest task with `task`'s
+    /// dedupe key that its creating agent made in `task.project_id` at or after
+    /// `admit.dedupe_since` is returned as it stands; else the creator's requests since
+    /// `admit.rate_since` against `admit.per_hour`, then the project's `requested` tasks against
+    /// `admit.pending_cap`; else (and only while a parent is not `planning`) the task, its
+    /// event and first message are written. `task` must carry a dedupe key and an agent
+    /// creator.
+    async fn insert_request(
+        &self,
+        task: &Task,
+        token: Option<TokenId>,
+        event: &TaskEvent,
+        first_message: &Message,
+        admit: &RequestAdmission,
+    ) -> StoreResult<RequestInsert>;
     // ---- wake-up: turn state, reservations and the queue ----
 
     /// Records what `session`'s harness reports: `state` and `channel` are each kept when
@@ -598,6 +614,34 @@ pub struct Claimant {
     pub project: Option<ProjectId>,
     pub harness: String,
     pub host: String,
+}
+
+/// The admission limits [`Store::insert_request`] applies.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestAdmission {
+    /// A request with the same dedupe key created at or after this is returned instead.
+    pub dedupe_since: OffsetDateTime,
+    /// The start of the creator's rate window.
+    pub rate_since: OffsetDateTime,
+    /// Requests the creator may make per rate window.
+    pub per_hour: u32,
+    /// `requested` tasks a project may hold.
+    pub pending_cap: u32,
+}
+
+/// What [`Store::insert_request`] did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RequestInsert {
+    /// The request was written.
+    Inserted,
+    /// A request with the same dedupe key exists; nothing was written.
+    Existing(Box<Task>),
+    /// The creator is at its hourly rate; `oldest` is its oldest request in the window.
+    TooMany { oldest: OffsetDateTime },
+    /// The project holds `pending_cap` requests waiting for approval.
+    ProjectFull,
+    /// The parent is `planning`; nothing was written.
+    ParentPlanning,
 }
 
 #[derive(Debug, Clone)]
