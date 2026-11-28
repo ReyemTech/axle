@@ -167,7 +167,10 @@ fn save_port(dir: &AxlDir, port: u16) -> Result<(), ClientError> {
     let mut cfg = load_config(dir)?;
     if port != DEFAULT_PORT {
         cfg.port = Some(port);
-        cfg.server_url = Some(format!("http://127.0.0.1:{port}"));
+        // A remote server the user logged in to stays; only unset or loopback URLs move.
+        if cfg.server_url.as_deref().is_none_or(is_local_url) {
+            cfg.server_url = Some(format!("http://127.0.0.1:{port}"));
+        }
     } else if let Some(old) = cfg.port.take() {
         if cfg.server_url.as_deref() == Some(&format!("http://127.0.0.1:{old}")) {
             cfg.server_url = None;
@@ -176,6 +179,16 @@ fn save_port(dir: &AxlDir, port: u16) -> Result<(), ClientError> {
         return Ok(());
     }
     save_config(dir, &cfg)
+}
+
+/// True for `http://127.0.0.1[:port]` and `http://localhost[:port]` (any path).
+fn is_local_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
+    host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost")
 }
 
 /// Deletes `axl.db` and its `-wal` / `-shm` companions, and nothing else (a user's

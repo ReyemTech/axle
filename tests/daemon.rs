@@ -300,6 +300,44 @@ fn install_saves_non_default_port_and_keeps_other_keys() {
 }
 
 #[test]
+fn install_port_keeps_a_remote_server_url_and_moves_a_local_one() {
+    let home = TempHome::new();
+    let dir = AxlDir::new(home.path());
+    let ctl = Systemd::new(home.path(), Box::new(Recorder::default()));
+
+    // A remote server stays; only the port is saved.
+    save_config(
+        &dir,
+        &ClientConfig {
+            server_url: Some("https://axle.example.com".into()),
+            port: None,
+        },
+    )
+    .unwrap();
+    let s = spec(home.path());
+    install_unit(&ctl, &dir, &s).unwrap();
+    let cfg = load_config(&dir).unwrap();
+    assert_eq!(cfg.port, Some(s.port));
+    assert_eq!(cfg.server_url.as_deref(), Some("https://axle.example.com"));
+
+    // A previous local URL (loopback or localhost) follows the new port.
+    for old in ["http://127.0.0.1:9", "http://localhost:9"] {
+        save_config(
+            &dir,
+            &ClientConfig {
+                server_url: Some(old.into()),
+                port: Some(9),
+            },
+        )
+        .unwrap();
+        let s = spec(home.path());
+        install_unit(&ctl, &dir, &s).unwrap();
+        let cfg = load_config(&dir).unwrap();
+        assert_eq!(cfg.server_url, Some(format!("http://127.0.0.1:{}", s.port)));
+    }
+}
+
+#[test]
 fn uninstall_keeps_db_unless_purge() {
     let home = TempHome::new();
     let dir = AxlDir::new(home.path());

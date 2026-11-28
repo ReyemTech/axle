@@ -425,6 +425,73 @@ async fn explicit_code_switches_servers_and_says_so() {
 }
 
 #[tokio::test]
+async fn revoked_saved_token_does_not_block_a_fresh_code() {
+    let srv = server().await;
+    let home = TempHome::new();
+    connect(&home, &srv).await;
+    let dir = AxlDir::new(home.path());
+    let old = std::fs::read_to_string(dir.token_path()).unwrap();
+    for t in srv.state.auth.list().await.unwrap() {
+        srv.state.auth.revoke(t.id).await.unwrap();
+    }
+    let issued = srv.state.enroll.issue_code("again").await.unwrap();
+    let (report, out) = run(
+        &home,
+        InstallArgs {
+            server: Some(srv.base.clone()),
+            code: Some(issued.code),
+            ..args()
+        },
+        &NoPrompt,
+        false,
+        &FakeService::default(),
+        T1,
+    )
+    .await;
+    report.unwrap();
+    let new = std::fs::read_to_string(dir.token_path()).unwrap();
+    assert_ne!(new, old, "token not replaced: {out}");
+    assert!(
+        axle::client::Api::new(&srv.base)
+            .whoami(new.trim())
+            .await
+            .is_ok(),
+        "new token rejected: {out}"
+    );
+}
+
+#[tokio::test]
+async fn valid_saved_token_leaves_the_code_unused() {
+    let srv = server().await;
+    let home = TempHome::new();
+    connect(&home, &srv).await;
+    let dir = AxlDir::new(home.path());
+    let old = std::fs::read_to_string(dir.token_path()).unwrap();
+    let issued = srv.state.enroll.issue_code("spare").await.unwrap();
+    let (report, out) = run(
+        &home,
+        InstallArgs {
+            server: Some(srv.base.clone()),
+            code: Some(issued.code.clone()),
+            ..args()
+        },
+        &NoPrompt,
+        false,
+        &FakeService::default(),
+        T1,
+    )
+    .await;
+    report.unwrap();
+    assert!(
+        out.contains("Already connected") && out.contains("the code was not used"),
+        "{out}"
+    );
+    assert_eq!(std::fs::read_to_string(dir.token_path()).unwrap(), old);
+    let redeemed = srv.state.enroll.exchange(&issued.code, "x", None).await;
+    assert!(redeemed.unwrap().is_some(), "the code was consumed");
+}
+
+#[tokio::test]
 async fn interactive_switch_without_code_asks_and_declines_by_default() {
     let srv = server().await;
     let other = server().await;
@@ -1894,6 +1961,51 @@ async fn status_whoami_401_means_login_but_500_does_not() {
         "{text}"
     );
     assert!(token.fix.is_some() && !report.ok);
+}
+
+/// `/readyz` answers 200; `/v1/whoami` gets its connection dropped without a reply.
+#[tokio::test]
+async fn status_whoami_transport_failure_is_unsuccessful_with_a_retry() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            if String::from_utf8_lossy(&buf[..n]).starts_with("GET /readyz") {
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\nconnection: close\r\n\r\nx",
+                    )
+                    .await;
+            }
+            // Anything else: drop the socket.
+        }
+    });
+    let home = TempHome::new();
+    let dir = AxlDir::new(home.path());
+    save_config(
+        &dir,
+        &ClientConfig {
+            server_url: Some(base),
+            port: None,
+        },
+    )
+    .unwrap();
+    write_token(&dir, "axl_0123456789abcdef").unwrap();
+    let (report, text) = run_status(&home, &FakeService::default(), home.exe("bin/axl")).await;
+    let token = value_of(&report, "token");
+    assert!(token.value.contains("could not check"), "{text}");
+    assert!(
+        token
+            .fix
+            .as_deref()
+            .is_some_and(|f| f.contains("axl status")),
+        "{text}"
+    );
+    assert!(!report.ok, "{text}");
 }
 
 #[tokio::test]

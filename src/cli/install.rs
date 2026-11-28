@@ -225,13 +225,37 @@ async fn ensure_server(
     if let Some(server) = &args.server {
         let url = normalise_url(server)?;
         if has_token && current == url {
-            if args.code.is_some() {
-                let _ = writeln!(
-                    env.out,
-                    "Already connected to {url}; the code was not used."
-                );
+            // A token file is not proof of access: ask the server before skipping.
+            let saved = read_token(None, dir).map_err(usage)?;
+            match Api::new(&url).whoami(&saved).await {
+                Ok(_) => {
+                    if args.code.is_some() {
+                        let _ = writeln!(
+                            env.out,
+                            "Already connected to {url}; the code was not used."
+                        );
+                    }
+                    return Ok(check_server(&url).await);
+                }
+                // Revoked, or the server's database was replaced: enroll again.
+                Err(ClientError::Server(m)) if m == "unauthorized" || m == "HTTP 401" => {
+                    let _ = writeln!(
+                        env.out,
+                        "The saved token for {url} was rejected; connecting again."
+                    );
+                }
+                // Cannot tell. An explicit code is intent to enroll; otherwise say so.
+                Err(e) if args.code.is_none() => {
+                    return Err(usage(format!(
+                        "cannot check this machine's token with {url}: {e}; retry, or run \
+                         `axl install --server {url} --code CODE` with a new code"
+                    )));
+                }
+                Err(_) => {}
             }
-            return Ok(check_server(&url).await);
+            return log_in(env, url, args.code.clone(), args.dry_run, false)
+                .await
+                .map(|()| None);
         }
         let mut force = args.force;
         if has_token && !args.dry_run {

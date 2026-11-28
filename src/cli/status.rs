@@ -228,7 +228,15 @@ async fn server_lines(
                 Some(fix),
             ));
         }
-        Err(e) => lines.push(line("token", format!("could not check ({e})"), None)),
+        // The check never completed (timeout, dropped connection): not a success.
+        Err(e) => {
+            let fix = if local {
+                "retry: axl status (or axl service restart)".to_string()
+            } else {
+                "retry: axl status, and check the network and the server".to_string()
+            };
+            lines.push(line("token", format!("could not check ({e})"), Some(fix)));
+        }
     }
     lines.extend(service);
 }
