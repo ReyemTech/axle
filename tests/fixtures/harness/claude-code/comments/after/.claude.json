@@ -1,0 +1,8 @@
+// user config, hand edited
+{
+	"numStartups": 3, // do not touch
+	"mcpServers": {
+		// docs server
+		"docs": { "type": "http", "url": "https://docs.example.com/mcp" }
+	}
+}

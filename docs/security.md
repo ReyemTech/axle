@@ -25,7 +25,8 @@ Axle never executes anything it receives. It stores and relays text.
 
 ## Tokens
 
-- Each machine, or each machine and harness, gets its own token from
+- Each machine, or each machine and harness, gets its own token, normally
+  through [enrollment](#enrollment) (`axl install` or **Connect a machine**) or by hand with
   `axl token create --label <name>`. Tokens are 256 random bits with an `axl_` prefix, so a
   leaked one is easy to recognise in logs and secret scanners.
 - The database stores only a SHA-256 hash. The plaintext is printed once.
@@ -65,6 +66,34 @@ Everything another participant wrote reaches the model wrapped as:
 Framing lowers the risk of prompt injection between agents; it does not remove it. Treat
 agents that share an Axle server as able to influence each other, and give each the
 permissions its own work needs.
+
+## Enrollment
+
+`axl install` and `axl login` get a token without anyone running `axl token create` on the
+server. Two paths, both unauthenticated by design and so tightly limited:
+
+- **One-time code.** **Tokens → Connect a machine** issues a code (`XXXXX-XXXXX`) that works
+  once and expires after 15 minutes. It is shown only in the response that creates it, never
+  in a URL, and the database keeps only a hash. The machine redeems it at `POST /v1/enroll`.
+- **Device flow.** `axl login` asks for a login (`POST /v1/login/start`) and polls
+  `POST /v1/login/poll` every 7 seconds. The human approves or denies it on `/ui/connect`
+  while signed in. It expires after 10 minutes. Denying, or revoking a pending request,
+  ends it.
+
+Both paths mint an ordinary per-machine token, shown once, which you can revoke on the
+Tokens page. The server never serves a token to anyone who has not redeemed a code or had a
+login approved, and these responses are sent with `Cache-Control: no-store`.
+
+`/v1/enroll` and `/v1/login/*` share a limit of **10 requests per minute per client IP**;
+over it the server answers 429 with `Retry-After`. Behind a reverse proxy every request
+arrives from the proxy's address, so set `AXL_TRUSTED_PROXY_HEADER` to the header your proxy
+fills in with the client IP (for example `X-Forwarded-For`). Axle reads the right-most entry,
+the one the nearest proxy appended, and it must parse as an IP address; otherwise the socket
+address is used. Only set it when a proxy you control overwrites or appends that header, or a
+client could choose its own bucket.
+
+`axl install` over plain `http://` to a non-loopback server warns that the token crosses the
+network unencrypted. Put TLS in front of any server that leaves your machine.
 
 ## Web UI
 

@@ -1,6 +1,8 @@
 //! The axum server: shared state, bearer-token auth, health probes, the `/v1` API, the MCP
 //! endpoint and the web UI.
 
+pub mod enroll;
+pub mod install_script;
 pub mod rate_limit;
 pub mod v1;
 
@@ -23,6 +25,7 @@ use crate::domain::TokenId;
 use crate::events::EventBus;
 use crate::http::rate_limit::RateLimiter;
 use crate::service::auth::AuthService;
+use crate::service::enroll::EnrollService;
 use crate::service::messages::MessageService;
 use crate::service::tasks::TaskService;
 use crate::store::Store;
@@ -38,9 +41,12 @@ pub struct AppState {
     pub auth: Arc<AuthService>,
     pub messages: Arc<MessageService>,
     pub tasks: Arc<TaskService>,
+    pub enroll: Arc<EnrollService>,
     /// Fired when the server starts shutting down; long-lived responses (SSE) end on it.
     pub shutdown: Shutdown,
     pub rate_limit: Arc<RateLimiter>,
+    /// Per-client-IP limit on the unauthenticated `/v1/enroll` and `/v1/login/*` endpoints.
+    pub enroll_limit: Arc<RateLimiter<std::net::IpAddr>>,
     /// Web UI sessions and login limits.
     pub ui: Arc<UiState>,
 }
@@ -119,12 +125,18 @@ impl AppState {
                 TaskService::from_config(store.clone(), clock.clone(), &config)
                     .with_events(bus.clone()),
             ),
+            enroll: Arc::new(EnrollService::new(
+                store.clone(),
+                clock.clone(),
+                bus.clone(),
+            )),
             bus,
             shutdown: Shutdown::new(),
             rate_limit: Arc::new(RateLimiter::new(
                 config.rate_limit_per_sec,
                 config.rate_limit_burst,
             )),
+            enroll_limit: Arc::new(RateLimiter::per_minute(enroll::ENROLL_PER_MINUTE)),
             ui: Arc::new(UiState::new()),
             config: Arc::new(config),
             store,
@@ -147,9 +159,12 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/install.sh", get(install_script::install_sh))
         .nest(
             "/v1",
-            v1::routes().route_layer(middleware::from_fn_with_state(state.clone(), require_token)),
+            v1::routes()
+                .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
+                .merge(enroll::routes()),
         )
         .merge(crate::ui::routes(state.clone()))
         .merge(mcp)
@@ -194,7 +209,7 @@ fn bearer(value: &str) -> Option<&str> {
 }
 
 /// 429 `{"error":"rate_limited"}` with `Retry-After` in whole seconds.
-fn rate_limited(retry_after: u64) -> Response {
+pub(crate) fn rate_limited(retry_after: u64) -> Response {
     let mut res = ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited").into_response();
     res.headers_mut()
         .insert(header::RETRY_AFTER, header::HeaderValue::from(retry_after));

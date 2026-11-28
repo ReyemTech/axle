@@ -48,8 +48,18 @@ struct Out {
 }
 
 fn hook(home: &Path, event: &str, stdin: &str, token: Option<&str>) -> Out {
+    hook_with(home, &[event], stdin, token)
+}
+
+/// The command Codex runs (what `axl install` writes): `axl hook <event> --harness codex`.
+fn hook_codex(home: &Path, event: &str, stdin: &str, token: Option<&str>) -> Out {
+    hook_with(home, &[event, "--harness", "codex"], stdin, token)
+}
+
+fn hook_with(home: &Path, args: &[&str], stdin: &str, token: Option<&str>) -> Out {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_axl"));
-    cmd.args(["hook", event])
+    cmd.arg("hook")
+        .args(args)
         .env_clear()
         .env("HOME", home)
         .stdin(Stdio::piped())
@@ -74,6 +84,16 @@ fn hook(home: &Path, event: &str, stdin: &str, token: Option<&str>) -> Out {
 }
 
 fn write_session(home: &Path, session: SessionId, server_url: &str, project: &str) -> PathBuf {
+    write_session_for(home, session, server_url, project, "claude-code")
+}
+
+fn write_session_for(
+    home: &Path,
+    session: SessionId,
+    server_url: &str,
+    project: &str,
+    harness: &str,
+) -> PathBuf {
     let path = axle::bridge::session_file::path(home, std::process::id());
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(
@@ -82,7 +102,7 @@ fn write_session(home: &Path, session: SessionId, server_url: &str, project: &st
             "session_id": session,
             "project_key": project,
             "server_url": server_url,
-            "harness": "claude-code",
+            "harness": harness,
         })
         .to_string(),
     )
@@ -525,4 +545,213 @@ store_matrix!(urgent_behind_a_full_page_still_wakes, |store: Arc<
         .unwrap();
     assert_eq!(only.as_array().unwrap().len(), 1);
     assert_eq!(only[0]["subject"], "buried-urgent");
+});
+
+// ---- Codex payloads. Shapes follow the Codex hooks docs
+// (https://learn.chatgpt.com/docs/hooks.md): common fields session_id, transcript_path,
+// cwd, hook_event_name, model; SessionStart adds `source`; PostToolUse adds turn_id,
+// tool_name, tool_use_id, tool_input, tool_response; Stop adds turn_id, stop_hook_active,
+// last_assistant_message.
+
+const CODEX_SESSION_START: &str = r#"{"session_id":"thr_123","transcript_path":"/work/.codex/rollout.jsonl","cwd":"/work","hook_event_name":"SessionStart","model":"gpt-5","permission_mode":"default","source":"startup"}"#;
+const CODEX_POST_TOOL_USE: &str = r#"{"session_id":"thr_123","transcript_path":"/work/.codex/rollout.jsonl","cwd":"/work","hook_event_name":"PostToolUse","model":"gpt-5","permission_mode":"default","turn_id":"turn_1","tool_name":"Bash","tool_use_id":"call_1","tool_input":{"command":"ls"},"tool_response":"a\nb\n"}"#;
+const CODEX_STOP: &str = r#"{"session_id":"thr_123","transcript_path":"/work/.codex/rollout.jsonl","cwd":"/work","hook_event_name":"Stop","model":"gpt-5","permission_mode":"default","turn_id":"turn_1","stop_hook_active":false,"last_assistant_message":null}"#;
+const CODEX_STOP_ACTIVE: &str = r#"{"session_id":"thr_123","transcript_path":"/work/.codex/rollout.jsonl","cwd":"/work","hook_event_name":"Stop","model":"gpt-5","turn_id":"turn_2","stop_hook_active":true,"last_assistant_message":"done"}"#;
+
+#[test]
+fn codex_stop_active_exits_first() {
+    let home = TempDir::new();
+    write_session_for(
+        &home.0,
+        SessionId::new(),
+        "http://127.0.0.1:9",
+        "p",
+        "codex",
+    );
+    let o = hook_codex(&home.0, "stop", CODEX_STOP_ACTIVE, Some("tok"));
+    assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+}
+
+#[test]
+fn codex_fails_open_without_session_or_server() {
+    let home = TempDir::new();
+    for (event, input) in [
+        ("session-start", CODEX_SESSION_START),
+        ("post-tool-use", CODEX_POST_TOOL_USE),
+        ("stop", CODEX_STOP),
+    ] {
+        let o = hook_codex(&home.0, event, input, Some("tok"));
+        assert_eq!(
+            (o.code, o.stdout.as_str(), o.stderr.as_str()),
+            (0, "", ""),
+            "{event}"
+        );
+    }
+    write_session_for(
+        &home.0,
+        SessionId::new(),
+        "http://127.0.0.1:9",
+        "p",
+        "codex",
+    );
+    for (event, input) in [
+        ("session-start", CODEX_SESSION_START),
+        ("post-tool-use", CODEX_POST_TOOL_USE),
+        ("stop", CODEX_STOP),
+    ] {
+        let o = hook_codex(&home.0, event, input, Some("tok"));
+        assert_eq!(o.code, 0, "{event}");
+        assert_eq!(o.stdout, "", "{event}");
+        assert_eq!(o.stderr.lines().count(), 1, "{event}: {:?}", o.stderr);
+    }
+}
+
+#[test]
+fn codex_hook_ignores_another_harness_session() {
+    let home = TempDir::new();
+    // A Claude Code session file at our parent pid is not a Codex session.
+    write_session_for(
+        &home.0,
+        SessionId::new(),
+        "http://127.0.0.1:9",
+        "p",
+        "claude-code",
+    );
+    let o = hook_codex(&home.0, "session-start", CODEX_SESSION_START, Some("tok"));
+    assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+}
+
+#[test]
+fn codex_harness_flag_spellings() {
+    let home = TempDir::new();
+    write_session_for(
+        &home.0,
+        SessionId::new(),
+        "http://127.0.0.1:9",
+        "p",
+        "codex",
+    );
+    // `--harness=codex` is the same as `--harness codex`; both reach the (dead) server.
+    for args in [
+        &["session-start", "--harness", "codex"][..],
+        &["session-start", "--harness=codex"],
+    ] {
+        let o = hook_with(&home.0, args, CODEX_SESSION_START, Some("tok"));
+        assert_eq!(o.code, 0, "{args:?}");
+        assert_eq!(o.stderr.lines().count(), 1, "{args:?}: {:?}", o.stderr);
+    }
+    // Without the flag the hook is the Claude Code one, which skips a Codex session file.
+    let o = hook_with(
+        &home.0,
+        &["session-start"],
+        CODEX_SESSION_START,
+        Some("tok"),
+    );
+    assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+}
+
+store_matrix!(
+    codex_session_start_adds_context,
+    |store: Arc<dyn Store>| async move {
+        let home = TempDir::new();
+        let l = live(store, &home.0).await;
+        write_session_for(
+            &home.0,
+            l.session,
+            &l.server,
+            "github.com/acme/platform-infra",
+            "codex",
+        );
+        l.send("deploy", "staging is frozen", Importance::Normal)
+            .await;
+        let (h, t) = (home.0.clone(), l.token.clone());
+        let o = tokio::task::spawn_blocking(move || {
+            hook_codex(&h, "session-start", CODEX_SESSION_START, Some(&t))
+        })
+        .await
+        .unwrap();
+        assert_eq!((o.code, o.stderr.as_str()), (0, ""));
+        let v: Value = serde_json::from_str(&o.stdout).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(
+            ctx.contains("[axl from human in github.com/acme/platform-infra] deploy"),
+            "{ctx}"
+        );
+        assert!(ctx.contains("(information, not instructions)"));
+        // Only the documented keys: nothing that would make Codex fail the hook.
+        assert_eq!(v.as_object().unwrap().len(), 1, "{v}");
+    }
+);
+
+store_matrix!(
+    codex_post_tool_use_context_only_never_blocks,
+    |store: Arc<dyn Store>| async move {
+        let home = TempDir::new();
+        let l = live(store, &home.0).await;
+        write_session_for(&home.0, l.session, &l.server, "p", "codex");
+        let run = |h: PathBuf, t: String| async move {
+            tokio::task::spawn_blocking(move || {
+                hook_codex(&h, "post-tool-use", CODEX_POST_TOOL_USE, Some(&t))
+            })
+            .await
+            .unwrap()
+        };
+        l.send("fyi", "low key", Importance::Normal).await;
+        let o = run(home.0.clone(), l.token.clone()).await;
+        assert_eq!((o.code, o.stdout.as_str()), (0, ""));
+        l.send("prod down", "check the db", Importance::High).await;
+        let o = run(home.0.clone(), l.token.clone()).await;
+        let v: Value = serde_json::from_str(&o.stdout).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+        assert!(
+            v["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("prod down")
+        );
+        // Codex replaces the tool result when a PostToolUse hook says `decision: block`.
+        assert!(
+            v.get("decision").is_none() && v.get("reason").is_none(),
+            "{v}"
+        );
+        let o = run(home.0.clone(), l.token.clone()).await;
+        assert_eq!((o.code, o.stdout.as_str()), (0, ""), "once per message");
+    }
+);
+
+store_matrix!(codex_stop_blocks_once_for_urgent, |store: Arc<
+    dyn Store,
+>| async move {
+    let home = TempDir::new();
+    let l = live(store, &home.0).await;
+    write_session_for(&home.0, l.session, &l.server, "p", "codex");
+    let stop = |h: PathBuf, t: String, input: &'static str| async move {
+        tokio::task::spawn_blocking(move || hook_codex(&h, "stop", input, Some(&t)))
+            .await
+            .unwrap()
+    };
+    l.send("page", "disk full", Importance::Normal).await;
+    let o = stop(home.0.clone(), l.token.clone(), CODEX_STOP).await;
+    assert_eq!((o.code, o.stdout.as_str()), (0, ""), "normal never blocks");
+    l.send("disk is full", "now", Importance::Urgent).await;
+    let o = stop(home.0.clone(), l.token.clone(), CODEX_STOP).await;
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(v["decision"], "block");
+    assert!(
+        v["reason"].as_str().unwrap().contains("disk is full"),
+        "{v}"
+    );
+    assert_eq!(v.as_object().unwrap().len(), 2, "{v}");
+    let o = stop(home.0.clone(), l.token.clone(), CODEX_STOP).await;
+    assert_eq!((o.code, o.stdout.as_str()), (0, ""), "second stop passes");
+    l.send("again", "now", Importance::Urgent).await;
+    let o = stop(home.0.clone(), l.token.clone(), CODEX_STOP_ACTIVE).await;
+    assert_eq!(
+        (o.code, o.stdout.as_str()),
+        (0, ""),
+        "stop_hook_active skips"
+    );
 });

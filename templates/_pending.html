@@ -1,0 +1,24 @@
+{% if pending.is_empty() %}
+<p class="empty">Nothing waiting. A code or device login you start shows up here until it is used, approved or expires.</p>
+{% else %}
+<ul class="rows">
+{% for p in pending %}
+  <li class="row" id="enrollment-{{ p.id }}" data-nav tabindex="-1">
+    <div class="row-main">
+      <span class="row-title">{{ p.title }}</span>
+      <span class="token-state"><span class="aspect" data-aspect="open" aria-hidden="true"></span>waiting</span>
+      <span class="muted">{{ p.kind }}</span>
+      {% if let Some(ip) = p.ip %}<span class="muted">from {{ ip }}</span>{% endif %}
+      <span class="muted">created <time datetime="{{ p.created.iso }}" title="{{ p.created.text }}">{{ p.created.ago }}</time></span>
+      <span class="muted" data-countdown="{{ p.left }}">{{ p.left_text }}</span>
+    </div>
+    {% if let Some(token) = csrf %}
+    <form method="post" action="/ui/enrollments/{{ p.id }}/revoke" data-confirm="Revoke {{ p.title }}? Its code stops working at once.">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <button type="submit" class="danger">Revoke</button>
+    </form>
+    {% endif %}
+  </li>
+{% endfor %}
+</ul>
+{% endif %}

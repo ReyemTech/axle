@@ -14,6 +14,12 @@ treat `/v1` as internal: it may change between releases.
 | `POST /v1/heartbeat` | bearer token | Presence and lease renewal |
 | `GET /v1/events` | bearer token | Server-sent events for one session |
 | `GET /v1/inbox/summary` | bearer token | Unread mail, for hooks |
+| `GET /install.sh` | none | The shell installer, with this server's address baked in |
+| `POST /v1/enroll` | none, per-IP limit | Redeem a one-time code for a token |
+| `POST /v1/login/start` | none, per-IP limit | Begin a device login |
+| `POST /v1/login/poll` | none, per-IP limit | Collect the token once the login is approved |
+| `GET /v1/whoami` | bearer token | The token's label and the server version |
+| `POST /v1/token/revoke` | bearer token | Revoke the calling token |
 | `/ui/…` | UI sign-in | The [web UI](web-ui.md) (HTML, not an API) |
 
 ## Authentication
@@ -61,6 +67,61 @@ Without `X-Axl-Session`, the session is derived from the transport's `Mcp-Sessio
 for a stateless client, from the token and the other headers, so the client keeps one
 session per agent and token. Direct clients get presence from their tool calls but no
 hooks.
+
+## Enrollment and install
+
+These endpoints need no token. `/v1/enroll` and `/v1/login/*` share a limit of 10 requests
+per minute per client IP (see [security](security.md#enrollment)), and every response is
+`Cache-Control: no-store`. When the server is bound beyond loopback and `AXL_PUBLIC_URL` is
+unset they answer 503 naming it, before consuming anything.
+
+### `POST /v1/enroll`
+
+```sh
+curl -s https://axle.example.com/v1/enroll \
+  -H 'content-type: application/json' \
+  -d '{"code":"ABCDE-FGHJK","host":"laptop"}'
+```
+
+```json
+{ "token": "axl_…", "server_url": "https://axle.example.com" }
+```
+
+A wrong, used or expired code is 400 `invalid or expired code`. Codes live 15 minutes and
+work once.
+
+### `POST /v1/login/start` and `POST /v1/login/poll`
+
+`start` takes `{"host":"laptop"}` and returns `device_code`, `user_code`, `verify_url`
+(`<server>/ui/connect`), `interval` (7 seconds) and `expires_in` (600 seconds). Poll with
+`{"device_code":"…"}` no faster than `interval`:
+
+| Answer | Meaning |
+|---|---|
+| 200 `{"token","server_url"}` | Approved; the token is returned once. |
+| 400 `authorization_pending` | Not approved yet; keep polling. |
+| 400 `slow_down` | Polled too fast; wait longer. |
+| 400 `denied` | The human denied it, or it was revoked. |
+| 400 `expired` | The 10 minutes ran out. |
+
+### `GET /v1/whoami` and `POST /v1/token/revoke`
+
+`whoami` returns `{"label","version"}` for the calling token, which is how `axl status`
+checks a connection. `token/revoke` revokes the calling token only; `axl logout --revoke`
+uses it.
+
+### `GET /install.sh`
+
+A POSIX shell script that installs `axl` if it is missing or older than the server, then runs
+`axl install --server <this server>` and `axl status`. Pass a one-time code as the first
+argument:
+
+```sh
+curl -fsSL https://axle.example.com/install.sh | sh -s -- ABCDE-FGHJK
+```
+
+It refuses to run as root unless `AXL_ALLOW_ROOT=1`, and asks before sending a token over
+plain `http://` to a non-loopback host.
 
 ## `POST /v1/register`
 

@@ -104,6 +104,46 @@ expect "$(env_val AXL_COOKIE_SECURE --set ingress.enabled=true --set 'ingress.ho
   --set 'ingress.tls[0].secretName=t' --set 'ingress.tls[0].hosts[0]=a')" true "cookie secure with TLS"
 expect "$(env_val AXL_COOKIE_SECURE --set ui.cookieSecure=true)" true "cookie secure forced"
 
+# trustedProxyHeader: AXL_TRUSTED_PROXY_HEADER defaults to X-Forwarded-For with an ingress
+expect "$(has_env AXL_TRUSTED_PROXY_HEADER)" 0 "no trusted proxy header without an ingress"
+expect "$(env_val AXL_TRUSTED_PROXY_HEADER --set ingress.enabled=true)" X-Forwarded-For \
+  "trusted proxy header defaults with an ingress"
+expect "$(env_val AXL_TRUSTED_PROXY_HEADER --set ingress.enabled=true --set trustedProxyHeader=X-Real-IP)" \
+  X-Real-IP "explicit trustedProxyHeader wins"
+expect "$(env_val AXL_TRUSTED_PROXY_HEADER --set trustedProxyHeader=X-Real-IP)" X-Real-IP \
+  "explicit trustedProxyHeader without an ingress"
+expect "$(has_env AXL_TRUSTED_PROXY_HEADER --set ingress.enabled=true --set trustedProxyHeader=)" 0 \
+  "empty trustedProxyHeader disables the default"
+
+# publicUrl: AXL_PUBLIC_URL is explicit, else derived from the first ingress host, else absent
+expect "$(has_env AXL_PUBLIC_URL)" 0 "no AXL_PUBLIC_URL by default"
+expect "$(env_val AXL_PUBLIC_URL --set ingress.enabled=true --set 'ingress.hosts[0].host=axle.example.com' \
+  --set 'ingress.tls[0].hosts[0]=axle.example.com')" https://axle.example.com "AXL_PUBLIC_URL from TLS ingress"
+expect "$(env_val AXL_PUBLIC_URL --set ingress.enabled=true --set 'ingress.hosts[0].host=axle.example.com')" \
+  http://axle.example.com "AXL_PUBLIC_URL from plain ingress"
+expect "$(env_val AXL_PUBLIC_URL --set publicUrl=https://x.test)" https://x.test "explicit publicUrl"
+expect "$(env_val AXL_PUBLIC_URL --set publicUrl=https://x.test --set ingress.enabled=true \
+  --set 'ingress.hosts[0].host=axle.example.com')" https://x.test "explicit publicUrl wins over ingress"
+expect "$(has_env AXL_PUBLIC_URL --set ingress.enabled=true)" 0 "no AXL_PUBLIC_URL for an ingress without hosts"
+expect "$(env_val AXL_PUBLIC_URL --set ingress.enabled=true --set 'ingress.hosts[0].paths[0].path=/' \
+  --set 'ingress.hosts[1].host=second.example.com')" http://second.example.com "AXL_PUBLIC_URL skips a hostless ingress entry"
+expect "$(has_env AXL_PUBLIC_URL --set ingress.enabled=true --set 'ingress.hosts[0].paths[0].path=/')" 0 \
+  "no AXL_PUBLIC_URL when no ingress entry has a host"
+
+# extraEnv overrides chart-rendered env without duplicate entries
+expect "$(has_env AXL_TRUSTED_PROXY_HEADER --set ingress.enabled=true \
+  --set 'extraEnv[0].name=AXL_TRUSTED_PROXY_HEADER' --set 'extraEnv[0].value=X-Real-IP')" 1 \
+  "extraEnv AXL_TRUSTED_PROXY_HEADER: exactly one entry"
+expect "$(env_val AXL_TRUSTED_PROXY_HEADER --set ingress.enabled=true \
+  --set 'extraEnv[0].name=AXL_TRUSTED_PROXY_HEADER' --set 'extraEnv[0].value=X-Real-IP')" X-Real-IP \
+  "extraEnv AXL_TRUSTED_PROXY_HEADER wins"
+expect "$(has_env AXL_PUBLIC_URL --set publicUrl=https://x.test \
+  --set 'extraEnv[0].name=AXL_PUBLIC_URL' --set 'extraEnv[0].value=https://y.test')" 1 \
+  "extraEnv AXL_PUBLIC_URL: exactly one entry"
+expect "$(env_val AXL_PUBLIC_URL --set publicUrl=https://x.test \
+  --set 'extraEnv[0].name=AXL_PUBLIC_URL' --set 'extraEnv[0].value=https://y.test')" https://y.test \
+  "extraEnv AXL_PUBLIC_URL wins"
+
 # invalid UI settings are rejected (schema or template)
 rejects() { local why="$1"; shift; if helm template t "$CHART" -f "$S" "$@" >/dev/null 2>&1; then fail "$why was accepted"; fi; }
 rejects "ui.auth.mode=open" --set ui.auth.mode=open

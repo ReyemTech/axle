@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Connect a machine{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1 class="page-title">Connect a machine</h1>
+  <p class="muted">A machine running <code>axl login</code> shows a short code. Type it here to let that machine in.</p>
+</div>
+{% if let Some(approved) = outcome %}
+<section class="panel" role="status">
+  {% if approved %}
+  <p><span class="aspect" data-aspect="done" aria-hidden="true"></span><strong>Approved.</strong> The machine finishes signing in within a few seconds.</p>
+  {% else %}
+  <p><span class="aspect" data-aspect="cancelled" aria-hidden="true"></span><strong>Denied.</strong> The machine was not connected.</p>
+  {% endif %}
+  <p class="button-row"><a class="button-like" href="/ui/connect">Connect another machine</a> <a class="button-like" href="/ui/tokens">Back to tokens</a></p>
+</section>
+{% else if let Some(r) = request %}
+<section class="panel confirm" aria-labelledby="confirm-title">
+  <h2 class="panel-title" id="confirm-title">Connect this machine?</h2>
+  <dl class="facts">
+    <div><dt>Host</dt><dd>{{ r.host }}</dd></div>
+    <div><dt>Requested from</dt><dd>{% if let Some(ip) = r.ip %}{{ ip }}{% else %}unknown address{% endif %}</dd></div>
+    <div><dt>Requested at</dt><dd><time datetime="{{ r.requested.iso }}" title="{{ r.requested.text }}">{{ r.requested.text }}</time></dd></div>
+    <div><dt>Expires</dt><dd data-countdown="{{ r.left }}">{{ r.left_text }}</dd></div>
+  </dl>
+  <p class="muted">Approve only if you started this sign-in yourself, on the host shown. Approving gives that machine a token.</p>
+  <div class="button-row">
+    <form method="post" action="/ui/connect/{{ r.id }}/approve">
+      {% if let Some(token) = csrf %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}
+      <button type="submit">Approve</button>
+    </form>
+    <form method="post" action="/ui/connect/{{ r.id }}/deny">
+      {% if let Some(token) = csrf %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}
+      <button type="submit" class="danger">Deny</button>
+    </form>
+  </div>
+</section>
+{% else %}
+<section class="panel">
+  {% if stale %}<p class="error" role="alert"><span class="aspect" data-aspect="blocked" aria-hidden="true"></span>That request is no longer pending. It expired, or was already approved or denied.</p>{% endif %}
+  <form class="stack" method="post" action="/ui/connect/lookup">
+    {% if let Some(token) = csrf %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}
+    <label for="user-code">Code shown on the machine</label>
+    <input id="user-code" name="user_code" type="text" placeholder="WXYZ-1234" autocomplete="off" autocapitalize="characters" spellcheck="false" required autofocus>
+    {% if let Some(message) = error %}<p class="error" role="alert"><span class="aspect" data-aspect="blocked" aria-hidden="true"></span>{{ message }}</p>{% endif %}
+    <button type="submit">Look up code</button>
+  </form>
+</section>
+{% endif %}
+{% endblock %}

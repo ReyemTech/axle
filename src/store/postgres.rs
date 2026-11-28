@@ -8,14 +8,15 @@ use uuid::Uuid;
 
 use super::{
     AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate,
-    MessageReceipt, ProjectsAdded, Recipient, Store, StoreError, StoreResult, TaskFilter,
-    TransitionRequest, Transitioned, child_event, children_complete_event, claim_event,
-    closes_child, edit_payload, projects_added_note, projects_added_payload, send_time_recipient,
+    MessageReceipt, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, Store,
+    StoreError, StoreResult, TaskFilter, TransitionRequest, Transitioned, child_event,
+    children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label,
+    projects_added_note, projects_added_payload, send_time_recipient,
 };
 use crate::domain::{
-    Actor, Address, Agent, AgentId, Eligibility, Importance, InboxItem, Message, MessageId,
-    Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TokenId,
-    TokenInfo,
+    Actor, Address, Agent, AgentId, Eligibility, Enrollment, EnrollmentId, EnrollmentStatus,
+    Importance, InboxItem, Message, MessageId, Project, ProjectId, Session, SessionId, Task,
+    TaskEvent, TaskEventKind, TaskId, TokenId, TokenInfo,
 };
 
 pub struct PostgresStore {
@@ -490,6 +491,84 @@ fn token_from(row: &PgRow) -> StoreResult<TokenInfo> {
     })
 }
 
+/// The columns `enrollment_from` reads (a macro so queries can `concat!` it statically).
+macro_rules! enrollment_cols {
+    () => {
+        "id, kind, label, host, status, token_id, created_at, expires_at, approved_at, requester_ip"
+    };
+}
+
+fn enrollment_from(row: &PgRow) -> StoreResult<Enrollment> {
+    Ok(Enrollment {
+        id: row.try_get::<Uuid, _>("id")?.into(),
+        kind: parse_text(row.try_get("kind")?)?,
+        label: row.try_get("label")?,
+        host: row.try_get("host")?,
+        status: parse_text(row.try_get("status")?)?,
+        token_id: opt_id(row, "token_id")?,
+        created_at: row.try_get("created_at")?,
+        expires_at: row.try_get("expires_at")?,
+        approved_at: row.try_get("approved_at")?,
+        requester_ip: row.try_get("requester_ip")?,
+    })
+}
+
+/// Reports the state of a device enrollment that could not be consumed.
+fn poll_state(e: &Enrollment, now: OffsetDateTime) -> PollOutcome {
+    match e.status {
+        EnrollmentStatus::Consumed | EnrollmentStatus::Expired => PollOutcome::Expired,
+        _ if e.expires_at <= now => PollOutcome::Expired,
+        EnrollmentStatus::Denied => PollOutcome::Denied,
+        EnrollmentStatus::Pending | EnrollmentStatus::Approved => PollOutcome::Pending,
+    }
+}
+
+/// The guarded `from_status -> consumed` move shared by codes and device polls, inside the
+/// caller's transaction (the guarded UPDATE takes the row lock, so a racing request re-checks
+/// the guard after the winner commits and finds nothing). Only when it returns a row is the
+/// token inserted and linked (the label comes from that row), so a lost race creates nothing.
+async fn consume_row(
+    tx: &mut PgConnection,
+    kind: &str,
+    from_status: &str,
+    secret_hash: &str,
+    host: Option<&str>,
+    now: OffsetDateTime,
+    token: &NewToken<'_>,
+) -> StoreResult<Option<Enrollment>> {
+    let Some(row) = sqlx::query(concat!(
+        "UPDATE enrollments SET status = 'consumed', host = COALESCE($1, host)
+         WHERE secret_hash = $2 AND kind = $3 AND status = $4 AND expires_at > $5
+         RETURNING ",
+        enrollment_cols!()
+    ))
+    .bind(host)
+    .bind(secret_hash)
+    .bind(kind)
+    .bind(from_status)
+    .bind(now)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let mut e = enrollment_from(&row)?;
+    sqlx::query("INSERT INTO tokens (id, label, hash, created_at) VALUES ($1, $2, $3, $4)")
+        .bind(token.id.as_uuid())
+        .bind(enrollment_token_label(&e))
+        .bind(token.hash)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE enrollments SET token_id = $1 WHERE id = $2")
+        .bind(token.id.as_uuid())
+        .bind(e.id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+    e.token_id = Some(token.id);
+    Ok(Some(e))
+}
+
 #[async_trait]
 impl Store for PostgresStore {
     async fn ping(&self) -> StoreResult<()> {
@@ -546,6 +625,168 @@ impl Store for PostgresStore {
         .await?
         .iter()
         .map(token_from)
+        .collect()
+    }
+
+    async fn insert_enrollment(&self, e: &NewEnrollment<'_>) -> StoreResult<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE enrollments SET status = 'expired'
+             WHERE status IN ('pending', 'approved') AND expires_at <= $1",
+        )
+        .bind(e.now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM enrollments WHERE expires_at < $1")
+            .bind(e.now - Duration::days(1))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO enrollments (id, kind, secret_hash, user_code_hash, label, host, status,
+                                      created_at, expires_at, requester_ip)
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9)",
+        )
+        .bind(e.id.as_uuid())
+        .bind(e.kind.as_str())
+        .bind(e.secret_hash)
+        .bind(e.user_code_hash)
+        .bind(e.label)
+        .bind(e.host)
+        .bind(e.now)
+        .bind(e.expires_at)
+        .bind(e.requester_ip)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn consume_code(
+        &self,
+        secret_hash: &str,
+        host: &str,
+        now: OffsetDateTime,
+        token: &NewToken<'_>,
+    ) -> StoreResult<Option<Enrollment>> {
+        let mut tx = self.pool.begin().await?;
+        let enrollment = consume_row(
+            &mut tx,
+            "code",
+            "pending",
+            secret_hash,
+            Some(host),
+            now,
+            token,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(enrollment)
+    }
+
+    async fn device_by_user_code(
+        &self,
+        user_code_hash: &str,
+        now: OffsetDateTime,
+    ) -> StoreResult<Option<Enrollment>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            enrollment_cols!(),
+            " FROM enrollments
+             WHERE user_code_hash = $1 AND kind = 'device' AND status = 'pending'
+               AND expires_at > $2"
+        ))
+        .bind(user_code_hash)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(enrollment_from)
+        .transpose()
+    }
+
+    async fn decide_device(
+        &self,
+        id: EnrollmentId,
+        approve: bool,
+        now: OffsetDateTime,
+    ) -> StoreResult<Option<Enrollment>> {
+        let (status, approved_at) = if approve {
+            ("approved", Some(now))
+        } else {
+            ("denied", None)
+        };
+        sqlx::query(concat!(
+            "UPDATE enrollments SET status = $1, approved_at = $2
+             WHERE id = $3 AND kind = 'device' AND status = 'pending' AND expires_at > $4
+             RETURNING ",
+            enrollment_cols!()
+        ))
+        .bind(status)
+        .bind(approved_at)
+        .bind(id.as_uuid())
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(enrollment_from)
+        .transpose()
+    }
+
+    async fn poll_device(
+        &self,
+        secret_hash: &str,
+        now: OffsetDateTime,
+        token: &NewToken<'_>,
+    ) -> StoreResult<PollOutcome> {
+        let mut tx = self.pool.begin().await?;
+        if let Some(e) =
+            consume_row(&mut tx, "device", "approved", secret_hash, None, now, token).await?
+        {
+            tx.commit().await?;
+            return Ok(PollOutcome::Consumed(e));
+        }
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            enrollment_cols!(),
+            " FROM enrollments WHERE secret_hash = $1 AND kind = 'device'"
+        ))
+        .bind(secret_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Ok(PollOutcome::Expired);
+        };
+        let e = enrollment_from(&row)?;
+        Ok(poll_state(&e, now))
+    }
+
+    async fn cancel_enrollment(&self, id: EnrollmentId, now: OffsetDateTime) -> StoreResult<bool> {
+        let found: Option<Uuid> = sqlx::query_scalar(
+            "UPDATE enrollments SET status = 'denied'
+             WHERE id = $1 AND status = 'pending' AND expires_at > $2
+             RETURNING id",
+        )
+        .bind(id.as_uuid())
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(found.is_some())
+    }
+
+    async fn list_pending_enrollments(&self, now: OffsetDateTime) -> StoreResult<Vec<Enrollment>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            enrollment_cols!(),
+            " FROM enrollments
+             WHERE status = 'pending' AND expires_at > $1
+             ORDER BY created_at DESC, id DESC"
+        ))
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(enrollment_from)
         .collect()
     }
 

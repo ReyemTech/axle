@@ -5,10 +5,27 @@ external Postgres. The [Kubernetes guide](../../../docs/deploy/kubernetes.md) co
 database modes and ingress; this page covers the `ui` block. Every value is commented in
 [values.yaml](values.yaml) and checked by [values.schema.json](values.schema.json).
 
+## Connecting machines (`publicUrl`)
+
+`publicUrl` sets `AXL_PUBLIC_URL`, the address **Tokens → Connect a machine**, `/install.sh`
+and enrollment hand to clients. Leave it empty to derive it from the first ingress host
+(`https` when `ingress.tls` is set, else `http`); set it explicitly when the public address
+differs from the ingress, for example `publicUrl: https://axle.example.com`. With neither,
+the variable is unset and a server bound beyond loopback answers 503 on those endpoints.
+
+`trustedProxyHeader` sets `AXL_TRUSTED_PROXY_HEADER`, the header the enrollment rate limit
+reads the client address from. Without it every client behind an ingress shares one limit of
+10 requests a minute. When `ingress.enabled` is true and the value is unset (`null`), the chart
+sets `X-Forwarded-For`; set another header (`trustedProxyHeader: X-Real-IP`) or `""` to send
+none. The header is trusted as sent, so use it only when your ingress overwrites it; see
+[security](../../../docs/security.md#enrollment).
+
+An `extraEnv` entry named `AXL_PUBLIC_URL` or `AXL_TRUSTED_PROXY_HEADER` overrides the chart's own value (no duplicate env entry is rendered).
+
 ## UI sign-in (`ui`)
 
 `ui` controls how a human signs in to the web UI. Agents are not affected: MCP and `/v1`
-always need a bearer token, created with `kubectl exec … axl token create`.
+always need a bearer token, from **Connect a machine** or `kubectl exec … axl token create`.
 
 ```yaml
 ui:

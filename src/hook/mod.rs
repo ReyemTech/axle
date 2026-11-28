@@ -1,4 +1,4 @@
-//! `axl hook <event>` (spec §10): Claude Code hooks that surface unread axl messages
+//! `axl hook <event> [--harness codex]` (spec §10): Claude Code and Codex hooks that surface unread axl messages
 //! while the harness is busy. A hook is a child of the harness, like the bridge, so it finds
 //! the bridge's session through `~/.axl/sessions/<harness-pid>.json`.
 //!
@@ -54,6 +54,46 @@ impl Event {
     }
 }
 
+/// Which harness runs the hook. Claude Code is the default; `axl install` writes
+/// `--harness codex` into Codex's hook commands.
+///
+/// Codex documents the same stdout shapes for the events Axle registers
+/// (https://learn.chatgpt.com/docs/hooks.md): `hookSpecificOutput.additionalContext` with
+/// `hookEventName` for SessionStart and PostToolUse (never a PostToolUse `decision: block`,
+/// which would replace the tool result), `{"decision":"block","reason":..}` for Stop (the
+/// reason becomes the continuation prompt), and `stop_hook_active` as the loop guard. What
+/// differs is only whose session file a hook may adopt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Harness {
+    #[default]
+    ClaudeCode,
+    Codex,
+}
+
+impl Harness {
+    /// The harness named by a `--harness <name>` or `--harness=<name>` among `args`; anything
+    /// else (no flag, an unknown name) is Claude Code.
+    pub fn from_args(args: &[String]) -> Harness {
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            let value = match a.strip_prefix("--harness=") {
+                Some(v) => Some(v),
+                None if a == "--harness" => it.next().map(String::as_str),
+                None => None,
+            };
+            if value == Some("codex") {
+                return Harness::Codex;
+            }
+        }
+        Harness::ClaudeCode
+    }
+
+    /// Whether a session file written by a bridge of `name` belongs to this harness.
+    fn owns(self, name: &str) -> bool {
+        (name == "codex") == (self == Harness::Codex)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct HookInput {
     #[serde(default)]
@@ -77,6 +117,7 @@ struct Item {
 /// the single stderr line (the caller still exits 0).
 pub async fn run(
     event: Event,
+    harness: Harness,
     stdin: &str,
     home: Option<&Path>,
     env_token: Option<&str>,
@@ -92,7 +133,7 @@ pub async fn run(
     let Some(home) = home else {
         return Ok(None);
     };
-    let Some((pid, info)) = find_session(home) else {
+    let Some((pid, info)) = find_session(home, harness) else {
         return Ok(None);
     };
     let token = token(home, env_token)?;
@@ -234,13 +275,7 @@ fn rank(importance: &str) -> u8 {
 }
 
 fn token(home: &Path, env_token: Option<&str>) -> Result<String, String> {
-    if let Some(t) = env_token.map(str::trim).filter(|t| !t.is_empty()) {
-        return Ok(t.to_string());
-    }
-    match std::fs::read_to_string(home.join(".axl").join("token")) {
-        Ok(t) if !t.trim().is_empty() => Ok(t.trim().to_string()),
-        _ => Err("no token (set AXL_TOKEN or write ~/.axl/token)".to_string()),
-    }
+    crate::client::read_token(env_token, &crate::client::AxlDir::new(home))
 }
 
 /// The session's unread mail, oldest first: the server's first page, plus any high or
@@ -286,7 +321,7 @@ async fn fetch_page(
 
 /// The session file of this hook's harness: the hook's parent, or (when a shell sits in
 /// between) the nearest ancestor that has one.
-fn find_session(home: &Path) -> Option<(u32, SessionInfo)> {
+fn find_session(home: &Path, harness: Harness) -> Option<(u32, SessionInfo)> {
     // SAFETY: getppid has no preconditions and cannot fail.
     let mut pid = unsafe { libc::getppid() } as u32;
     for _ in 0..ANCESTOR_DEPTH {
@@ -295,6 +330,7 @@ fn find_session(home: &Path) -> Option<(u32, SessionInfo)> {
         }
         if let Ok(bytes) = std::fs::read(session_file::path(home, pid))
             && let Ok(info) = serde_json::from_slice::<SessionInfo>(&bytes)
+            && harness.owns(&info.harness)
         {
             return Some((pid, info));
         }
@@ -338,7 +374,29 @@ fn write_seen(path: &PathBuf, seen: &[String]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::clean;
+    use super::{Harness, clean};
+
+    #[test]
+    fn harness_flag_parsing() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(Harness::from_args(&args(&[])), Harness::ClaudeCode);
+        assert_eq!(
+            Harness::from_args(&args(&["--harness", "codex"])),
+            Harness::Codex
+        );
+        assert_eq!(
+            Harness::from_args(&args(&["x", "--harness=codex"])),
+            Harness::Codex
+        );
+        assert_eq!(
+            Harness::from_args(&args(&["--harness", "opencode"])),
+            Harness::ClaudeCode
+        );
+        assert_eq!(
+            Harness::from_args(&args(&["--harness"])),
+            Harness::ClaudeCode
+        );
+    }
 
     #[test]
     fn clean_flattens_cuts_and_defuses_frame() {

@@ -1,0 +1,5 @@
+{
+  "name": "axle",
+  "version": "{{VERSION}}",
+  "description": "Axle: message other coding agents and claim tasks under leases"
+}

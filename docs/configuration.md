@@ -15,6 +15,8 @@ variables.
 | `AXL_TRUSTED_HEADER` | unset | A request header set by an authenticating proxy (for example `X-Auth-Request-Email`); requests that carry it are signed in. `--trusted-header` overrides it. |
 | `AXL_ALLOWED_HOSTS` | none | Extra comma-separated `Host` names the UI answers to when it has no sign-in, ports ignored. `localhost`, `127.0.0.1`, `[::1]` and the bind address are always allowed. |
 | `AXL_COOKIE_SECURE` | `false` | Mark the UI session cookie `Secure`. Set it to `true` whenever the UI is served over https. Accepts `true`, `false`, `1`, `0`. |
+| `AXL_PUBLIC_URL` | unset | The address clients reach this server at, such as `https://axle.example.com` (scheme and host, no path). Required for `/install.sh`, the **Connect a machine** commands and enrollment when the server is bound beyond loopback; without it they answer 503. On loopback the bind address is used. |
+| `AXL_TRUSTED_PROXY_HEADER` | unset | A header your reverse proxy sets to the client IP, such as `X-Forwarded-For`. Its right-most entry (which must parse as an IP) keys the 10-per-minute limit on `/v1/enroll` and `/v1/login/*`. Unset: the socket address is used. |
 | `AXL_RATE_LIMIT_PER_SEC` | `20` | Sustained requests per second, per agent token. Must be a positive whole number. |
 | `AXL_RATE_LIMIT_BURST` | `100` | Burst size, per agent token. Must be a positive whole number. |
 
@@ -35,6 +37,9 @@ These are not configurable yet:
 | Subject or task title | 200 characters |
 | UI session lifetime | 12 hours |
 | UI login attempts | 10 per minute per client IP |
+| Enrollment and device-login requests | 10 per minute per client IP |
+| One-time code lifetime | 15 minutes, single use |
+| Device login lifetime | 10 minutes, polled every 7 seconds |
 
 ## Bridge and hooks (`axl bridge`, `axl hook`)
 
@@ -43,6 +48,10 @@ These are not configurable yet:
 | `AXL_TOKEN` | read from `~/.axl/token` | The agent's bearer token. Prefer the file (mode 0600), so the token is not in the harness's environment or config. |
 | `AXL_SERVER_URL` | `http://127.0.0.1:7420` | The server's base URL. Used by the bridge; hooks use the URL the bridge recorded in its session file. |
 | `AXL_PROJECT` | from `.axl` or git `origin` | Pin the session's project key. See [projects and identity](concepts.md#projects-and-identity). |
+
+`axl login` and `axl install` write `~/.axl/config.toml` (`server_url`, `port`) and
+`~/.axl/token`; see the [CLI reference](cli.md#files-on-the-client). `AXL_SERVER_URL` and
+`AXL_TOKEN` win over both files.
 
 The bridge reads `~/.axl/token` again on each retry, so a token written after the harness
 started is picked up within 30 seconds.
@@ -98,33 +107,12 @@ AXL_UI_AUTH=none AXL_ALLOWED_HOSTS=axle.internal.example.com axl serve --bind 0.
 
 ## Command-line reference
 
-```text
-$ axl --help
-MCP coordination server
-
-Usage: axl <COMMAND>
-
-Commands:
-  serve    Run the coordination server (needs DATABASE_URL; see AXL_UI_AUTH for UI sign-in)
-  bridge   Stdio MCP bridge a harness spawns per session (reads AXL_TOKEN or ~/.axl/token, AXL_SERVER_URL, AXL_PROJECT)
-  hook     Claude Code hook: reads the hook JSON on stdin, prints hook JSON on stdout. Always exits 0 (fail-open); problems are one line on stderr
-  migrate  Run database migrations (needs DATABASE_URL)
-  project  Manage projects
-  token    Manage agent bearer tokens (needs DATABASE_URL)
-  help     Print this message or the help of the given subcommand(s)
-
-Options:
-  -h, --help     Print help
-  -V, --version  Print version
-```
-
-| Command | Notes |
+| Command | Purpose |
 |---|---|
-| `axl serve [--bind <ADDR>] [--trusted-header <NAME>]` | Runs the server. Stops cleanly on Ctrl-C or SIGTERM, draining requests for up to 5 seconds. |
-| `axl bridge --harness <NAME>` | Started by a harness, one per session. See [harnesses](harnesses/claude-code.md). |
-| `axl hook <event>` | `session-start`, `user-prompt-submit`, `post-tool-use` or `stop`. See [Claude Code hooks](harnesses/claude-code.md#hooks). |
-| `axl migrate` | Applies database migrations and exits. |
-| `axl token create --label <LABEL>` | Prints a new token on stdout (only the token), and a note with its id on stderr. |
-| `axl token list` | Tab-separated: id, label, created, last used, revoked (`-` when never). |
-| `axl token revoke <ID>` | Revokes at once; agents using it get 401. |
-| `axl project` | Reserved; not implemented yet. Rename projects in the [web UI](web-ui.md#projects). |
+| `axl serve` | Run the server (needs `DATABASE_URL`). `--bind` and `--trusted-header` override the variables above. |
+| `axl token create\|list\|revoke` | Manage tokens by hand (needs `DATABASE_URL`). |
+| `axl install`, `login`, `logout`, `uninstall`, `status`, `service` | Set up a machine; see the [CLI reference](cli.md). |
+| `axl bridge`, `axl hook` | Spawned by harnesses. |
+| `axl migrate`, `axl project` | Migrate the database; manage projects. |
+
+Run `axl --help` for the full list.

@@ -10,6 +10,10 @@ use time::OffsetDateTime;
 
 use crate::domain::TokenId;
 
+/// Above this many buckets, `check` first drops the ones that have fully refilled (they are
+/// indistinguishable from a fresh bucket), so unauthenticated keys cannot grow the map forever.
+const SWEEP_ABOVE: usize = 1024;
+
 struct Bucket {
     tokens: f64,
     at: OffsetDateTime,
@@ -45,6 +49,13 @@ impl<K: Eq + Hash> RateLimiter<K> {
     /// after `secs` whole seconds (at least 1).
     pub fn check(&self, key: K, now: OffsetDateTime) -> Result<(), u64> {
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        if buckets.len() > SWEEP_ABOVE {
+            let (per_sec, burst) = (self.per_sec, self.burst);
+            buckets.retain(|_, b| {
+                let elapsed = (now - b.at).as_seconds_f64().max(0.0);
+                b.tokens + elapsed * per_sec < burst
+            });
+        }
         let bucket = buckets.entry(key).or_insert(Bucket {
             tokens: self.burst,
             at: now,
@@ -94,6 +105,27 @@ mod tests {
         assert!(limiter.check(token, later).is_err());
         // Going back in time does not refill.
         assert!(limiter.check(token, t0).is_err());
+    }
+
+    #[test]
+    fn refilled_buckets_are_evicted_once_the_map_is_large() {
+        let t0 = datetime!(2026-11-27 9:00 UTC);
+        let limiter = RateLimiter::per_minute(10);
+        for key in 0..(SWEEP_ABOVE as u32 + 50) {
+            assert_eq!(limiter.check(key, t0), Ok(()));
+        }
+        let size = |l: &RateLimiter<u32>| l.buckets.lock().unwrap().len();
+        assert_eq!(size(&limiter), SWEEP_ABOVE + 50);
+        // Each key spent one token; a minute later all are full again and get dropped.
+        assert_eq!(limiter.check(u32::MAX, t0 + Duration::minutes(2)), Ok(()));
+        assert_eq!(size(&limiter), 1);
+        // A bucket that is still drained survives a sweep.
+        let limiter = RateLimiter::per_minute(1);
+        assert_eq!(limiter.check(0u32, t0), Ok(()));
+        for key in 1..(SWEEP_ABOVE as u32 + 2) {
+            let _ = limiter.check(key, t0);
+        }
+        assert!(limiter.check(0, t0 + Duration::seconds(1)).is_err());
     }
 
     #[test]

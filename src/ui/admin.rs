@@ -3,9 +3,11 @@
 use askama::Template;
 use axum::Extension;
 use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 
 use super::SessionCtx;
+use super::connect::{self, ConnectPanel, PendingRow};
 use super::task_page::Stamp;
 use super::views::{Pulse, UiError, UiResult, html, line_colours, pulse_counts};
 use crate::domain::DISPLAY_NAME_MAX;
@@ -77,11 +79,26 @@ struct TokensPage {
     pulse: Option<Pulse>,
     nav: &'static str,
     tokens: Vec<TokenRow>,
+    /// Enrollments waiting to be used or approved.
+    pending: Vec<PendingRow>,
+    connect: ConnectPanel,
 }
 
 pub async fn tokens(
     State(state): State<AppState>,
     Extension(session): Extension<SessionCtx>,
+    headers: HeaderMap,
+) -> UiResult<Response> {
+    let panel = connect::idle_panel(&state, &headers);
+    tokens_page(&state, session, panel, StatusCode::OK).await
+}
+
+/// The tokens page with `connect` as the Connect a machine panel (idle, rejected or issued).
+pub(super) async fn tokens_page(
+    state: &AppState,
+    session: SessionCtx,
+    connect: ConnectPanel,
+    status: StatusCode,
 ) -> UiResult<Response> {
     let now = state.clock.now();
     let mut tokens: Vec<TokenRow> = state
@@ -101,11 +118,15 @@ pub async fn tokens(
     // Live tokens first, newest first within each group.
     tokens.reverse();
     tokens.sort_by_key(|t| t.revoked.is_some());
-    html(&TokensPage {
+    let mut res = html(&TokensPage {
         logout: session.logout,
         csrf: Some(session.csrf),
-        pulse: Some(pulse_counts(&state).await?),
+        pulse: Some(pulse_counts(state).await?),
         nav: "tokens",
         tokens,
-    })
+        pending: connect::pending_rows(state).await?,
+        connect,
+    })?;
+    *res.status_mut() = status;
+    Ok(res)
 }

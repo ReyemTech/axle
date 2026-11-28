@@ -29,7 +29,9 @@ or set your own value. The other choices:
 
 The `-p 127.0.0.1:…` mapping publishes the port on loopback only. Widen it only behind TLS.
 
-Create the first agent token inside the container:
+Machines connect from **Tokens → Connect a machine** in the web UI (set `AXL_PUBLIC_URL`;
+see [below](#letting-machines-connect)). To create a token by hand instead, run this inside
+the container:
 
 ```sh
 docker exec axle axl token create --label laptop
@@ -73,6 +75,19 @@ export AXL_ADMIN_SECRET="$(openssl rand -hex 16)"
 docker compose up -d
 docker compose exec axle axl token create --label laptop
 ```
+
+## Letting machines connect
+
+Set `AXL_PUBLIC_URL` to the address people will use, so **Tokens → Connect a machine** and
+`/install.sh` can hand it out. Add one line to either `docker run` above (or to the `environment:` of your compose file):
+
+```sh
+  -e AXL_PUBLIC_URL=https://axle.example.com \
+```
+
+Behind a reverse proxy also set `AXL_TRUSTED_PROXY_HEADER` (for example `X-Forwarded-For`)
+so the enrollment limit counts clients, not the proxy; see
+[security](../security.md#enrollment).
 
 ## Behind a reverse proxy
 

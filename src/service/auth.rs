@@ -44,12 +44,10 @@ impl AuthService {
         if label.is_empty() {
             return Err(AuthError::EmptyLabel);
         }
-        let mut bytes = [0u8; TOKEN_BYTES];
-        getrandom::fill(&mut bytes).map_err(|e| AuthError::Random(e.to_string()))?;
-        let plaintext = format!("{TOKEN_PREFIX}{}", hex(&bytes));
+        let (plaintext, hash) = mint()?;
         let id = TokenId::new();
         self.store
-            .insert_token(id, label, &hash(&plaintext), self.clock.now())
+            .insert_token(id, label, &hash, self.clock.now())
             .await?;
         Ok((id, plaintext))
     }
@@ -77,8 +75,17 @@ impl AuthService {
     }
 }
 
+/// A fresh random token: `(plaintext, hash)`. Only the hash is ever stored.
+pub fn mint() -> Result<(String, String), AuthError> {
+    let mut bytes = [0u8; TOKEN_BYTES];
+    getrandom::fill(&mut bytes).map_err(|e| AuthError::Random(e.to_string()))?;
+    let plaintext = format!("{TOKEN_PREFIX}{}", hex(&bytes));
+    let hash = hash(&plaintext);
+    Ok((plaintext, hash))
+}
+
 /// Hex SHA-256 of the full plaintext token (prefix included).
-fn hash(plaintext: &str) -> String {
+pub fn hash(plaintext: &str) -> String {
     hex(&Sha256::digest(plaintext.as_bytes()))
 }
 

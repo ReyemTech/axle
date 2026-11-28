@@ -11,6 +11,7 @@
 
 pub mod actions;
 pub mod admin;
+pub mod connect;
 pub mod inbox;
 pub mod needs;
 pub mod task_page;
@@ -18,12 +19,10 @@ pub mod views;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::net::SocketAddr;
 use std::sync::Mutex;
 
 use axum::body::Body;
-use axum::extract::connect_info::ConnectInfo;
-use axum::extract::{Form, Path, Request, State};
+use axum::extract::{Form, Path, Query, Request, State};
 use axum::http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -38,6 +37,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::config::UiAuth;
 use crate::http::AppState;
+use crate::http::enroll::client_ip;
 use crate::http::rate_limit::RateLimiter;
 
 /// The session cookie.
@@ -54,7 +54,7 @@ const FORM_LIMIT: usize = 256 * 1024;
 /// Server-side UI sessions and the login rate limit.
 pub struct UiState {
     sessions: Mutex<HashMap<String, UiSession>>,
-    login_limit: RateLimiter<String>,
+    login_limit: RateLimiter<std::net::IpAddr>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +177,13 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/ui/projects/{id}/rename", post(actions::rename_project))
         .route("/ui/tokens", get(admin::tokens))
         .route("/ui/tokens/{id}/revoke", post(actions::revoke_token))
+        .route("/ui/tokens/connect", post(connect::connect_machine))
+        .route("/ui/enrollments/pending", get(connect::pending_fragment))
+        .route("/ui/enrollments/{id}/revoke", post(connect::revoke))
+        .route("/ui/connect", get(connect::connect_page))
+        .route("/ui/connect/lookup", post(connect::lookup))
+        .route("/ui/connect/{id}/approve", post(connect::approve))
+        .route("/ui/connect/{id}/deny", post(connect::deny))
         .route("/ui/live", get(live))
         .route("/ui/logout", post(logout))
         .route_layer(middleware::from_fn_with_state(
@@ -299,7 +306,7 @@ async fn require_session(State(state): State<AppState>, req: Request, next: Next
         session = Some(ctx);
     }
     let Some(mut session) = session else {
-        return to_login(req.headers());
+        return to_login(req.headers(), req.uri().path());
     };
     session.logout = !open;
     let mut req = req;
@@ -320,14 +327,29 @@ async fn require_session(State(state): State<AppState>, req: Request, next: Next
 
 /// Not signed in: a 303 to the login page, or for htmx requests a 401 with `HX-Redirect`
 /// (so a fragment swap does not paste the login page into the board).
-fn to_login(headers: &HeaderMap) -> Response {
+///
+/// Only the device-approval page (`CONNECT_PATH`) is carried over as `?next=`, so signing in
+/// returns there; every other page lands on the overview.
+fn to_login(headers: &HeaderMap, path: &str) -> Response {
+    let target = match safe_next(path) {
+        Some(next) => format!("/ui/login?next={next}"),
+        None => "/ui/login".to_string(),
+    };
     if headers.contains_key("hx-request") {
         let mut res = StatusCode::UNAUTHORIZED.into_response();
-        res.headers_mut()
-            .insert("hx-redirect", HeaderValue::from_static("/ui/login"));
+        res.headers_mut().insert(
+            "hx-redirect",
+            HeaderValue::from_str(&target).expect("static path"),
+        );
         return res;
     }
-    Redirect::to("/ui/login").into_response()
+    Redirect::to(&target).into_response()
+}
+
+/// The path a sign-in may return to. Exactly `/ui/connect`: anything else (another path, an
+/// absolute URL) is ignored, so `next` cannot be used as an open redirect.
+fn safe_next(raw: &str) -> Option<&'static str> {
+    (raw == connect::CONNECT_PATH).then_some(connect::CONNECT_PATH)
 }
 
 /// Checks the `X-CSRF-Token` header, else the `csrf` field of a urlencoded form body (the
@@ -363,43 +385,56 @@ async fn csrf_ok(req: Request, expected: &str) -> (bool, Request) {
 
 // ---------------------------------------------------------------- login / logout
 
-async fn login_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+#[derive(Deserialize)]
+struct LoginQuery {
+    #[serde(default)]
+    next: String,
+}
+
+async fn login_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<LoginQuery>,
+) -> Response {
     let now = state.clock.now();
+    let next = safe_next(&query.next);
     if state.config.ui_auth == UiAuth::None
         || session_cookie(&headers).is_some_and(|id| state.ui.get(id, now).is_some())
     {
-        return Redirect::to("/ui/").into_response();
+        return Redirect::to(next.unwrap_or("/ui/")).into_response();
     }
-    views::login_page(StatusCode::OK, None)
+    views::login_page(StatusCode::OK, None, next)
 }
 
 #[derive(Deserialize)]
 struct LoginForm {
     #[serde(default)]
     secret: String,
-}
-
-/// The client IP the login limit is keyed by (`unknown` when the server was not started
-/// with connection info, e.g. in tests).
-fn client_ip(extensions: &Extensions) -> String {
-    extensions
-        .get::<ConnectInfo<SocketAddr>>()
-        .map_or_else(|| "unknown".to_string(), |ci| ci.0.ip().to_string())
+    #[serde(default)]
+    next: String,
 }
 
 async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     extensions: Extensions,
     Form(form): Form<LoginForm>,
 ) -> Response {
     let now = state.clock.now();
+    let next = safe_next(&form.next);
     if state.config.ui_auth == UiAuth::None {
-        return Redirect::to("/ui/").into_response();
+        return Redirect::to(next.unwrap_or("/ui/")).into_response();
     }
-    if let Err(retry_after) = state.ui.login_limit.check(client_ip(&extensions), now) {
+    let ip = client_ip(
+        &headers,
+        &extensions,
+        state.config.trusted_proxy_header.as_deref(),
+    );
+    if let Err(retry_after) = state.ui.login_limit.check(ip, now) {
         let mut res = views::login_page(
             StatusCode::TOO_MANY_REQUESTS,
             Some("Too many login attempts. Wait a minute and try again."),
+            next,
         );
         res.headers_mut()
             .insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
@@ -409,13 +444,14 @@ async fn login(
         return views::login_page(
             StatusCode::UNAUTHORIZED,
             Some("Sign in through your auth proxy; no admin secret is configured."),
+            next,
         );
     };
     if !constant_time_eq(&form.secret, secret) {
-        return views::login_page(StatusCode::UNAUTHORIZED, Some("Wrong admin secret."));
+        return views::login_page(StatusCode::UNAUTHORIZED, Some("Wrong admin secret."), next);
     }
     let ctx = state.ui.create(now);
-    let mut res = Redirect::to("/ui/").into_response();
+    let mut res = Redirect::to(next.unwrap_or("/ui/")).into_response();
     res.headers_mut()
         .insert(header::SET_COOKIE, session_set_cookie(&state, &ctx.id));
     res

@@ -10,6 +10,7 @@ use std::convert::Infallible;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use futures_util::Stream;
@@ -37,6 +38,37 @@ pub fn routes() -> Router<AppState> {
         .route("/heartbeat", post(heartbeat))
         .route("/events", get(events))
         .route("/inbox/summary", get(inbox_summary))
+        .route("/whoami", get(whoami))
+        .route("/token/revoke", post(revoke_self))
+}
+
+// ---------------------------------------------------------------- whoami
+
+/// The calling token's label and the server version (what `axl doctor` checks).
+async fn whoami(
+    State(state): State<AppState>,
+    Extension(AuthToken(token)): Extension<AuthToken>,
+) -> Result<Response, ApiError> {
+    let tokens = state.auth.list().await.map_err(ApiError::internal)?;
+    let label = tokens
+        .into_iter()
+        .find(|t| t.id == token && t.revoked_at.is_none())
+        .map(|t| t.label)
+        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized"))?;
+    Ok(super::enroll::no_store(
+        Json(serde_json::json!({ "label": label, "version": env!("CARGO_PKG_VERSION") }))
+            .into_response(),
+    )
+    .await)
+}
+
+/// Revokes the calling token (`axl logout --revoke`); no other token is touched.
+async fn revoke_self(
+    State(state): State<AppState>,
+    Extension(AuthToken(token)): Extension<AuthToken>,
+) -> Result<Response, ApiError> {
+    state.auth.revoke(token).await.map_err(ApiError::internal)?;
+    Ok(super::enroll::no_store(Json(serde_json::json!({ "revoked": true })).into_response()).await)
 }
 
 // ---------------------------------------------------------------- register
@@ -256,7 +288,7 @@ impl Watcher {
             Event::MessageCreated { id, to, .. } => self.wants_message(id, to).await,
             Event::TaskChanged { id, project_id, .. } => self.wants_task(id, project_id).await,
             // The human's inbox is not an agent's business.
-            Event::HumanArchived { .. } => Ok(false),
+            Event::HumanArchived { .. } | Event::EnrollmentChanged { .. } => Ok(false),
         };
         result.unwrap_or_else(|e| {
             eprintln!("axl: dropping event for session {}: {e}", self.session);

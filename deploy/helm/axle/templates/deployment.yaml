@@ -1,6 +1,8 @@
 {{- include "axle.validateUi" . }}
 {{- $sqlite := eq .Values.database.mode "sqlite" }}
 {{- $auth := .Values.ui.auth }}
+{{- $extraNames := list }}
+{{- range .Values.extraEnv }}{{- $extraNames = append $extraNames .name }}{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -76,6 +78,18 @@ spec:
               value: {{ include "axle.allowedHosts" . | quote }}
             - name: AXL_COOKIE_SECURE
               value: {{ include "axle.cookieSecure" . | quote }}
+            {{- with include "axle.publicUrl" . }}
+            {{- if not (has "AXL_PUBLIC_URL" $extraNames) }}
+            - name: AXL_PUBLIC_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with include "axle.trustedProxyHeader" . }}
+            {{- if not (has "AXL_TRUSTED_PROXY_HEADER" $extraNames) }}
+            - name: AXL_TRUSTED_PROXY_HEADER
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

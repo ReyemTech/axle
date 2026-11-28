@@ -1,0 +1,15 @@
+[Unit]
+Description=Axle coordination server
+After=network.target
+
+[Service]
+ExecStart={{AXL}} serve
+Environment="DATABASE_URL=sqlite://{{HOME}}/.axl/axl.db"
+Environment="AXL_BIND=127.0.0.1:7420"
+Environment="AXL_UI_AUTH=auto"
+Restart=on-failure
+StandardOutput=append:{{HOME}}/.axl/logs/axl.log
+StandardError=append:{{HOME}}/.axl/logs/axl.log
+
+[Install]
+WantedBy=default.target

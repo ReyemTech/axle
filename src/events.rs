@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::clock::Clock;
-use crate::domain::{Address, MessageId, ProjectId, TaskEventKind, TaskId, TaskStatus};
+use crate::domain::{
+    Address, EnrollmentId, EnrollmentStatus, MessageId, ProjectId, TaskEventKind, TaskId,
+    TaskStatus,
+};
 use crate::store::{Store, StoreResult};
 
 /// Events buffered per subscriber before it starts lagging.
@@ -34,6 +37,11 @@ pub enum Event {
     },
     /// Messages left the human's inbox (archived, dismissed or answered).
     HumanArchived { archived: Vec<MessageId> },
+    /// An enrollment (one-time code or device login) changed state.
+    EnrollmentChanged {
+        id: EnrollmentId,
+        status: EnrollmentStatus,
+    },
 }
 
 impl Event {
@@ -43,6 +51,7 @@ impl Event {
             Event::MessageCreated { .. } => "MessageCreated",
             Event::TaskChanged { .. } => "TaskChanged",
             Event::HumanArchived { .. } => "HumanArchived",
+            Event::EnrollmentChanged { .. } => "EnrollmentChanged",
         }
     }
 
@@ -50,7 +59,7 @@ impl Event {
         match *self {
             Event::MessageCreated { project_id, .. } => project_id,
             Event::TaskChanged { project_id, .. } => Some(project_id),
-            Event::HumanArchived { .. } => None,
+            Event::HumanArchived { .. } | Event::EnrollmentChanged { .. } => None,
         }
     }
 }

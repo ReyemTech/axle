@@ -1,0 +1,12 @@
+{
+  "numStartups": 12,
+  "mcpServers": {
+    "axle": {
+      "type": "stdio",
+      "command": "axl",
+      "args": ["bridge", "--harness", "claude-code"],
+      "env": { "AXL_SERVER_URL": "http://100.64.0.10:7420" }
+    },
+    "other": { "type": "stdio", "command": "other-mcp", "args": [] }
+  }
+}

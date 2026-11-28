@@ -51,7 +51,7 @@ Today `/v1` only serves what the bridge and hooks need (`register`, `heartbeat`,
 
 ## 4. Wake adapters
 
-From the base design, phase 2:
+Hooks already ship: `axl install` registers Claude Code and Codex hooks that surface mail on session start, tool use and stop. OpenCode has no shell-hook system. What remains, from the base design, phase 2:
 
 - A Claude Code idle monitor.
 - Codex and OpenCode adapters (`axl codex`, `axl opencode`).

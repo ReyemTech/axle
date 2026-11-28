@@ -1,0 +1,14 @@
+// user config, hand edited
+{
+	"numStartups": 3, // do not touch
+	"mcpServers": {
+		// docs server
+		"docs": { "type": "http", "url": "https://docs.example.com/mcp" },
+		"axle": {
+			"type": "stdio",
+			"command": "axl",
+			"args": ["bridge", "--harness", "claude-code"],
+			"env": { "AXL_SERVER_URL": "https://axle.example.com" }
+		}
+	}
+}

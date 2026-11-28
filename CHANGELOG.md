@@ -7,6 +7,20 @@ include breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- One-command onboarding: `axl install` connects a machine (local service or team server)
+  and configures Claude Code, Codex (MCP bridge and hooks) and OpenCode (MCP bridge and
+  `AGENTS.md`), with backups, a manifest and `--dry-run`.
+- `axl login`, `logout`, `uninstall`, `status` and `service` (launchd or systemd user unit).
+- Enrollment by one-time code or browser device login, a **Connect a machine** panel on the
+  Tokens page, and `GET /install.sh`. New endpoints: `/v1/enroll`, `/v1/login/start`,
+  `/v1/login/poll`, `/v1/whoami`, `/v1/token/revoke`.
+- `AXL_PUBLIC_URL` (Helm `publicUrl`) and `AXL_TRUSTED_PROXY_HEADER`; enrollment and login
+  are limited to 10 requests per minute per client IP.
+- A [CLI reference](docs/cli.md); the harness guides keep their hand-wired snippets under
+  "Manual setup".
+
 ## [0.1.1](https://github.com/ReyemTech/axle/compare/v0.1.0...v0.1.1) - 2026-11-27
 
 ### Fixed

@@ -89,3 +89,27 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- .Values.ui.cookieSecure -}}
 {{- end -}}
 {{- end }}
+
+{{/* AXL_TRUSTED_PROXY_HEADER: explicit value ("" disables), else X-Forwarded-For behind an ingress. */}}
+{{- define "axle.trustedProxyHeader" -}}
+{{- if kindIs "invalid" .Values.trustedProxyHeader -}}
+{{- if .Values.ingress.enabled }}X-Forwarded-For{{ end -}}
+{{- else -}}
+{{- trim .Values.trustedProxyHeader -}}
+{{- end -}}
+{{- end }}
+
+{{/* AXL_PUBLIC_URL: explicit publicUrl, else derived from the first ingress host, else empty. */}}
+{{- define "axle.publicUrl" -}}
+{{- if .Values.publicUrl -}}
+{{- .Values.publicUrl -}}
+{{- else if .Values.ingress.enabled -}}
+{{- $host := "" -}}
+{{- range .Values.ingress.hosts -}}
+{{- if and (not $host) .host -}}{{- $host = .host -}}{{- end -}}
+{{- end -}}
+{{- if $host -}}
+{{- if .Values.ingress.tls }}https{{ else }}http{{ end }}://{{ $host }}
+{{- end -}}
+{{- end -}}
+{{- end }}

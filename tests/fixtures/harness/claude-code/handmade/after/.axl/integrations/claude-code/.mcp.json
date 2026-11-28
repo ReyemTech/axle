@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "axle": {
+      "type": "stdio",
+      "command": "{{AXL}}",
+      "args": ["bridge", "--harness", "claude-code"]
+    }
+  }
+}

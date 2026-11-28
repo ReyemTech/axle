@@ -3,7 +3,29 @@
 {% block content %}
 <div class="page-head">
   <h1 class="page-title">Tokens</h1>
-  <p class="muted">One bearer token per host and harness. Create them with <code>axl token create --label &lt;name&gt;</code>; the secret is shown only then.</p>
+  <p class="muted">One bearer token per host and harness. Connect a machine below, or create one with <code>axl token create --label &lt;name&gt;</code>; the secret is shown only once.</p>
+</div>
+<section class="panel connect" id="connect">
+  <h2 class="panel-title">Connect a machine</h2>
+{% if let Some(hint) = connect.hint %}
+  <p class="hint"><span class="aspect" data-aspect="stale" aria-hidden="true"></span>{{ hint }} Until then the install command would point at an address other machines cannot reach, so none is offered.</p>
+{% else %}
+{% include "_connect_result.html" %}
+  <form class="stack" method="post" action="/ui/tokens/connect">
+    {% if let Some(token) = csrf %}<input type="hidden" name="csrf" value="{{ token }}">{% endif %}
+    <label for="connect-label">Name this machine</label>
+    <input id="connect-label" name="label" type="text" maxlength="64" value="{{ connect.label }}" placeholder="work laptop" autocomplete="off" required>
+    {% if let Some(message) = connect.error %}<p class="error" role="alert"><span class="aspect" data-aspect="blocked" aria-hidden="true"></span>{{ message }}</p>{% endif %}
+    <button type="submit">Create one-time code</button>
+  </form>
+{% endif %}
+  <h3 class="panel-subtitle">Waiting to connect</h3>
+  <div id="pending" hx-get="/ui/enrollments/pending" hx-trigger="sse:tokens delay:300ms, every 30s" hx-swap="innerHTML">
+{% include "_pending.html" %}
+  </div>
+</section>
+<div class="section-head">
+  <h2 class="section-title">Active tokens</h2>
 </div>
 {% if tokens.is_empty() %}
 <p class="empty">No tokens yet. Create one with <code>axl token create --label &lt;name&gt;</code> on the server.</p>

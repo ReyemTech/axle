@@ -1,0 +1,12 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "theme": "tokyonight",
+  "mcp": {
+    "docs": {
+      "type": "local",
+      "command": ["docs-mcp", "--stdio"],
+      "enabled": true
+    }
+  },
+  "autoupdate": false
+}

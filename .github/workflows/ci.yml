@@ -52,6 +52,7 @@ jobs:
         with:
           # PRs restore main's cache but never save their own, so it stays small and fresh.
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --features pg-tests -- -D warnings
       # pg-tests only adds the Postgres tests, so this one run covers SQLite too.

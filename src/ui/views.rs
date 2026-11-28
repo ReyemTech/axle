@@ -113,10 +113,13 @@ struct LoginPage<'a> {
     pulse: Option<Pulse>,
     nav: &'static str,
     error: Option<&'a str>,
+    /// Where to return after signing in (only ever `/ui/connect`).
+    next: Option<&'static str>,
 }
 
-pub fn login_page(status: StatusCode, error: Option<&str>) -> Response {
+pub fn login_page(status: StatusCode, error: Option<&str>, next: Option<&'static str>) -> Response {
     let page = LoginPage {
+        next,
         csrf: None,
         logout: false,
         pulse: None,
@@ -916,6 +919,10 @@ async fn task_frames(state: &AppState, event: &Event) -> UiResult<Frames> {
                 ("inbox".to_string(), PING.to_string()),
                 ("overview".into(), PING.into()),
             ]);
+        }
+        // The tokens page lists pending enrollments next to the tokens they mint.
+        Event::EnrollmentChanged { .. } => {
+            return Ok(vec![("tokens".to_string(), PING.to_string())]);
         }
         Event::MessageCreated { to, .. } => {
             let mut frames = vec![("inbox".to_string(), PING.to_string())];

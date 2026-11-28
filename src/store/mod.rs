@@ -13,9 +13,9 @@ use time::{Duration, OffsetDateTime};
 
 use crate::config::Backend;
 use crate::domain::{
-    Actor, Address, Agent, AgentId, Importance, InboxItem, Message, MessageId, PlanState, Project,
-    ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId,
-    TokenInfo,
+    Actor, Address, Agent, AgentId, Enrollment, EnrollmentId, EnrollmentKind, Importance,
+    InboxItem, Message, MessageId, PlanState, Project, ProjectId, Session, SessionId, Task,
+    TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId, TokenInfo,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +32,46 @@ pub enum StoreError {
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
+
+/// A new enrollment row; `secret_hash` / `user_code_hash` are SHA-256 hex of the secrets.
+#[derive(Debug, Clone)]
+pub struct NewEnrollment<'a> {
+    pub id: EnrollmentId,
+    pub kind: EnrollmentKind,
+    pub secret_hash: &'a str,
+    pub user_code_hash: Option<&'a str>,
+    pub label: &'a str,
+    pub host: &'a str,
+    pub requester_ip: Option<&'a str>,
+    pub now: OffsetDateTime,
+    pub expires_at: OffsetDateTime,
+}
+
+/// A token minted by redeeming an enrollment. It carries no label: the store derives it from
+/// the enrollment row inside the consuming transaction.
+#[derive(Debug, Clone)]
+pub struct NewToken<'a> {
+    pub id: TokenId,
+    pub hash: &'a str,
+}
+
+/// What a device-flow poll found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollOutcome {
+    Pending,
+    Denied,
+    Expired,
+    /// The poll that won: the enrollment is now consumed and its token created.
+    Consumed(Enrollment),
+}
+
+/// Label of the token minted for `e`: code `<label> (<host>)`, device `<host> (device login)`.
+pub(crate) fn enrollment_token_label(e: &Enrollment) -> String {
+    match e.kind {
+        EnrollmentKind::Code => format!("{} ({})", e.label, e.host),
+        EnrollmentKind::Device => format!("{} (device login)", e.host),
+    }
+}
 
 #[async_trait]
 pub trait Store: Send + Sync {
@@ -54,6 +94,49 @@ pub trait Store: Send + Sync {
     async fn revoke_token(&self, id: TokenId, now: OffsetDateTime) -> StoreResult<()>;
     /// Every token, oldest first.
     async fn list_tokens(&self) -> StoreResult<Vec<TokenInfo>>;
+
+    // ---- enrollments ----
+
+    /// Stores a new enrollment. In the same transaction, `pending` / `approved` rows whose
+    /// `expires_at <= now` become `expired` and rows expired more than a day ago are deleted.
+    async fn insert_enrollment(&self, e: &NewEnrollment<'_>) -> StoreResult<()>;
+    /// Redeems a one-time code: one transaction that moves the `code` enrollment from
+    /// `pending` to `consumed` (recording `host`) and inserts `token`, labelled from the row
+    /// (see `enrollment_token_label`). `None` when the code is unknown, used or expired; no
+    /// token is created then.
+    async fn consume_code(
+        &self,
+        secret_hash: &str,
+        host: &str,
+        now: OffsetDateTime,
+        token: &NewToken<'_>,
+    ) -> StoreResult<Option<Enrollment>>;
+    /// The pending, unexpired device enrollment with this user-code hash.
+    async fn device_by_user_code(
+        &self,
+        user_code_hash: &str,
+        now: OffsetDateTime,
+    ) -> StoreResult<Option<Enrollment>>;
+    /// Approves or denies a pending, unexpired device enrollment; `None` if it is neither.
+    async fn decide_device(
+        &self,
+        id: EnrollmentId,
+        approve: bool,
+        now: OffsetDateTime,
+    ) -> StoreResult<Option<Enrollment>>;
+    /// The device flow's poll: an `approved`, unexpired enrollment is consumed and `token`
+    /// inserted in one transaction; otherwise the row's state is reported.
+    async fn poll_device(
+        &self,
+        secret_hash: &str,
+        now: OffsetDateTime,
+        token: &NewToken<'_>,
+    ) -> StoreResult<PollOutcome>;
+    /// Moves a `pending`, unexpired enrollment to `denied` (the UI's Revoke); `false` if it
+    /// was not pending.
+    async fn cancel_enrollment(&self, id: EnrollmentId, now: OffsetDateTime) -> StoreResult<bool>;
+    /// Pending, unexpired enrollments, newest first.
+    async fn list_pending_enrollments(&self, now: OffsetDateTime) -> StoreResult<Vec<Enrollment>>;
 
     // ---- events ----
 

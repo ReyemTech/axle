@@ -168,6 +168,15 @@
         }
       }
     },
+    "publicUrl": {
+      "type": "string"
+    },
+    "trustedProxyHeader": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "ingress": {
       "type": "object",
       "properties": {

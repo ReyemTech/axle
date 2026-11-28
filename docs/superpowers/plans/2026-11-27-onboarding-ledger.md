@@ -1,0 +1,95 @@
+# Onboarding build ledger (2026-11-27)
+
+Record of the rulings made and the minor findings deferred while building the onboarding plan. Kept so the deferred items can be triaged into follow-up work.
+
+## Rulings
+
+- Pre-flight: Ruling: token label is derived by the store from the enrollment row, `NewToken` loses `label` — service cannot know the row label before consuming; spec §2 requires `<label> (<host>)` — cost if wrong: Task 2/3 interface rework mid-execution.
+- Pre-flight: Ruling: `POLL_INTERVAL_SECS` = 7 and client treats 429 as slow_down — spec §2 mandates a per-IP limit of ~10/min on `/v1/login/*` and leaves intervals to the builder; 5 s drains the bucket mid-flow — cost if wrong: device logins fail with 429 after about 4.5 minutes.
+- Pre-flight: Ruling: `/v1/enroll` and `/v1/login/start` return 503 naming `AXL_PUBLIC_URL` before touching the store when `advertised_url` is Err — spec §3 requires the variable off loopback and `{token, server_url}` replies — cost if wrong: a code burned with no valid `server_url`.
+- Pre-flight: Ruling: define `LinkEdit { path, target: Option<PathBuf>, before }` in Task 8 — Plan references it and Task 9 needs the skills symlink (spec §5 Claude Code) — cost if wrong: Task 9 implementer invents an incompatible shape.
+- Pre-flight: Ruling: backups are once per file per run — spec §5 "before the first change" and Task 13 `rerun_rewrites_moved_binary` expects a backup on a changed rerun — cost if wrong: hand edits made between runs unprotected. (No plan text change; tests use distinct `now` values.)
+- Pre-flight: Ruling: Task 13 merges edits in order Claude, Codex, OpenCode, first changed edit per path wins (config.toml URL), and passes `claude_code::MODE` — spec §5 says the old `AXL_SERVER_URL` moves only if config has none — cost if wrong: later editor overwrites URL or compile mismatch.
+- Pre-flight: Ruling: "no token or URL in written files" applies to harness config files only, not manifest or backups — spec anti-goals and Global Constraints name harness config files; the manifest must keep the original snippet — cost if wrong: test fails on correct behaviour. (No plan text change.)
+- Pre-flight: Ruling: `daemon::install_unit` is the single place for the port check (skipped if the service is already running) and port save; `axl service install` and Task 13 both call it; Task 13 local mode saves config by load-modify-save — spec §8 port rules must hold under `axl install` — cost if wrong: install onto a taken port, or `port` lost from config.toml.
+- Pre-flight: Ruling: `--dry-run` skips login and prints `would log in to <url>`; install surfaces login's `--force` error unchanged for a different server — spec §5 "--dry-run writes nothing" and §4 switching rule — cost if wrong: dry run writes a token, or users are told to use a flag install lacks.
+- Owner: Ruling: every detected harness gets the full setup (MCP bridge + hooks + instructions); Codex is NOT MCP-only — Task 10 writes the Codex hooks block (SessionStart, PostToolUse, Stop → `axl hook <event>`) and `axl hook` must parse Codex hook payloads (with tests) — owner said "the enrollment should be done for all harnesses" — cost if wrong: extra Codex hook work, removable.
+- Owner: Ruling: harnesses keep using the local `axl bridge` even against a hosted server (project detection, session registration/heartbeats, session file for hooks, token kept in ~/.axl/token) — owner asked, answered — cost if wrong: none now.
+- Task 1: ⚠️ cannot-verify (save_config clobbers marker block) — Ruling: not a gap; the `# >>> axle >>>` markers belong to Codex's ~/.codex/config.toml (Task 10, toml_edit), not ~/.axl/config.toml — cost if wrong: none.
+- Task 4: ⚠️ docs for AXL_PUBLIC_URL / AXL_TRUSTED_PROXY_HEADER not in diff — Ruling: covered by Task 16 docs — cost if wrong: none.
+- Task 9: Ruling: plugin-loading spike answered by docs research (claude-plugin-research.md) — skills-dir plugins are documented to load hooks/.mcp.json/skills — cost if wrong: harness falls back to user-scope mode (implemented).
+- Task 10: Ruling: brief's MCP-only decision overridden by owner — hooks block written + axl hook handles Codex payloads (tests hooks_block_written replaces no_hooks_block_written) — cost if wrong: extra code, removable.
+- Task 11: Ruling: OpenCode gets MCP bridge + AGENTS.md instructions; it has no shell-command hook system (only JS plugins), so "hooks" for OpenCode arrive with the wake-up spec — owner's "all harnesses" ruling satisfied as far as each harness supports — cost if wrong: an OpenCode plugin later.
+- Task 11: Ruling: keep `mcp.axle = {type:"local", command:[…], enabled:true}` — verified against the owner's installed OpenCode v2.3.2, whose working opencode.jsonc uses exactly mcp.<name> with type/command/enabled — cost if wrong: entry ignored by a future OpenCode schema; adapt then.
+- Task 11: Ruling: prefer opencode.jsonc when both exist — OpenCode merges both; harmless — cost if wrong: entry lands in the lower-precedence file (still merged).
+- Task 13: Ruling: InstallEnv by &mut, service as factory, extra login_hooks/now fields — accepted (testability, no real service probing in server mode) — cost if wrong: none. Cross-task bug found: axl login takes --url but spec §4 and the UI's copied command use positional URL (axl login <url> --code …) → fix in Task 13 fix round.
+- Task 15: Ruling: status_with(env, env_url, env_token) beyond brief accepted (tests independent of developer env) — cost if wrong: none.
+- Final: Ruling: I1 — `axl install` gains --force; an explicit --code is consent to switch servers (prints "Switching from X to Y"); interactive without code asks; non-interactive without code errors naming `axl install --server Y --force`. Supersedes pre-flight ruling 9's pass-through — cost if wrong: a pasted code moves a machine off its previous server (it was the user's explicit action).
+- Final: Ruling: I2 — UI "already installed" command becomes `axl install --server <url> --code <CODE>` (login happens inside install); docs/deploy/local.md fixed — cost if wrong: none.
+- Final: Ruling: live Claude Code plugin loading / live Codex hooks / real launchd-systemd not exercised — documented formats + `claude plugin validate` accepted the generated plugin — cost if wrong: harness not wired until fixed; owner should do a 2-minute manual check before release.
+- Final: Ruling: residual Helm duplicate-env finding is load-bearing (helm upgrade may fail) → smallest change: skip the chart-rendered entry when extraEnv names AXL_TRUSTED_PROXY_HEADER, with a helm.sh case; dispatched as a PR-iteration fix (post-SDD) — cost if wrong: none.
+
+## Deferred minor findings
+
+- Task 1: minor (deferred): HOME-unset branch in bridge duplicates URL logic and skips blank-env filter
+- Task 1: minor (deferred): ~/.axl created with umask then chmod; use DirBuilder mode 0700
+- Task 1: minor (deferred): hook now reports "cannot read ~/.axl/token" on non-NotFound errors
+- Task 1: minor (deferred): fixed .tmp name in atomic write can collide between concurrent writers
+- Task 1: minor (deferred): tests miss loose-mode token replace, no-HOME branch, save_config dropping unknown keys
+- Task 1: minor (deferred): TempHome test helper copy-pasted in three places
+- Task 1: minor (deferred): no separate RED run captured
+- Task 1: minor (deferred): warning test asserts returned string, not that it reaches stderr
+- Task 2: minor (deferred): no test pins rollback when token insert fails after the status flip
+- Task 2: minor (deferred): cleanup test can't observe mark-as-expired half
+- Task 2: minor (deferred): denied row past expiry polls as Expired (per brief)
+- Task 2: minor (deferred): SQLite poll_device takes BEGIN IMMEDIATE on every poll
+- Task 2: minor (deferred): user_code_hash UNIQUE collision → DB error; Task 3/5 issuer must retry with a new code (carry to Task 3)
+- Task 2: minor (deferred): cleanup deletes consumed rows after 1 day, dropping enrollment→token link (within spec)
+- Task 3: minor (deferred): issue_code only trims label; empty/very long labels pass — carry to Task 5 form validation (1..=64 chars)
+- Task 3: minor (deferred): SlowDown check/insert in separate lock sections; retain O(n) per poll
+- Task 3: minor (deferred): DeviceStart / PollReply::Token derive Debug — secrets could leak via {:?}; prefer redacting Debug
+- Task 3: minor (deferred): unused _ip in exchange; normalize_code pub only for tests; untested slow-down refresh, pruning, cancel, collision retry
+- Task 4: minor (deferred): poll/start/enroll share one 10/min per-IP bucket — concurrent logins or NAT'd clients can hit 429 (treated as slow_down)
+- Task 4: minor (deferred): malformed JSON rejected before limiter runs
+- Task 4: minor (deferred): public_url host/port only charset-checked
+- Task 4: minor (deferred): loopback bind behind same-host proxy advertises 127.0.0.1 instead of 503
+- Task 4: minor (deferred): whoami scans whole token list
+- Task 4: minor (deferred): whoami_requires_token passed vacuously in RED
+- Task 4: minor (deferred): >1024 undrained keys → O(n) retain under mutex per call; prefer amortized/timer sweep
+- Task 5: minor (deferred): /ui/connect/lookup has no per-IP limit (signed-in only, except `none` mode on loopback)
+- Task 5: minor (deferred): unused .panel-subtitle; stale Revoke after countdown 0; weak <script> assertion in test
+- Task 5: minor (deferred): app.js countdown expiry behaviour has no automated test (no JS harness); tokens list doesn't live-refresh on consume
+- Task 6: minor (deferred): non-numeric `axl --version` prints test errors then reinstalls
+- Task 6: minor (deferred): no tests for http prompt path or "$1" passthrough (partly covered by fix round)
+- Task 6: minor (deferred): helm axle.allowedHosts helper appends .host from every ingress entry unchecked (pre-existing)
+- Task 7: minor (deferred): verify_url opened without same-origin check; printed without stripping control chars
+- Task 7: minor (deferred): URL from env/config skips normalise_url; switch check is plain string compare
+- Task 7: minor (deferred): logout revokes against AXL_SERVER_URL env URL but reads only the file token
+- Task 7: minor (deferred): save_config drops comments/unknown keys; rollback writes default config even if none existed
+- Task 7: minor (deferred): slow_down, deadline expiry, non-http URL rejection untested
+- Task 7: minor (deferred): save_config failure after redeem (before write_token) still burns the code; Retry-After clamp lacks unit test
+- Task 8: minor (deferred): remove_block not byte-exact when original lacks trailing newline
+- Task 8: minor (deferred): /usr/local Cellar prefix untested; ownership/xattrs not preserved on atomic write (mode is)
+- Task 8: minor (deferred): LinkEdit.before ignored in apply; apply returns no report; Manifest lacks remove API (Task 14 must add)
+- Task 8: minor (deferred): axl_path can return relative if current_dir() fails; duplicate start marker (start,start,end) swallows content between
+- Task 9: minor (deferred): no decoy hook with valid event name in unrelated fixture; is_axl_hook_command checks basename only
+- Task 9: minor (deferred): plugin mode blocks install on unparseable ~/.claude.json/settings.json even without Axle entries; adopts any mcpServers.axle regardless of command
+- Task 9: minor (deferred): new_file_mode .axl ancestor test could match unrelated .axl dir; weak assertions in trailing-commas test
+- Task 9: minor (deferred): empty dirs left after uninstall; CLAUDE.md block stays when switching to plugin mode
+- Task 10: minor (deferred): Codex hook timeout=5 equals axl hook's 5 s internal ceiling — Codex may kill first
+- Task 10: minor (deferred): is_axl_hook_command ignores managed `--harness codex` form (pasted copy outside markers duplicates)
+- Task 10: minor (deferred): byte-exact survival only reconstruction-tested for unrelated fixture
+- Task 10: minor (deferred): unknown --harness value falls back to Claude Code; Codex fixtures from doc tables, not real payloads
+- Task 11: minor (deferred): jsonc_comments_preserved uses contains, not byte compare; plan_uninstall passes empty snippet on unparseable file; non-object mcp snippet duplicates key; hand-made axle in non-target file ignored when both exist; uninstall after adoption removes managed entry rather than restoring original (consistent with Tasks 9-10 and spec)
+- Task 12: minor (deferred): save_port drops unknown config keys/comments (ClientConfig has 2 keys)
+- Task 12: minor (deferred): port check skipped when running even if --port changed (brief-mandated)
+- Task 12: minor (deferred): no tests for start/stop/restart/status; misnamed config test; default-port half skips when 7420 busy; After=network.target no-op in user unit
+- Task 12: minor (deferred): launchd proceeds to bootstrap silently if still loaded after 25 polls
+- Task 13: minor (deferred): --local re-run token-reuse path untested; dry-run --server B with token for A prints "would log in" where real run errors (--force)
+- Task 13: minor (deferred): redact renders Authorization Bearer oddly; redact not applied outside install flow; partial-failure test relies on unix perms (fails as root)
+- Task 14: minor (deferred): no tests for pruning safety (other skills, user file in integrations), partial failure, NeedsManual next to clean harness
+- Task 14: minor (deferred): own-file deletion check is lexical starts_with (.. in manifest path); only first problem returned; pre-existing empty ~/.claude/skills removed; logout prints URL unredacted; revoke test reads real AXL_SERVER_URL env
+- Task 15: minor (deferred): config/manifest "fix" lines are prose not commands; "could not check" lines have no fix (exit 0 though unverified); stale-path check flags any absolute path ending /axl in config text
+- Task 15: minor (deferred): local 429 on whoami suggests service restart; no-token + unreachable still suggests login; config/server lines precede root-cause service line
+- Task 16: minor (deferred): docs/deploy/local.md says "(or axl login)" configures harnesses — login doesn't; cli.md Codex table row lacks --harness codex (in prose only)
+- Final: minor (deferred): M2 legacy exported AXL_SERVER_URL overrides saved server; M3 legacy "unreachable 127.0.0.1" warning computed before adopted URL moves; M5 unauthenticated device-login starts can flood pending list via rotated IPv6

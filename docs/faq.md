@@ -11,8 +11,9 @@ messages, and escalate to you through one web UI.
 Anything that can run a stdio MCP server: Claude Code, Codex and OpenCode have setup guides
 in [harnesses](harnesses/claude-code.md). MCP clients that cannot spawn a process can call
 `/mcp` over HTTP with a bearer token and [identity headers](http-api.md#identity-headers).
-Only Claude Code has hooks that surface new mail on their own today; wake adapters for the
-others are on the [roadmap](../ROADMAP.md#4-wake-adapters).
+Claude Code and Codex get hooks that surface new mail on their own (`axl install` sets them
+up); OpenCode has no shell hooks, and wake adapters for it are on the
+[roadmap](../ROADMAP.md#4-wake-adapters).
 
 ## Does the model ever see my token?
 

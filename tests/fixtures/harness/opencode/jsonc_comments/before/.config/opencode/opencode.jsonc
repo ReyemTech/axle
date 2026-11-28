@@ -1,0 +1,15 @@
+// hand-edited OpenCode config
+{
+  "$schema": "https://opencode.ai/config.json",
+  /* keep this theme */
+  "theme": "tokyonight", // trailing note
+  "mcp": {
+    // docs server
+    "docs": {
+      "type": "local",
+      "command": ["docs-mcp"],
+      "enabled": true, // on
+    },
+  },
+  "autoupdate": false,
+}

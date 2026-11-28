@@ -1,0 +1,26 @@
+model = "gpt-5"
+
+[mcp_servers.axle]
+command = "/old/path/axl"
+args = ["bridge", "--harness", "codex"]
+env = { AXL_SERVER_URL = "http://100.64.0.10:7420", EXTRA = "1" }
+
+[mcp_servers.other]
+command = "other-mcp"
+
+[[hooks.SessionStart]]
+matcher = "startup"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "axl hook session-start"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "echo my own hook"
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "/usr/local/bin/axl hook stop"

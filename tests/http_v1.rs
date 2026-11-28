@@ -185,6 +185,33 @@ async fn next_event(
 }
 
 #[tokio::test]
+async fn revoke_self_revokes_caller_only() {
+    let app = app().await;
+    let mine = app.token().await;
+    let other = app.token().await;
+    let (status, _) = app.post(&mine, "/v1/token/revoke", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let whoami = |token: String| {
+        let app = &app;
+        async move {
+            app.call(
+                Request::get("/v1/whoami")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .status()
+        }
+    };
+    assert_eq!(whoami(mine.clone()).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(whoami(other).await, StatusCode::OK);
+    // Revoking again is refused like any request with a dead token.
+    let (status, _) = app.post(&mine, "/v1/token/revoke", json!({})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn rejects_without_token() {
     let app = app().await;
     for req in [
@@ -359,6 +386,23 @@ async fn events_stream_delivers_message() {
         .expect("an event within 1 s");
     assert_eq!(name, "MessageCreated");
     assert_eq!(data["to"], json!({"kind": "agent", "id": agent}));
+}
+
+#[tokio::test]
+async fn enrollment_events_are_not_sent_to_agents() {
+    let app = app().await;
+    let token = app.token().await;
+    let (session, _) = app.register(&token, "github.com/acme/platform-infra").await;
+    let mut stream = app.events(&token, session).await;
+
+    app.state.enroll.issue_code("work laptop").await.unwrap();
+
+    assert!(
+        next_event(&mut stream, Duration::from_millis(200))
+            .await
+            .is_none(),
+        "enrollment changes must not reach agent streams"
+    );
 }
 
 #[tokio::test]

@@ -57,6 +57,17 @@ ui:
   # Mark the UI session cookie Secure (AXL_COOKIE_SECURE). null: on when the ingress has TLS.
   cookieSecure: null
 
+# The address clients use to reach Axle (AXL_PUBLIC_URL), served in /install.sh and handed out
+# by /v1/enroll. Empty: derived from the first ingress host (https with ingress.tls, else http);
+# with no ingress host the variable is left unset and a non-loopback server answers 503.
+publicUrl: ""
+
+# The header your ingress sets to the real client address (AXL_TRUSTED_PROXY_HEADER); the
+# enrollment rate limit counts clients by it. Behind an ingress every client would otherwise
+# share one limit. null: X-Forwarded-For when ingress.enabled, else unset. "": never set.
+# The header is trusted blindly, so only use it when the ingress overwrites it.
+trustedProxyHeader: null
+
 service:
   type: ClusterIP
   port: 7420

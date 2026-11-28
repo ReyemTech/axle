@@ -53,7 +53,15 @@ macro_rules! id_type {
     )+};
 }
 
-id_type!(ProjectId, AgentId, SessionId, TaskId, MessageId, TokenId);
+id_type!(
+    ProjectId,
+    AgentId,
+    SessionId,
+    TaskId,
+    MessageId,
+    TokenId,
+    EnrollmentId
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
@@ -199,6 +207,53 @@ text_enum!(PlanState {
     ChangesRequested => "changes_requested",
     Approved => "approved",
 });
+
+/// How an enrollment is redeemed: a one-time code pasted into a command, or the device flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrollmentKind {
+    Code,
+    Device,
+}
+
+text_enum!(EnrollmentKind {
+    Code => "code",
+    Device => "device",
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrollmentStatus {
+    Pending,
+    Approved,
+    Consumed,
+    Expired,
+    Denied,
+}
+
+text_enum!(EnrollmentStatus {
+    Pending => "pending",
+    Approved => "approved",
+    Consumed => "consumed",
+    Expired => "expired",
+    Denied => "denied",
+});
+
+/// A pending or finished request to mint a host token (the secrets are stored only as hashes
+/// and never appear here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Enrollment {
+    pub id: EnrollmentId,
+    pub kind: EnrollmentKind,
+    pub label: String,
+    pub host: String,
+    pub status: EnrollmentStatus,
+    pub token_id: Option<TokenId>,
+    pub created_at: OffsetDateTime,
+    pub expires_at: OffsetDateTime,
+    pub approved_at: Option<OffsetDateTime>,
+    pub requester_ip: Option<String>,
+}
 
 /// Optional claim filter: when set, only agents with this harness / on this host may claim.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
