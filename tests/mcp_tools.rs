@@ -1534,3 +1534,67 @@ store_matrix!(
         }
     }
 );
+
+store_matrix!(up_front_checks_see_the_rest_of_the_request, |store: Arc<
+    dyn Store,
+>| async move {
+    let server = start(store).await;
+    let creator = server.agent("mac", "claude-code").await;
+    let create = |title: &'static str| {
+        let creator = &creator;
+        async move {
+            let v = ok(creator, "task_create", json!({"title": title, "body": ""})).await;
+            v["id"].as_str().unwrap().to_string()
+        }
+    };
+
+    // B is full (20 links, one of them with A): replacing A's link in one call fits.
+    let a = create("A").await;
+    let b = create("B").await;
+    ok(
+        &creator,
+        "task_update",
+        json!({"id": a, "related": [{"id": b, "kind": "relates"}]}),
+    )
+    .await;
+    let mut others = Vec::new();
+    for _ in 0..19 {
+        others.push(json!({"id": create("filler").await, "kind": "relates"}));
+    }
+    ok(&creator, "task_update", json!({"id": b, "related": others})).await;
+    ok(
+        &creator,
+        "task_update",
+        json!({"id": a, "unrelate": [b], "related": [{"id": b, "kind": "follow-up"}]}),
+    )
+    .await;
+    let detail = ok(&creator, "task_get", json!({"id": a})).await;
+    assert_eq!(detail["related"][0]["kind"], "follow-up", "{detail}");
+
+    // W waits on P; one call re-points the wait to X and moves W under P.
+    let w = create("W").await;
+    let p = create("P").await;
+    let x = create("X").await;
+    ok(&creator, "task_claim", json!({"id": w})).await;
+    let block_on_p = json!({"status": "blocked", "reason": "needs P",
+                                "waiting_on": {"task": p}});
+    let mut args = block_on_p.clone();
+    args["id"] = json!(w);
+    ok(&creator, "task_update", args).await;
+    let moved = ok(
+        &creator,
+        "task_update",
+        json!({"id": w, "status": "blocked", "waiting_on": {"task": x}, "parent": p}),
+    )
+    .await;
+    assert_eq!(moved["parent"], p);
+    // Without the re-point the same move is still refused.
+    let v = create("V").await;
+    ok(&creator, "task_claim", json!({"id": v})).await;
+    let mut args = block_on_p;
+    args["id"] = json!(v);
+    ok(&creator, "task_update", args).await;
+    let (is_error, text) = call(&creator, "task_update", json!({"id": v, "parent": p})).await;
+    assert!(is_error && text.contains("own ancestor"), "{text}");
+    creator.cancel().await.unwrap();
+});

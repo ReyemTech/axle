@@ -1153,8 +1153,12 @@ impl AxleMcp {
         if let Some(parent) = parent {
             let ctx = MoveContext {
                 adds_projects: !projects.is_empty(),
-                pending_wait: match &waiting_on {
-                    Some(WaitingOn::Task(t)) => Some(*t),
+                // Review clears the wait; a block with `waiting_on` replaces it; a block
+                // update without one keeps it.
+                moved_wait: match (p.status, &waiting_on) {
+                    (Some(UpdateStatusParam::Review), _) => Some(None),
+                    (Some(UpdateStatusParam::Blocked), Some(WaitingOn::Task(t))) => Some(Some(*t)),
+                    (Some(UpdateStatusParam::Blocked), Some(_)) => Some(None),
                     _ => None,
                 },
             };

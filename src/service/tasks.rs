@@ -327,8 +327,9 @@ pub fn plan_words(state: PlanState) -> &'static str {
 pub struct MoveContext {
     /// The request also adds participating projects (a task with them cannot be a child).
     pub adds_projects: bool,
-    /// The request also blocks the task waiting on this task.
-    pub pending_wait: Option<TaskId>,
+    /// The task wait the moved task will have after the request's status change: `None` when
+    /// the request leaves its wait alone, `Some(None)` when it ends up waiting on no task.
+    pub moved_wait: Option<Option<TaskId>>,
 }
 
 /// A target named twice keeps its last kind; removals are deduplicated. Returns the additions,
@@ -1342,24 +1343,23 @@ impl TaskService {
         {
             return Err(TaskError::ChildProjectMismatch);
         }
-        // No task of the moved subtree may wait on one of its new ancestors, counting a wait
-        // the same request is about to set on the task itself.
-        if let Some(target) = ctx.pending_wait
-            && above.contains(&target)
-        {
-            return Err(TaskError::MoveMakesAncestorWait {
-                task: id,
-                title: task.title.clone(),
-            });
-        }
+        // No task of the moved subtree may wait on one of its new ancestors. The moved task is
+        // judged by the wait it will have once the same request's status change has run;
+        // its subtasks by their stored state.
         let mut subtree = vec![task];
         let mut i = 0;
         while i < subtree.len() && subtree.len() <= MAX_CHAIN {
             let t = &subtree[i];
-            if let Some(WaitingOn::Task(target)) =
-                t.block.as_ref().and_then(|b| b.waiting_on.as_ref())
-                && t.status == TaskStatus::Blocked
-                && above.contains(target)
+            let stored = match t.block.as_ref().and_then(|b| b.waiting_on.as_ref()) {
+                Some(WaitingOn::Task(target)) if t.status == TaskStatus::Blocked => Some(*target),
+                _ => None,
+            };
+            let wait = match ctx.moved_wait {
+                Some(pending) if i == 0 => pending,
+                _ => stored,
+            };
+            if let Some(target) = wait
+                && above.contains(&target)
             {
                 return Err(TaskError::MoveMakesAncestorWait {
                     task: t.id,
@@ -1419,7 +1419,14 @@ impl TaskService {
                 continue;
             }
             mine.push(*target);
-            let theirs = self.store.task_links(*target).await?.len();
+            // Not counting a link with this task the same request removes first.
+            let theirs = self
+                .store
+                .task_links(*target)
+                .await?
+                .iter()
+                .filter(|l| !(removes.contains(target) && (l.task_id == id || l.target_id == id)))
+                .count();
             if theirs >= MAX_LINKS as usize {
                 return Err(TaskError::TooManyLinks(*target));
             }
