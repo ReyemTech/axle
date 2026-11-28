@@ -99,8 +99,9 @@
   <section class="panel delivery-panel" aria-label="Delivery">
     <h2 class="panel-title">Delivery <span class="short-id" title="Task id">{{ delivery.short_id }}</span></h2>
     {% if let Some(e) = delivery.error %}<p class="error" role="alert">{{ e }}</p>{% endif %}
+    {% if let Some(pr) = delivery.pr %}<p><a class="pr-chip" href="{{ pr.url }}" rel="noopener noreferrer">{{ pr.text }}</a></p>{% endif %}
     {% if delivery.rows.is_empty() %}
-    {% if let Some(pr) = delivery.pr %}<p><a class="pr-chip" href="{{ pr.url }}" rel="noopener noreferrer">{{ pr.text }}</a></p>{% else %}<p class="empty">No delivery stages for this project.</p>{% endif %}
+    {% if delivery.pr.is_none() %}<p class="empty">No delivery stages for this project.</p>{% endif %}
     {% else %}
     <ol class="stage-rows">
     {% for r in delivery.rows %}

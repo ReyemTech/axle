@@ -354,6 +354,8 @@ pub struct PrLink {
 pub struct DeliveryPanel {
     pub short_id: String,
     pub rows: Vec<StageRow>,
+    /// The PR link shown on its own: set when no In PR row carries it (no stages, or a
+    /// project whose enabled stages leave In PR out).
     pub pr: Option<PrLink>,
     pub can_link: bool,
     pub can_unlink: bool,
@@ -423,7 +425,10 @@ async fn delivery_panel(
         short_id: short_id(task.id),
         rows,
         can_unlink: pr.is_some() && open && !delivering && !merged,
-        pr: pr.as_ref().map(pr_link),
+        pr: pr
+            .as_ref()
+            .filter(|_| !enabled.contains(&DeliveryStage::InPr))
+            .map(pr_link),
         can_link: open,
         can_move: delivering,
         error,

@@ -188,7 +188,8 @@ The task page shows, top to bottom:
   (`range=all`, so older usage is not cut off by the default range); a parent adds *incl. subtasks* and
   sums its descendants. No usage, no line.
 - **Delivery** (when the project has [stages](delivery.md) on, or a PR is linked): the
-  short id, the linked PR as a chip, and the stages with where the task is. **Link PR** takes
+  short id, the linked PR as a chip (on the In PR row, or above the stages when In PR is
+  off), and the stages with where the task is. **Link PR** takes
   a pull request URL, **Unlink PR** removes it (not after a merge), **Advance stage** moves a
   delivering task one stage forward and **Mark done** finishes it. These are human only.
 - **Subtasks**: children with their status and progress.

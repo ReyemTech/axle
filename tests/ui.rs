@@ -5277,6 +5277,34 @@ mod delivery_panel {
     }
 
     #[tokio::test]
+    async fn delivery_panel_shows_pr_without_in_pr_stage() {
+        // Only later stages enabled: no In PR row carries the link, so it shows on its own,
+        // once, on a delivering task and after it is done.
+        let (app, cookie, _csrf, web) = setup(&[Merged, Released]).await;
+        let task = delivering(&app, &web).await;
+        let path = format!("/ui/tasks/{}", task.id);
+        let page = app.get(&path, Some(&cookie)).await;
+        assert_eq!(
+            select_texts(&page, ".delivery-panel .stage-label"),
+            ["Merged", "Released"]
+        );
+        assert_eq!(select_texts(&page, PR_LINK), ["PR #12"]);
+        move_to(&app, &task, Released, vec![Merged]).await;
+        let page = app.get(&path, Some(&cookie)).await;
+        assert_eq!(
+            app.state
+                .store
+                .get_task(task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Done
+        );
+        assert_eq!(select_texts(&page, PR_LINK), ["PR #12"]);
+    }
+
+    #[tokio::test]
     async fn link_pr_form() {
         let (app, cookie, csrf, web) = setup(&[InPr, Merged]).await;
         let task = app.task(&web, "Ship it", None).await;
