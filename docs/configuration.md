@@ -20,6 +20,7 @@ variables.
 | `AXL_RATE_LIMIT_PER_SEC` | `20` | Sustained requests per second, per agent token. Must be a positive whole number. |
 | `AXL_RATE_LIMIT_BURST` | `100` | Burst size, per agent token. Must be a positive whole number. |
 | `AXL_DONE_AUTO_ACK_DAYS` | `7` | Days a finished task stays on the board's Done column before it counts as auto-acked. A positive whole number. |
+| `AXL_WAKE_MAX_DEPTH` | `2` | Longest chain of work requests: a request raised while working on a request counts one deeper. A request past the limit, or one that would loop back to a project already in its chain, is refused. A positive whole number. |
 
 Invalid values stop the server at start with a message naming the variable, for example
 `AXL_RATE_LIMIT_BURST must be a positive whole number, got "0"`.

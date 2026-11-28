@@ -230,6 +230,8 @@ pub struct ServerConfig {
     pub rate_limit_burst: u32,
     /// `AXL_DONE_AUTO_ACK_DAYS` (default 7 days).
     pub done_auto_ack: Duration,
+    /// Longest chain of work requests (`AXL_WAKE_MAX_DEPTH`, default 2).
+    pub wake_max_depth: u32,
     /// Mark the UI session cookie `Secure` (`AXL_COOKIE_SECURE`, default false). Set it
     /// whenever the UI is reached over https, e.g. behind a TLS ingress.
     pub cookie_secure: bool,
@@ -392,6 +394,7 @@ impl ServerConfig {
             rate_limit_per_sec: positive(&get, "AXL_RATE_LIMIT_PER_SEC", 20)?,
             rate_limit_burst: positive(&get, "AXL_RATE_LIMIT_BURST", 100)?,
             done_auto_ack: Duration::days(i64::from(positive(&get, "AXL_DONE_AUTO_ACK_DAYS", 7)?)),
+            wake_max_depth: positive(&get, "AXL_WAKE_MAX_DEPTH", 2)?,
             cookie_secure: boolean(&get, "AXL_COOKIE_SECURE", false)?,
             public_url,
             trusted_proxy_header,
@@ -520,6 +523,25 @@ mod tests {
             );
             assert!(e.to_string().contains("AXL_DONE_AUTO_ACK_DAYS"));
         }
+    }
+
+    #[test]
+    fn wake_max_depth() {
+        let base = [
+            ("DATABASE_URL", "sqlite://./axl.db"),
+            ("AXL_ADMIN_SECRET", "s3cret-s3cret-s3cret"),
+        ];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let vars: Vec<(&str, &str)> = base.iter().chain(extra).copied().collect();
+            ServerConfig::from_lookup(lookup(&vars))
+        };
+        assert_eq!(with(&[]).unwrap().wake_max_depth, 2);
+        assert_eq!(
+            with(&[("AXL_WAKE_MAX_DEPTH", "3")]).unwrap().wake_max_depth,
+            3
+        );
+        let e = with(&[("AXL_WAKE_MAX_DEPTH", "0")]).unwrap_err();
+        assert!(matches!(e, ConfigError::BadNumber("AXL_WAKE_MAX_DEPTH", _)));
     }
 
     #[test]
