@@ -5362,6 +5362,23 @@ async fn pause_wake_ups_shows_state_and_router_skips() {
     let cookie = app.login().await;
     let infra = app.agent(INFRA, "mac", "claude-code").await;
     let project = infra.agent.project_id.unwrap();
+    // An idle, wakeable, live session: free to take the task once wake-ups resume.
+    let now = app.state.clock.now();
+    app.state
+        .store
+        .report_turn(
+            infra.session.id,
+            Some(axle::domain::TurnState::Idle),
+            Some(axle::domain::WakeChannel::ClaudeSocket),
+            now - time::Duration::seconds(30),
+        )
+        .await
+        .unwrap();
+    app.state
+        .store
+        .touch_heartbeat(infra.session.id, now)
+        .await
+        .unwrap();
     let csrf = csrf_for(&app, &cookie).await;
 
     let top = app.get("/ui/", Some(&cookie)).await;
@@ -5421,6 +5438,14 @@ async fn pause_wake_ups_shows_state_and_router_skips() {
             .await
             .contains(&"Wake-ups resumed".to_string())
     );
+    // Resuming placed the queued task: it is no longer waiting for a session.
+    let queued = app
+        .state
+        .store
+        .list_queued(app.state.clock.now())
+        .await
+        .unwrap();
+    assert!(queued.is_empty(), "{queued:?}");
     let top = app.get("/ui/", Some(&cookie)).await;
     assert!(top.text().contains("Pause wake-ups"));
     assert!(!top.text().contains("wake-ups paused"));
