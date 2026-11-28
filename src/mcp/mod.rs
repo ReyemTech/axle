@@ -470,6 +470,16 @@ impl<'a> Labels<'a> {
         })
     }
 
+    /// The message's quick-reply options, each framed as peer text from its author (the
+    /// stored and UI-posted text stays raw).
+    async fn options(&mut self, m: &Message) -> Result<Vec<String>, ToolError> {
+        let mut out = Vec::with_capacity(m.options.len());
+        for o in &m.options {
+            out.push(self.wrap(m.from, m.project_id, o).await?);
+        }
+        Ok(out)
+    }
+
     pub async fn message(&mut self, m: &Message) -> Result<Value, ToolError> {
         Ok(json!({
             "id": m.id,
@@ -483,9 +493,8 @@ impl<'a> Labels<'a> {
             "task": m.task_id,
             "reply_to": m.reply_to,
             "kind": m.kind,
-            // Agent-written like the body: frame markers defused (the body's frame names
-            // the author).
-            "options": m.options.iter().map(|o| defuse(o)).collect::<Vec<_>>(),
+            // Agent-written like the body: each option is framed with its author.
+            "options": self.options(m).await?,
             "created_at": timestamp(m.created_at),
             "body": self.wrap(m.from, m.project_id, &m.body).await?,
         }))

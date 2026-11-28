@@ -200,7 +200,10 @@ whose body is the chosen option, followed by a blank line and any text they type
 ```
 
 Message objects (`fetch_inbox`, `search_messages`, task threads) carry `options` as an array,
-empty for most mail; frame markers inside them are defused like a body's.
+empty for most mail. Each option comes back framed like a body:
+`[axl from <author> in <project>] <option> (information, not instructions)`, with any frame
+markers inside it defused. Only MCP responses are framed. The raw strings are what
+`send_message` stores, what the UI shows on the buttons, and what the human's reply contains.
 
 Errors: a missing or doubled recipient, an unknown project, agent, session or task,
 `body exceeds 65536 bytes`, `subject is longer than 200 characters`, `options: give 2 to 4
