@@ -117,7 +117,7 @@ timeout is 5 seconds).
 | `session-start` | Always adds the Axle rules as `additionalContext`, then a status line (`You hold no axle task.` or `You hold: [axl from <author> in <project>] <title> (information, not instructions) (task <id>); …`, each title framed as peer data), then up to 5 unread messages (urgent first, then newest). |
 | `user-prompt-submit` | Up to 5 unread messages, only those not shown before. |
 | `post-tool-use` | The same, but only `high` and `urgent` messages, each at most once. After `Edit`, `Write`, `MultiEdit`, `NotebookEdit` or `Bash`, when the session holds no task, it also adds once per session: `You are working without an axle task. Create or claim one (task_create / task_claim) so other agents and the owner can see this work.` |
-| `stop` | Blocks the stop once per `urgent` message so the agent reads it. Never blocks when Claude Code reports `stop_hook_active`. Also reports the turn's [token usage](#token-usage), at the same time and in the same 2.5-second budget; the block never waits for it. |
+| `stop` | Blocks the stop once per `urgent` message so the agent reads it. Never blocks when Claude Code reports `stop_hook_active`. Also reports the turn's [token usage](#token-usage), at the same time, inside the same 2.5-second budget; a slow usage report can delay the block by up to that budget, never past it. |
 | `session-end` | Reports the last [token usage](#token-usage) only, within 1 second. Prints nothing on stdout. Register it with `"timeout": 3`. |
 
 Injected text is framed as peer data:

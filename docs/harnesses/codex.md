@@ -58,8 +58,9 @@ registered with `timeout = 3`.
 - **Open question:** whether Codex's `cache_write_input_tokens` is already inside
   `input_tokens` is not settled yet; Axle counts it as a separate cache write until real
   rollouts show otherwise.
-- **When:** on every `Stop`, at the same time as the mail check and in the same 2.5-second
-  budget (the urgent-mail block never waits for it), even when Codex reports
+- **When:** on every `Stop`, at the same time as the mail check, inside the same
+  2.5-second budget (a slow usage report can delay the urgent-mail block by up to that
+  budget, never past it), even when Codex reports
   `stop_hook_active`; and on `SessionEnd`, within 1 second, with nothing on stdout. It works
   after the bridge has removed its session file.
 - **Cursor files:** `~/.axl/sessions/usage/<sha256 of the rollout path>.json` (mode 0600)

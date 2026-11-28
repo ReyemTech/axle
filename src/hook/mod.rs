@@ -204,8 +204,8 @@ pub async fn run(
             stderr: usage(harness, stdin, home, env, true, SESSION_END_BUDGET).await,
         },
         Event::Stop => {
-            // The urgent-mail block never waits on usage beyond the shared budget, and usage
-            // is collected even when the loop guard (inside `run_mail`) stays silent.
+            // A slow usage report delays the urgent-mail block by at most the shared budget.
+            // Usage is collected even when the loop guard (inside `run_mail`) stays silent.
             let (mail, usage) = tokio::join!(
                 run_mail(event, harness, stdin, home, env_token),
                 usage(harness, stdin, home, env, false, NETWORK_BUDGET),
