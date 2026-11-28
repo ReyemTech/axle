@@ -7,10 +7,12 @@ mod common;
 use std::sync::Arc;
 
 use axle::clock::TestClock;
-use axle::domain::{LinkKind, MessageKind, SessionId, Task, TaskEventKind, TaskId, TaskStatus};
+use axle::domain::{
+    LinkKind, MessageKind, SessionId, Task, TaskEventKind, TaskId, TaskStatus, WaitingOn,
+};
 use axle::service::identity::{IdentityInput, IdentityService, Resolved};
 use axle::service::tasks::{
-    Caller, ClaimOutcome, Completion, MAX_LINKS, NewTask, TaskError, TaskService,
+    BlockInput, Caller, ClaimOutcome, Completion, MAX_LINKS, NewTask, TaskError, TaskService,
 };
 use axle::store::Store;
 use time::macros::datetime;
@@ -709,5 +711,77 @@ store_matrix!(
                 other => panic!("round {round}: unexpected status {other}"),
             }
         }
+    }
+);
+
+impl Env {
+    /// `worker` claims `t` and blocks it waiting on `target`.
+    async fn block_on(&self, worker: &Resolved, t: TaskId, target: TaskId) {
+        self.svc.claim(worker, t).await.unwrap();
+        self.svc
+            .block_with(
+                worker,
+                t,
+                BlockInput {
+                    reason: Some("needs the other one".into()),
+                    waiting_on: Some(WaitingOn::Task(target)),
+                    unblock: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+}
+
+store_matrix!(
+    a_move_never_makes_a_task_wait_on_its_ancestor,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let worker = env.session("linux").await;
+
+        // The moved task itself waits on the new parent.
+        let parent = env.task(Caller::Human, "parent").await;
+        let waiter = env.task(Caller::Human, "waiter").await;
+        env.block_on(&worker, waiter.id, parent.id).await;
+        let err = env
+            .svc
+            .move_under(Caller::Human, waiter.id, parent.id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, TaskError::MoveMakesAncestorWait { task, .. } if *task == waiter.id),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("\"waiter\""), "{err}");
+
+        // A subtask of the moved task waits on an ancestor of the new parent.
+        let top = env.task(Caller::Human, "top").await;
+        let mid = env.child(&top, "mid").await;
+        let moved = env.task(Caller::Human, "moved").await;
+        let deep = env.child(&moved, "deep").await;
+        env.block_on(&worker, deep.id, top.id).await;
+        let err = env
+            .svc
+            .move_under(Caller::Human, moved.id, mid.id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, TaskError::MoveMakesAncestorWait { task, .. } if *task == deep.id),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("\"deep\""), "{err}");
+        for t in [&waiter, &moved] {
+            let now = env.store.get_task(t.id).await.unwrap().unwrap();
+            assert_eq!(now.parent_id, None, "nothing moved");
+        }
+
+        // A wait on a task outside the new ancestry is fine.
+        let elsewhere = env.task(Caller::Human, "elsewhere").await;
+        let fine = env.task(Caller::Human, "fine").await;
+        env.block_on(&worker, fine.id, elsewhere.id).await;
+        env.svc
+            .move_under(Caller::Human, fine.id, parent.id)
+            .await
+            .unwrap();
     }
 );

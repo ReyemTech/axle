@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use super::{
     AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate,
-    MessageReceipt, MoveRequest, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient,
-    RelateRequest, Related, Store, StoreError, StoreResult, TaskFilter, TaskOrder,
+    MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome, ProjectsAdded,
+    Recipient, RelateRequest, Related, Store, StoreError, StoreResult, TaskFilter, TaskOrder,
     TransitionRequest, Transitioned, UnblockRule, Unblocked, block_previous_payload, child_event,
     children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label,
     like_pattern, options_from, options_to, projects_added_note, projects_added_payload,
@@ -1693,7 +1693,7 @@ impl Store for PostgresStore {
         })
     }
 
-    async fn move_task(&self, req: &MoveRequest) -> StoreResult<Option<Task>> {
+    async fn move_task(&self, req: &MoveRequest) -> StoreResult<Moved> {
         let (agent, session) = match req.editor {
             Some((a, s)) => (Some(a.as_uuid()), Some(s.as_uuid())),
             None => (None, None),
@@ -1741,7 +1741,35 @@ impl Store for PostgresStore {
         .transpose()?;
         if allowed.is_none() {
             tx.commit().await?;
-            return Ok(None);
+            return Ok(Moved::Refused);
+        }
+        // The new ancestors of the moved subtree are the parent and its ancestors: no task in
+        // the subtree may be waiting on one of them.
+        let waiting: Option<String> = sqlx::query_scalar(
+            "WITH RECURSIVE
+                 up(id, parent_id) AS (
+                     SELECT id, parent_id FROM tasks WHERE id = $2
+                     UNION
+                     SELECT t.id, t.parent_id FROM tasks t JOIN up ON t.id = up.parent_id),
+                 down(id) AS (
+                     SELECT id FROM tasks WHERE id = $1
+                     UNION
+                     SELECT t.id FROM tasks t JOIN down ON t.parent_id = down.id)
+             SELECT CAST(w.id AS TEXT) FROM down d JOIN tasks w ON w.id = d.id
+              WHERE w.status = 'blocked' AND w.waiting_kind = 'task'
+                AND w.waiting_task_id IN (SELECT id FROM up)
+              ORDER BY w.created_at, w.id LIMIT 1",
+        )
+        .bind(id)
+        .bind(parent)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(w) = waiting {
+            tx.commit().await?;
+            let w: uuid::Uuid = w
+                .parse()
+                .map_err(|e| StoreError::Corrupt(format!("task id {w:?}: {e}")))?;
+            return Ok(Moved::WaitOnAncestor(w.into()));
         }
         let task = sqlx::query(concat!(
             "UPDATE tasks SET parent_id = $1, version = version + 1, updated_at = $2
@@ -1757,7 +1785,7 @@ impl Store for PostgresStore {
         .and_then(|row| task_from(&row))?;
         insert_event(&mut tx, &req.event, req.token).await?;
         tx.commit().await?;
-        Ok(Some(task))
+        Ok(Moved::Moved(task))
     }
 
     async fn task_links(&self, task: TaskId) -> StoreResult<Vec<TaskLink>> {

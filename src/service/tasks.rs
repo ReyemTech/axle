@@ -20,7 +20,7 @@ use crate::service::identity::{IdentityError, NAME_MAX, Resolved, check_label};
 use crate::service::messages::{MessageError, SUBJECT_MAX, check_body, check_subject};
 use crate::store::{
     AddProjectsRequest, BlockWrite, ClaimRequest, Claimant, EditRequest, LeaseUpdate, MoveRequest,
-    RelateRequest, Related, Store, StoreError, TaskFilter, TransitionRequest, Transitioned,
+    Moved, RelateRequest, Related, Store, StoreError, TaskFilter, TransitionRequest, Transitioned,
     UnblockRule, claim_event,
 };
 
@@ -267,6 +267,12 @@ pub enum TaskError {
     ParentClosed(TaskStatus),
     #[error("the parent is a subtask of this task, which would make a cycle")]
     ParentIsDescendant,
+    /// Moving would make a blocked task wait on its own ancestor.
+    #[error(
+        "task \"{title}\" ({task}) is blocked waiting on the new parent or one of its \
+         ancestors; a task cannot wait on its own ancestor, so re-point or clear that wait first"
+    )]
+    MoveMakesAncestorWait { task: TaskId, title: String },
     /// The task body is over the message cap, or a promoted message does not exist.
     #[error(transparent)]
     Message(#[from] MessageError),
@@ -1217,10 +1223,22 @@ impl TaskService {
                 Some(serde_json::json!({ "parent": parent.to_string() })),
             ),
         };
-        if let Some(task) = self.store.move_task(&req).await? {
-            self.changed(&task, TaskEventKind::MovedUnder).await;
-            self.changed(&p, TaskEventKind::MovedUnder).await;
-            return Ok(task);
+        match self.store.move_task(&req).await? {
+            Moved::Moved(task) => {
+                self.changed(&task, TaskEventKind::MovedUnder).await;
+                self.changed(&p, TaskEventKind::MovedUnder).await;
+                return Ok(task);
+            }
+            Moved::WaitOnAncestor(w) => {
+                let title = self
+                    .store
+                    .get_task(w)
+                    .await?
+                    .map(|t| t.title)
+                    .unwrap_or_default();
+                return Err(TaskError::MoveMakesAncestorWait { task: w, title });
+            }
+            Moved::Refused => {}
         }
         // Explain the refusal from a fresh read.
         let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;

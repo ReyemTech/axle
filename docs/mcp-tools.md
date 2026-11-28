@@ -447,7 +447,9 @@ waiters stay blocked until their owner re-points or releases them.
 `moved_under` event. The parent must not be `planning`, `done` or `cancelled`, and must be in
 the task's project or span it (the `task_create` rule). Refused for the task itself, a parent
 that is one of the task's own subtasks (a cycle), a task with participating projects, and a
-task that already has a parent: moving a subtask to another parent is not supported. The
+task that already has a parent: moving a subtask to another parent is not supported. It is
+also refused when the task or one of its subtasks is blocked waiting on the new parent or one
+of its ancestors (a task never waits on its own ancestor); the error names that task. The
 parent's progress counts it at once; from then on it behaves like any child (the
 coordinator hears when it blocks or closes, and the parent goes to `review` when its last
 open child closes).
@@ -459,6 +461,7 @@ Errors: ``nothing to update: pass `status`, `title`, `body`, `add_projects`, `re
 `parent task not found`,
 `the task already has a parent; moving a subtask to another parent is not supported`,
 `the parent task is done` / `cancelled`, `the parent is a subtask of this task, which would make a cycle`,
+`task "<title>" (<id>) is blocked waiting on the new parent or one of its ancestors; …`,
 `a child task's project must be its parent's project or one the parent spans`,
 `a reason is required to block a task`,
 `` `reason` goes with `status`; pass `status: blocked` or `status: review` ``,

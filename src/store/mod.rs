@@ -246,9 +246,11 @@ pub trait Store: Send + Sync {
     /// `req.editor` is `None` (the human), its creator or the session holding it (`planning`,
     /// `claimed`, `blocked` or `review`), the parent is not `planning`, `done` or `cancelled`,
     /// the task's project is the parent's or one the parent spans, and the task is not the
-    /// parent or one of its ancestors. Sets `parent_id`, bumps `version` / `updated_at` and
-    /// appends `req.event`. `None` when the guard did not match.
-    async fn move_task(&self, req: &MoveRequest) -> StoreResult<Option<Task>>;
+    /// parent or one of its ancestors. It is also refused (`Moved::WaitOnAncestor`) when the
+    /// task or one of its subtasks is blocked waiting on the new parent or one of the parent's
+    /// ancestors, since a task never waits on its own ancestor. Sets `parent_id`, bumps
+    /// `version` / `updated_at` and appends `req.event`.
+    async fn move_task(&self, req: &MoveRequest) -> StoreResult<Moved>;
     /// Every link of `task`, whichever way it points, oldest first.
     async fn task_links(&self, task: TaskId) -> StoreResult<Vec<TaskLink>>;
     async fn get_task(&self, id: TaskId) -> StoreResult<Option<Task>>;
@@ -684,6 +686,18 @@ pub struct AddProjectsRequest<'a> {
     pub event: TaskEvent,
     /// Posted to the thread when something was added; its body is filled in.
     pub note: Message,
+}
+
+/// What `move_task` did. Short-lived, so the large variant is not boxed.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum Moved {
+    Moved(Task),
+    /// The guard did not match (callers re-read to explain why).
+    Refused,
+    /// This task (the moved one or a subtask of it) waits on a task that would become its
+    /// ancestor.
+    WaitOnAncestor(TaskId),
 }
 
 /// A request to move a top-level task under a parent (see `Store::move_task`).

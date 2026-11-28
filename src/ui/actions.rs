@@ -56,9 +56,9 @@ fn task_error(e: TaskError) -> UiError {
         | TaskError::OwnParent
         | TaskError::UnknownParent
         | TaskError::ParentIsDescendant) => UiError::Invalid(capitalise(&e.to_string())),
-        e @ (TaskError::AlreadyAChild | TaskError::ParentClosed(_)) => {
-            UiError::Conflict(capitalise(&e.to_string()))
-        }
+        e @ (TaskError::AlreadyAChild
+        | TaskError::ParentClosed(_)
+        | TaskError::MoveMakesAncestorWait { .. }) => UiError::Conflict(capitalise(&e.to_string())),
         e @ (TaskError::ReasonRequired
         | TaskError::NothingToUpdate
         | TaskError::WaitOnSelf
