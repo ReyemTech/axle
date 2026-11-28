@@ -373,6 +373,96 @@ async fn heartbeat_lists_held_leases() {
 }
 
 #[tokio::test]
+async fn leases_lists_held_tasks_with_titles_and_renews_nothing() {
+    let app = app().await;
+    let token = app.token().await;
+    let (session, _) = app.register(&token, "github.com/acme/platform-infra").await;
+    let get = |path: String| {
+        let token = token.clone();
+        let app = &app;
+        async move {
+            let res = app
+                .call(
+                    Request::get(path)
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await;
+            let status = res.status();
+            let bytes = res.into_body().collect().await.unwrap().to_bytes();
+            (
+                status,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    };
+    let (status, body) = get(format!("/v1/leases?session={session}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!([]));
+
+    let project = app.project_id("github.com/acme/platform-infra").await;
+    let task = app
+        .state
+        .tasks
+        .create(
+            axle::service::tasks::Caller::Human,
+            axle::service::tasks::NewTask {
+                project_id: project,
+                title: "rotate the keys".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let resolved = axle::service::identity::IdentityService::load(&*app.state.store, session)
+        .await
+        .unwrap()
+        .expect("registered session");
+    app.state.tasks.claim(&resolved, task.id).await.unwrap();
+    let before = app
+        .state
+        .tasks
+        .get(task.id)
+        .await
+        .unwrap()
+        .task
+        .lease_expires_at;
+
+    app.clock.advance(time::Duration::seconds(30));
+    let (status, body) = get(format!("/v1/leases?session={session}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!([{"id": task.id, "title": "rotate the keys", "status": "claimed"}])
+    );
+    // A read: the lease is not renewed (that is what the heartbeat is for).
+    let after = app
+        .state
+        .tasks
+        .get(task.id)
+        .await
+        .unwrap()
+        .task
+        .lease_expires_at;
+    assert_eq!(before, after);
+
+    // Another token cannot read this session's leases.
+    let other = app.token().await;
+    let res = app
+        .call(
+            Request::get(format!("/v1/leases?session={session}"))
+                .header(header::AUTHORIZATION, format!("Bearer {other}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let (status, _) = get(format!("/v1/leases?session={}", SessionId::new())).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn events_stream_delivers_message() {
     let app = app().await;
     let token = app.token().await;
