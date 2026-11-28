@@ -46,10 +46,11 @@ These are not configurable yet:
 ### Prices
 
 The server prices each reported usage record at API rates, in USD per million tokens, from a
-built-in table (version printed at start: `axl: prices: 2026-11-28, 24 models`). A model the
+built-in table (version printed at start: `axl: prices: 2026-11-28, N models`). A model the
 table does not know gets no price: it shows its tokens and "no price". Point
 `AXL_PRICES_FILE` at a file to add models or change prices; the start-up line then ends with
-`(+ <file>)`.
+`(+ <file>)`. Stored records keep their cost until `axl usage reprice` recomputes it
+([CLI](cli.md#server-and-tokens)).
 
 ```toml
 version = "2026-12-01"          # required; becomes part of each record's price_ref

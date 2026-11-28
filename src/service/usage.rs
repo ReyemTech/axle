@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use time::{Date, Month, Time};
 
 use crate::clock::Clock;
 use crate::service::identity::Resolved;
 use crate::store::{
-    NewUsage, Store, StoreError, StoreResult, UsageBatch, UsageCounts, UsageFilter, UsageGroup,
-    UsageRow,
+    NewUsage, Pricer, Store, StoreError, StoreResult, UsageBatch, UsageCounts, UsageFilter,
+    UsageGroup, UsageRow,
 };
 use crate::usage::prices::PriceTable;
 use crate::usage::report::{
@@ -24,6 +25,40 @@ pub enum UsageError {
     Envelope(String),
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+const REPRICE_PAGE: u32 = 500;
+
+/// What `UsageService::reprice` did: records rewritten, and how many of those still have
+/// no price.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Repriced {
+    pub updated: u64,
+    pub unpriced: u64,
+}
+
+/// `--since` as given on the command line: `YYYY-MM-DD` (that day's UTC midnight) or RFC 3339.
+pub fn parse_since(raw: &str) -> Result<OffsetDateTime, String> {
+    let raw = raw.trim();
+    if let Ok(t) = OffsetDateTime::parse(raw, &Rfc3339) {
+        return Ok(t);
+    }
+    let bad = || format!("`{raw}` is not a date: use YYYY-MM-DD or an RFC 3339 timestamp");
+    let mut parts = raw.split('-');
+    let (Some(y), Some(m), Some(d), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(bad());
+    };
+    if y.len() != 4 || m.len() != 2 || d.len() != 2 {
+        return Err(bad());
+    }
+    let (Ok(y), Ok(m), Ok(d)) = (y.parse::<i32>(), m.parse::<u8>(), d.parse::<u8>()) else {
+        return Err(bad());
+    };
+    let month = Month::try_from(m).map_err(|_| bad())?;
+    let date = Date::from_calendar_date(y, month, d).map_err(|_| bad())?;
+    Ok(date.with_time(Time::MIDNIGHT).assume_utc())
 }
 
 pub struct UsageService {
@@ -82,6 +117,42 @@ impl UsageService {
             outcome.duplicate = written.duplicate;
         }
         Ok(outcome)
+    }
+
+    /// Prices stored records again with the current table, in pages of 500 by id: those
+    /// at or after `since` (all when `None`), only the ones without a price when
+    /// `unpriced_only`.
+    pub async fn reprice(
+        &self,
+        since: Option<OffsetDateTime>,
+        unpriced_only: bool,
+    ) -> StoreResult<Repriced> {
+        let mut out = Repriced::default();
+        let mut after = None;
+        loop {
+            let page = self
+                .store
+                .usage_to_reprice(since, unpriced_only, after, REPRICE_PAGE)
+                .await?;
+            let Some(last) = page.last() else { break };
+            after = Some(last.id);
+            let costs: Vec<_> = page
+                .iter()
+                .map(|r| {
+                    (
+                        r.id,
+                        self.prices.price(&r.model, r.speed.as_deref(), &r.counts),
+                    )
+                })
+                .collect();
+            self.store.set_usage_costs(&costs).await?;
+            out.updated += costs.len() as u64;
+            out.unpriced += costs.iter().filter(|(_, p)| p.is_none()).count() as u64;
+            if page.len() < REPRICE_PAGE as usize {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     pub async fn summary(

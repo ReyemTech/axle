@@ -131,6 +131,24 @@ enum Command {
         #[command(subcommand)]
         command: TokenCommand,
     },
+    /// Token usage maintenance (needs DATABASE_URL)
+    Usage {
+        #[command(subcommand)]
+        command: UsageCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum UsageCommand {
+    /// Recompute stored costs with the current price table (built-in, plus AXL_PRICES_FILE)
+    Reprice {
+        /// Only records at or after this time: YYYY-MM-DD (UTC) or RFC 3339
+        #[arg(long)]
+        since: Option<String>,
+        /// Only records that have no price yet
+        #[arg(long)]
+        unpriced: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -256,6 +274,7 @@ async fn main() -> ExitCode {
         Command::Service { command } => service(command),
         Command::Migrate => migrate().await,
         Command::Token { command } => token(command).await,
+        Command::Usage { command } => usage(command).await,
         Command::Project => Err("not implemented".into()),
     };
     match result {
@@ -502,6 +521,29 @@ fn service(command: ServiceCommand) -> CliResult {
 async fn migrate() -> CliResult {
     open_store(&backend_from_env()?).await?;
     eprintln!("axl: migrations applied");
+    Ok(())
+}
+
+async fn usage(command: UsageCommand) -> CliResult {
+    let UsageCommand::Reprice { since, unpriced } = command;
+    let since = since
+        .as_deref()
+        .map(axle::service::usage::parse_since)
+        .transpose()?;
+    let prices_file = std::env::var("AXL_PRICES_FILE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    let prices = axle::usage::prices::PriceTable::load(prices_file.as_deref())?;
+    let store: Arc<dyn Store> = open_store(&backend_from_env()?).await?;
+    let svc =
+        axle::service::usage::UsageService::new(store, Arc::new(SystemClock), Arc::new(prices));
+    let done = svc.reprice(since, unpriced).await?;
+    eprintln!(
+        "axl: repriced {} records ({} without a price)",
+        done.updated, done.unpriced
+    );
     Ok(())
 }
 
