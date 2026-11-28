@@ -8,8 +8,8 @@
     {% for p in projects %}<a href="/ui/board?project={{ p.id }}" title="{{ p.key }}"{% if p.selected %} aria-current="page"{% endif %}><span class="line-swatch" data-line="{{ p.line }}" aria-hidden="true"></span>{{ p.name }}</a>{% endfor %}
   </nav>
   <nav class="segmented density" aria-label="Card view">
-    <a href="{{ detailed_href }}"{% if !compact %} aria-current="true"{% endif %}>Detailed</a>
-    <a href="{{ compact_href }}"{% if compact %} aria-current="true"{% endif %}>Compact</a>
+    <a href="{{ detailed_href }}" data-density-link{% if !compact %} aria-current="true"{% endif %}>Detailed</a>
+    <a href="{{ compact_href }}" data-density-link{% if compact %} aria-current="true"{% endif %}>Compact</a>
   </nav>
   <details class="key">
     <summary class="button-like">Key</summary>

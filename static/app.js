@@ -16,10 +16,7 @@
     // while the filter is in use asks for every card (`all`), so the filter searches all of
     // them rather than the 12 shown.
     if (e.detail.elt && e.detail.elt.id === "columns") {
-      var expand = Array.prototype.map.call(
-        document.querySelectorAll("#columns > .column[data-expanded]"),
-        function (c) { return c.getAttribute("data-status"); }
-      );
+      var expand = expandedColumns();
       if (searchQuery() !== "") expand.push("all");
       fetchedAll = searchQuery() !== "";
       if (expand.length) e.detail.parameters.expand = expand.join(",");
@@ -30,6 +27,24 @@
     var search = document.getElementById("search");
     return search ? search.value.trim().toLowerCase() : "";
   }
+  // The columns expanded on screen (Show more / Show top 12 swap them without reloading).
+  function expandedColumns() {
+    return Array.prototype.map.call(
+      document.querySelectorAll("#columns > .column[data-expanded]"),
+      function (c) { return c.getAttribute("data-status"); }
+    );
+  }
+  // Detailed / Compact links carry the expansion of the first render; on click, use the
+  // expansion on screen instead so switching density keeps what is expanded.
+  document.addEventListener("click", function (e) {
+    var link = e.target instanceof Element ? e.target.closest("a[data-density-link]") : null;
+    if (!link || !document.getElementById("columns")) return;
+    var url = new URL(link.href, window.location.href);
+    var expand = expandedColumns();
+    if (expand.length) url.searchParams.set("expand", expand.join(","));
+    else url.searchParams.delete("expand");
+    link.href = url.pathname + url.search;
+  });
   // Whether the board's columns on screen were fetched uncapped for the filter.
   var fetchedAll = false;
   // Filtering a capped board fetches every card first; clearing the filter caps it again.

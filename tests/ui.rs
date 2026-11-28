@@ -4352,3 +4352,92 @@ async fn filtering_can_fetch_every_card() {
     let js = app.get("/ui/static/app.js", None).await;
     assert!(js.body.contains("axl:refetch") && js.body.contains("data-capped"));
 }
+
+#[tokio::test]
+async fn urgent_thread_mail_and_its_archiving_refresh_the_board() {
+    use axle::events::Event;
+    let app = app().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let task = app
+        .state
+        .tasks
+        .create(
+            Caller::Human,
+            NewTask {
+                project_id: infra.agent.project_id.unwrap(),
+                title: "Human task".into(),
+                body: "body".into(),
+                ..NewTask::default()
+            },
+        )
+        .await
+        .unwrap();
+    let send = |importance| {
+        let app = &app;
+        let infra = &infra;
+        async move {
+            app.state
+                .messages
+                .send(
+                    &Actor::Agent(infra.agent.id, infra.session.id),
+                    NewMessage {
+                        to: Address::Task(task.id),
+                        subject: None,
+                        body: "x".into(),
+                        importance,
+                        reply_to: None,
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let board = |frames: &[(String, String)]| frames.iter().any(|(n, _)| n == "board");
+    let created = |m: &axle::domain::Message| Event::MessageCreated {
+        id: m.id,
+        to: m.to,
+        project_id: m.project_id,
+    };
+
+    let normal = send(Importance::Normal).await;
+    let frames = axle::ui::views::live_frames(&app.state, &created(&normal)).await;
+    assert!(
+        !board(&frames),
+        "ordinary thread mail does not re-rank: {frames:?}"
+    );
+
+    let urgent = send(Importance::Urgent).await;
+    let frames = axle::ui::views::live_frames(&app.state, &created(&urgent)).await;
+    assert!(
+        board(&frames),
+        "urgent thread mail re-ranks the board: {frames:?}"
+    );
+
+    let archived = Event::HumanArchived {
+        archived: vec![urgent.id],
+    };
+    let frames = axle::ui::views::live_frames(&app.state, &archived).await;
+    assert!(board(&frames), "archiving it re-ranks too: {frames:?}");
+    let archived = Event::HumanArchived {
+        archived: vec![normal.id],
+    };
+    let frames = axle::ui::views::live_frames(&app.state, &archived).await;
+    assert!(!board(&frames), "{frames:?}");
+}
+
+#[tokio::test]
+async fn density_links_follow_the_current_expansion() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let page = app.get("/ui/board?expand=open", Some(&cookie)).await;
+    // Without JS the links carry the page's expansion.
+    let hrefs = attrs(&page, ".density a", "href");
+    assert!(hrefs.iter().all(|h| h.contains("expand=open")), "{hrefs:?}");
+    // With JS, a click re-reads the expansion from the columns on screen.
+    assert_eq!(
+        attrs(&page, ".density a[data-density-link]", "href").len(),
+        2
+    );
+    let js = app.get("/ui/static/app.js", None).await;
+    assert!(js.body.contains("data-density-link"));
+}

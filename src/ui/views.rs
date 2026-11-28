@@ -1283,23 +1283,43 @@ pub async fn live_frames(state: &AppState, event: &Event) -> Frames {
     }
 }
 
+/// Whether message `id` is urgent mail in a task's thread (what the board ranks first).
+async fn urgent_in_thread(state: &AppState, id: crate::domain::MessageId) -> UiResult<bool> {
+    Ok(state
+        .store
+        .get_message(id)
+        .await?
+        .is_some_and(|m| m.task_id.is_some() && m.importance == Importance::Urgent))
+}
+
 async fn task_frames(state: &AppState, event: &Event) -> UiResult<Frames> {
     let (id, kind) = match *event {
         Event::TaskChanged { id, kind, .. } => (id, kind),
-        Event::HumanArchived { .. } => {
-            return Ok(vec![
+        Event::HumanArchived { ref archived } => {
+            let mut frames = vec![
                 ("inbox".to_string(), PING.to_string()),
                 ("overview".into(), PING.into()),
-            ]);
+            ];
+            // Urgent thread mail ranks its card first; once archived the board re-ranks.
+            for id in archived {
+                if urgent_in_thread(state, *id).await? {
+                    frames.push(("board".into(), PING.into()));
+                    break;
+                }
+            }
+            return Ok(frames);
         }
         // The tokens page lists pending enrollments next to the tokens they mint.
         Event::EnrollmentChanged { .. } => {
             return Ok(vec![("tokens".to_string(), PING.to_string())]);
         }
-        Event::MessageCreated { to, .. } => {
+        Event::MessageCreated { id, to, .. } => {
             let mut frames = vec![("inbox".to_string(), PING.to_string())];
             if let Address::Task(t) = to {
                 frames.push((format!("detail-{t}"), PING.into()));
+                if urgent_in_thread(state, id).await? {
+                    frames.push(("board".into(), PING.into()));
+                }
             }
             frames.push(("overview".into(), PING.into()));
             return Ok(frames);
