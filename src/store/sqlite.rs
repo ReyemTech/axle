@@ -2896,6 +2896,11 @@ impl Store for SqliteStore {
     ) -> StoreResult<UsageWritten> {
         let mut written = UsageWritten::default();
         let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let agent = live_agent(&mut tx, batch.agent.id).await?;
+        let project = match batch.agent.project_id {
+            Some(p) => Some(live_project(&mut tx, p).await?),
+            None => None,
+        };
         for r in batch.records {
             let id = UsageId::new();
             let priced = pricer.price(&r.model, r.speed.as_deref(), &r.counts);
@@ -2925,8 +2930,8 @@ impl Store for SqliteStore {
             .bind(&batch.agent.harness)
             .bind(&r.key)
             .bind(batch.session.to_string())
-            .bind(batch.agent.id.to_string())
-            .bind(batch.agent.project_id.map(|p| p.to_string()))
+            .bind(agent.to_string())
+            .bind(project.map(|p| p.to_string()))
             .bind(batch.token.to_string())
             .bind(&r.model)
             .bind(r.counts.input)
@@ -3150,8 +3155,8 @@ macro_rules! usage_sql {
              JOIN agents g ON g.id = r.agent_id
              WHERE (?1 IS NULL OR r.occurred_at >= ?1)
                AND (?2 IS NULL OR r.occurred_at < ?2)
-               AND (?3 IS NULL OR r.project_id = ?3)
-               AND (?4 IS NULL OR r.agent_id = ?4)
+               AND (?3 IS NULL OR COALESCE((SELECT merged_into FROM projects WHERE id = r.project_id), r.project_id) = ?3)
+               AND (?4 IS NULL OR COALESCE((SELECT merged_into FROM agents WHERE id = r.agent_id), r.agent_id) = ?4)
                AND (?5 IS NULL OR r.harness = ?5)
                AND (?6 IS NULL OR g.host = ?6)
                AND (?7 IS NULL OR r.model = ?7)
@@ -3169,12 +3174,12 @@ fn usage_summary_sql(group: UsageGroup) -> &'static str {
     match group {
         UsageGroup::Total => usage_sql!("NULL", ""),
         UsageGroup::Project => usage_sql!(
-            "r.project_id",
+            "COALESCE((SELECT merged_into FROM projects WHERE id = r.project_id), r.project_id)",
             " GROUP BY 1"
         ),
         UsageGroup::Task => usage_sql!("a.task_id", " GROUP BY 1"),
         UsageGroup::Agent => usage_sql!(
-            "r.agent_id",
+            "COALESCE((SELECT merged_into FROM agents WHERE id = r.agent_id), r.agent_id)",
             " GROUP BY 1"
         ),
         UsageGroup::Harness => usage_sql!("r.harness", " GROUP BY 1"),
