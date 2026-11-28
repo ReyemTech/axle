@@ -11,7 +11,8 @@ use super::{
     MessageReceipt, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, Store,
     StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, child_event,
     children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label,
-    like_pattern, projects_added_note, projects_added_payload, send_time_recipient,
+    like_pattern, options_from, options_to, projects_added_note, projects_added_payload,
+    send_time_recipient,
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, Eligibility, Enrollment, EnrollmentId, EnrollmentStatus,
@@ -342,7 +343,7 @@ async fn claim_locked(
 macro_rules! message_cols {
     () => {
         "m.id, m.project_id, m.from_agent_id, m.from_session_id, m.to_kind, m.to_id, m.task_id,
-         m.subject, m.body, m.importance, m.reply_to, m.created_at, m.kind"
+         m.subject, m.body, m.importance, m.reply_to, m.created_at, m.kind, m.options"
     };
 }
 
@@ -405,6 +406,7 @@ fn message_from(row: &PgRow) -> StoreResult<Message> {
         reply_to: opt_id(row, "reply_to")?,
         created_at: row.try_get("created_at")?,
         kind: parse_text(row.try_get("kind")?)?,
+        options: options_from(row.try_get("options")?)?,
     })
 }
 
@@ -418,8 +420,8 @@ async fn insert_message(
     sqlx::query(
         "INSERT INTO messages
              (id, project_id, from_agent_id, from_session_id, token_id, to_kind, to_id, task_id,
-              subject, body, importance, reply_to, created_at, kind)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+              subject, body, importance, reply_to, created_at, kind, options)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
     )
     .bind(m.id.as_uuid())
     .bind(m.project_id.map(|p| p.as_uuid()))
@@ -435,6 +437,7 @@ async fn insert_message(
     .bind(m.reply_to.map(|r| r.as_uuid()))
     .bind(m.created_at)
     .bind(m.kind.as_str())
+    .bind(options_to(&m.options))
     .execute(&mut *conn)
     .await?;
     if let Some((agent, session)) = send_time_recipient(&m.to) {

@@ -29,6 +29,11 @@ pub use crate::store::InboxFilter;
 pub const BODY_LIMIT: usize = 65_536;
 /// Longest accepted message subject (and task title), in characters.
 pub const SUBJECT_MAX: usize = 200;
+/// Fewest and most quick replies a message to the human may offer.
+pub const OPTIONS_MIN: usize = 2;
+pub const OPTIONS_MAX: usize = 4;
+/// Longest quick reply, in characters (after trimming).
+pub const OPTION_MAX: usize = 80;
 
 #[derive(Debug, Clone)]
 pub struct NewMessage {
@@ -51,6 +56,12 @@ pub enum MessageError {
     /// A reply to a message for the human goes to its sender or its thread.
     #[error("a reply goes to the message's sender or its task thread")]
     MismatchedReply,
+    /// Quick replies break a rule (count, length, line break, duplicate).
+    #[error("options: {0}")]
+    BadOptions(String),
+    /// Quick replies are buttons in the human's UI; no other recipient can press them.
+    #[error("options are only for messages to the human (to: {{\"human\": true}})")]
+    OptionsNeedHuman,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -64,6 +75,42 @@ pub fn check_subject(field: &'static str, text: &str) -> Result<(), MessageError
         });
     }
     Ok(())
+}
+
+/// Quick replies, trimmed: `OPTIONS_MIN..=OPTIONS_MAX` of them, each 1..=`OPTION_MAX`
+/// characters on one line, no two the same (ignoring case). None at all is fine.
+pub fn check_options(options: &[String]) -> Result<Vec<String>, MessageError> {
+    if options.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bad = |why: String| Err(MessageError::BadOptions(why));
+    if !(OPTIONS_MIN..=OPTIONS_MAX).contains(&options.len()) {
+        return bad(format!(
+            "give {OPTIONS_MIN} to {OPTIONS_MAX} answers, not {}",
+            options.len()
+        ));
+    }
+    let mut out: Vec<String> = Vec::with_capacity(options.len());
+    for raw in options {
+        let option = raw.trim();
+        if option.is_empty() {
+            return bad("an answer is empty".into());
+        }
+        if option.chars().count() > OPTION_MAX {
+            return bad(format!("an answer is longer than {OPTION_MAX} characters"));
+        }
+        if option.contains(['\n', '\r']) {
+            return bad("an answer contains a line break; keep each to one line".into());
+        }
+        if out
+            .iter()
+            .any(|o| o.to_lowercase() == option.to_lowercase())
+        {
+            return bad(format!("{option:?} is offered twice"));
+        }
+        out.push(option.to_string());
+    }
+    Ok(out)
 }
 
 /// Rejects bodies over `BODY_LIMIT` bytes.
@@ -96,7 +143,22 @@ impl MessageService {
     }
 
     pub async fn send(&self, caller: &Actor, new: NewMessage) -> Result<Message, MessageError> {
-        self.send_inner(caller, new, false).await
+        self.send_inner(caller, new, Vec::new(), false).await
+    }
+
+    /// `send`, offering the human quick replies (`check_options`). Only a message to the
+    /// human may carry them; an empty list is a plain `send`.
+    pub async fn send_with_options(
+        &self,
+        caller: &Actor,
+        new: NewMessage,
+        options: &[String],
+    ) -> Result<Message, MessageError> {
+        let options = check_options(options)?;
+        if !options.is_empty() && new.to != Address::Human {
+            return Err(MessageError::OptionsNeedHuman);
+        }
+        self.send_inner(caller, new, options, false).await
     }
 
     /// The human sends a message. When it replies to a message addressed to the human, it
@@ -126,7 +188,9 @@ impl MessageService {
             }
             None => false,
         };
-        let message = self.send_inner(&Actor::Human, new, answers_human).await?;
+        let message = self
+            .send_inner(&Actor::Human, new, Vec::new(), answers_human)
+            .await?;
         if answers_human {
             self.archived(message.reply_to.into_iter().collect()).await;
         }
@@ -145,6 +209,7 @@ impl MessageService {
         &self,
         caller: &Actor,
         new: NewMessage,
+        options: Vec<String>,
         archive_original: bool,
     ) -> Result<Message, MessageError> {
         check_body(&new.body)?;
@@ -170,6 +235,7 @@ impl MessageService {
             reply_to: new.reply_to,
             created_at: self.clock.now(),
             kind: crate::domain::MessageKind::Message,
+            options,
         };
         if archive_original {
             self.store

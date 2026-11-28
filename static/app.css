@@ -796,6 +796,12 @@ p.peer-frame { margin: 0; }
 .need-changes[open] { flex-basis: 100%; order: 3; }
 .need-changes[open] > summary { margin-bottom: 8px; background: var(--band); border-color: var(--text); }
 
+/* Quick replies: an agent's offered answers, one labelled button each, above the text box. */
+.quick-replies { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; margin: 4px 0 2px; }
+.quick-label { color: var(--muted); font-size: 12px; font-weight: 600; }
+button.quick-reply { white-space: normal; height: auto; min-height: 30px; padding: 4px 12px; text-align: left; max-width: 100%; overflow-wrap: anywhere; }
+.need-actions .quick-form { flex-basis: 100%; }
+
 /* ---------------------------------------------------------------- task page */
 .task-page { display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, 340px); gap: 32px; align-items: start; }
 .task-live { display: grid; gap: 10px; min-width: 0; }

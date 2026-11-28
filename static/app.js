@@ -81,7 +81,7 @@
     if (!(t instanceof HTMLTextAreaElement) || !t.form) return;
     var form = t.form;
     e.preventDefault();
-    var submit = form.querySelector('button[type="submit"], input[type="submit"]');
+    var submit = form.querySelector('button[type="submit"]:not(.quick-reply), input[type="submit"]');
     if (submit && submit.disabled) return;
     if (sending.has(form) || form.classList.contains("htmx-request")) return;
     sending.add(form);

@@ -786,3 +786,69 @@ store_matrix!(
         assert_eq!(env.store.list_agents(1).await.unwrap().len(), 1);
     }
 );
+
+store_matrix!(
+    quick_reply_options_round_trip,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let agent = env.session(INFRA, "mac").await;
+        let asked = env
+            .msgs
+            .send_with_options(
+                &actor(&agent),
+                NewMessage {
+                    importance: Importance::Urgent,
+                    ..msg(Address::Human, "Ship it?")
+                },
+                &["  Yes, ship  ".into(), "No".into(), "Wait for CI".into()],
+            )
+            .await
+            .unwrap();
+        let want = vec![
+            "Yes, ship".to_string(),
+            "No".to_string(),
+            "Wait for CI".to_string(),
+        ];
+        assert_eq!(asked.options, want, "trimmed, in order");
+
+        // Every read path returns them.
+        let got = env.store.get_message(asked.id).await.unwrap().unwrap();
+        assert_eq!(got.options, want);
+        let inbox = env.msgs.human_inbox(InboxFilter::default()).await.unwrap();
+        assert_eq!(inbox[0].message.options, want);
+        let attention = env.store.human_attention(10).await.unwrap();
+        assert_eq!(attention[0].options, want);
+        let found = env.msgs.search("ship", None, 10).await.unwrap();
+        assert_eq!(found[0].options, want);
+        let feed = env.store.list_messages(None, None, 10).await.unwrap();
+        assert_eq!(feed[0].options, want);
+
+        // Plain mail has none; the human's reply is an ordinary message.
+        let plain = env.send(&agent, Address::Human, "fyi").await;
+        let plain = env.store.get_message(plain).await.unwrap().unwrap();
+        assert!(plain.options.is_empty());
+        let reply = env
+            .msgs
+            .send_as_human(NewMessage {
+                reply_to: Some(asked.id),
+                ..msg(Address::Agent(agent.agent.id), "Yes, ship")
+            })
+            .await
+            .unwrap();
+        assert!(reply.options.is_empty());
+
+        // Options are only for the human, and are checked before anything is written.
+        let other = env.session(WEB_APP, "mac").await;
+        let err = env
+            .msgs
+            .send_with_options(
+                &actor(&agent),
+                msg(Address::Agent(other.agent.id), "?"),
+                &["a".into(), "b".into()],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MessageError::OptionsNeedHuman), "{err:?}");
+        assert!(env.inbox_ids(&other).await.is_empty());
+    }
+);

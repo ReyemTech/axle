@@ -16,6 +16,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::SessionCtx;
+use super::inbox::{ReplyTarget, reply_target};
 use super::views::{Labels, ProjectLabel, UiResult, html};
 use crate::domain::{Actor, Message, MessageKind, PlanState, Task, TaskId, TaskStatus};
 use crate::http::AppState;
@@ -77,6 +78,10 @@ pub struct NeedCard {
     /// For reply cards: the message, which can be dismissed.
     pub message_id: Option<String>,
     pub importance: &'static str,
+    /// For reply cards whose sender offered quick replies: the answers (peer text) and where
+    /// a reply goes.
+    pub options: Vec<String>,
+    pub reply: Option<ReplyTarget>,
 }
 
 /// "42s", "12m", "3h", "2d".
@@ -161,6 +166,8 @@ pub(super) async fn needs_you(
             plan_id: plan.map(|p| p.id.to_string()),
             message_id: None,
             importance: "high",
+            options: Vec::new(),
+            reply: None,
         });
     }
 
@@ -193,6 +200,8 @@ pub(super) async fn needs_you(
             plan_id: None,
             message_id: None,
             importance: "high",
+            options: Vec::new(),
+            reply: None,
         });
     }
 
@@ -229,6 +238,12 @@ pub(super) async fn needs_you(
             plan_id: None,
             message_id: Some(m.id.to_string()),
             importance: m.importance.as_str(),
+            reply: if m.options.is_empty() {
+                None
+            } else {
+                reply_target(&m)
+            },
+            options: m.options,
         });
     }
     Ok(cards)

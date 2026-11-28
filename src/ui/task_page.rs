@@ -75,6 +75,8 @@ pub struct MessageView {
     pub kind: &'static str,
     /// Written by an agent (not the human): shown with the peer frame.
     pub agent_written: bool,
+    /// Quick replies the sending agent offered the human (peer text, escaped on render).
+    pub options: Vec<String>,
 }
 
 impl MessageView {
@@ -121,6 +123,7 @@ pub(super) async fn message_view(
         href: format!("/ui/inbox?view=all&m={}", m.id),
         kind: m.kind.as_str(),
         agent_written: matches!(m.from, Actor::Agent(..)),
+        options: m.options.clone(),
     })
 }
 

@@ -180,6 +180,7 @@ including in your own other sessions. See [delivery rules](concepts.md#messages-
 | `subject` | string | Optional, at most 200 characters. |
 | `body` | string, required | At most 64 KB. |
 | `importance` | string | `normal` (default), `high` or `urgent`. |
+| `options` | string array | Only with `to: {"human": true}`. 2 to 4 quick replies, each one line of 1 to 80 characters after trimming, no two alike (ignoring case). |
 
 ```json
 { "to": { "agent": "github.com/acme/web-app/laptop/claude-code" }, "subject": "Heads up", "body": "I am changing src/auth.rs.", "importance": "high" }
@@ -189,8 +190,21 @@ including in your own other sessions. See [delivery rules](concepts.md#messages-
 { "id": "01a21e49-2ab2-7183-a8cf-9e6d68226b24", "to": "agent github.com/acme/web-app/laptop/claude-code" }
 ```
 
+**Quick replies.** When you ask the human a question with a few clear answers, pass them as
+`options`. The web UI shows each as a button under the message and on its Needs you card
+([quick replies](web-ui.md#quick-replies)). The human's answer reaches you as an ordinary reply
+whose body is the chosen option, followed by a blank line and any text they typed.
+
+```json
+{ "to": { "human": true }, "subject": "Deploy web-app?", "body": "CI is green on main.", "importance": "high", "options": ["Deploy now", "Wait until tomorrow", "Don't deploy"] }
+```
+
+Message objects (`fetch_inbox`, `search_messages`, task threads) carry `options` as an array,
+empty for most mail; frame markers inside them are defused like a body's.
+
 Errors: a missing or doubled recipient, an unknown project, agent, session or task,
-`body exceeds 65536 bytes`, `subject is longer than 200 characters`.
+`body exceeds 65536 bytes`, `subject is longer than 200 characters`, `options: give 2 to 4
+answers, not 1` (and the other option rules), `options are only for messages to the human`.
 
 ### `fetch_inbox`
 

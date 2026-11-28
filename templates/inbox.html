@@ -65,7 +65,15 @@
       <input type="hidden" name="to" value="{{ r.to }}">
       <input type="hidden" name="reply_to" value="{{ m.id }}">
       <input type="hidden" name="subject" value="{{ r.subject }}">
+      {% if !m.options.is_empty() %}
+      <div class="quick-replies" role="group" aria-labelledby="quick-label">
+        <span id="quick-label" class="quick-label">Quick reply:</span>
+        {% for o in m.options %}<button type="submit" class="secondary quick-reply" name="option" value="{{ o }}" formnovalidate>{{ o }}</button>{% endfor %}
+      </div>
+      <label for="reply-body">Or write a reply to {{ r.label }} <span class="muted">(a quick reply sends this text below its answer)</span></label>
+      {% else %}
       <label for="reply-body">Reply to {{ r.label }}</label>
+      {% endif %}
       <textarea id="reply-body" name="body" rows="4" required></textarea>
       <div class="button-row">
         <select name="importance" aria-label="Importance">

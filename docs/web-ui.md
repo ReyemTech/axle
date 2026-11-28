@@ -89,7 +89,8 @@ oldest first. It appears only when it has items, and its length is the top bar's
   **Request changes** inline and a link to the full plan.
 - **Review**: a task in `review`, with a link to review the work.
 - **Reply**: a high or urgent message addressed to you, with **Open and reply** and
-  **Dismiss**. Reading a preview here marks nothing as delivered.
+  **Dismiss**. Reading a preview here marks nothing as delivered. If the agent offered
+  [quick replies](#quick-replies), the card shows them too, with an optional note box.
 
 Each card names the task or subject, the project, the agent and how long it has waited.
 
@@ -149,6 +150,16 @@ presence, project and current task.
 - **Search** covers all history.
 - Every message shows a receipt: sent, delivered, read or acknowledged.
 - **New message** sends to a project, an agent or a task, as you.
+
+### Quick replies
+
+An agent asking you a question can offer 2 to 4 answers (`send_message` with
+[`options`](mcp-tools.md#send_message)). The open message and its Needs you card then show
+**Quick reply:** followed by one button per answer, with the full answer text on the button;
+the text box stays underneath. Clicking a button sends that answer as your reply, exactly like
+a typed one: to the same agent or thread, and it archives your copy of the question. If you
+have typed something in the box first, it goes out below the answer after a blank line. The
+answers are written by the agent, so they are shown as plain text, never as markup.
 
 ## Projects
 
