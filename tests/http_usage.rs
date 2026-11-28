@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use time::format_description::well_known::Rfc3339;
 use time::macros::datetime;
-use time::{Duration, OffsetDateTime};
+use time::Duration;
 use tower::ServiceExt;
 
 struct App {
@@ -172,6 +172,27 @@ async fn auth_and_ownership() {
     let (status, _) = app.post(&other, body).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(app.stored("k1").await.is_none());
+}
+
+/// The bridge is gone (the session row stays, its leases long expired), but SessionEnd and
+/// later Stop runs still report through the cached session id: the server takes it as long
+/// as the session belongs to the token.
+#[tokio::test]
+async fn accepts_usage_for_an_ended_session() {
+    let app = app().await;
+    let token = app.token().await;
+    let other = app.token().await;
+    let session = app.register(&token).await;
+    let started = app.at(Duration::ZERO);
+    app.clock.advance(Duration::days(30));
+
+    let body = report(session, vec![record("late", &started)]);
+    let (status, out) = app.post(&other, body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{out}");
+    let (status, out) = app.post(&token, body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out, json!({"accepted": 1, "duplicate": 0, "rejected": []}));
+    assert_eq!(app.stored("late").await.unwrap().session, session);
 }
 
 #[tokio::test]
@@ -344,7 +365,6 @@ async fn not_a_heartbeat() {
         .unwrap()
         .last_heartbeat_at;
     assert_eq!(before, after);
-    let _: OffsetDateTime = after;
 }
 
 #[tokio::test]
