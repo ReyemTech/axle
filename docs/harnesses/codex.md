@@ -55,9 +55,15 @@ registered with `timeout = 3`.
   (`last_token_usage`, keyed by the rollout's session id and an ordinal). Only counts, the
   model id, opaque ids and timestamps leave the machine (see
   [security](../security.md#token-usage)).
-- **Open question:** whether Codex's `cache_write_input_tokens` is already inside
-  `input_tokens` is not settled yet; Axle counts it as a separate cache write until real
-  rollouts show otherwise.
+- **Unverified: cache writes.** Axle assumes Codex's `cache_write_input_tokens` is *not*
+  part of `input_tokens`, so it subtracts only `cached_input_tokens` from input and prices
+  cache writes separately. This has not been checked against real rollouts. If Codex does
+  count cache writes inside `input_tokens`, those tokens are priced twice (once as input,
+  once as a cache write), and Codex costs read high. To check your own rollouts, count the
+  `token_usage_record` lines where `input_tokens` is less than `cached_input_tokens` plus
+  `cache_write_input_tokens`. Any such line means the cache counts are not both inside
+  `input_tokens`. If there are none while `cache_write_input_tokens` is often non-zero, the
+  writes are probably inside `input_tokens` and are being double-counted.
 - **When:** on every `Stop`, at the same time as the mail check, inside the same
   2.5-second budget (a slow usage report can delay the urgent-mail block by up to that
   budget, never past it), even when Codex reports

@@ -196,9 +196,11 @@ impl Usage {
             // Codex's input includes cached input, as in the OpenAI API.
             input: n(self.input_tokens).saturating_sub(cached).max(0),
             cache_read: cached,
-            // Open question (spec, settled question 3): whether `cache_write_input_tokens`
-            // is inside `input_tokens`. Settling it needs real rollouts, which tests may not
-            // read, so this keeps the spec's mapping: a separate 5-minute cache write.
+            // UNVERIFIED (spec, settled question 3): this assumes `cache_write_input_tokens`
+            // is NOT inside `input_tokens`, so it is not subtracted from input. If Codex does
+            // count cache writes inside `input_tokens`, those tokens are priced twice (as input
+            // and as a cache write). Settling it needs real rollouts, which tests may not read;
+            // docs/harnesses/codex.md says how the owner can check.
             cache_write_5m: n(self.cache_write_input_tokens),
             cache_write_1h: 0,
             output: n(self.output_tokens),
