@@ -128,6 +128,11 @@ async fn run(c: Collect<'_>, cfg: &crate::client::UsageConfig, limits: Limits) -
         warned: false,
         updated_at: rfc3339(SystemTime::now()).unwrap_or_default(),
     };
+    let unreadable = Cursor {
+        path: transcript.clone(),
+        warned: true,
+        ..template.clone()
+    };
     let home = c.home.to_path_buf();
     let read = tokio::task::spawn_blocking(move || {
         read_all(parser, &home, files, main, &template, limits)
@@ -137,6 +142,11 @@ async fn run(c: Collect<'_>, cfg: &crate::client::UsageConfig, limits: Limits) -
     let mut reads = match read {
         Ok(r) => r,
         Err(e) => {
+            // Once per session: the cursor (keyed by path, so no file is needed) remembers it.
+            if cursor::load(c.home, &transcript).is_some_and(|m| m.warned) {
+                return None;
+            }
+            let _ = cursor::save(c.home, &unreadable);
             return Some(format!(
                 "cannot read the transcript for usage ({})",
                 e.kind()

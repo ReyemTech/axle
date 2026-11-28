@@ -574,6 +574,11 @@ async fn unreadable_transcript_is_one_line() {
         "{line}"
     );
     assert!(!line.contains(h.path().to_str().unwrap()), "{line}");
+    assert_eq!(
+        run(&h, &h.stdin(), session(&url), &e).await,
+        None,
+        "once per session"
+    );
     assert_eq!(count(&bodies), 0);
 }
 
