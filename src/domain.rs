@@ -305,6 +305,21 @@ text_enum!(WakeOutcome {
     Skipped => "skipped",
 });
 
+/// Where a work request stands when it is created (carried by `RequestCreated`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestState {
+    AwaitingHuman,
+    Routed,
+    Queued,
+}
+
+text_enum!(RequestState {
+    AwaitingHuman => "awaiting_human",
+    Routed => "routed",
+    Queued => "queued",
+});
+
 /// One row of the append-only wake log. Every change of outcome is a new row; caps count
 /// `Sent` rows; `run_id` links the rows of one headless run.
 #[derive(Debug, Clone, PartialEq)]

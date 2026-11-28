@@ -1375,6 +1375,16 @@ async fn task_frames(state: &AppState, event: &Event) -> UiResult<Frames> {
         Event::EnrollmentChanged { .. } => {
             return Ok(vec![("tokens".to_string(), PING.to_string())]);
         }
+        // The needs-you panel (and the pulse) re-fetch on `overview`; a request may also have
+        // changed a card's column.
+        Event::RequestCreated { .. } | Event::RequestDecided { .. } => {
+            return Ok(vec![
+                ("overview".to_string(), PING.to_string()),
+                ("board".into(), PING.into()),
+            ]);
+        }
+        // Wake prompts and their results are for the bridge and the wake log, not a page.
+        Event::WakeRequested { .. } | Event::WakeResult { .. } => return Ok(Vec::new()),
         Event::MessageCreated { id, to, .. } => {
             let mut frames = vec![("inbox".to_string(), PING.to_string())];
             if let Address::Task(t) = to {

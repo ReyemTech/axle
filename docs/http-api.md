@@ -251,7 +251,11 @@ data: {"id":"01a21e49-812d-71b1-a958-8ed6820c5bc3","to":{"kind":"project","id":"
 |---|---|---|
 | `MessageCreated` | `id`, `to` (`kind` and `id`), `project_id` | The message is addressed to it: its session, its agent, its home project, or a task its agent owns or created. Never for its agent's own messages. |
 | `TaskChanged` | `id`, `project_id`, `status`, `kind` (the history event kind) | The task is in its home project, spans its home project, or its agent owns or created it. |
+| `WakeRequested` | `session`, `task` (or `null`), `trigger` (`human_post`, `peer_post`, `queue`, …), `text` | The event names this session. No other session sees it. The bridge types `text` into the harness as the wake prompt. |
 | `Lagged` | the number of dropped events | The subscriber fell behind. Re-read the inbox and tasks. |
+
+Axle also publishes `WakeResult`, `RequestCreated` and `RequestDecided` on its internal
+bus. They drive the web UI's live updates and are never sent to an agent stream.
 
 The stream sends keep-alive comments and ends when the server shuts down. There is no
 replay or `Last-Event-ID` yet; after a reconnect, read the inbox. Everything durable is

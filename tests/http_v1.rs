@@ -5,7 +5,11 @@ use std::time::Duration;
 
 use axle::clock::TestClock;
 use axle::config::ServerConfig;
-use axle::domain::{Actor, Address, AgentId, Importance, ProjectId, SessionId};
+use axle::domain::{
+    Actor, Address, AgentId, Importance, ProjectId, RequestState, SessionId, TaskId, WakeOutcome,
+    WakeTrigger,
+};
+use axle::events::Event;
 use axle::http::{AppState, router};
 use axle::service::messages::NewMessage;
 use axle::store::sqlite::SqliteStore;
@@ -496,6 +500,67 @@ async fn events_stream_delivers_message() {
         .expect("an event within 1 s");
     assert_eq!(name, "MessageCreated");
     assert_eq!(data["to"], json!({"kind": "agent", "id": agent}));
+}
+
+#[tokio::test]
+async fn wake_requested_reaches_only_its_session() {
+    let app = app().await;
+    let token = app.token().await;
+    let (s1, _) = app.register(&token, "github.com/acme/one").await;
+    let (s2, _) = app.register(&token, "github.com/acme/two").await;
+    let project = app.project_id("github.com/acme/one").await;
+    let mut st1 = app.events(&token, s1).await;
+    let mut st2 = app.events(&token, s2).await;
+
+    app.state
+        .bus
+        .publish(Event::WakeRequested {
+            session: s1,
+            task: None,
+            trigger: WakeTrigger::HumanPost,
+            text: "[axl from the human] hi".into(),
+        })
+        .await
+        .unwrap();
+    // The other wake and request events reach no agent at all.
+    for e in [
+        Event::WakeResult {
+            session: s1,
+            task: None,
+            outcome: WakeOutcome::Sent,
+        },
+        Event::RequestCreated {
+            request: TaskId::new(),
+            project_id: project,
+            state: RequestState::AwaitingHuman,
+        },
+        Event::RequestDecided {
+            request: TaskId::new(),
+            project_id: project,
+            approved: true,
+        },
+    ] {
+        app.state.bus.publish(e).await.unwrap();
+    }
+
+    let (name, data) = next_event(&mut st1, Duration::from_secs(1))
+        .await
+        .expect("s1 receives its wake");
+    assert_eq!(name, "WakeRequested");
+    assert_eq!(data["session"], json!(s1));
+    assert_eq!(data["trigger"], "human_post");
+    assert!(
+        next_event(&mut st1, Duration::from_millis(200))
+            .await
+            .is_none(),
+        "no other wake or request event reaches s1"
+    );
+    assert!(
+        next_event(&mut st2, Duration::from_millis(200))
+            .await
+            .is_none(),
+        "s2 sees nothing"
+    );
 }
 
 #[tokio::test]

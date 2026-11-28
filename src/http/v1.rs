@@ -336,8 +336,15 @@ impl Watcher {
         let result = match *event {
             Event::MessageCreated { id, to, .. } => self.wants_message(id, to).await,
             Event::TaskChanged { id, project_id, .. } => self.wants_task(id, project_id).await,
-            // The human's inbox is not an agent's business.
-            Event::HumanArchived { .. } | Event::EnrollmentChanged { .. } => Ok(false),
+            // A wake prompt goes to the one session it names.
+            Event::WakeRequested { session, .. } => Ok(session == self.session),
+            // The human's inbox, wake results and work-request hints are not an agent's
+            // business.
+            Event::HumanArchived { .. }
+            | Event::EnrollmentChanged { .. }
+            | Event::WakeResult { .. }
+            | Event::RequestCreated { .. }
+            | Event::RequestDecided { .. } => Ok(false),
         };
         result.unwrap_or_else(|e| {
             eprintln!("axl: dropping event for session {}: {e}", self.session);

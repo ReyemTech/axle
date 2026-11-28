@@ -12,8 +12,8 @@ use tokio::sync::broadcast;
 
 use crate::clock::Clock;
 use crate::domain::{
-    Address, EnrollmentId, EnrollmentStatus, MessageId, ProjectId, TaskEventKind, TaskId,
-    TaskStatus,
+    Address, EnrollmentId, EnrollmentStatus, MessageId, ProjectId, RequestState, SessionId,
+    TaskEventKind, TaskId, TaskStatus, WakeOutcome, WakeTrigger,
 };
 use crate::store::{Store, StoreResult};
 
@@ -42,6 +42,32 @@ pub enum Event {
         id: EnrollmentId,
         status: EnrollmentStatus,
     },
+    /// A wake prompt for one session. Reaches only that session's `/v1/events` stream; the
+    /// bridge types `text` into the harness.
+    WakeRequested {
+        session: SessionId,
+        task: Option<TaskId>,
+        trigger: WakeTrigger,
+        text: String,
+    },
+    /// How a wake attempt turned out. A UI hint only; no agent sees it.
+    WakeResult {
+        session: SessionId,
+        task: Option<TaskId>,
+        outcome: WakeOutcome,
+    },
+    /// A work request was filed. A UI hint for the needs-you panel; no agent sees it.
+    RequestCreated {
+        request: TaskId,
+        project_id: ProjectId,
+        state: RequestState,
+    },
+    /// The human approved or declined a work request. A UI hint; no agent sees it.
+    RequestDecided {
+        request: TaskId,
+        project_id: ProjectId,
+        approved: bool,
+    },
 }
 
 impl Event {
@@ -52,6 +78,10 @@ impl Event {
             Event::TaskChanged { .. } => "TaskChanged",
             Event::HumanArchived { .. } => "HumanArchived",
             Event::EnrollmentChanged { .. } => "EnrollmentChanged",
+            Event::WakeRequested { .. } => "WakeRequested",
+            Event::WakeResult { .. } => "WakeResult",
+            Event::RequestCreated { .. } => "RequestCreated",
+            Event::RequestDecided { .. } => "RequestDecided",
         }
     }
 
@@ -59,7 +89,13 @@ impl Event {
         match *self {
             Event::MessageCreated { project_id, .. } => project_id,
             Event::TaskChanged { project_id, .. } => Some(project_id),
-            Event::HumanArchived { .. } | Event::EnrollmentChanged { .. } => None,
+            Event::RequestCreated { project_id, .. } | Event::RequestDecided { project_id, .. } => {
+                Some(project_id)
+            }
+            Event::HumanArchived { .. }
+            | Event::EnrollmentChanged { .. }
+            | Event::WakeRequested { .. }
+            | Event::WakeResult { .. } => None,
         }
     }
 }
@@ -134,5 +170,83 @@ mod tests {
             serde_json::to_value(Address::Human).unwrap(),
             serde_json::json!({"kind": "human"})
         );
+    }
+
+    #[test]
+    fn wake_and_request_events_round_trip_as_themselves() {
+        let events = [
+            Event::WakeRequested {
+                session: SessionId::new(),
+                task: Some(TaskId::new()),
+                trigger: WakeTrigger::HumanPost,
+                text: "[axl from human] hello".into(),
+            },
+            Event::WakeRequested {
+                session: SessionId::new(),
+                task: None,
+                trigger: WakeTrigger::Queue,
+                text: String::new(),
+            },
+            Event::WakeResult {
+                session: SessionId::new(),
+                task: None,
+                outcome: WakeOutcome::Delivered,
+            },
+            Event::RequestCreated {
+                request: TaskId::new(),
+                project_id: ProjectId::new(),
+                state: RequestState::AwaitingHuman,
+            },
+            Event::RequestDecided {
+                request: TaskId::new(),
+                project_id: ProjectId::new(),
+                approved: true,
+            },
+        ];
+        for e in events {
+            let v = serde_json::to_value(&e).unwrap();
+            assert_eq!(serde_json::from_value::<Event>(v).unwrap(), e);
+        }
+        let v = serde_json::to_value(Event::RequestCreated {
+            request: TaskId::new(),
+            project_id: ProjectId::new(),
+            state: RequestState::Queued,
+        })
+        .unwrap();
+        assert_eq!(v["state"], "queued");
+    }
+
+    #[test]
+    fn wake_and_request_events_have_names_and_projects() {
+        let project = ProjectId::new();
+        let wake = Event::WakeRequested {
+            session: SessionId::new(),
+            task: None,
+            trigger: WakeTrigger::PeerPost,
+            text: "x".into(),
+        };
+        assert_eq!(wake.name(), "WakeRequested");
+        assert_eq!(wake.project_id(), None);
+        let result = Event::WakeResult {
+            session: SessionId::new(),
+            task: None,
+            outcome: WakeOutcome::Failed,
+        };
+        assert_eq!(result.name(), "WakeResult");
+        assert_eq!(result.project_id(), None);
+        let created = Event::RequestCreated {
+            request: TaskId::new(),
+            project_id: project,
+            state: RequestState::Routed,
+        };
+        assert_eq!(created.name(), "RequestCreated");
+        assert_eq!(created.project_id(), Some(project));
+        let decided = Event::RequestDecided {
+            request: TaskId::new(),
+            project_id: project,
+            approved: false,
+        };
+        assert_eq!(decided.name(), "RequestDecided");
+        assert_eq!(decided.project_id(), Some(project));
     }
 }
