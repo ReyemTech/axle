@@ -230,12 +230,17 @@ fn linkify<'a>(text: CowStr<'a>, out: &mut Vec<Event<'a>>) {
         let mut end = tail
             .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '`'))
             .unwrap_or(tail.len());
-        // Trailing punctuation belongs to the sentence, not the address.
+        // Trailing punctuation belongs to the sentence, not the address. Parentheses are
+        // counted once and adjusted as they are trimmed, so this stays linear.
+        let opens = tail[..end].matches('(').count();
+        let mut closes = tail[..end].matches(')').count();
         while end > 0 {
             let last = tail[..end].chars().next_back().unwrap_or(' ');
-            let unbalanced_paren =
-                last == ')' && tail[..end].matches('(').count() < tail[..end].matches(')').count();
+            let unbalanced_paren = last == ')' && opens < closes;
             if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | ']') || unbalanced_paren {
+                if last == ')' {
+                    closes -= 1;
+                }
                 end -= last.len_utf8();
             } else {
                 break;
@@ -440,5 +445,32 @@ mod tests {
         assert!(!out.contains("<img"), "{out}");
         assert!(!out.contains("<a href=x"), "{out}");
         assert!(!out.contains("\" onmouseover"), "{out}");
+    }
+
+    #[test]
+    fn paren_trimming_keeps_balanced_and_stays_linear() {
+        let out = r("see https://en.wikipedia.org/wiki/Foo(bar) and (https://a.b/c) ok");
+        assert!(
+            out.contains(">https://en.wikipedia.org/wiki/Foo(bar)</a>"),
+            "{out}"
+        );
+        assert!(out.contains(">https://a.b/c</a>)"), "{out}");
+
+        // 65,000 unbalanced ')' fit the message cap; trimming must not rescan the URL each time.
+        let src = format!("https://example.com/{}", ")".repeat(65_000));
+        let t = std::time::Instant::now();
+        let out = r(&src);
+        let took = t.elapsed();
+        assert!(
+            out.contains(">https://example.com/</a>)))"),
+            "{}",
+            &out[..out.len().min(300)]
+        );
+        assert!(
+            out.contains("href=\"https://example.com/\""),
+            "{}",
+            &out[..out.len().min(300)]
+        );
+        assert!(took.as_secs() < 1, "took {took:?}");
     }
 }

@@ -3136,7 +3136,6 @@ async fn cmd_enter_sends_message_forms() {
     }
 }
 
-<<<<<<< HEAD
 fn href_of(page: &Page, css: &str) -> String {
     let sel = Selector::parse(css).unwrap();
     page.html()
@@ -3459,7 +3458,8 @@ fn app_js_filters_bulk_ack_ids() {
     assert!(js.contains("input[data-ack-for]"));
     assert!(js.contains("addEventListener(\"submit\""));
     assert!(js.contains("updateBulkAck("));
-=======
+}
+
 // ---------------------------------------------------------------- rendered markdown
 
 /// Agent markdown with hostile HTML, a script link and a remote image mixed in.
@@ -3590,5 +3590,4 @@ async fn markdown_renders_in_plan_thread_inbox_and_needs_you() {
         "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
          connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
     );
->>>>>>> cec69cc (feat(ui): render agent markdown safely in plans, threads and inbox)
 }
