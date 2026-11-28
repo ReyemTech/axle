@@ -257,6 +257,33 @@ store_matrix!(
 );
 
 store_matrix!(
+    ack_reaches_done_descendants_below_non_done_intermediates,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store).await;
+        let p = env.create_titled("p", None).await;
+        let c = env.create_titled("c", Some(p)).await;
+        let g = env.create_titled("g", Some(c)).await;
+        let open = env.create_titled("open", Some(c)).await;
+        let claimed = env.create_titled("claimed", Some(g)).await;
+        env.svc.cancel(Caller::Agent(&env.agent), c).await.unwrap();
+        env.claim(claimed).await;
+        for id in [g, p] {
+            env.claim(id).await;
+            env.complete(id).await;
+        }
+
+        env.clock.advance(Duration::minutes(5));
+        let now = env.clock.now();
+        let acked = env.svc.ack_done(&[p]).await.unwrap();
+        assert_eq!(set(acked), set([p, g]));
+        assert_eq!(env.get(g).await.acked_at, Some(now));
+        for id in [c, open, claimed] {
+            assert_eq!(env.get(id).await.acked_at, None);
+        }
+    }
+);
+
+store_matrix!(
     leaving_done_clears_ack,
     |store: Arc<dyn Store>| async move {
         let env = Env::new(store).await;

@@ -1299,10 +1299,9 @@ impl Store for PostgresStore {
             "WITH RECURSIVE sub(id) AS (
                  SELECT id FROM tasks WHERE id = ANY($1) AND status = 'done'
                  UNION
-                 SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
-                  WHERE t.status = 'done')
+                 SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id)
              UPDATE tasks SET acked_at = $2
-              WHERE id IN (SELECT id FROM sub) AND acked_at IS NULL
+              WHERE id IN (SELECT id FROM sub) AND status = 'done' AND acked_at IS NULL
               RETURNING id",
         )
         .bind(listed)
