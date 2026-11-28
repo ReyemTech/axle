@@ -19,7 +19,7 @@ use super::{
     related_payload, send_time_recipient, unblocked_records,
 };
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId,
+    Actor, Address, Adoption, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId,
     EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId, Session,
     SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo,
     WaitingOn,
@@ -112,7 +112,194 @@ fn project_from(row: &SqliteRow) -> StoreResult<Project> {
         key: row.try_get("key")?,
         display_name: row.try_get("display_name")?,
         created_at: ts::dec(row.try_get("created_at")?)?,
+        local_host: row.try_get("local_host")?,
+        adopt_key: row.try_get("adopt_key")?,
     })
+}
+
+/// The columns `project_from` reads (a macro so queries can `concat!` it statically).
+macro_rules! project_cols {
+    () => {
+        "id, key, display_name, created_at, local_host, adopt_key"
+    };
+}
+
+/// The project `id` now is: itself, or the project a merge folded it into.
+async fn live_project(c: &mut SqliteConnection, id: ProjectId) -> StoreResult<ProjectId> {
+    let live: String =
+        sqlx::query_scalar("SELECT COALESCE((SELECT merged_into FROM projects WHERE id = ?1), ?1)")
+            .bind(id.to_string())
+            .fetch_one(&mut *c)
+            .await?;
+    uuid_of(&live)
+}
+
+/// The agent `id` now is: itself, or the agent a merge folded it into.
+async fn live_agent(c: &mut SqliteConnection, id: AgentId) -> StoreResult<AgentId> {
+    let live: String =
+        sqlx::query_scalar("SELECT COALESCE((SELECT merged_into FROM agents WHERE id = ?1), ?1)")
+            .bind(id.to_string())
+            .fetch_one(&mut *c)
+            .await?;
+    uuid_of(&live)
+}
+
+async fn live_actor(c: &mut SqliteConnection, actor: Actor) -> StoreResult<Actor> {
+    Ok(match actor {
+        Actor::Agent(a, s) => Actor::Agent(live_agent(c, a).await?, s),
+        Actor::Human => Actor::Human,
+    })
+}
+
+/// `m` with every project and agent id it stores resolved (see `merge_project`'s rule).
+async fn live_message(c: &mut SqliteConnection, m: &Message) -> StoreResult<Message> {
+    let mut m = m.clone();
+    if let Some(p) = m.project_id {
+        m.project_id = Some(live_project(c, p).await?);
+    }
+    m.to = match m.to {
+        Address::Project(p) => Address::Project(live_project(c, p).await?),
+        Address::Agent(a) => Address::Agent(live_agent(c, a).await?),
+        other => other,
+    };
+    m.from = live_actor(c, m.from).await?;
+    Ok(m)
+}
+
+/// `req` with its claimant's agent and home project resolved.
+async fn live_claim(c: &mut SqliteConnection, req: &ClaimRequest) -> StoreResult<ClaimRequest> {
+    let mut req = req.clone();
+    req.claimant.agent = live_agent(c, req.claimant.agent).await?;
+    if let Some(p) = req.claimant.project {
+        req.claimant.project = Some(live_project(c, p).await?);
+    }
+    Ok(req)
+}
+
+/// Moves everything of project `src` into `dst` (both ids as text) and leaves `src` as a
+/// redirect row (`merged_into`, key `merged/<id>`). An agent of `src` whose host and harness
+/// `dst` already has is folded into that agent; the others move with their cursors.
+///
+/// **Rule:** every write that stores a project or agent id resolves `merged_into` (the
+/// `live_*` helpers, or `COALESCE` in the statement) inside the transaction that stores it:
+/// messages (project, project and agent recipients, sender), tasks (project, participating
+/// projects, creator), claims and owners, event actors, agents' home projects and cursors,
+/// sessions. A write transaction here takes the database's write lock up front, so no
+/// adoption can land between that resolution and the insert. A value that slipped past
+/// the services (an id resolved before the merge committed) therefore never lands on a
+/// retired row.
+async fn merge_project(c: &mut SqliteConnection, src: &str, dst: &str) -> StoreResult<()> {
+    let run = |sql: &'static str| sqlx::query(sql).bind(src).bind(dst);
+    // First, while every cursor still points at `src`, give each of its agents a recipient
+    // row for every project or task message still due to it: once messages and cursors move
+    // (or an agent is folded into one whose cursor is further on), `seq > acked_seq` would
+    // no longer find them, and unread mail would vanish. The target's agents (the survivors
+    // of any fold) get theirs too, while each is still a separate recipient: "already has a
+    // receipt" is per original recipient, so one agent's acked copy never stands in for
+    // another's pending one.
+    let agents: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM agents WHERE project_id = ?1 OR project_id = ?2")
+            .bind(src)
+            .bind(dst)
+            .fetch_all(&mut *c)
+            .await?;
+    for agent in &agents {
+        materialize_agent(&mut *c, agent).await?;
+    }
+    run("UPDATE tasks SET project_id = ?2 WHERE project_id = ?1")
+        .execute(&mut *c)
+        .await?;
+    run("DELETE FROM task_projects WHERE project_id = ?1
+           AND task_id IN (SELECT task_id FROM task_projects WHERE project_id = ?2)")
+    .execute(&mut *c)
+    .await?;
+    run("UPDATE task_projects SET project_id = ?2 WHERE project_id = ?1")
+        .execute(&mut *c)
+        .await?;
+    // A participating project that is now the lead project is not listed twice.
+    sqlx::query(
+        "DELETE FROM task_projects
+         WHERE project_id = (SELECT t.project_id FROM tasks t WHERE t.id = task_projects.task_id)",
+    )
+    .execute(&mut *c)
+    .await?;
+    run("UPDATE messages SET project_id = ?2 WHERE project_id = ?1")
+        .execute(&mut *c)
+        .await?;
+    run("UPDATE messages SET to_id = ?2 WHERE to_kind = 'project' AND to_id = ?1")
+        .execute(&mut *c)
+        .await?;
+
+    let pairs = sqlx::query(
+        "SELECT a.id AS from_id, b.id AS to_id FROM agents a
+           LEFT JOIN agents b ON b.project_id = ?2 AND b.host = a.host AND b.harness = a.harness
+          WHERE a.project_id = ?1",
+    )
+    .bind(src)
+    .bind(dst)
+    .fetch_all(&mut *c)
+    .await?;
+    for row in pairs {
+        let from: String = row.try_get("from_id")?;
+        let to: Option<String> = row.try_get("to_id")?;
+        let Some(to) = to else {
+            sqlx::query("UPDATE agents SET project_id = ?2 WHERE id = ?1")
+                .bind(&from)
+                .bind(dst)
+                .execute(&mut *c)
+                .await?;
+            // Its due mail is materialised above; like a new agent of `dst`, it starts after
+            // the newest message rather than inheriting `dst`'s history.
+            sqlx::query(
+                "UPDATE agent_cursors
+                    SET project_id = ?2,
+                        acked_seq = (SELECT COALESCE(MAX(seq), 0) FROM messages)
+                  WHERE agent_id = ?1 AND project_id = ?3",
+            )
+            .bind(&from)
+            .bind(dst)
+            .bind(src)
+            .execute(&mut *c)
+            .await?;
+            continue;
+        };
+        for sql in [
+            // The folded id keeps resolving to the survivor (and so do ids folded into it).
+            "UPDATE agents SET merged_into = ?2 WHERE id = ?1 OR merged_into = ?1",
+            // Live state follows the survivor: running sessions, and who holds or created a
+            // task (what claims and thread delivery check). History and mail are never
+            // rewritten: task events, messages and receipts keep the folded id, which reads
+            // resolve through `agents.merged_into` (labels, the survivor's inbox).
+            "UPDATE sessions SET agent_id = ?2 WHERE agent_id = ?1",
+            "UPDATE tasks SET owner_agent_id = ?2 WHERE owner_agent_id = ?1",
+            "UPDATE tasks SET created_by_agent_id = ?2 WHERE created_by_agent_id = ?1",
+            "DELETE FROM agent_cursors WHERE agent_id = ?1",
+        ] {
+            sqlx::query(sql)
+                .bind(&from)
+                .bind(&to)
+                .execute(&mut *c)
+                .await?;
+        }
+    }
+    sqlx::query("DELETE FROM agent_cursors WHERE project_id = ?")
+        .bind(src)
+        .execute(&mut *c)
+        .await?;
+    run("UPDATE project_aliases SET project_id = ?2 WHERE project_id = ?1")
+        .execute(&mut *c)
+        .await?;
+    run("UPDATE projects SET merged_into = ?2 WHERE merged_into = ?1")
+        .execute(&mut *c)
+        .await?;
+    run(
+        "UPDATE projects SET key = 'merged/' || id, merged_into = ?2, local_host = NULL,
+            local_folder = NULL, adopt_key = NULL
+         WHERE id = ?1",
+    )
+    .execute(&mut *c)
+    .await?;
+    Ok(())
 }
 
 /// Reads agent columns, optionally prefixed (`a_id`, ...) for joined rows.
@@ -216,7 +403,7 @@ async fn insert_event(
     event: &TaskEvent,
     token: Option<TokenId>,
 ) -> StoreResult<()> {
-    let (agent, session) = event.actor.ids();
+    let (agent, session) = live_actor(&mut *conn, event.actor).await?.ids();
     sqlx::query(
         "INSERT INTO task_events
              (id, task_id, kind, actor_agent_id, actor_session_id, token_id, note, payload,
@@ -498,17 +685,33 @@ macro_rules! message_cols {
 /// the human's rows.
 macro_rules! owned_rows {
     () => {
-        "((recipient_agent_id IS ?1 AND recipient_session_id IS NULL)
+        "((recipient_session_id IS NULL
+           AND (recipient_agent_id IS ?1
+                OR recipient_agent_id IN (SELECT f.id FROM agents f WHERE f.merged_into = ?1)))
           OR (recipient_agent_id IS NULL AND recipient_session_id = ?2))"
     };
 }
 
-/// `owned_rows` joined to `messages m`, minus agent rows for mail the agent sent itself.
+/// `owned_rows` (alias `r`) joined to `messages m`, minus agent rows for mail the agent sent
+/// itself. An agent's rows include those of agents folded into it by a project merge, which
+/// are never rewritten: "its own mail" compares the stored sender with the row's own
+/// recipient, and when two of its rows hold one message only one is listed (its own row
+/// first, else the lowest id), so mail still unread on either stays unread.
 macro_rules! inbox_rows {
     () => {
         concat!(
             owned_rows!(),
-            " AND (recipient_session_id IS NOT NULL OR m.from_agent_id IS NOT ?1)"
+            " AND (r.recipient_session_id IS NOT NULL OR m.from_agent_id IS NOT r.recipient_agent_id)
+              AND NOT (r.recipient_session_id IS NULL AND EXISTS (
+                  SELECT 1 FROM message_recipients r2
+                   WHERE r2.message_id = r.message_id AND r2.acked_at IS NULL
+                     AND r2.recipient_session_id IS NULL
+                     AND r2.recipient_agent_id IS NOT r.recipient_agent_id
+                     AND (r2.recipient_agent_id = ?1
+                          OR (r.recipient_agent_id IS NOT ?1
+                              AND r2.recipient_agent_id < r.recipient_agent_id
+                              AND r2.recipient_agent_id IN
+                                  (SELECT f.id FROM agents f WHERE f.merged_into = ?1)))))"
         )
     };
 }
@@ -528,8 +731,8 @@ macro_rules! pending_messages {
                               WHERE t.id = m.task_id
                                 AND (t.owner_agent_id = ?1 OR t.created_by_agent_id IS ?1))))
          AND NOT EXISTS (SELECT 1 FROM message_recipients r
-                         WHERE r.message_id = m.id AND r.recipient_agent_id IS ?1
-                           AND r.recipient_session_id IS NULL)"
+                         WHERE r.message_id = m.id AND r.recipient_session_id IS NULL
+                           AND r.recipient_agent_id IS ?1)"
     };
 }
 
@@ -561,6 +764,7 @@ async fn insert_message(
     m: &Message,
     token: Option<TokenId>,
 ) -> StoreResult<()> {
+    let m = &live_message(&mut *conn, m).await?;
     let (from_agent, from_session) = m.from.ids();
     let (to_kind, to_id) = m.to.columns();
     sqlx::query(
@@ -609,6 +813,15 @@ fn recipient_binds(to: Recipient) -> (Option<String>, Option<String>) {
 /// Gives the recipient a row for every project / task message now due to it.
 async fn materialize(conn: &mut SqliteConnection, to: Recipient) -> StoreResult<()> {
     let (agent, _) = recipient_binds(to);
+    materialize_for(conn, agent.as_deref()).await
+}
+
+/// `materialize` for the agent `agent` (id text).
+async fn materialize_agent(conn: &mut SqliteConnection, agent: &str) -> StoreResult<()> {
+    materialize_for(conn, Some(agent)).await
+}
+
+async fn materialize_for(conn: &mut SqliteConnection, agent: Option<&str>) -> StoreResult<()> {
     sqlx::query(concat!(
         "INSERT INTO message_recipients (message_id, recipient_agent_id)
          SELECT m.id, ?1 FROM messages m WHERE ",
@@ -1271,6 +1484,9 @@ impl Store for SqliteStore {
         display_name: &str,
         now: OffsetDateTime,
     ) -> StoreResult<Project> {
+        if let Some(p) = self.get_project_by_key(key).await? {
+            return Ok(p);
+        }
         sqlx::query(
             "INSERT INTO projects (id, key, display_name, created_at) VALUES (?, ?, ?, ?)
              ON CONFLICT (key) DO NOTHING",
@@ -1287,32 +1503,195 @@ impl Store for SqliteStore {
     }
 
     async fn get_project_by_key(&self, key: &str) -> StoreResult<Option<Project>> {
-        sqlx::query("SELECT id, key, display_name, created_at FROM projects WHERE key = ?")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await?
-            .as_ref()
-            .map(project_from)
-            .transpose()
+        // A live key first; else an adopted local key resolves to where it moved.
+        sqlx::query(concat!(
+            "SELECT ",
+            project_cols!(),
+            " FROM projects
+             WHERE id = COALESCE(
+                 (SELECT id FROM projects WHERE key = ?1 AND merged_into IS NULL),
+                 (SELECT project_id FROM project_aliases WHERE key = ?1
+                   ORDER BY created_at DESC, id DESC LIMIT 1))"
+        ))
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(project_from)
+        .transpose()
     }
 
     async fn get_project(&self, id: ProjectId) -> StoreResult<Option<Project>> {
-        sqlx::query("SELECT id, key, display_name, created_at FROM projects WHERE id = ?")
-            .bind(id.to_string())
-            .fetch_optional(&self.pool)
-            .await?
-            .as_ref()
-            .map(project_from)
-            .transpose()
+        // A merged project's id resolves to the project it was merged into.
+        sqlx::query(concat!(
+            "SELECT ",
+            project_cols!(),
+            " FROM projects
+             WHERE id = COALESCE((SELECT merged_into FROM projects WHERE id = ?1), ?1)"
+        ))
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(project_from)
+        .transpose()
     }
 
     async fn list_projects(&self) -> StoreResult<Vec<Project>> {
-        sqlx::query("SELECT id, key, display_name, created_at FROM projects ORDER BY key")
-            .fetch_all(&self.pool)
+        sqlx::query(concat!(
+            "SELECT ",
+            project_cols!(),
+            " FROM projects WHERE merged_into IS NULL ORDER BY key"
+        ))
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(project_from)
+        .collect()
+    }
+
+    async fn local_project(
+        &self,
+        host: &str,
+        folder: &str,
+        key: &str,
+        display_name: &str,
+        now: OffsetDateTime,
+    ) -> StoreResult<Project> {
+        if let Some(p) = self.find_local_project(host, folder).await? {
+            return Ok(p);
+        }
+        let adopted: Option<String> = sqlx::query_scalar(
+            "SELECT project_id FROM project_aliases WHERE local_host = ? AND local_folder = ?
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(host)
+        .bind(folder)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(id) = adopted {
+            return self
+                .get_project(uuid_of(&id)?)
+                .await?
+                .ok_or(StoreError::NotFound("project"));
+        }
+        // The plain key first; if another project has it, the folder-suffixed one. Either
+        // insert may lose a race to the same folder, which the lookup below then finds.
+        for candidate in [key.to_string(), super::suffixed_local_key(key, folder)] {
+            sqlx::query(
+                "INSERT INTO projects (id, key, display_name, created_at, local_host, local_folder)
+                 VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            )
+            .bind(ProjectId::new().to_string())
+            .bind(&candidate)
+            .bind(display_name)
+            .bind(ts::enc(now))
+            .bind(host)
+            .bind(folder)
+            .execute(&self.pool)
+            .await?;
+            if let Some(p) = self.find_local_project(host, folder).await? {
+                return Ok(p);
+            }
+        }
+        Err(StoreError::NotFound("project"))
+    }
+
+    async fn find_local_project(&self, host: &str, folder: &str) -> StoreResult<Option<Project>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            project_cols!(),
+            " FROM projects
+             WHERE local_host = ? AND local_folder = ? AND merged_into IS NULL"
+        ))
+        .bind(host)
+        .bind(folder)
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(project_from)
+        .transpose()
+    }
+
+    async fn note_adoption(&self, id: ProjectId, key: &str) -> StoreResult<()> {
+        sqlx::query(
+            "UPDATE projects SET adopt_key = ?1
+             WHERE id = ?2 AND local_folder IS NOT NULL AND key <> ?1
+               AND adopt_key IS NOT ?1",
+        )
+        .bind(key)
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn adopt_project(
+        &self,
+        id: ProjectId,
+        display_name: &str,
+        now: OffsetDateTime,
+    ) -> StoreResult<Adoption> {
+        let src = id.to_string();
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let row = sqlx::query(
+            "SELECT key, local_host, local_folder, adopt_key FROM projects
+             WHERE id = ? AND merged_into IS NULL AND local_folder IS NOT NULL
+               AND adopt_key IS NOT NULL",
+        )
+        .bind(&src)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::NotFound("project"))?;
+        let old_key: String = row.try_get("key")?;
+        let host: String = row.try_get("local_host")?;
+        let folder: String = row.try_get("local_folder")?;
+        let new_key: String = row.try_get("adopt_key")?;
+        let target: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM projects WHERE key = ? AND merged_into IS NULL AND id <> ?",
+        )
+        .bind(&new_key)
+        .bind(&src)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let dst = target.clone().unwrap_or_else(|| src.clone());
+        sqlx::query(
+            "INSERT INTO project_aliases (id, key, project_id, local_host, local_folder, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(ProjectId::new().to_string())
+        .bind(&old_key)
+        .bind(&dst)
+        .bind(&host)
+        .bind(&folder)
+        .bind(ts::enc(now))
+        .execute(&mut *tx)
+        .await?;
+        let Some(dst) = target else {
+            sqlx::query(
+                "UPDATE projects SET key = ?, display_name = ?, local_host = NULL,
+                        local_folder = NULL, adopt_key = NULL
+                 WHERE id = ?",
+            )
+            .bind(&new_key)
+            .bind(display_name)
+            .bind(&src)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            let p = self
+                .get_project(id)
+                .await?
+                .ok_or(StoreError::NotFound("project"))?;
+            return Ok(Adoption::Renamed(p));
+        };
+        merge_project(&mut tx, &src, &dst).await?;
+        tx.commit().await?;
+        let p = self
+            .get_project(uuid_of(&dst)?)
             .await?
-            .iter()
-            .map(project_from)
-            .collect()
+            .ok_or(StoreError::NotFound("project"))?;
+        Ok(Adoption::Merged(p))
     }
 
     async fn rename_project(&self, id: ProjectId, display_name: &str) -> StoreResult<()> {
@@ -1334,9 +1713,13 @@ impl Store for SqliteStore {
         harness: &str,
         now: OffsetDateTime,
     ) -> StoreResult<Agent> {
-        let project = project.map(|p| p.to_string());
         let id = AgentId::new().to_string();
         let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        // A home project retired by a merge resolves to the project it moved into.
+        let project = match project {
+            Some(p) => Some(live_project(&mut tx, p).await?.to_string()),
+            None => None,
+        };
         let inserted = sqlx::query(
             "INSERT INTO agents (id, project_id, host, harness, created_at) VALUES (?, ?, ?, ?, ?)
              ON CONFLICT DO NOTHING",
@@ -1375,18 +1758,23 @@ impl Store for SqliteStore {
     }
 
     async fn get_agent(&self, id: AgentId) -> StoreResult<Option<Agent>> {
-        sqlx::query("SELECT id, project_id, host, harness, created_at FROM agents WHERE id = ?")
-            .bind(id.to_string())
-            .fetch_optional(&self.pool)
-            .await?
-            .as_ref()
-            .map(|row| agent_from(row, ""))
-            .transpose()
+        // An agent folded away by a project merge resolves to the one it was folded into.
+        sqlx::query(
+            "SELECT id, project_id, host, harness, created_at FROM agents
+             WHERE id = COALESCE((SELECT merged_into FROM agents WHERE id = ?1), ?1)",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(|row| agent_from(row, ""))
+        .transpose()
     }
 
     async fn list_agents(&self, limit: u32) -> StoreResult<Vec<Agent>> {
         sqlx::query(
             "SELECT id, project_id, host, harness, created_at FROM agents
+             WHERE merged_into IS NULL
              ORDER BY created_at DESC, id DESC LIMIT ?",
         )
         .bind(i64::from(limit))
@@ -1405,10 +1793,13 @@ impl Store for SqliteStore {
         now: OffsetDateTime,
     ) -> StoreResult<Session> {
         let now = ts::enc(now);
+        // An agent folded away by a merge (between the caller's lookup and this insert)
+        // never gets a new session: it goes to the agent it was folded into, in the insert.
         sqlx::query(
             "INSERT INTO sessions
                  (id, agent_id, token_id, started_at, last_heartbeat_at, last_tool_call_at)
-             VALUES (?, ?, ?, ?, ?, ?)
+             VALUES (?1, COALESCE((SELECT merged_into FROM agents WHERE id = ?2), ?2),
+                     ?3, ?4, ?5, ?6)
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(id.to_string())
@@ -1476,7 +1867,7 @@ impl Store for SqliteStore {
             ", a.id AS a_id, a.project_id AS a_project_id, a.host AS a_host,
                     a.harness AS a_harness, a.created_at AS a_created_at
              FROM sessions s JOIN agents a ON a.id = s.agent_id
-             WHERE ? IS NULL OR a.project_id = ?
+             WHERE (? IS NULL OR a.project_id = ?) AND a.merged_into IS NULL
              ORDER BY s.started_at, s.id"
         );
         let project = project.map(|p| p.to_string());
@@ -1498,8 +1889,18 @@ impl Store for SqliteStore {
         event: &TaskEvent,
         first_message: &Message,
     ) -> StoreResult<bool> {
-        let (by_agent, by_session) = task.created_by.ids();
         let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        // Project and creator ids resolve through merges here, under the write lock.
+        let mut live = task.clone();
+        live.project_id = live_project(&mut tx, task.project_id).await?;
+        live.created_by = live_actor(&mut tx, task.created_by).await?;
+        let task = &live;
+        let mut extras = Vec::with_capacity(extra_projects.len());
+        for p in extra_projects {
+            extras.push(live_project(&mut tx, *p).await?);
+        }
+        let extra_projects = extras.as_slice();
+        let (by_agent, by_session) = task.created_by.ids();
         if let Some(parent) = task.parent_id {
             let status: Option<String> =
                 sqlx::query_scalar("SELECT status FROM tasks WHERE id = ?")
@@ -1592,7 +1993,11 @@ impl Store for SqliteStore {
         };
         let mut added = Vec::new();
         let mut names = Vec::new();
-        for project in req.projects {
+        let mut live = Vec::with_capacity(req.projects.len());
+        for p in req.projects {
+            live.push(live_project(&mut tx, *p).await?);
+        }
+        for project in &live {
             if *project == task.project_id || added.contains(project) {
                 continue;
             }
@@ -2019,6 +2424,7 @@ impl Store for SqliteStore {
 
     async fn claim_task(&self, task: TaskId, req: &ClaimRequest) -> StoreResult<ClaimAttempt> {
         let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let req = &live_claim(&mut tx, req).await?;
         let attempt = claim_locked(&mut tx, task, req).await?;
         tx.commit().await?;
         Ok(attempt)
@@ -2029,11 +2435,13 @@ impl Store for SqliteStore {
         project: ProjectId,
         req: &ClaimRequest,
     ) -> StoreResult<Option<Task>> {
-        let c = &req.claimant;
-        let home = c.project.map(|p| p.to_string());
         // The write lock taken by BEGIN IMMEDIATE is SQLite's equivalent of SKIP LOCKED:
         // no other writer can pick the same row between this SELECT and the UPDATE.
         let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let req = &live_claim(&mut tx, req).await?;
+        let project = live_project(&mut tx, project).await?;
+        let c = &req.claimant;
+        let home = c.project.map(|p| p.to_string());
         // Same reclaimable set as the claim guard minus same-agent takeover: open work and
         // abandoned (expired) claims. `claim_locked` then applies the full guard.
         let picked: Option<String> = sqlx::query_scalar(concat!(

@@ -42,6 +42,9 @@ pub enum Event {
         id: EnrollmentId,
         status: EnrollmentStatus,
     },
+    /// A local project was merged into `into` (adopting a git remote): its agents may now
+    /// have other ids, so subscribers re-resolve who they are.
+    ProjectMerged { from: ProjectId, into: ProjectId },
 }
 
 impl Event {
@@ -52,6 +55,7 @@ impl Event {
             Event::TaskChanged { .. } => "TaskChanged",
             Event::HumanArchived { .. } => "HumanArchived",
             Event::EnrollmentChanged { .. } => "EnrollmentChanged",
+            Event::ProjectMerged { .. } => "ProjectMerged",
         }
     }
 
@@ -59,6 +63,7 @@ impl Event {
         match *self {
             Event::MessageCreated { project_id, .. } => project_id,
             Event::TaskChanged { project_id, .. } => Some(project_id),
+            Event::ProjectMerged { into, .. } => Some(into),
             Event::HumanArchived { .. } | Event::EnrollmentChanged { .. } => None,
         }
     }

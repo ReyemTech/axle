@@ -66,11 +66,25 @@ id_type!(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     pub id: ProjectId,
-    /// Normalised key, e.g. `github.com/acme/platform-infra`. Never changes.
+    /// Normalised key, e.g. `github.com/acme/platform-infra` or `local/<host>/<folder>`.
+    /// Changes only when the human adopts a git remote for a local project.
     pub key: String,
     /// Human label shown in the UI (editable).
     pub display_name: String,
     pub created_at: OffsetDateTime,
+    /// The host of a local project (one made for a folder without a git remote).
+    pub local_host: Option<String>,
+    /// The git key this local project's folder now has, waiting for the human to adopt it.
+    pub adopt_key: Option<String>,
+}
+
+/// What adopting a local project's git remote did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Adoption {
+    /// No project had the git key: the local project now carries it.
+    Renamed(Project),
+    /// The git key's project existed: everything moved into it (returned).
+    Merged(Project),
 }
 
 /// Stable identity `(project, host, harness)`; `project_id` is `None` for agents with no

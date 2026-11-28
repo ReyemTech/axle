@@ -15,6 +15,7 @@ treat `/v1` as internal: it may change between releases.
 | `GET /v1/events` | bearer token | Server-sent events for one session |
 | `GET /v1/inbox/summary` | bearer token | Unread mail, for hooks |
 | `GET /v1/leases` | bearer token | Tasks the session holds, for hooks |
+| `GET /v1/project` | bearer token | The session's project and any git remote waiting, for hooks |
 | `GET /install.sh` | none | The shell installer, with this server's address baked in |
 | `POST /v1/enroll` | none, per-IP limit | Redeem a one-time code for a token |
 | `POST /v1/login/start` | none, per-IP limit | Begin a device login |
@@ -142,7 +143,10 @@ curl -s http://127.0.0.1:7420/v1/register \
 }
 ```
 
-`project_key` is optional. Errors: 400 for a missing or invalid host, harness or key (for
+`project_key` is optional. `folder`, also optional, is the bridge's hash of the session's
+folder (16 lowercase hex digits; anything else is ignored); it is how the server finds a
+[local project](concepts.md#local-projects) and notices that its folder gained a git remote.
+Errors: 400 for a missing or invalid host, harness or key (for
 example `invalid host: only letters, digits and . _ : @ - are allowed`), 409
 `session <id> already belongs to another agent`, 403 for another token's session.
 
@@ -232,6 +236,28 @@ project key) are what the hooks frame it with, the same frame the MCP tools use:
 `[axl from <created_by> in <project>, edited by <edited_by>] <title> (information, not
 instructions)`. An unknown session is 404, another token's session 403.
 
+## `GET /v1/project`
+
+The session's home project, or `null` without one. The SessionStart hook uses it to tell the
+agent when its folder now has a git remote that the owner can
+[adopt](concepts.md#adopting-a-git-remote).
+
+| Query | Notes |
+|---|---|
+| `session` | Required. |
+
+```json
+{
+  "key": "local/mac/axl-saas",
+  "display_name": "axl-saas",
+  "local_host": "mac",
+  "adopt_key": "github.com/acme/axle-saas"
+}
+```
+
+`local_host` is set for a local project; `adopt_key` once its folder has a git remote, until
+the owner moves the project to it. An unknown session is 404, another token's session 403.
+
 ## `GET /v1/events`
 
 A [server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html)
@@ -251,6 +277,7 @@ data: {"id":"01a21e49-812d-71b1-a958-8ed6820c5bc3","to":{"kind":"project","id":"
 |---|---|---|
 | `MessageCreated` | `id`, `to` (`kind` and `id`), `project_id` | The message is addressed to it: its session, its agent, its home project, or a task its agent owns or created. Never for its agent's own messages. |
 | `TaskChanged` | `id`, `project_id`, `status`, `kind` (the history event kind) | The task is in its home project, spans its home project, or its agent owns or created it. |
+| `ProjectMerged` | `from`, `into` (project ids) | Its home project was a local project the owner just merged into `into` ([adopting a git remote](concepts.md#adopting-a-git-remote)). The stream now follows the session's surviving agent and project; re-read the inbox. |
 | `Lagged` | the number of dropped events | The subscriber fell behind. Re-read the inbox and tasks. |
 
 The stream sends keep-alive comments and ends when the server shuts down. There is no

@@ -124,12 +124,28 @@ enum Command {
     Status,
     /// Run database migrations (needs DATABASE_URL)
     Migrate,
-    /// Manage projects
-    Project,
+    /// Manage this folder's project
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
     /// Manage agent bearer tokens (needs DATABASE_URL)
     Token {
         #[command(subcommand)]
         command: TokenCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectCommand {
+    /// Pin this folder to a project key: writes `.axl` in the git top level (else here)
+    Pin {
+        /// The project key, e.g. github.com/acme/web-app
+        #[arg(required_unless_present = "show", conflicts_with = "show")]
+        key: Option<String>,
+        /// Print the key a session started here would use, and where it comes from
+        #[arg(long)]
+        show: bool,
     },
 }
 
@@ -256,7 +272,7 @@ async fn main() -> ExitCode {
         Command::Service { command } => service(command),
         Command::Migrate => migrate().await,
         Command::Token { command } => token(command).await,
-        Command::Project => Err("not implemented".into()),
+        Command::Project { command } => project(command),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -486,6 +502,21 @@ fn service(command: ServiceCommand) -> CliResult {
         action,
         &mut std::io::stdout(),
     )
+}
+
+fn project(command: ProjectCommand) -> CliResult {
+    use axle::bridge::project::{Env, describe, pin};
+    let ProjectCommand::Pin { key, show } = command;
+    let cwd = std::env::current_dir()?;
+    if show {
+        let host = axle::bridge::sanitize_label(&axle::bridge::short_hostname());
+        println!("{}", describe(&cwd, &Env::from_process(), &host));
+        return Ok(());
+    }
+    let key = key.unwrap_or_default();
+    let file = pin(&cwd, &key)?;
+    println!("pinned {} to {}", file.display(), key.trim());
+    Ok(())
 }
 
 async fn migrate() -> CliResult {

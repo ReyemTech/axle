@@ -8,6 +8,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use serde::Deserialize;
 
 use super::views::{UiError, UiResult};
+use crate::domain::Adoption;
 use crate::domain::{
     Actor, Address, Importance, LinkKind, MessageId, ProjectId, TaskId, TokenId, clean_display_name,
 };
@@ -638,6 +639,26 @@ pub async fn rename_project(
     match state.store.rename_project(id, &name).await {
         Ok(()) => Ok(see_other("/ui/projects")),
         Err(StoreError::NotFound(_)) => Err(UiError::NotFound("No such project.")),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// "Move tasks and history to it": adopts the git remote a local project's folder now has
+/// (renames the project, or merges it into the existing one), then shows the Projects page.
+pub async fn adopt_project(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> UiResult<Response> {
+    let id: ProjectId = id
+        .parse()
+        .map_err(|_| UiError::NotFound("No such project."))?;
+    match state.adopt_project(id).await {
+        Ok(Adoption::Renamed(p) | Adoption::Merged(p)) => {
+            Ok(see_other(&format!("/ui/projects#project-{}", p.id)))
+        }
+        Err(StoreError::NotFound(_)) => Err(UiError::NotFound(
+            "No local project with a git remote to move to.",
+        )),
         Err(e) => Err(e.into()),
     }
 }

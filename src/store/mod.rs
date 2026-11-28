@@ -13,10 +13,10 @@ use time::{Duration, OffsetDateTime};
 
 use crate::config::Backend;
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, Enrollment, EnrollmentId, EnrollmentKind,
-    Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState, Project,
-    ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus,
-    TokenId, TokenInfo, WaitingOn,
+    Actor, Address, Adoption, Agent, AgentId, BlockDetail, Enrollment, EnrollmentId,
+    EnrollmentKind, Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState,
+    Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink,
+    TaskStatus, TokenId, TokenInfo, WaitingOn,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +64,13 @@ pub enum PollOutcome {
     Expired,
     /// The poll that won: the enrollment is now consumed and its token created.
     Consumed(Enrollment),
+}
+
+/// The key a local project gets when another project already has `key`: `<key>-<first 6
+/// characters of the folder hash>`, so same-named folders on one host stay distinct.
+pub fn suffixed_local_key(key: &str, folder: &str) -> String {
+    let short: String = folder.chars().take(6).collect();
+    format!("{key}-{short}")
 }
 
 /// Label of the token minted for `e`: code `<label> (<host>)`, device `<host> (device login)`.
@@ -168,6 +175,32 @@ pub trait Store: Send + Sync {
     async fn list_projects(&self) -> StoreResult<Vec<Project>>;
     /// Changes only the display name; `NotFound` if the project does not exist.
     async fn rename_project(&self, id: ProjectId, display_name: &str) -> StoreResult<()>;
+
+    /// The local project of `folder` (a bridge folder hash) on `host`, creating it on first
+    /// contact as `key`, or as `<key>-<first 6 of folder>` when another project already has
+    /// `key`. A folder whose local project was adopted resolves to the adopted project.
+    async fn local_project(
+        &self,
+        host: &str,
+        folder: &str,
+        key: &str,
+        display_name: &str,
+        now: OffsetDateTime,
+    ) -> StoreResult<Project>;
+    /// The un-adopted local project of `folder` on `host`, if there is one.
+    async fn find_local_project(&self, host: &str, folder: &str) -> StoreResult<Option<Project>>;
+    /// Records that local project `id`'s folder now has git key `key`. No-op otherwise.
+    async fn note_adoption(&self, id: ProjectId, key: &str) -> StoreResult<()>;
+    /// Moves local project `id` to its recorded `adopt_key`: renames it in place when no
+    /// project has that key, else merges its tasks, messages and agents into that project
+    /// and leaves `id` as a redirect. The old key keeps resolving. `NotFound` if `id` is not
+    /// a local project with a recorded git key.
+    async fn adopt_project(
+        &self,
+        id: ProjectId,
+        display_name: &str,
+        now: OffsetDateTime,
+    ) -> StoreResult<Adoption>;
 
     // ---- agents ----
 

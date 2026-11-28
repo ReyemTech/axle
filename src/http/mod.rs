@@ -143,6 +143,26 @@ impl AppState {
             clock,
         }
     }
+
+    /// The owner's "Move tasks and history to it" (see `IdentityService::adopt`). A merge
+    /// publishes `ProjectMerged`, so open event streams of the merged project's sessions
+    /// pick up their surviving agent and project ids.
+    pub async fn adopt_project(
+        &self,
+        id: crate::domain::ProjectId,
+    ) -> Result<crate::domain::Adoption, crate::store::StoreError> {
+        let out = crate::service::identity::IdentityService::adopt(&*self.store, &*self.clock, id)
+            .await?;
+        if let crate::domain::Adoption::Merged(into) = &out {
+            self.bus
+                .emit(crate::events::Event::ProjectMerged {
+                    from: id,
+                    into: into.id,
+                })
+                .await;
+        }
+        Ok(out)
+    }
 }
 
 /// The authenticated caller's token, set by `require_token`.

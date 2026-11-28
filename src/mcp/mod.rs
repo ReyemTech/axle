@@ -41,6 +41,8 @@ use crate::store::{Store, StoreError};
 pub const HARNESS_HEADER: &str = "x-axl-harness";
 pub const HOST_HEADER: &str = "x-axl-host";
 pub const PROJECT_HEADER: &str = "x-axl-project";
+/// The bridge's hash of the session's folder (local projects and adopting a remote).
+pub const FOLDER_HEADER: &str = "x-axl-folder";
 pub const SESSION_HEADER: &str = "x-axl-session";
 /// Set by the Streamable HTTP transport once the client has initialised a session.
 pub const MCP_SESSION_HEADER: &str = "mcp-session-id";
@@ -202,6 +204,9 @@ pub fn identity_input(headers: &HeaderMap, token: TokenId) -> IdentityInput {
     let project_key = header(headers, PROJECT_HEADER);
     let host = header(headers, HOST_HEADER).unwrap_or_else(|| UNKNOWN.to_string());
     let harness = header(headers, HARNESS_HEADER).unwrap_or_else(|| UNKNOWN.to_string());
+    // Only a well-formed folder hash counts, as in the identity service.
+    let folder =
+        header(headers, FOLDER_HEADER).filter(|f| crate::bridge::project::is_folder_hash(f));
     let session = match (
         header(headers, SESSION_HEADER),
         header(headers, MCP_SESSION_HEADER),
@@ -211,13 +216,20 @@ pub fn identity_input(headers: &HeaderMap, token: TokenId) -> IdentityInput {
             Err(_) => derived_session(&format!("axl-session\n{s}")),
         },
         (None, Some(m)) => derived_session(&format!("mcp-session\n{m}")),
+        // The folder is part of the identity (same-named local folders are different
+        // projects), so it is part of the seed; without one the seed is unchanged.
         (None, None) => derived_session(&format!(
-            "stateless\n{token}\n{}\n{host}\n{harness}",
-            project_key.as_deref().unwrap_or_default()
+            "stateless\n{token}\n{}\n{host}\n{harness}{}",
+            project_key.as_deref().unwrap_or_default(),
+            folder
+                .as_deref()
+                .map(|f| format!("\nfolder:{f}"))
+                .unwrap_or_default()
         )),
     };
     IdentityInput {
         project_key,
+        folder,
         host,
         harness,
         session,
@@ -669,5 +681,24 @@ mod tests {
             identity_input(&HeaderMap::new(), TokenId::new()).session
         );
         assert_ne!(bare.session, mcp.session);
+
+        // Stateless clients in two same-named local folders (same token, host, harness and
+        // key) are two sessions: the folder hash is part of the seed. A malformed folder
+        // value is ignored, as the identity service ignores it.
+        let local = |folder: &str| {
+            identity_input(
+                &headers(&[
+                    (HOST_HEADER, "mac"),
+                    (HARNESS_HEADER, "codex"),
+                    (PROJECT_HEADER, "local/mac/web"),
+                    (FOLDER_HEADER, folder),
+                ]),
+                token,
+            )
+            .session
+        };
+        assert_ne!(local("0123456789abcdef"), local("fedcba9876543210"));
+        assert_eq!(local("0123456789abcdef"), local("0123456789abcdef"));
+        assert_eq!(local("not a hash"), local("also not"));
     }
 }

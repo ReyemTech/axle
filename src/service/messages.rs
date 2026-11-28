@@ -222,12 +222,12 @@ impl MessageService {
         {
             return Err(MessageError::NotFound("message"));
         }
-        let (project_id, task_id) = self.place(&new.to, sender_project).await?;
+        let (to, project_id, task_id) = self.place(&new.to, sender_project).await?;
         let message = Message {
             id: MessageId::new(),
             project_id,
             from: *caller,
-            to: new.to,
+            to,
             subject: new.subject,
             body: new.body,
             importance: new.importance,
@@ -367,19 +367,22 @@ impl MessageService {
         Ok((agent.project_id, Some(session.token_id)))
     }
 
-    /// The message's `(project_id, task_id)` for an address, checking the target exists.
+    /// The message's canonical address and `(project_id, task_id)`, checking the target
+    /// exists. A project or agent id left behind by a project merge is replaced by the id it
+    /// redirects to, so the message reaches someone who reads it.
     async fn place(
         &self,
         to: &Address,
         sender_project: Option<ProjectId>,
-    ) -> Result<(Option<ProjectId>, Option<TaskId>), MessageError> {
+    ) -> Result<(Address, Option<ProjectId>, Option<TaskId>), MessageError> {
         Ok(match *to {
             Address::Project(p) => {
-                self.store
+                let project = self
+                    .store
                     .get_project(p)
                     .await?
                     .ok_or(MessageError::NotFound("project"))?;
-                (Some(p), None)
+                (Address::Project(project.id), Some(project.id), None)
             }
             Address::Agent(a) => {
                 let agent = self
@@ -387,7 +390,7 @@ impl MessageService {
                     .get_agent(a)
                     .await?
                     .ok_or(MessageError::NotFound("agent"))?;
-                (agent.project_id, None)
+                (Address::Agent(agent.id), agent.project_id, None)
             }
             Address::Session(s) => {
                 let session = self
@@ -400,7 +403,7 @@ impl MessageService {
                     .get_agent(session.agent_id)
                     .await?
                     .ok_or(MessageError::NotFound("agent"))?;
-                (agent.project_id, None)
+                (*to, agent.project_id, None)
             }
             Address::Task(t) => {
                 let task = self
@@ -408,9 +411,9 @@ impl MessageService {
                     .get_task(t)
                     .await?
                     .ok_or(MessageError::NotFound("task"))?;
-                (Some(task.project_id), Some(t))
+                (*to, Some(task.project_id), Some(t))
             }
-            Address::Human => (sender_project, None),
+            Address::Human => (*to, sender_project, None),
         })
     }
 }

@@ -46,6 +46,7 @@ impl Env {
             &*self.clock,
             IdentityInput {
                 project_key: Some(PROJECT.to_string()),
+                folder: None,
                 host: host.into(),
                 harness: "claude-code".into(),
                 session: SessionId::new(),
@@ -513,6 +514,7 @@ store_matrix!(a_top_level_task_moves_under_a_parent, |store: Arc<
         &*env.clock,
         IdentityInput {
             project_key: Some("github.com/acme/web-app".into()),
+            folder: None,
             host: "mac".into(),
             harness: "claude-code".into(),
             session: SessionId::new(),

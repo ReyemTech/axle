@@ -31,12 +31,13 @@ use rmcp::{ErrorData, RoleClient, RoleServer, ServerHandler, ServiceExt};
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use self::project::{Env, resolve_project};
+use self::project::{Env, detect};
 use self::session_file::{SessionFile, SessionInfo};
 use crate::client::{AxlDir, read_token, resolve_server_url};
 use crate::domain::SessionId;
 use crate::mcp::{
-    AxleMcp, HARNESS_HEADER, HOST_HEADER, INSTRUCTIONS, PROJECT_HEADER, SESSION_HEADER, UNKNOWN,
+    AxleMcp, FOLDER_HEADER, HARNESS_HEADER, HOST_HEADER, INSTRUCTIONS, PROJECT_HEADER,
+    SESSION_HEADER, UNKNOWN,
 };
 use crate::service::identity::NAME_MAX;
 
@@ -59,6 +60,8 @@ pub struct Config {
     pub harness: String,
     pub host: String,
     pub project_key: Option<String>,
+    /// `project::folder_hash` of the session's folder; `None` when a pin decided the project.
+    pub folder: Option<String>,
     /// Without a trailing `/`.
     pub server_url: String,
     /// `HEARTBEAT`, unless `AXL_HEARTBEAT_MS` (tests and tuning only) sets another.
@@ -75,11 +78,14 @@ impl Config {
         if harness_label != harness {
             eprintln!("axl: harness name {harness:?} used as {harness_label:?}");
         }
+        let host = sanitize_label(&short_hostname());
+        let detected = detect(cwd, env, &host);
         Self {
             session_id: SessionId::new(),
             harness: harness_label,
-            host: sanitize_label(&short_hostname()),
-            project_key: resolve_project(cwd, env),
+            host,
+            project_key: detected.key,
+            folder: detected.folder,
             server_url: match env.get("HOME") {
                 Some(home) => {
                     resolve_server_url(env.get("AXL_SERVER_URL"), &AxlDir::new(Path::new(home)))
@@ -215,6 +221,9 @@ impl Bridge {
         if let Some(p) = &c.project_key {
             put(PROJECT_HEADER, p);
         }
+        if let Some(f) = &c.folder {
+            put(FOLDER_HEADER, f);
+        }
         headers
     }
 
@@ -330,6 +339,7 @@ impl Bridge {
             "host": c.host,
             "harness": c.harness,
             "project_key": c.project_key,
+            "folder": c.folder,
         });
         match self.post(http, "register", body).await {
             Ok(()) => {

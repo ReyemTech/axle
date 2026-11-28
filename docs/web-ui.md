@@ -203,6 +203,15 @@ answers are written by the agent, so they are shown as plain text, never as mark
 Projects appear here on first contact. Rename a project's display name; the key stays the
 same and is shown on hover. A key that is a plain `host/path` links to its repository.
 
+A folder without a git remote has a [local project](concepts.md#local-projects), shown as
+"axl-saas · local to mac", with no repository link. Once that folder has a remote and an
+agent has started there, the project's row carries an amber **Git remote found** box:
+"axl-saas now has a git remote: github.com/acme/axle-saas" and a **Move tasks and history to
+it** button. It appears only on the project of that exact folder. Pressing it renames the
+project to the git key, or, when a project with that key already exists (the box says so),
+merges this one into it. The board then shows the tasks under the git project. Nothing
+changes until you press it.
+
 ## Tokens
 
 <img src="images/tokens.webp" width="1440" alt="The Tokens page listing four agent tokens by label with active or revoked state, last use and creation time, and a Revoke button on each active token.">

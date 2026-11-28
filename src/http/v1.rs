@@ -39,6 +39,7 @@ pub fn routes() -> Router<AppState> {
         .route("/events", get(events))
         .route("/inbox/summary", get(inbox_summary))
         .route("/leases", get(leases))
+        .route("/project", get(session_project))
         .route("/whoami", get(whoami))
         .route("/token/revoke", post(revoke_self))
 }
@@ -81,6 +82,9 @@ pub struct RegisterRequest {
     pub harness: String,
     #[serde(default)]
     pub project_key: Option<String>,
+    /// The bridge's folder hash (see `bridge::project::folder_hash`).
+    #[serde(default)]
+    pub folder: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -106,6 +110,7 @@ async fn register(
         &*state.clock,
         IdentityInput {
             project_key: req.project_key,
+            folder: req.folder,
             host: req.host,
             harness: req.harness,
             session: req.session_id,
@@ -155,6 +160,33 @@ async fn session_for(
         }));
     }
     Ok(r)
+}
+
+// ---------------------------------------------------------------- project
+
+/// The session's home project, for the SessionStart hook: `null` with no project.
+#[derive(Debug, Serialize)]
+pub struct SessionProject {
+    pub key: String,
+    pub display_name: String,
+    /// The machine, for a local project (a folder without a git remote).
+    pub local_host: Option<String>,
+    /// The git key the folder now has, until the human moves the project to it.
+    pub adopt_key: Option<String>,
+}
+
+async fn session_project(
+    State(state): State<AppState>,
+    Extension(AuthToken(token)): Extension<AuthToken>,
+    Query(q): Query<SessionQuery>,
+) -> Result<Json<Option<SessionProject>>, ApiError> {
+    let r = session_for(&state, token, q.session).await?;
+    Ok(Json(r.project.map(|p| SessionProject {
+        key: p.key,
+        display_name: p.display_name,
+        local_host: p.local_host,
+        adopt_key: p.adopt_key,
+    })))
 }
 
 // ---------------------------------------------------------------- heartbeat
@@ -289,7 +321,7 @@ async fn events(
         project: r.agent.project_id,
     };
     let shutdown = state.shutdown.clone();
-    let stream = futures_util::stream::unfold((rx, watcher), move |(mut rx, w)| {
+    let stream = futures_util::stream::unfold((rx, watcher), move |(mut rx, mut w)| {
         let shutdown = shutdown.clone();
         async move {
             loop {
@@ -332,17 +364,35 @@ impl Watcher {
     /// itself. Task changes for tasks in its home project (or spanning it) or that the agent
     /// owns or created. A lookup failure drops the event (they are hints; the inbox is the
     /// record).
-    async fn wants(&self, event: &Event) -> bool {
+    async fn wants(&mut self, event: &Event) -> bool {
         let result = match *event {
             Event::MessageCreated { id, to, .. } => self.wants_message(id, to).await,
             Event::TaskChanged { id, project_id, .. } => self.wants_task(id, project_id).await,
             // The human's inbox is not an agent's business.
             Event::HumanArchived { .. } | Event::EnrollmentChanged { .. } => Ok(false),
+            // This session's project was merged: its agent and project may have new ids.
+            // Re-resolve them, and pass the event on so the client re-reads its inbox.
+            Event::ProjectMerged { from, .. } if Some(from) == self.project => self.reload().await,
+            Event::ProjectMerged { .. } => Ok(false),
         };
         result.unwrap_or_else(|e| {
             eprintln!("axl: dropping event for session {}: {e}", self.session);
             false
         })
+    }
+
+    /// Re-reads the session's agent and home project (after a merge folded or moved them).
+    async fn reload(&mut self) -> crate::store::StoreResult<bool> {
+        match IdentityService::load(&*self.store, self.session).await {
+            Ok(Some(r)) => {
+                self.agent = r.agent.id;
+                self.project = r.agent.project_id;
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(IdentityError::Store(e)) => Err(e),
+            Err(e) => Err(crate::store::StoreError::Corrupt(e.to_string())),
+        }
     }
 
     async fn wants_message(&self, id: MessageId, to: Address) -> crate::store::StoreResult<bool> {

@@ -12,6 +12,7 @@ use time::macros::datetime;
 fn input(token: TokenId, project_key: Option<&str>, session: SessionId) -> IdentityInput {
     IdentityInput {
         project_key: project_key.map(str::to_string),
+        folder: None,
         host: "mac".into(),
         harness: "claude-code".into(),
         session,

@@ -12,6 +12,7 @@ set up a machine. This page covers the setup commands and the server and token c
 | [`axl uninstall`](#axl-uninstall) | Undo `axl install` |
 | [`axl status`](#axl-status) | Show what is connected and what is not |
 | [`axl service`](#axl-service) | Run the server in the background on this machine |
+| [`axl project`](#axl-project) | Pin this folder to a project, or show which one it uses |
 | [`axl serve`](#server-and-tokens) | Run the server in the foreground |
 | [`axl token`](#server-and-tokens) | Create, list and revoke tokens by hand |
 
@@ -116,6 +117,23 @@ Prints one line each for the server, the token, the local service (when there is
 every harness, with a `fix:` line under anything that needs attention. It is the first
 thing to run when an agent cannot reach Axle.
 
+## `axl project`
+
+```sh
+axl project pin <key>
+axl project pin --show
+```
+
+`pin` writes `project = "<key>"` to the `.axl` file of the git top level, or of the current
+directory outside a repository, so every session in that tree uses `<key>` whatever its
+remote. An existing `.axl` keeps its other lines and comments; only `project` changes. The
+key must use letters, digits and `. _ : @ - /`, up to 200 bytes.
+
+`--show` prints the key a session started here would use and where it comes from:
+`AXL_PROJECT`, the `.axl` file (with its path), the git `origin` remote, or a local project
+for a folder with no remote. See [projects and identity](concepts.md#projects-and-identity).
+Neither form needs the server.
+
 ## `axl service`
 
 ```sh
@@ -148,8 +166,7 @@ axl token create --label NAME | list | revoke ID
 also needs `DATABASE_URL`. It is the manual and admin path: `create` prints a token once
 (redirect it into `~/.axl/token` with mode 0600), `list` shows id, label, creation, last use
 and revocation, and `revoke` cuts one off by id. For normal onboarding use `axl install` or
-**Tokens → Connect a machine** instead. `axl project` and `axl migrate` have their own
-`--help`.
+**Tokens → Connect a machine** instead. `axl migrate` has its own `--help`.
 
 ## Files on the client
 

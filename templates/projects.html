@@ -3,16 +3,16 @@
 {% block content %}
 <div class="page-head">
   <h1 class="page-title">Projects</h1>
-  <p class="muted">A project's key comes from its git remote and never changes. Its display name is what people and agents see.</p>
+  <p class="muted">A project's key comes from its git remote. A folder without one gets a local project, shown as "local to" its machine; once the folder has a remote you can move its tasks and history to it here. Keys change only when you do that. The display name is what people and agents see.</p>
 </div>
 {% if projects.is_empty() %}
-<p class="empty">No projects yet. One appears when an agent first connects from a repository.</p>
+<p class="empty">No projects yet. One appears when an agent first connects from a folder.</p>
 {% else %}
 <ul class="rows">
 {% for p in projects %}
   <li class="row" id="project-{{ p.id }}" data-nav tabindex="-1">
     <div class="row-main">
-      <span class="row-title"><span class="line-swatch" data-line="{{ p.line }}" aria-hidden="true"></span>{{ p.name }}</span>
+      <span class="row-title"><span class="line-swatch" data-line="{{ p.line }}" aria-hidden="true"></span>{{ p.name }}{% if let Some(host) = p.local_host %}<span class="row-local"> · local to {{ host }}</span>{% endif %}</span>
       <code class="row-key">{% if let Some(url) = p.repo_url %}<a href="{{ url }}" rel="noopener noreferrer" target="_blank">{{ p.key }}<span class="visually-hidden"> (open repository in a new tab)</span></a>{% else %}{{ p.key }}{% endif %}</code>
       <span class="muted">since <time datetime="{{ p.created.iso }}" title="{{ p.created.text }}">{{ p.created.text }}</time></span>
     </div>
@@ -23,6 +23,18 @@
       <input id="name-{{ p.id }}" name="display_name" value="{{ p.name }}" maxlength="{{ max }}" required>
       <button type="submit" class="secondary">Rename</button>
     </form>
+    {% endif %}
+    {% if let Some(remote) = p.adopt_key %}
+    <div class="adopt" role="status">
+      <span class="adopt-label">Git remote found</span>
+      <span><strong>{{ p.name }}</strong> now has a git remote: <code>{{ remote }}</code>{% if p.adopt_exists %} (that project already exists; this one merges into it){% endif %}</span>
+      {% if let Some(token) = csrf %}
+      <form class="inline-form" method="post" action="/ui/projects/{{ p.id }}/adopt">
+        <input type="hidden" name="csrf" value="{{ token }}">
+        <button type="submit">Move tasks and history to it</button>
+      </form>
+      {% endif %}
+    </div>
     {% endif %}
   </li>
 {% endfor %}

@@ -26,23 +26,60 @@ The bridge works out a session's project from its working directory, in this ord
 
 1. `AXL_PROJECT`, if set.
 2. The nearest `.axl` file walking up from the working directory, a TOML file with
-   `project = "<key>"`.
+   `project = "<key>"`. `axl project pin <key>` writes one (see [CLI](cli.md#axl-project)).
 3. The git `origin` remote, normalised: lowercase, no user or port, no `.git` suffix. SSH,
    `ssh://`, `https://` and `git://` forms of one repository give the same key.
-4. Otherwise, no project.
+4. Otherwise, a **local project** for the folder (below).
 
 ```toml
 # .axl: pin this directory tree to a project
 project = "github.com/acme/web-app"
 ```
 
-A session with no project still works: it can read, message and act on tasks by naming a
-project. It cannot use `task_claim` with `next: true`, and it is only eligible for tasks it
-is named on. Resolution never fails the harness; an unusable value is logged once to stderr
-and treated as no project.
+Resolution never fails the harness; an unusable `AXL_PROJECT` or `.axl` value is logged
+once to stderr and the session runs with no project. A session with no project still
+works: it can read, message and act on tasks by naming a project. It cannot use
+`task_claim` with `next: true`, and it is only eligible for tasks it is named on.
 
 Keys may use letters, digits and `. _ : @ - /`, up to 200 bytes. Projects are created on
 first contact; there is no command to create one.
+
+### Local projects
+
+Work often starts before `git init`, or in a repository with no remote yet. Such a folder
+gets the key `local/<host>/<folder>`: the host and the folder's name (the git top level's
+name inside a repository, else the working directory's), each lowercased with every run of
+characters other than letters, digits, `.`, `_` and `-` turned into one `-`, at most 64
+bytes. `~/Code/Axl SaaS` on `mac` is `local/mac/axl-saas`. The UI shows it as
+"axl-saas · local to mac" and links it nowhere.
+
+The bridge also sends a hash of the folder's absolute path (never the path itself), and the
+server finds local projects by host and hash, not by name. So subdirectories of one
+repository share its project, and two folders with the same name on one machine stay apart:
+the first keeps `local/<host>/<folder>`, the second gets the key with the first six
+characters of its hash appended (`local/mac/web-3f9a1c`).
+
+### Adopting a git remote
+
+When a folder with a local project gains a git remote, the next session there sends the git
+key, but it **stays on the local project**: keys never change on their own. The server
+notes the remote, the session's SessionStart status says so, and the
+[Projects page](web-ui.md#projects) shows "axl-saas now has a git remote:
+github.com/acme/axle-saas" with **Move tasks and history to it**. Only that human action
+changes the key:
+
+- If no project has the git key yet, the local project is renamed in place. Its tasks,
+  messages and agents stay attached, and a display name still at its default follows the new
+  key.
+- If the git key's project already exists (another machine got there first), the local
+  project is merged into it: tasks, messages and agents move, and an agent whose host and
+  harness that project already has is folded into it. The local project stays behind as a
+  redirect, so old links and ids still resolve.
+
+Either way the old local key keeps resolving to the moved project, so agents keep working:
+a session started before the remote still sends the local key and lands on the moved
+project, and new sessions use the git key. A pin (`AXL_PROJECT` or `.axl`) takes no part in
+any of this.
 
 ## Agents and sessions
 
