@@ -15,6 +15,8 @@
     <summary class="button-like">Key</summary>
     <dl class="key-list">
       <div><dt><span class="aspect" data-aspect="open" aria-hidden="true"></span>open</dt><dd>Waiting for an agent to claim it.</dd></div>
+      <div><dt><span class="aspect" data-aspect="requested" aria-hidden="true"></span>requested</dt><dd>Another agent asked for this work; it waits in the Open column's Requested lane for your approval and cannot be claimed yet.</dd></div>
+      <div><dt><span class="aspect" data-aspect="queued" aria-hidden="true"></span>queued</dt><dd>Approved or started, and waiting for a free session to take it.</dd></div>
       <div><dt><span class="aspect" data-aspect="planning" aria-hidden="true"></span>planning</dt><dd>Held by an agent writing a plan; no work starts until you approve it.</dd></div>
       <div><dt><span class="aspect" data-aspect="plan-submitted" aria-hidden="true"></span>plan awaiting you</dt><dd>The plan is waiting for your Approve or Request changes; its lease does not run.</dd></div>
       <div><dt><span class="aspect" data-aspect="claimed" aria-hidden="true"></span>claimed</dt><dd>One agent holds it under a lease.</dd></div>

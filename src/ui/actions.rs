@@ -9,7 +9,8 @@ use serde::Deserialize;
 
 use super::views::{UiError, UiResult};
 use crate::domain::{
-    Actor, Address, Importance, LinkKind, MessageId, ProjectId, TaskId, TokenId, clean_display_name,
+    Actor, Address, Importance, LinkKind, MessageId, ProjectId, TaskId, TokenId, WakeTrigger,
+    clean_display_name,
 };
 use crate::http::AppState;
 use crate::service::auth::AuthError;
@@ -271,6 +272,94 @@ pub async fn request_plan_changes(
         &form.back,
         id,
     )
+}
+
+#[derive(Deserialize)]
+pub struct RequestForm {
+    /// The task version the human read; the decision applies only while it is current.
+    #[serde(default)]
+    version: i64,
+    #[serde(default)]
+    note: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    back: String,
+}
+
+/// A decision on a request that has since changed says so (409) instead of acting on it.
+fn request_error(e: TaskError) -> UiError {
+    match e {
+        TaskError::RequestChanged => {
+            UiError::Conflict("Nothing was done: this request changed — review it again.".into())
+        }
+        e => task_error(e),
+    }
+}
+
+/// The human approves work request `id` as they read it; it is routed or queued.
+pub async fn approve_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<RequestForm>,
+) -> UiResult<Response> {
+    let id = task_id(&id)?;
+    state
+        .tasks
+        .approve_request(id, form.version)
+        .await
+        .map_err(request_error)?;
+    Ok(see_other(&back_to(&form.back, id)))
+}
+
+/// The human declines work request `id`, with an optional note to the requester.
+pub async fn decline_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<RequestForm>,
+) -> UiResult<Response> {
+    let id = task_id(&id)?;
+    state
+        .tasks
+        .decline_request(id, form.version, Some(&form.note))
+        .await
+        .map_err(request_error)?;
+    Ok(see_other(&back_to(&form.back, id)))
+}
+
+/// The human answers the requester in the request's thread. The request stays pending; the
+/// requester's agent is woken to read the answer. (A requested task has no owner, so the
+/// thread post itself wakes nobody.)
+pub async fn reply_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<RequestForm>,
+) -> UiResult<Response> {
+    let id = task_id(&id)?;
+    required_body(&form.body)?;
+    let task = state
+        .store
+        .get_task(id)
+        .await?
+        .ok_or(UiError::NotFound("No such task."))?;
+    state
+        .messages
+        .send_as_human(NewMessage {
+            to: Address::Task(id),
+            subject: None,
+            body: form.body,
+            importance: Importance::Normal,
+            reply_to: None,
+        })
+        .await
+        .map_err(message_error)?;
+    if let Some(requester) = task.created_by.ids().0 {
+        state
+            .wake
+            .wake_agent(requester, WakeTrigger::HumanReply)
+            .await?;
+    }
+    Ok(see_other(&back_to(&form.back, id)))
 }
 
 #[derive(Deserialize)]

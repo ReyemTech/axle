@@ -174,6 +174,15 @@ pub fn routes(state: AppState) -> Router<AppState> {
             "/ui/tasks/{id}/plan/changes",
             post(actions::request_plan_changes),
         )
+        .route(
+            "/ui/tasks/{id}/request/approve",
+            post(actions::approve_request),
+        )
+        .route(
+            "/ui/tasks/{id}/request/decline",
+            post(actions::decline_request),
+        )
+        .route("/ui/tasks/{id}/request/reply", post(actions::reply_request))
         .route("/ui/tasks/{id}/projects", post(actions::add_project))
         .route("/ui/tasks/{id}/related", post(actions::add_related))
         .route("/ui/tasks/{id}/parent", post(actions::move_under))

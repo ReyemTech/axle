@@ -164,6 +164,16 @@ kbd {
   border-color: var(--sig-amber);
   background: radial-gradient(circle, var(--sig-amber) 0 30%, transparent 34%);
 }
+/* Requested: a dashed amber ring (waiting on you). Queued: a dashed ink ring (approved,
+   waiting for a session). Both always sit beside their word. */
+.aspect[data-aspect="requested"] { border-style: dashed; border-color: var(--sig-amber); }
+.aspect[data-aspect="queued"] { border-style: dashed; border-color: var(--text); }
+.badge-state { display: inline-flex; gap: 5px; align-items: center; font-weight: 600; white-space: nowrap; }
+.badge-state[data-badge="requested"] { color: var(--warn); }
+.lane { margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px dashed var(--rule-strong); }
+.lane-head { display: flex; gap: 6px; align-items: center; margin: 4px 0; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--warn); }
+.lane-note { margin: 0 0 6px; font-size: 12.5px; color: var(--muted); }
+.agent-woken { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
 :is(.aspect[data-aspect="cancelled"], .station[data-status="cancelled"]) {
   border-color: var(--rule-strong);
   background: linear-gradient(135deg, transparent 44%, var(--rule-strong) 44% 56%, transparent 56%);

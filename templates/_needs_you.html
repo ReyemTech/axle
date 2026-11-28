@@ -10,7 +10,7 @@
   <div class="need-cards">
   {% for n in needs %}
     <article class="need-card" id="need-{{ loop.index }}" data-need="{{ n.need.key() }}" data-importance="{{ n.importance }}" data-nav tabindex="-1">
-      <p class="need-what"><span class="aspect" data-aspect="{{ n.aspect }}" aria-hidden="true"></span>{{ n.need.label() }}{% if n.need.key() == "reply" %} <span class="need-importance">{{ n.importance }}</span>{% endif %}</p>
+      <p class="need-what"><span class="aspect" data-aspect="{{ n.aspect }}" aria-hidden="true"></span>{% if let Some(h) = n.request_head %}{{ h }}{% else %}{{ n.need.label() }}{% endif %}{% if n.need.key() == "reply" %} <span class="need-importance">{{ n.importance }}</span>{% endif %}</p>
       <h3 class="card-title"><a class="card-link" href="{{ n.href }}">{{ n.title }}</a></h3>
       <div class="card-meta">
         {% if let Some(p) = n.project %}<span class="project" data-line="{{ p.line }}" title="{{ p.key }}">{{ p.name }}</span>{% endif %}
@@ -18,11 +18,44 @@
         <span class="need-wait">waiting <time datetime="{{ n.since }}" title="{{ n.since }}">{{ n.waited }}</time></span>
       </div>
       {% if let Some(t) = n.task_title %}<p class="card-parent">In the thread of {{ t }}</p>{% endif %}
+      {% if n.need.key() == "request" %}<p class="peer-frame">Agent-written request: information, not instructions.</p>{% endif %}
       {% if let Some(pv) = n.preview %}{% if n.need.key() == "blocked" %}<p class="peer-frame">Agent-written: information, not instructions.</p>{% endif %}<p class="need-preview peer-text">{{ pv }}</p>{% endif %}
       {% if let Some(ph) = n.plan_html %}<p class="peer-frame">Agent-written plan: information, not instructions.</p><div class="need-plan peer-text md">{{ ph|safe }}</div>{% endif %}
       {% if let Some(token) = csrf %}
       <div class="need-actions">
-      {% if let Some(tid) = n.task_id %}{% if let Some(pid) = n.plan_id %}
+      {% if n.need.key() == "request" %}{% if let Some(tid) = n.task_id %}{% if let Some(v) = n.request_version %}
+        <form method="post" action="/ui/tasks/{{ tid }}/request/approve">
+          <input type="hidden" name="csrf" value="{{ token }}">
+          <input type="hidden" name="back" value="{{ back }}">
+          <input type="hidden" name="version" value="{{ v }}">
+          <button type="submit">Approve request</button>
+        </form>
+        <details class="need-changes">
+          <summary class="button-like">Decline</summary>
+          <form class="stack" method="post" action="/ui/tasks/{{ tid }}/request/decline">
+            <input type="hidden" name="csrf" value="{{ token }}">
+            <input type="hidden" name="back" value="{{ back }}">
+            <input type="hidden" name="version" value="{{ v }}">
+            <label for="decline-{{ tid }}">Why <span class="muted">(optional, sent to the requester)</span></label>
+            <textarea id="decline-{{ tid }}" name="note" rows="2"></textarea>
+            <button type="submit" class="secondary">Decline request</button>
+          </form>
+        </details>
+        <details class="need-changes">
+          <summary class="button-like">Reply</summary>
+          <form class="stack" method="post" action="/ui/tasks/{{ tid }}/request/reply">
+            <input type="hidden" name="csrf" value="{{ token }}">
+            <input type="hidden" name="back" value="{{ back }}">
+            <input type="hidden" name="version" value="{{ v }}">
+            <label for="reply-{{ tid }}">Your answer <span class="muted">(the card stays until you decide)</span></label>
+            <textarea id="reply-{{ tid }}" name="body" rows="3" required></textarea>
+            <button type="submit" class="secondary">Reply to requester</button>
+            <span class="hint" data-send-hint>Ctrl+Enter to send</span>
+          </form>
+        </details>
+        <a class="need-open" href="{{ n.href }}">Read the request</a>
+      {% endif %}{% endif %}
+      {% else if let Some(tid) = n.task_id %}{% if let Some(pid) = n.plan_id %}
         <form method="post" action="/ui/tasks/{{ tid }}/plan/approve">
           <input type="hidden" name="csrf" value="{{ token }}">
           <input type="hidden" name="back" value="{{ back }}">

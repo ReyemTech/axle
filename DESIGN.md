@@ -299,6 +299,8 @@ Quiet geometry. Cards, panels, columns, lists and the reader use a 6px radius; b
 ### Needs you
 An amber band (Warn Soft fill, Caution Amber 1px border, 6px radius) at the top of the board and the overview, rendered only when something waits on the human. Its head mirrors a column head (glyph, uppercase label, count in warn at 18px bold) over a 2px amber rule. Inside, a responsive grid of attention cards (card fill, 2px amber border, red border and soft red fill for urgent mail), each led by the verb in uppercase warn text beside its glyph ("Approve plan", "Review", "Reply"), then the title link, project, agent and "waiting 12m", a clipped preview, and the action (Approve plan as primary, Request changes as an inline disclosure, or a labelled link). Live refreshes skip the band while a change request is open or focused. The top bar's "N need you" equals the card count and links to it.
 
+A **work request** card leads with "Work request · project ← agent · age", shows the title and first line of the body as framed peer text, and carries Approve request (primary), Decline and Reply as inline disclosures with labelled submit buttons. On the board, requests sit in a **Requested** lane (dashed amber ring beside the word) at the top of the open column; an approved task waiting for a session shows a "queued" badge (dashed ink ring beside the word).
+
 ### Plan panel
 On the task page, above the lease: the latest plan as peer text in a card-filled box. While it awaits the human the panel takes the Needs-you treatment (warn soft fill, 2px amber border, warn title with the plan-awaiting glyph) and carries Approve plan plus a Request changes form with a required note.
 
