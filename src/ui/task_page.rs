@@ -150,6 +150,17 @@ pub struct Evidence {
     pub links: Vec<String>,
 }
 
+/// A link to another task, as this task's page lists it.
+pub struct RelatedLink {
+    pub id: String,
+    /// The link in words, before the other task's title (e.g. "duplicate of").
+    pub label: &'static str,
+    pub kind: &'static str,
+    pub status: &'static str,
+    pub project: ProjectLabel,
+    pub title: String,
+}
+
 pub struct ChildLink {
     pub id: String,
     pub status: &'static str,
@@ -289,6 +300,7 @@ struct TaskPage {
     /// Whether this is an earlier page of the thread.
     thread_paged: bool,
     children: Vec<ChildLink>,
+    related: Vec<RelatedLink>,
     evidence: Option<Evidence>,
     plan: Option<PlanView>,
     /// A decision was refused because the plan changed.
@@ -516,6 +528,25 @@ pub async fn task_page(
         });
     }
 
+    let related = state
+        .tasks
+        .related(id)
+        .await
+        .map_err(|e| match e {
+            crate::service::tasks::TaskError::Store(e) => UiError::from(e),
+            e => UiError::Invalid(e.to_string()),
+        })?
+        .into_iter()
+        .map(|r| RelatedLink {
+            id: r.other.id.to_string(),
+            label: r.label(),
+            kind: r.link.kind.as_str(),
+            status: r.other.status.as_str(),
+            project: labels.project(r.other.project_id),
+            title: r.other.title,
+        })
+        .collect();
+
     let plan = match latest_plan(&state, id).await? {
         Some(m) => Some(PlanView {
             id: m.id.to_string(),
@@ -575,6 +606,7 @@ pub async fn task_page(
         earlier,
         thread_paged: thread_before.is_some(),
         children,
+        related,
         evidence,
         child_projects,
         plan,

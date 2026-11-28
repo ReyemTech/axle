@@ -4441,3 +4441,178 @@ async fn density_links_follow_the_current_expansion() {
     let js = app.get("/ui/static/app.js", None).await;
     assert!(js.body.contains("data-density-link"));
 }
+
+#[tokio::test]
+async fn a_normal_question_needs_you_until_answered() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let q = app
+        .state
+        .messages
+        .send_with_options(
+            &Actor::Agent(infra.agent.id, infra.session.id),
+            NewMessage {
+                to: Address::Human,
+                subject: Some("Rebase first?".into()),
+                body: "which way?".into(),
+                importance: Importance::Normal,
+                reply_to: None,
+            },
+            &["Rebase".into(), "Merge".into()],
+        )
+        .await
+        .unwrap();
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    assert_eq!(
+        select_texts(&board, "#needs-you .card-title"),
+        ["Rebase first?"]
+    );
+    assert_eq!(
+        select_texts(&board, ".need-card button.quick-reply"),
+        ["Rebase", "Merge"]
+    );
+
+    // A one-click answer takes it out of Needs you.
+    let csrf = csrf_of(&board);
+    let page = app
+        .post_form(
+            "/ui/messages",
+            Some(&cookie),
+            &form(
+                &csrf,
+                &[
+                    ("to_kind", "agent"),
+                    ("to", &infra.agent.id.to_string()),
+                    ("reply_to", &q.id.to_string()),
+                    ("option", "Rebase"),
+                    ("body", ""),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    let fragment = app.get("/ui/needs-you", Some(&cookie)).await;
+    assert!(select_texts(&fragment, ".need-card").is_empty());
+}
+
+// ---------------------------------------------------------------- related links
+
+#[tokio::test]
+async fn task_page_lists_related_tasks_and_the_human_links_them() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let original = app.task(&infra, "Original work", None).await;
+    let again = app.task(&infra, "Same work again", None).await;
+    let later = app.task(&infra, "Later work", None).await;
+    let csrf = csrf_for(&app, &cookie).await;
+    let path = format!("/ui/tasks/{}", original.id);
+
+    let page = app.get(&path, Some(&cookie)).await;
+    assert_eq!(select_texts(&page, "[aria-label=Related] .count"), ["0"]);
+
+    // Without the CSRF token nothing is linked.
+    let page = app
+        .post_form(
+            &format!("{path}/related"),
+            Some(&cookie),
+            &format!("task={}&kind=relates", later.id),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::FORBIDDEN);
+    assert!(
+        app.state
+            .tasks
+            .related(original.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A pasted link works as well as an id.
+    let page = app
+        .post_form(
+            &format!("/ui/tasks/{}/related", later.id),
+            Some(&cookie),
+            &form(
+                &csrf,
+                &[
+                    ("task", &format!("http://axle.local{path}")),
+                    ("kind", "follow-up"),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    app.clock.advance(time::Duration::seconds(1));
+    let page = app
+        .post_form(
+            &format!("/ui/tasks/{}/related", again.id),
+            Some(&cookie),
+            &form(
+                &csrf,
+                &[("task", &original.id.to_string()), ("kind", "duplicate")],
+            ),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    let again_now = app.state.store.get_task(again.id).await.unwrap().unwrap();
+    assert_eq!(again_now.status, TaskStatus::Cancelled);
+
+    let page = app.get(&path, Some(&cookie)).await;
+    assert_eq!(
+        select_texts(&page, ".related .related-kind"),
+        ["follow-up", "duplicated by"]
+    );
+    let titles = select_texts(&page, ".related .child-title");
+    assert!(titles[0].ends_with("Later work"), "{titles:?}");
+    assert!(titles[1].ends_with("Same work again"), "{titles:?}");
+    assert_eq!(
+        select_texts(&page, ".related .child-state"),
+        ["open", "cancelled"]
+    );
+    let other = app
+        .get(&format!("/ui/tasks/{}", later.id), Some(&cookie))
+        .await;
+    assert_eq!(
+        select_texts(&other, ".related .related-kind"),
+        ["follow-up of"]
+    );
+
+    // Bad input is refused.
+    for (task, kind) in [
+        (original.id.to_string(), "relates".to_string()),
+        ("not-a-task".into(), "relates".into()),
+        (later.id.to_string(), "blocks".into()),
+    ] {
+        let page = app
+            .post_form(
+                &format!("{path}/related"),
+                Some(&cookie),
+                &form(&csrf, &[("task", &task), ("kind", &kind)]),
+            )
+            .await;
+        assert_eq!(
+            page.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{task} {kind}"
+        );
+    }
+
+    // Unlink from the target's side removes it from both.
+    let page = app
+        .post_form(
+            &format!("{path}/related/{}/remove", later.id),
+            Some(&cookie),
+            &form(&csrf, &[]),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    let page = app.get(&path, Some(&cookie)).await;
+    assert_eq!(
+        select_texts(&page, ".related .related-kind"),
+        ["duplicated by"]
+    );
+    assert!(app.state.tasks.related(later.id).await.unwrap().is_empty());
+}

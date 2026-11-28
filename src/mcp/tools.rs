@@ -16,8 +16,8 @@ use serde_json::{Value, json};
 
 use super::{AxleMcp, Labels, ToolError, project_view, render, timestamp};
 use crate::domain::{
-    Address, Agent, Eligibility, Importance, MessageId, Project, ProjectId, Session, SessionId,
-    TaskId, TaskStatus, WaitingOn,
+    Address, Agent, Eligibility, Importance, LinkKind, MessageId, Project, ProjectId, Session,
+    SessionId, TaskId, TaskStatus, WaitingOn,
 };
 use crate::service::identity::Resolved;
 use crate::service::messages::{InboxFilter, NewMessage, check_body, check_subject};
@@ -280,6 +280,41 @@ pub struct TaskUpdateParams {
     /// Projects to add to a top-level task (keys or display names; creator or owner only).
     /// Projects are never removed; adding one already listed does nothing.
     pub add_projects: Option<Vec<String>>,
+    /// Links from this task to other tasks (creator or owner only; at most 20 per task). Both
+    /// tasks show the link. `duplicate` cancels this task as a duplicate of the target.
+    pub related: Option<Vec<RelatedParam>>,
+    /// Task ids whose link with this task to remove, whichever task added it (creator or
+    /// owner only).
+    pub unrelate: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RelatedParam {
+    /// The other task's id.
+    pub id: String,
+    pub kind: LinkKindParam,
+}
+
+/// What this task is to the other one.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum LinkKindParam {
+    /// The tasks are related.
+    Relates,
+    /// This task follows up on the other.
+    FollowUp,
+    /// This task duplicates the other: it is cancelled (refused once it is done).
+    Duplicate,
+}
+
+impl From<LinkKindParam> for LinkKind {
+    fn from(k: LinkKindParam) -> Self {
+        match k {
+            LinkKindParam::Relates => LinkKind::Relates,
+            LinkKindParam::FollowUp => LinkKind::FollowUp,
+            LinkKindParam::Duplicate => LinkKind::Duplicate,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -429,7 +464,9 @@ impl AxleMcp {
         render(self.task_list_impl(p).await)
     }
 
-    #[tool(description = described!("A task with its children, progress, history and thread."))]
+    #[tool(description = described!(
+        "A task with its children, progress, related tasks, history and thread."
+    ))]
     async fn task_get(
         &self,
         Extension(parts): Extension<Parts>,
@@ -466,10 +503,12 @@ impl AxleMcp {
     #[tool(description = described!(
         "Set a task you own to `blocked` (with a reason, and optionally `waiting_on` and \
          `unblock`: what it waits on and what would unblock it) or `review`, edit its title or \
-         body (creator or owner), and/or add participating projects to a top-level task \
-         (`add_projects`; creator or owner). `blocked` on a task you hold blocked updates its \
-         reason, `waiting_on` or `unblock`. A task waiting on another task is unblocked when \
-         that task is done."
+         body (creator or owner), add participating projects to a top-level task \
+         (`add_projects`; creator or owner), and/or link it to other tasks (`related`: \
+         `relates`, `follow-up` or `duplicate`, which cancels this task; `unrelate` removes \
+         links; creator or owner). `blocked` on a task you hold blocked updates its reason, \
+         `waiting_on` or `unblock`. A task waiting on another task is unblocked when that task \
+         is done."
     ))]
     async fn task_update(
         &self,
@@ -910,10 +949,22 @@ impl AxleMcp {
         for m in &thread {
             messages.push(labels.message(m).await?);
         }
+        let mut related = vec![];
+        for r in self.state.tasks.related(id).await? {
+            related.push(json!({
+                "id": r.other.id,
+                "kind": r.link.kind.as_str(),
+                "direction": if r.outgoing { "outgoing" } else { "incoming" },
+                "label": r.label(),
+                "title": labels.task_title(&r.other).await?,
+                "status": r.other.status,
+            }));
+        }
         Ok(json!({
             "task": labels.task(&detail.task).await?,
             "progress": { "done": detail.progress.done, "total": detail.progress.total },
             "children": children,
+            "related": related,
             "events": events,
             "thread": messages,
         }))
@@ -995,10 +1046,28 @@ impl AxleMcp {
     async fn task_update_impl(&self, me: &Resolved, p: TaskUpdateParams) -> ToolResult {
         let id: TaskId = parse_id("task", &p.id)?;
         let add_projects = p.add_projects.unwrap_or_default();
-        if p.status.is_none() && p.title.is_none() && p.body.is_none() && add_projects.is_empty() {
+        let mut related = Vec::new();
+        for r in p.related.unwrap_or_default() {
+            related.push((parse_id::<TaskId>("task", &r.id)?, LinkKind::from(r.kind)));
+        }
+        let mut unrelate = Vec::new();
+        for r in p.unrelate.unwrap_or_default() {
+            unrelate.push(parse_id::<TaskId>("task", &r)?);
+        }
+        if p.status.is_none()
+            && p.title.is_none()
+            && p.body.is_none()
+            && add_projects.is_empty()
+            && related.is_empty()
+            && unrelate.is_empty()
+        {
             return Err(ToolError::invalid(
-                "nothing to update: pass `status`, `title`, `body` and/or `add_projects`",
+                "nothing to update: pass `status`, `title`, `body`, `add_projects`, `related` \
+                 and/or `unrelate`",
             ));
+        }
+        if related.iter().any(|(t, _)| *t == id) {
+            return Err(ToolError::from(crate::service::tasks::TaskError::SelfLink));
         }
         let mut projects = Vec::with_capacity(add_projects.len());
         for name in &add_projects {
@@ -1088,6 +1157,14 @@ impl AxleMcp {
                 self.state
                     .tasks
                     .add_projects(Caller::Agent(me), id, &projects)
+                    .await?,
+            );
+        }
+        if !related.is_empty() || !unrelate.is_empty() {
+            task = Some(
+                self.state
+                    .tasks
+                    .relate(Caller::Agent(me), id, &related, &unrelate)
                     .await?,
             );
         }

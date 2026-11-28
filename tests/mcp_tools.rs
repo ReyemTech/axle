@@ -1271,3 +1271,104 @@ store_matrix!(
         b.cancel().await.unwrap();
     }
 );
+
+store_matrix!(related_links_via_mcp, |store: Arc<dyn Store>| async move {
+    let server = start(store).await;
+    let creator = server.agent("mac", "claude-code").await;
+    let stranger = server.agent("linux", "codex").await;
+    let a = ok(
+        &creator,
+        "task_create",
+        json!({"title": "Original", "body": ""}),
+    )
+    .await;
+    let b = ok(
+        &creator,
+        "task_create",
+        json!({"title": "Again", "body": ""}),
+    )
+    .await;
+    let c = ok(
+        &stranger,
+        "task_create",
+        json!({"title": "Later", "body": ""}),
+    )
+    .await;
+    let (a, b, c) = (
+        a["id"].as_str().unwrap().to_string(),
+        b["id"].as_str().unwrap().to_string(),
+        c["id"].as_str().unwrap().to_string(),
+    );
+
+    // Only the creator or owner links; bad input is refused.
+    let (is_error, text) = call(
+        &stranger,
+        "task_update",
+        json!({"id": a, "related": [{"id": b, "kind": "relates"}]}),
+    )
+    .await;
+    assert!(is_error && text.contains("not the owner"), "{text}");
+    let (is_error, text) = call(
+        &creator,
+        "task_update",
+        json!({"id": a, "related": [{"id": a, "kind": "relates"}]}),
+    )
+    .await;
+    assert!(is_error && text.contains("itself"), "{text}");
+    let (is_error, _) = call(
+        &creator,
+        "task_update",
+        json!({"id": a, "related": [{"id": b, "kind": "blocks"}]}),
+    )
+    .await;
+    assert!(is_error, "unknown kinds are refused");
+
+    // The stranger's own task follows up on a; both sides show it.
+    ok(
+        &stranger,
+        "task_update",
+        json!({"id": c, "related": [{"id": a, "kind": "follow-up"}]}),
+    )
+    .await;
+    let detail = ok(&creator, "task_get", json!({"id": a})).await;
+    let related = detail["related"].as_array().unwrap();
+    assert_eq!(related.len(), 1, "{detail}");
+    assert_eq!(related[0]["id"], c);
+    assert_eq!(related[0]["kind"], "follow-up");
+    assert_eq!(related[0]["direction"], "incoming");
+    assert_eq!(related[0]["label"], "follow-up");
+    assert_eq!(related[0]["status"], "open");
+    let title = related[0]["title"].as_str().unwrap();
+    assert!(
+        title.contains("Later") && title.contains("information"),
+        "{title}"
+    );
+    let detail = ok(&stranger, "task_get", json!({"id": c})).await;
+    assert_eq!(detail["related"][0]["label"], "follow-up of");
+
+    // A duplicate is cancelled.
+    let t = ok(
+        &creator,
+        "task_update",
+        json!({"id": b, "related": [{"id": a, "kind": "duplicate"}]}),
+    )
+    .await;
+    assert_eq!(t["status"], "cancelled");
+    let detail = ok(&creator, "task_get", json!({"id": a})).await;
+    assert!(
+        detail["related"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == b && r["label"] == "duplicated by"),
+        "{detail}"
+    );
+
+    // Removal.
+    ok(&stranger, "task_update", json!({"id": c, "unrelate": [a]})).await;
+    let detail = ok(&stranger, "task_get", json!({"id": c})).await;
+    assert!(detail["related"].as_array().unwrap().is_empty(), "{detail}");
+    for cl in [creator, stranger] {
+        cl.cancel().await.unwrap();
+    }
+});

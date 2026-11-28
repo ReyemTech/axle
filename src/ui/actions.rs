@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use super::views::{UiError, UiResult};
 use crate::domain::{
-    Actor, Address, Importance, MessageId, ProjectId, TaskId, TokenId, clean_display_name,
+    Actor, Address, Importance, LinkKind, MessageId, ProjectId, TaskId, TokenId, clean_display_name,
 };
 use crate::http::AppState;
 use crate::service::auth::AuthError;
@@ -47,7 +47,12 @@ fn task_error(e: TaskError) -> UiError {
         | TaskError::PlanNotApproved(_)
         | TaskError::NotPlanning(_)
         | TaskError::NoPlanToReview(_)
-        | TaskError::PlanChanged) => UiError::Conflict(capitalise(&e.to_string())),
+        | TaskError::PlanChanged
+        | TaskError::DuplicateOfDone
+        | TaskError::TooManyLinks(_)) => UiError::Conflict(capitalise(&e.to_string())),
+        e @ (TaskError::SelfLink | TaskError::UnknownLinkTarget(_) | TaskError::DuplicateTwice) => {
+            UiError::Invalid(capitalise(&e.to_string()))
+        }
         e @ (TaskError::ReasonRequired
         | TaskError::NothingToUpdate
         | TaskError::WaitOnSelf
@@ -275,6 +280,57 @@ pub async fn add_project(
     state
         .tasks
         .add_projects(Caller::Human, id, &[project])
+        .await
+        .map_err(task_error)?;
+    Ok(see_other(&format!("/ui/tasks/{id}")))
+}
+
+#[derive(Deserialize)]
+pub struct RelatedForm {
+    /// The other task: its id, or a link to its page.
+    #[serde(default)]
+    task: String,
+    /// `relates`, `follow-up` or `duplicate`.
+    #[serde(default)]
+    kind: String,
+}
+
+/// Links the task to another one as the human.
+pub async fn add_related(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<RelatedForm>,
+) -> UiResult<Response> {
+    let id = task_id(&id)?;
+    // A pasted task link works as well as a bare id.
+    let raw = form.task.trim().trim_end_matches('/');
+    let raw = raw.rsplit('/').next().unwrap_or_default();
+    let raw = raw.split(['?', '#']).next().unwrap_or_default();
+    let target: TaskId = opt_id(raw, "task id")?
+        .ok_or_else(|| UiError::Invalid("Give the other task's id or link.".into()))?;
+    let kind: LinkKind = form
+        .kind
+        .trim()
+        .parse()
+        .map_err(|_| UiError::Invalid("A link is relates, follow-up or duplicate.".into()))?;
+    state
+        .tasks
+        .relate(Caller::Human, id, &[(target, kind)], &[])
+        .await
+        .map_err(task_error)?;
+    Ok(see_other(&format!("/ui/tasks/{id}")))
+}
+
+/// Removes the link between the task and `other`, whichever task added it.
+pub async fn remove_related(
+    State(state): State<AppState>,
+    Path((id, other)): Path<(String, String)>,
+) -> UiResult<Response> {
+    let id = task_id(&id)?;
+    let other = task_id(&other)?;
+    state
+        .tasks
+        .relate(Caller::Human, id, &[], &[other])
         .await
         .map_err(task_error)?;
     Ok(see_other(&format!("/ui/tasks/{id}")))

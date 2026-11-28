@@ -673,6 +673,11 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
 .child-owner { grid-column: 2; font: 12px var(--mono); color: var(--muted); }
 .child-state { font: 600 12px var(--font); color: var(--text); }
 .child[data-status="done"] .child-title, .child[data-status="cancelled"] .child-title { color: var(--muted); }
+/* Related rows: the link in words, the other task, its state, and Unlink at the end. */
+.related { grid-template-columns: 10px auto minmax(0, 1fr) auto; }
+.related-kind { font: 600 12px var(--font); color: var(--muted); white-space: nowrap; }
+.related .child-owner { grid-column: 3; }
+.related-remove { grid-column: 4; grid-row: 1; }
 
 /* ---------------------------------------------------------------- pages, panels */
 .page-head { display: grid; gap: 4px; margin-bottom: 12px; max-width: 75ch; }

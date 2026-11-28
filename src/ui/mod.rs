@@ -175,6 +175,11 @@ pub fn routes(state: AppState) -> Router<AppState> {
             post(actions::request_plan_changes),
         )
         .route("/ui/tasks/{id}/projects", post(actions::add_project))
+        .route("/ui/tasks/{id}/related", post(actions::add_related))
+        .route(
+            "/ui/tasks/{id}/related/{other}/remove",
+            post(actions::remove_related),
+        )
         .route("/ui/needs-you", get(needs::needs_fragment))
         .route("/ui/inbox", get(inbox::inbox))
         .route("/ui/inbox/{id}/archive", post(actions::archive))

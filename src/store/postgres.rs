@@ -8,16 +8,18 @@ use uuid::Uuid;
 
 use super::{
     AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate,
-    MessageReceipt, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, Store,
-    StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, UnblockRule,
-    Unblocked, block_previous_payload, child_event, children_complete_event, claim_event,
-    closes_child, edit_payload, enrollment_token_label, like_pattern, options_from, options_to,
-    projects_added_note, projects_added_payload, send_time_recipient, unblocked_records,
+    MessageReceipt, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, RelateRequest,
+    Related, Store, StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest,
+    Transitioned, UnblockRule, Unblocked, block_previous_payload, child_event,
+    children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label,
+    like_pattern, options_from, options_to, projects_added_note, projects_added_payload,
+    related_payload, send_time_recipient, unblocked_records,
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId,
     EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId, Session,
-    SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId, TokenInfo, WaitingOn,
+    SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo,
+    WaitingOn,
 };
 
 pub struct PostgresStore {
@@ -1374,6 +1376,153 @@ impl Store for PostgresStore {
         Ok(Some(ProjectsAdded { task, added }))
     }
 
+    async fn relate_tasks(&self, req: &RelateRequest<'_>) -> StoreResult<Related> {
+        let (agent, session) = match req.editor {
+            Some((a, s)) => (Some(a.as_uuid()), Some(s.as_uuid())),
+            None => (None, None),
+        };
+        let id = req.task.as_uuid();
+        let mut tx = self.pool.begin().await?;
+        // The guard, as a locking read (a no-op change writes nothing).
+        let guarded = sqlx::query(concat!(
+            "SELECT ",
+            task_cols!(),
+            " FROM tasks
+             WHERE id = $1
+               AND ($2::uuid IS NULL OR created_by_agent_id = $2
+                    OR (owner_session_id = $3::uuid
+                        AND status IN ('planning', 'claimed', 'blocked', 'review')))
+             FOR UPDATE"
+        ))
+        .bind(id)
+        .bind(agent)
+        .bind(session)
+        .fetch_optional(&mut *tx)
+        .await?
+        .as_ref()
+        .map(task_from)
+        .transpose()?;
+        let Some(mut task) = guarded else {
+            tx.commit().await?;
+            return Ok(Related::Denied);
+        };
+        const UNLINK: &str = "DELETE FROM task_links
+             WHERE (task_id = $1 AND target_id = $2) OR (task_id = $2 AND target_id = $1)";
+        let mut removed = Vec::new();
+        for other in req.remove {
+            let gone = sqlx::query(UNLINK)
+                .bind(id)
+                .bind(other.as_uuid())
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            if gone > 0 {
+                removed.push(*other);
+            }
+        }
+        let mut added = Vec::new();
+        for (target, kind) in req.add {
+            let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM tasks WHERE id = $1")
+                .bind(target.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await?;
+            if exists.is_none() {
+                return Ok(Related::UnknownTarget(*target));
+            }
+            let same: Option<i32> = sqlx::query_scalar(
+                "SELECT 1 FROM task_links WHERE task_id = $1 AND target_id = $2 AND kind = $3",
+            )
+            .bind(id)
+            .bind(target.as_uuid())
+            .bind(kind.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if same.is_some() {
+                continue;
+            }
+            sqlx::query(UNLINK)
+                .bind(id)
+                .bind(target.as_uuid())
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO task_links (task_id, target_id, kind, created_at)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(id)
+            .bind(target.as_uuid())
+            .bind(kind.as_str())
+            .bind(req.event.at)
+            .execute(&mut *tx)
+            .await?;
+            added.push(TaskLink {
+                task_id: req.task,
+                target_id: *target,
+                kind: *kind,
+                created_at: req.event.at,
+            });
+        }
+        if added.is_empty() && removed.is_empty() {
+            tx.commit().await?;
+            return Ok(Related::Applied {
+                task,
+                added,
+                removed,
+            });
+        }
+        let touched = std::iter::once(req.task).chain(added.iter().map(|l| l.target_id));
+        for t in touched {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM task_links WHERE task_id = $1 OR target_id = $1",
+            )
+            .bind(t.as_uuid())
+            .fetch_one(&mut *tx)
+            .await?;
+            if n > i64::from(req.max_links) {
+                return Ok(Related::TooMany(t));
+            }
+        }
+        task = sqlx::query(concat!(
+            "UPDATE tasks SET version = version + 1, updated_at = $1 WHERE id = $2 RETURNING ",
+            task_cols!()
+        ))
+        .bind(req.event.at)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(StoreError::from)
+        .and_then(|row| task_from(&row))?;
+        let mut event = req.event.clone();
+        event.payload = Some(related_payload(&added, &removed));
+        insert_event(&mut tx, &event, req.token).await?;
+        tx.commit().await?;
+        Ok(Related::Applied {
+            task,
+            added,
+            removed,
+        })
+    }
+
+    async fn task_links(&self, task: TaskId) -> StoreResult<Vec<TaskLink>> {
+        sqlx::query(
+            "SELECT task_id, target_id, kind, created_at FROM task_links
+             WHERE task_id = $1 OR target_id = $1 ORDER BY created_at, task_id, target_id",
+        )
+        .bind(task.as_uuid())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|row| {
+            Ok(TaskLink {
+                task_id: row.try_get::<Uuid, _>("task_id")?.into(),
+                target_id: row.try_get::<Uuid, _>("target_id")?.into(),
+                kind: parse_text(row.try_get("kind")?)?,
+                created_at: row.try_get("created_at")?,
+            })
+        })
+        .collect()
+    }
+
     async fn get_task(&self, id: TaskId) -> StoreResult<Option<Task>> {
         sqlx::query(concat!(
             "SELECT ",
@@ -2107,7 +2256,8 @@ impl Store for PostgresStore {
             "SELECT ",
             message_cols!(),
             " FROM messages m
-             WHERE m.importance IN ('high', 'urgent') AND m.kind <> 'plan'
+             WHERE (m.importance IN ('high', 'urgent') OR m.options IS NOT NULL)
+               AND m.kind <> 'plan'
                AND (EXISTS (SELECT 1 FROM message_recipients r
                             WHERE r.message_id = m.id AND r.recipient_agent_id IS NULL
                               AND r.recipient_session_id IS NULL AND r.acked_at IS NULL)
