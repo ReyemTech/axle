@@ -354,10 +354,14 @@ pub async fn reply_request(
         .await
         .map_err(message_error)?;
     if let Some(requester) = task.created_by.ids().0 {
-        state
+        // The reply is saved; a failed wake is logged, never shown as a failed reply.
+        if let Err(e) = state
             .wake
             .wake_agent(requester, WakeTrigger::HumanReply)
-            .await?;
+            .await
+        {
+            eprintln!("axl: failed to wake the requester of request {id}: {e}");
+        }
     }
     Ok(see_other(&back_to(&form.back, id)))
 }
