@@ -42,7 +42,8 @@ enum Command {
     /// Always exits 0 (fail-open); problems are one line on stderr. Codex's commands add
     /// `--harness codex`.
     Hook {
-        /// session-start | user-prompt-submit | post-tool-use | stop (anything else is ignored)
+        /// session-start | user-prompt-submit | post-tool-use | stop | session-end (anything
+        /// else is ignored)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -303,8 +304,8 @@ async fn hook(event: axle::hook::Event, harness: axle::hook::Harness) {
             .unwrap_or_default()
         };
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let token = std::env::var("AXL_TOKEN").ok();
-        axle::hook::run(event, harness, &stdin, home.as_deref(), token.as_deref()).await
+        let env = |k: &str| std::env::var(k).ok();
+        axle::hook::run(event, harness, &stdin, home.as_deref(), &env).await
     };
     // Hard ceiling on total runtime, including a stdin that never closes: below the
     // harnesses' 5 s hook timeout, so the hook ends on its own terms.

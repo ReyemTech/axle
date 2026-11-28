@@ -40,6 +40,46 @@ Start Codex in a repository and ask it to call `whoami`. The agent shows up as
   task, a reminder to create or claim one (`task_create` / `task_claim`). It is added
   context, never a `decision: block`. These are the tool names in Codex's PostToolUse
   payloads; other tools never trigger it.
+- Token usage, reported on `Stop` and `SessionEnd` (below).
+
+## Token usage
+
+`axl hook stop --harness codex` and `axl hook session-end --harness codex` report the
+session's token usage to the server, which prices it at API rates. `SessionEnd` is
+registered with `timeout = 3`.
+
+- **What is read:** the rollout file named by `transcript_path` in the hook input. Only
+  `token_usage_record` events count (key `response_id`; input is `input_tokens` minus
+  `cached_input_tokens`, which count as cache reads; `cache_write_input_tokens` count as
+  cache writes). An older rollout without them falls back to `token_count` events
+  (`last_token_usage`, keyed by the rollout's session id and an ordinal). Only counts, the
+  model id, opaque ids and timestamps leave the machine (see
+  [security](../security.md#token-usage)).
+- **Open question:** whether Codex's `cache_write_input_tokens` is already inside
+  `input_tokens` is not settled yet; Axle counts it as a separate cache write until real
+  rollouts show otherwise.
+- **When:** on every `Stop`, at the same time as the mail check and in the same 2.5-second
+  budget (the urgent-mail block never waits for it), even when Codex reports
+  `stop_hook_active`; and on `SessionEnd`, within 1 second, with nothing on stdout. It works
+  after the bridge has removed its session file.
+- **Cursor files:** `~/.axl/sessions/usage/<sha256 of the rollout path>.json` (mode 0600)
+  remember how far the rollout was read, and cache the Axle session id and server URL, never
+  the token. A cursor advances only after the server accepted the batch (or refused it for
+  good: 400, 403, 404); otherwise the next run resends and the server drops duplicates. One
+  run reads at most 8 MB, 500 records and 300 ms of parsing. A new cursor skips records
+  older than the session. Cursors untouched for 30 days are deleted on `SessionEnd`.
+- **Off switch:** `AXL_USAGE=off` in the environment, or `[usage] enabled = false` in
+  `~/.axl/config.toml`.
+- **Billing:** `auth_mode` in `~/.codex/auth.json` decides it: `chatgpt` is
+  `subscription`, `apikey` is `api`, anything else `unknown` (environment variables are
+  ignored). Override it in `~/.axl/config.toml`, which always wins:
+
+  ```toml
+  [usage.billing]
+  codex = "api"   # or "subscription", "unknown"
+  ```
+
+A problem is at most one stderr line, after any mail error; the hook still exits 0.
 
 ## Manual setup
 
