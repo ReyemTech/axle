@@ -6,7 +6,7 @@ mod common;
 
 use std::sync::Arc;
 
-use axle::clock::{Clock, TestClock};
+use axle::clock::TestClock;
 use axle::domain::{LinkKind, MessageKind, SessionId, Task, TaskEventKind, TaskId, TaskStatus};
 use axle::service::identity::{IdentityInput, IdentityService, Resolved};
 use axle::service::tasks::{
@@ -391,4 +391,157 @@ store_matrix!(a_duplicate_is_cancelled_with_a_note, |store: Arc<
         .await
         .unwrap();
     assert_eq!(t.status, TaskStatus::Done);
+});
+
+store_matrix!(a_top_level_task_moves_under_a_parent, |store: Arc<
+    dyn Store,
+>| async move {
+    let env = Env::new(store);
+    let creator = env.session("mac").await;
+    let lead = env.session("linux").await;
+    let parent = env.task(Caller::Human, "parent").await;
+    let loose = env.task(Caller::Agent(&creator), "loose").await;
+    env.svc.claim(&lead, parent.id).await.unwrap();
+
+    let moved = env
+        .svc
+        .move_under(Caller::Agent(&creator), loose.id, parent.id)
+        .await
+        .unwrap();
+    assert_eq!(moved.parent_id, Some(parent.id));
+    assert!(moved.version > loose.version);
+    let event = env
+        .store
+        .task_events(loose.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind == TaskEventKind::MovedUnder)
+        .unwrap();
+    assert_eq!(event.note.as_deref(), Some("moved under \"parent\""));
+    assert_eq!(event.payload.unwrap()["parent"], parent.id.to_string());
+    // The parent counts it at once, and consolidates when it closes.
+    let detail = env.svc.get(parent.id).await.unwrap();
+    assert_eq!((detail.progress.done, detail.progress.total), (0, 1));
+    env.svc.claim(&creator, loose.id).await.unwrap();
+    env.svc
+        .complete(
+            &creator,
+            loose.id,
+            Completion {
+                summary: "done".into(),
+                ..Completion::default()
+            },
+        )
+        .await
+        .unwrap();
+    let p = env.store.get_task(parent.id).await.unwrap().unwrap();
+    assert_eq!(
+        p.status,
+        TaskStatus::Review,
+        "last child closed: parent to review"
+    );
+
+    // Refusals.
+    let other = env.task(Caller::Human, "other").await;
+    assert!(matches!(
+        env.svc.move_under(Caller::Human, other.id, other.id).await,
+        Err(TaskError::OwnParent)
+    ));
+    assert!(matches!(
+        env.svc
+            .move_under(Caller::Human, other.id, TaskId::new())
+            .await,
+        Err(TaskError::UnknownParent)
+    ));
+    assert!(matches!(
+        env.svc.move_under(Caller::Human, loose.id, other.id).await,
+        Err(TaskError::AlreadyAChild)
+    ));
+    // `parent` is now an ancestor of `loose`: moving it under `loose` would be a cycle
+    // (refused for a done parent first, so use an open grandchild).
+    let grandparent = env.task(Caller::Human, "top").await;
+    let child = env
+        .svc
+        .create(
+            Caller::Human,
+            NewTask {
+                project_id: grandparent.project_id,
+                parent_id: Some(grandparent.id),
+                title: "child".into(),
+                ..NewTask::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        env.svc
+            .move_under(Caller::Human, grandparent.id, child.id)
+            .await,
+        Err(TaskError::ParentIsDescendant)
+    ));
+    let cancelled = env.task(Caller::Human, "gone").await;
+    env.svc.cancel(Caller::Human, cancelled.id).await.unwrap();
+    assert!(matches!(
+        env.svc
+            .move_under(Caller::Human, other.id, cancelled.id)
+            .await,
+        Err(TaskError::ParentClosed(TaskStatus::Cancelled))
+    ));
+    assert!(matches!(
+        env.svc.move_under(Caller::Human, other.id, loose.id).await,
+        Err(TaskError::ParentClosed(TaskStatus::Done))
+    ));
+    // Only its creator, its owner or the human may move it.
+    let mine = env.task(Caller::Agent(&creator), "mine").await;
+    assert!(matches!(
+        env.svc
+            .move_under(Caller::Agent(&lead), mine.id, other.id)
+            .await,
+        Err(TaskError::NotOwner)
+    ));
+    env.svc.claim(&lead, mine.id).await.unwrap();
+    env.svc
+        .move_under(Caller::Agent(&lead), mine.id, other.id)
+        .await
+        .unwrap();
+    // A task in another project, unless the parent spans it.
+    let elsewhere = IdentityService::resolve(
+        &*env.store,
+        &*env.clock,
+        IdentityInput {
+            project_key: Some("github.com/acme/web-app".into()),
+            host: "mac".into(),
+            harness: "claude-code".into(),
+            session: SessionId::new(),
+            token: common::token(&*env.store).await,
+        },
+    )
+    .await
+    .unwrap();
+    let foreign = env.task(Caller::Agent(&elsewhere), "web part").await;
+    assert!(matches!(
+        env.svc
+            .move_under(Caller::Human, foreign.id, other.id)
+            .await,
+        Err(TaskError::ChildProjectMismatch)
+    ));
+    env.svc
+        .add_projects(Caller::Human, other.id, &[foreign.project_id])
+        .await
+        .unwrap();
+    env.svc
+        .move_under(Caller::Human, foreign.id, other.id)
+        .await
+        .unwrap();
+    // A task spanning projects cannot become a child.
+    let wide = env.task(Caller::Human, "wide").await;
+    env.svc
+        .add_projects(Caller::Human, wide.id, &[foreign.project_id])
+        .await
+        .unwrap();
+    assert!(matches!(
+        env.svc.move_under(Caller::Human, wide.id, other.id).await,
+        Err(TaskError::ChildExtraProjects)
+    ));
 });

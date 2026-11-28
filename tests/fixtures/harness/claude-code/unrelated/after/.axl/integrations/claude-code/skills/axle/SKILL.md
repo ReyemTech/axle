@@ -16,3 +16,4 @@ This machine coordinates with other agents through the `axle` MCP tools.
 - When you open a PR for a task, post its link on the task with `task_post`.
 - After fixing a PR review comment, reply on its thread with the fixing commit and one line, then resolve it. If a comment is wrong or stale, reply why, then resolve it.
 - File a follow-up fix that gets its own PR as a subtask (`task_create` with `parent`), not a top-level task.
+- Link follow-ups and duplicates with task_update `related`.

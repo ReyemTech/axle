@@ -4616,3 +4616,59 @@ async fn task_page_lists_related_tasks_and_the_human_links_them() {
     );
     assert!(app.state.tasks.related(later.id).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn human_moves_a_task_under_a_parent() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let parent = app.task(&infra, "Parent", None).await;
+    let loose = app.task(&infra, "Loose", None).await;
+    let csrf = csrf_for(&app, &cookie).await;
+    let path = format!("/ui/tasks/{}", loose.id);
+    let page = app.get(&path, Some(&cookie)).await;
+    assert_eq!(
+        select_texts(&page, "form[action$='/parent'] button"),
+        ["Make it a subtask"]
+    );
+
+    let page = app
+        .post_form(
+            &format!("{path}/parent"),
+            Some(&cookie),
+            &format!("parent={}", parent.id),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::FORBIDDEN, "CSRF is required");
+    let page = app
+        .post_form(
+            &format!("{path}/parent"),
+            Some(&cookie),
+            &form(&csrf, &[("parent", &format!("/ui/tasks/{}", parent.id))]),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.body);
+    let page = app.get(&path, Some(&cookie)).await;
+    assert!(select_texts(&page, ".crumb")[0].contains("Parent"));
+    assert!(select_texts(&page, "form[action$='/parent']").is_empty());
+    assert!(
+        select_texts(&page, ".event-kind")
+            .iter()
+            .any(|k| k == "moved under")
+    );
+    let page = app
+        .get(&format!("/ui/tasks/{}", parent.id), Some(&cookie))
+        .await;
+    assert!(select_texts(&page, "[aria-label=Subtasks] .child-title")[0].ends_with("Loose"));
+
+    // A second move is refused as a conflict.
+    let other = app.task(&infra, "Other", None).await;
+    let page = app
+        .post_form(
+            &format!("{path}/parent"),
+            Some(&cookie),
+            &form(&csrf, &[("parent", &other.id.to_string())]),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::CONFLICT, "{}", page.body);
+}

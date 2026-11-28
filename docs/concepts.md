@@ -185,6 +185,31 @@ Work that spans repositories is a **parent** task with **children**:
 
 `task_get` on a parent returns its children and a `progress` count of finished children.
 
+A top-level task created on its own can be moved under a parent later (`task_update` with
+`parent`, or **Move under a parent** on the task page), by its creator, its owner or the
+human. The same project rule applies, the parent must still take subtasks (not `planning`,
+`done` or `cancelled`), and cycles are refused. Moving a subtask to a different parent is
+not supported.
+
+## Related tasks
+
+Tasks that are not parent and child can still be **linked**, so a follow-up or a duplicate
+points back at what it came from. A link is added from one task (`task_update` with
+`related`, or **Link a task** on the task page) by that task's creator, its owner or the
+human, and both tasks show it:
+
+| Kind | On the task that added it | On the other task |
+|---|---|---|
+| `relates` | related to | related to |
+| `follow-up` | follow-up of | follow-up |
+| `duplicate` | duplicate of | duplicated by |
+
+Marking a task a `duplicate` also cancels it, with a note in its thread naming the original;
+a done task cannot be marked a duplicate. A pair of tasks has at most one link (a new kind
+replaces the old), a task has at most 20, and a task cannot link to itself. `unrelate` (or
+**Unlink**) removes a link from either side; it does not reopen a cancelled duplicate. Every
+change is a `related` event in the history of the task it was made from.
+
 ## The plan gate
 
 A task created with `requires_plan` (the **Plan first** box in the UI, ticked by default)

@@ -264,6 +264,8 @@ pub struct TaskView {
     pub also: Vec<ProjectLabel>,
     /// A top-level task that is not closed: projects can be added.
     pub can_add_project: bool,
+    /// A top-level task with no extra projects: it can be moved under a parent.
+    pub can_move: bool,
     pub project: ProjectLabel,
     pub created_by: String,
     pub created_at: Stamp,
@@ -441,6 +443,7 @@ pub async fn task_page(
         can_decide: task.status == TaskStatus::Planning && task.plan_state == PlanState::Submitted,
         also: extra.iter().map(|p| labels.project(*p)).collect(),
         can_add_project: task.parent_id.is_none() && open,
+        can_move: task.parent_id.is_none() && extra.is_empty(),
         project: labels.project(task.project_id),
         created_by: labels.actor_label(task.created_by).await?,
         created_at: Stamp::new(now, task.created_at),

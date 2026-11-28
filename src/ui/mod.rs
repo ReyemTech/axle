@@ -176,6 +176,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         )
         .route("/ui/tasks/{id}/projects", post(actions::add_project))
         .route("/ui/tasks/{id}/related", post(actions::add_related))
+        .route("/ui/tasks/{id}/parent", post(actions::move_under))
         .route(
             "/ui/tasks/{id}/related/{other}/remove",
             post(actions::remove_related),

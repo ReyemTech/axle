@@ -239,6 +239,18 @@
       <button type="submit" class="secondary">+ Link task</button>
     </form>
   </section>
+  {% if task.can_move %}
+  <section class="panel">
+    <h2 class="panel-title">Move under a parent</h2>
+    <form class="stack" method="post" action="/ui/tasks/{{ task.id }}/parent">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <label for="move-parent">Parent task <span class="muted">(id or link)</span></label>
+      <input id="move-parent" name="parent" required autocomplete="off">
+      <button type="submit" class="secondary">Make it a subtask</button>
+    </form>
+    <p class="hint">The parent must be open for subtasks, in this task's project or one it spans.</p>
+  </section>
+  {% endif %}
   {% if task.can_cancel && task.status != "planning" %}
   <section class="panel">
     <h2 class="panel-title">Add a subtask</h2>

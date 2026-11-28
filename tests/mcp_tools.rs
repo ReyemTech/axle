@@ -1372,3 +1372,85 @@ store_matrix!(related_links_via_mcp, |store: Arc<dyn Store>| async move {
         cl.cancel().await.unwrap();
     }
 });
+
+store_matrix!(
+    move_under_a_parent_via_mcp,
+    |store: Arc<dyn Store>| async move {
+        let server = start(store).await;
+        let creator = server.agent("mac", "claude-code").await;
+        let stranger = server.agent("linux", "codex").await;
+        let id = |v: Value| v["id"].as_str().unwrap().to_string();
+        let parent = id(ok(
+            &creator,
+            "task_create",
+            json!({"title": "Parent", "body": ""}),
+        )
+        .await);
+        let loose = id(ok(
+            &creator,
+            "task_create",
+            json!({"title": "Loose", "body": ""}),
+        )
+        .await);
+
+        let (is_error, text) = call(
+            &stranger,
+            "task_update",
+            json!({"id": loose, "parent": parent}),
+        )
+        .await;
+        assert!(is_error && text.contains("not the owner"), "{text}");
+        let (is_error, text) = call(
+            &creator,
+            "task_update",
+            json!({"id": loose, "parent": loose}),
+        )
+        .await;
+        assert!(is_error && text.contains("own parent"), "{text}");
+
+        let moved = ok(
+            &creator,
+            "task_update",
+            json!({"id": loose, "parent": parent}),
+        )
+        .await;
+        assert_eq!(moved["parent"], parent);
+        let detail = ok(&creator, "task_get", json!({"id": parent})).await;
+        assert_eq!(detail["progress"]["total"], 1, "{detail}");
+        assert_eq!(detail["children"][0]["id"], loose);
+        let detail = ok(&creator, "task_get", json!({"id": loose})).await;
+        assert!(
+            detail["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["kind"] == "moved_under"),
+            "{detail}"
+        );
+
+        // Moving a subtask again is out of scope; a cycle is refused.
+        let other = id(ok(
+            &creator,
+            "task_create",
+            json!({"title": "Other", "body": ""}),
+        )
+        .await);
+        let (is_error, text) = call(
+            &creator,
+            "task_update",
+            json!({"id": loose, "parent": other}),
+        )
+        .await;
+        assert!(is_error && text.contains("not supported"), "{text}");
+        let (is_error, text) = call(
+            &creator,
+            "task_update",
+            json!({"id": parent, "parent": loose}),
+        )
+        .await;
+        assert!(is_error && text.contains("cycle"), "{text}");
+        for cl in [creator, stranger] {
+            cl.cancel().await.unwrap();
+        }
+    }
+);

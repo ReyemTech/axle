@@ -8,9 +8,9 @@ use uuid::Uuid;
 
 use super::{
     AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate,
-    MessageReceipt, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, RelateRequest,
-    Related, Store, StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest,
-    Transitioned, UnblockRule, Unblocked, block_previous_payload, child_event,
+    MessageReceipt, MoveRequest, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient,
+    RelateRequest, Related, Store, StoreError, StoreResult, TaskFilter, TaskOrder,
+    TransitionRequest, Transitioned, UnblockRule, Unblocked, block_previous_payload, child_event,
     children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label,
     like_pattern, options_from, options_to, projects_added_note, projects_added_payload,
     related_payload, send_time_recipient, unblocked_records,
@@ -1501,6 +1501,68 @@ impl Store for PostgresStore {
             added,
             removed,
         })
+    }
+
+    async fn move_task(&self, req: &MoveRequest) -> StoreResult<Option<Task>> {
+        let (agent, session) = match req.editor {
+            Some((a, s)) => (Some(a.as_uuid()), Some(s.as_uuid())),
+            None => (None, None),
+        };
+        let id = req.task.as_uuid();
+        let parent = req.parent.as_uuid();
+        let mut tx = self.pool.begin().await?;
+        // Lock both rows in id order, so two moves of the same pair serialise.
+        sqlx::query("SELECT id FROM tasks WHERE id = ANY($1) ORDER BY id FOR UPDATE")
+            .bind(vec![id, parent])
+            .fetch_all(&mut *tx)
+            .await?;
+        // The ancestor walk rules out cycles (the task is top-level, so it can only be the
+        // parent or an ancestor of it).
+        let allowed: Option<i32> = sqlx::query(
+            "WITH RECURSIVE ancestors(id, parent_id) AS (
+                 SELECT id, parent_id FROM tasks WHERE id = $4
+                 UNION
+                 SELECT t.id, t.parent_id FROM tasks t JOIN ancestors a ON t.id = a.parent_id
+             )
+             SELECT 1 AS ok FROM tasks t, tasks p
+             WHERE t.id = $1 AND p.id = $4 AND t.parent_id IS NULL
+               AND NOT EXISTS (SELECT 1 FROM task_projects x WHERE x.task_id = t.id)
+               AND ($2::uuid IS NULL OR t.created_by_agent_id = $2
+                    OR (t.owner_session_id = $3::uuid
+                        AND t.status IN ('planning', 'claimed', 'blocked', 'review')))
+               AND p.status NOT IN ('planning', 'done', 'cancelled')
+               AND (p.project_id = t.project_id
+                    OR EXISTS (SELECT 1 FROM task_projects x
+                               WHERE x.task_id = p.id AND x.project_id = t.project_id))
+               AND NOT EXISTS (SELECT 1 FROM ancestors a WHERE a.id = t.id)",
+        )
+        .bind(id)
+        .bind(agent)
+        .bind(session)
+        .bind(parent)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| row.try_get("ok"))
+        .transpose()?;
+        if allowed.is_none() {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let task = sqlx::query(concat!(
+            "UPDATE tasks SET parent_id = $1, version = version + 1, updated_at = $2
+             WHERE id = $3 RETURNING ",
+            task_cols!()
+        ))
+        .bind(parent)
+        .bind(req.event.at)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(StoreError::from)
+        .and_then(|row| task_from(&row))?;
+        insert_event(&mut tx, &req.event, req.token).await?;
+        tx.commit().await?;
+        Ok(Some(task))
     }
 
     async fn task_links(&self, task: TaskId) -> StoreResult<Vec<TaskLink>> {

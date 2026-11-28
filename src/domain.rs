@@ -429,6 +429,8 @@ pub enum TaskEventKind {
     Unblocked,
     /// Links to other tasks were added or removed (listed in the payload).
     Related,
+    /// A top-level task was moved under a parent (in the payload; the note names it).
+    MovedUnder,
     /// The human acknowledged a done task. Only ever published as a live event; it is
     /// never written to a task's history.
     Acked,
@@ -458,6 +460,7 @@ text_enum!(TaskEventKind {
     BlockUpdated => "block_updated",
     Unblocked => "unblocked",
     Related => "related",
+    MovedUnder => "moved_under",
     Acked => "acked",
 });
 

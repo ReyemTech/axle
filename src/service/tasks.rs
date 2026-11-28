@@ -19,7 +19,7 @@ use crate::events::{Event, EventBus};
 use crate::service::identity::{IdentityError, NAME_MAX, Resolved, check_label};
 use crate::service::messages::{MessageError, SUBJECT_MAX, check_body, check_subject};
 use crate::store::{
-    AddProjectsRequest, BlockWrite, ClaimRequest, Claimant, EditRequest, LeaseUpdate,
+    AddProjectsRequest, BlockWrite, ClaimRequest, Claimant, EditRequest, LeaseUpdate, MoveRequest,
     RelateRequest, Related, Store, StoreError, TaskFilter, TransitionRequest, Transitioned,
     UnblockRule, claim_event,
 };
@@ -257,6 +257,16 @@ pub enum TaskError {
     DuplicateOfDone,
     #[error("a task can be a duplicate of one task only")]
     DuplicateTwice,
+    #[error("a task cannot be its own parent")]
+    OwnParent,
+    #[error("parent task not found")]
+    UnknownParent,
+    #[error("the task already has a parent; moving a subtask to another parent is not supported")]
+    AlreadyAChild,
+    #[error("the parent task is {0}")]
+    ParentClosed(TaskStatus),
+    #[error("the parent is a subtask of this task, which would make a cycle")]
+    ParentIsDescendant,
     /// The task body is over the message cap, or a promoted message does not exist.
     #[error(transparent)]
     Message(#[from] MessageError),
@@ -1156,6 +1166,88 @@ impl TaskService {
                 .await?;
         }
         Ok(task)
+    }
+
+    /// Moves the top-level task `id` under `parent`. Allowed for the human, the creating agent
+    /// and the session holding the task. Refused for the task itself, a task that already has
+    /// a parent (moving a child to another parent is not supported) or extra projects, a parent
+    /// that is planning, done or cancelled or is the task's own subtask, and a parent outside
+    /// the task's project (it must be the parent's project or one the parent spans, as for
+    /// `create`). The parent's progress counts it at once, and the usual rules (the coordinator
+    /// is told when it is blocked or closes, the parent consolidates when its last open child
+    /// closes) apply from then on.
+    pub async fn move_under(
+        &self,
+        by: Caller<'_>,
+        id: TaskId,
+        parent: TaskId,
+    ) -> Result<Task, TaskError> {
+        if id == parent {
+            return Err(TaskError::OwnParent);
+        }
+        let p = self
+            .store
+            .get_task(parent)
+            .await?
+            .ok_or(TaskError::UnknownParent)?;
+        let req = MoveRequest {
+            task: id,
+            parent,
+            editor: match by {
+                Caller::Agent(r) => Some((r.agent.id, r.session.id)),
+                Caller::Human => None,
+            },
+            token: by.token(),
+            event: self.event(
+                id,
+                by.actor(),
+                TaskEventKind::MovedUnder,
+                Some(format!("moved under \"{}\"", p.title)),
+                Some(serde_json::json!({ "parent": parent.to_string() })),
+            ),
+        };
+        if let Some(task) = self.store.move_task(&req).await? {
+            self.changed(&task, TaskEventKind::MovedUnder).await;
+            self.changed(&p, TaskEventKind::MovedUnder).await;
+            return Ok(task);
+        }
+        // Explain the refusal from a fresh read.
+        let task = self.store.get_task(id).await?.ok_or(TaskError::NotFound)?;
+        let p = self
+            .store
+            .get_task(parent)
+            .await?
+            .ok_or(TaskError::UnknownParent)?;
+        if task.parent_id.is_some() {
+            return Err(TaskError::AlreadyAChild);
+        }
+        if !self.store.task_projects(id).await?.is_empty() {
+            return Err(TaskError::ChildExtraProjects);
+        }
+        match p.status {
+            TaskStatus::Planning => return Err(TaskError::PlanNotApproved(p.plan_state)),
+            s @ (TaskStatus::Done | TaskStatus::Cancelled) => {
+                return Err(TaskError::ParentClosed(s));
+            }
+            _ => {}
+        }
+        let mut up = p.parent_id;
+        while let Some(a) = up {
+            if a == id {
+                return Err(TaskError::ParentIsDescendant);
+            }
+            up = self.store.get_task(a).await?.and_then(|t| t.parent_id);
+        }
+        if p.project_id != task.project_id
+            && !self
+                .store
+                .task_projects(parent)
+                .await?
+                .contains(&task.project_id)
+        {
+            return Err(TaskError::ChildProjectMismatch);
+        }
+        Err(TaskError::NotOwner)
     }
 
     /// Every link of task `id`, oldest first, with the task at the other end.

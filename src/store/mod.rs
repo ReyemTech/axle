@@ -240,6 +240,14 @@ pub trait Store: Send + Sync {
     /// `req.max_links` links, or nothing is written. When anything changed it bumps `version` /
     /// `updated_at` and appends `req.event` (payload from `related_payload`).
     async fn relate_tasks(&self, req: &RelateRequest<'_>) -> StoreResult<Related>;
+    /// Moves the top-level task `req.task` under `req.parent`, in one transaction that locks
+    /// both: applies only if the task still has no parent and no extra participating projects,
+    /// `req.editor` is `None` (the human), its creator or the session holding it (`planning`,
+    /// `claimed`, `blocked` or `review`), the parent is not `planning`, `done` or `cancelled`,
+    /// the task's project is the parent's or one the parent spans, and the task is not the
+    /// parent or one of its ancestors. Sets `parent_id`, bumps `version` / `updated_at` and
+    /// appends `req.event`. `None` when the guard did not match.
+    async fn move_task(&self, req: &MoveRequest) -> StoreResult<Option<Task>>;
     /// Every link of `task`, whichever way it points, oldest first.
     async fn task_links(&self, task: TaskId) -> StoreResult<Vec<TaskLink>>;
     async fn get_task(&self, id: TaskId) -> StoreResult<Option<Task>>;
@@ -677,6 +685,18 @@ pub struct AddProjectsRequest<'a> {
     pub note: Message,
 }
 
+/// A request to move a top-level task under a parent (see `Store::move_task`).
+#[derive(Debug, Clone)]
+pub struct MoveRequest {
+    pub task: TaskId,
+    pub parent: TaskId,
+    /// `None`: the human; else the agent (allowed as creator) and its session (as holder).
+    pub editor: Option<(AgentId, SessionId)>,
+    pub token: Option<TokenId>,
+    /// Appended on success (`at` is also the new `updated_at`).
+    pub event: TaskEvent,
+}
+
 /// A request to add and remove links of a task (see `Store::relate_tasks`).
 #[derive(Debug, Clone)]
 pub struct RelateRequest<'a> {
@@ -695,7 +715,8 @@ pub struct RelateRequest<'a> {
     pub event: TaskEvent,
 }
 
-/// What `relate_tasks` did.
+/// What `relate_tasks` did. Short-lived, so the large variant is not boxed.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Related {
     /// The task does not exist or the editor may not change it.

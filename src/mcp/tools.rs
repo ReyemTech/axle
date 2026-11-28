@@ -286,6 +286,9 @@ pub struct TaskUpdateParams {
     /// Task ids whose link with this task to remove, whichever task added it (creator or
     /// owner only).
     pub unrelate: Option<Vec<String>>,
+    /// Move this top-level task under this parent task (id; creator or owner only). The
+    /// parent must be open for subtasks and in the task's project or one it spans.
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -506,7 +509,8 @@ impl AxleMcp {
          body (creator or owner), add participating projects to a top-level task \
          (`add_projects`; creator or owner), and/or link it to other tasks (`related`: \
          `relates`, `follow-up` or `duplicate`, which cancels this task; `unrelate` removes \
-         links; creator or owner). `blocked` on a task you hold blocked updates its reason, \
+         links; creator or owner), and/or move a top-level task under a parent (`parent`; \
+         creator or owner). `blocked` on a task you hold blocked updates its reason, \
          `waiting_on` or `unblock`. A task waiting on another task is unblocked when that task \
          is done."
     ))]
@@ -1054,17 +1058,25 @@ impl AxleMcp {
         for r in p.unrelate.unwrap_or_default() {
             unrelate.push(parse_id::<TaskId>("task", &r)?);
         }
+        let parent = match p.parent.as_deref() {
+            Some(raw) => Some(parse_id::<TaskId>("parent task", raw)?),
+            None => None,
+        };
         if p.status.is_none()
             && p.title.is_none()
             && p.body.is_none()
             && add_projects.is_empty()
             && related.is_empty()
             && unrelate.is_empty()
+            && parent.is_none()
         {
             return Err(ToolError::invalid(
-                "nothing to update: pass `status`, `title`, `body`, `add_projects`, `related` \
-                 and/or `unrelate`",
+                "nothing to update: pass `status`, `title`, `body`, `add_projects`, `related`, \
+                 `unrelate` and/or `parent`",
             ));
+        }
+        if parent == Some(id) {
+            return Err(ToolError::from(crate::service::tasks::TaskError::OwnParent));
         }
         if related.iter().any(|(t, _)| *t == id) {
             return Err(ToolError::from(crate::service::tasks::TaskError::SelfLink));
@@ -1157,6 +1169,14 @@ impl AxleMcp {
                 self.state
                     .tasks
                     .add_projects(Caller::Agent(me), id, &projects)
+                    .await?,
+            );
+        }
+        if let Some(parent) = parent {
+            task = Some(
+                self.state
+                    .tasks
+                    .move_under(Caller::Agent(me), id, parent)
                     .await?,
             );
         }

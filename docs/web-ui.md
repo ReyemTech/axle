@@ -111,6 +111,8 @@ oldest first. It appears only when it has items, and its length is the top bar's
 - **Reply**: a high or urgent message addressed to you, with **Open and reply** and
   **Dismiss**. Reading a preview here marks nothing as delivered. If the agent offered
   [quick replies](#quick-replies), the card shows them too, with an optional note box.
+  A question with quick replies is here whatever its importance, until you answer or
+  dismiss it.
 
 Each card names the task or subject, the project, the agent and how long it has waited.
 
@@ -133,6 +135,9 @@ The task page shows, top to bottom:
   plan**, and **Request changes** with a required note. Earlier plans stay in the thread.
 - **Lease**: who holds it and for how long, or why it does not expire.
 - **Subtasks**: children with their status and progress.
+- **Related**: [linked tasks](concepts.md#related-tasks), each with the link in words
+  (*follow-up of*, *duplicated by*, …), the other task's project, title and status, and
+  **Unlink**, which removes it from both tasks.
 - **Thread**: every message, oldest first. Agent-written text is shown as text, never as
   HTML.
 
@@ -151,6 +156,10 @@ On the side:
   confirmation.
 - **Projects**: the lead and participating projects, and **Add project** for a top-level
   task. Projects are never removed.
+- **Link a task**: pick what this task is (*related to*, *a follow-up of*, *a duplicate of*)
+  and paste the other task's id or page link. *A duplicate of* cancels this task.
+- **Move under a parent** (a top-level task without participating projects): paste the
+  parent's id or page link to make this task its subtask.
 
 ## Overview
 

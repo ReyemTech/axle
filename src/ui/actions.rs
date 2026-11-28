@@ -50,8 +50,14 @@ fn task_error(e: TaskError) -> UiError {
         | TaskError::PlanChanged
         | TaskError::DuplicateOfDone
         | TaskError::TooManyLinks(_)) => UiError::Conflict(capitalise(&e.to_string())),
-        e @ (TaskError::SelfLink | TaskError::UnknownLinkTarget(_) | TaskError::DuplicateTwice) => {
-            UiError::Invalid(capitalise(&e.to_string()))
+        e @ (TaskError::SelfLink
+        | TaskError::UnknownLinkTarget(_)
+        | TaskError::DuplicateTwice
+        | TaskError::OwnParent
+        | TaskError::UnknownParent
+        | TaskError::ParentIsDescendant) => UiError::Invalid(capitalise(&e.to_string())),
+        e @ (TaskError::AlreadyAChild | TaskError::ParentClosed(_)) => {
+            UiError::Conflict(capitalise(&e.to_string()))
         }
         e @ (TaskError::ReasonRequired
         | TaskError::NothingToUpdate
@@ -302,12 +308,7 @@ pub async fn add_related(
     Form(form): Form<RelatedForm>,
 ) -> UiResult<Response> {
     let id = task_id(&id)?;
-    // A pasted task link works as well as a bare id.
-    let raw = form.task.trim().trim_end_matches('/');
-    let raw = raw.rsplit('/').next().unwrap_or_default();
-    let raw = raw.split(['?', '#']).next().unwrap_or_default();
-    let target: TaskId = opt_id(raw, "task id")?
-        .ok_or_else(|| UiError::Invalid("Give the other task's id or link.".into()))?;
+    let target = pasted_task(&form.task)?;
     let kind: LinkKind = form
         .kind
         .trim()
@@ -316,6 +317,38 @@ pub async fn add_related(
     state
         .tasks
         .relate(Caller::Human, id, &[(target, kind)], &[])
+        .await
+        .map_err(task_error)?;
+    Ok(see_other(&format!("/ui/tasks/{id}")))
+}
+
+/// A task id typed or pasted by the human: a bare id or a link to its page.
+fn pasted_task(raw: &str) -> UiResult<TaskId> {
+    let raw = raw.trim().trim_end_matches('/');
+    let raw = raw.split(['?', '#']).next().unwrap_or_default();
+    let raw = raw.rsplit('/').next().unwrap_or_default();
+    opt_id(raw, "task id")?
+        .ok_or_else(|| UiError::Invalid("Give the other task's id or link.".into()))
+}
+
+#[derive(Deserialize)]
+pub struct ParentForm {
+    /// The new parent: its id, or a link to its page.
+    #[serde(default)]
+    parent: String,
+}
+
+/// Moves a top-level task under a parent as the human.
+pub async fn move_under(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<ParentForm>,
+) -> UiResult<Response> {
+    let id = task_id(&id)?;
+    let parent = pasted_task(&form.parent)?;
+    state
+        .tasks
+        .move_under(Caller::Human, id, parent)
         .await
         .map_err(task_error)?;
     Ok(see_other(&format!("/ui/tasks/{id}")))
