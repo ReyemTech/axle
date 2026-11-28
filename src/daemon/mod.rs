@@ -143,16 +143,20 @@ pub fn port_free(port: u16) -> bool {
     TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).is_ok()
 }
 
-/// Installs and starts the unit. The one place that checks the port (skipped when the
-/// service is already running, since it is then the one holding it) and records a
-/// non-default port in `config.toml`.
+/// Installs and starts the unit. The one place that checks the port (skipped only when
+/// the service is already running on that very port, since it is then the one holding
+/// it; a changed port is checked before anything is rewritten or restarted) and records
+/// a non-default port in `config.toml`.
 pub fn install_unit(
     ctl: &dyn ServiceControl,
     dir: &AxlDir,
     spec: &UnitSpec,
 ) -> Result<(), DaemonError> {
     let running = matches!(ctl.status(), Ok(ServiceState::Running));
-    if !running && !port_free(spec.port) {
+    // The port the running service holds now: the saved one, else the default.
+    let current = load_config(dir)?.port.unwrap_or(DEFAULT_PORT);
+    let holds_it = running && current == spec.port;
+    if !holds_it && !port_free(spec.port) {
         return Err(DaemonError::PortInUse(spec.port));
     }
     dir.ensure()?;

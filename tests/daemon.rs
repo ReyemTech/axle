@@ -247,24 +247,79 @@ fn taken_port_is_refused_with_hint() {
     );
 }
 
-#[test]
-fn running_service_skips_port_check() {
-    let home = TempHome::new();
-    let held = TcpListener::bind("127.0.0.1:0").unwrap(); // the service itself holds it
-    let port = held.local_addr().unwrap().port();
-    let rec = Recorder {
+fn running_recorder() -> Recorder {
+    Recorder {
         stdout: vec![("is-active", "active\n")],
         ..Default::default()
-    };
+    }
+}
+
+fn restarted(rec: &Recorder) -> bool {
+    rec.calls()
+        .iter()
+        .any(|c| c.contains(&"restart".to_string()))
+}
+
+#[test]
+fn running_service_skips_port_check_for_its_own_port() {
+    let home = TempHome::new();
+    let dir = AxlDir::new(home.path());
+    let held = TcpListener::bind("127.0.0.1:0").unwrap(); // the service itself holds it
+    let port = held.local_addr().unwrap().port();
+    save_config(
+        &dir,
+        &ClientConfig {
+            server_url: None,
+            port: Some(port),
+        },
+    )
+    .unwrap();
+    let rec = running_recorder();
     let ctl = Systemd::new(home.path(), Box::new(rec.clone()));
     let mut s = spec(home.path());
     s.port = port;
-    install_unit(&ctl, &AxlDir::new(home.path()), &s).unwrap();
+    install_unit(&ctl, &dir, &s).unwrap();
+    assert!(restarted(&rec));
+}
+
+#[test]
+fn running_service_refuses_a_changed_occupied_port_untouched() {
+    let home = TempHome::new();
+    let dir = AxlDir::new(home.path());
+    let held = TcpListener::bind("127.0.0.1:0").unwrap(); // someone else holds it
+    let port = held.local_addr().unwrap().port();
+    let unit = unit_path(home.path());
+    std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    std::fs::write(&unit, "ORIGINAL").unwrap();
+    let rec = running_recorder();
+    let ctl = Systemd::new(home.path(), Box::new(rec.clone()));
+    let mut s = spec(home.path());
+    s.port = port;
+    let err = install_unit(&ctl, &dir, &s).unwrap_err();
+    assert!(matches!(err, DaemonError::PortInUse(p) if p == port));
+    assert_eq!(std::fs::read_to_string(&unit).unwrap(), "ORIGINAL");
+    assert!(!restarted(&rec));
     assert!(
         rec.calls()
             .iter()
-            .any(|c| c.contains(&"restart".to_string()))
+            .all(|c| !c.contains(&"enable".to_string()))
     );
+}
+
+#[test]
+fn running_service_moves_to_a_free_port() {
+    let home = TempHome::new();
+    let dir = AxlDir::new(home.path());
+    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let rec = running_recorder();
+    let ctl = Systemd::new(home.path(), Box::new(rec.clone()));
+    let mut s = spec(home.path());
+    s.port = port;
+    install_unit(&ctl, &dir, &s).unwrap();
+    assert!(restarted(&rec));
+    assert_eq!(load_config(&dir).unwrap().port, Some(port));
 }
 
 #[test]
