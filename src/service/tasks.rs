@@ -1754,7 +1754,8 @@ impl TaskService {
                 latest_plan: None,
                 archive_plans: g.archive_plans,
                 block: g.block.clone(),
-                unblock: (g.to == Some(TaskStatus::Done)).then(|| self.unblock_rule()),
+                // Always: a cancel can finish a `delivering` parent, which unblocks its waiters.
+                unblock: Some(self.unblock_rule()),
             };
             if let Some(done) = self.store.transition_task(&req).await? {
                 if g.kind != TaskEventKind::Renewed {
@@ -1974,7 +1975,8 @@ impl TaskService {
             latest_plan: None,
             archive_plans: false,
             block: None,
-            unblock: None,
+            // A cancel can finish a `delivering` parent, which unblocks its waiters.
+            unblock: Some(self.unblock_rule()),
         }
     }
 }

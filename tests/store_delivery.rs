@@ -504,7 +504,11 @@ async fn settings(
 ) -> Vec<Task> {
     let mut d = ProjectDelivery::defaults(project, at);
     d.stages = stages.to_vec();
-    store.set_project_delivery(&d, None).await.unwrap()
+    store
+        .set_project_delivery(&d, None, None)
+        .await
+        .unwrap()
+        .moved
 }
 
 fn delivered_notes(events: &[TaskEvent]) -> Vec<Option<String>> {
@@ -546,9 +550,10 @@ store_matrix!(
         d.required_environment = "prod-eu".into();
         assert!(
             store
-                .set_project_delivery(&d, None)
+                .set_project_delivery(&d, None, None)
                 .await
                 .unwrap()
+                .moved
                 .is_empty()
         );
         assert_eq!(
@@ -566,14 +571,17 @@ store_matrix!(
         changed.deploy_source = DeploySource::Generic;
         changed.required_environment = "staging".into();
         changed.updated_at = T2;
-        store.set_project_delivery(&changed, None).await.unwrap();
+        store
+            .set_project_delivery(&changed, None, None)
+            .await
+            .unwrap();
         assert_eq!(
             store.get_project_delivery(project.id).await.unwrap(),
             Some(changed.clone())
         );
 
         let o = ProjectDelivery::defaults(&other, T1);
-        store.set_project_delivery(&o, None).await.unwrap();
+        store.set_project_delivery(&o, None, None).await.unwrap();
         let mut all = store.list_project_delivery().await.unwrap();
         all.sort_by_key(|d| d.project_id.to_string());
         let mut want = vec![changed, o];
@@ -1332,7 +1340,7 @@ store_matrix!(
             let mut d = ProjectDelivery::defaults(&fx.project, T2);
             d.stages = vec![InPr, Merged, Released];
             let (saved, _) = tokio::join!(
-                fx.store.set_project_delivery(&d, None),
+                fx.store.set_project_delivery(&d, None, None),
                 fx.deliver(a.id, T2)
             );
             saved.unwrap_or_else(|e| panic!("round {round}: {e}"));
@@ -1642,6 +1650,7 @@ fn stage_move(
         actor: Actor::Human,
         token: None,
         now: at,
+        unblock: None,
     }
 }
 
@@ -1924,7 +1933,7 @@ store_matrix!(mark_delivered_guarded, |store: Arc<dyn Store>| async move {
     let claimed = fx.claimed("not yet", None).await;
     assert!(
         fx.store
-            .mark_delivered(claimed.id, Actor::Human, None, T2)
+            .mark_delivered(claimed.id, Actor::Human, None, T2, None)
             .await
             .unwrap()
             .is_none()
@@ -1935,7 +1944,7 @@ store_matrix!(mark_delivered_guarded, |store: Arc<dyn Store>| async move {
     let task = fx.delivering("ship", Some(parent.id), 12).await;
     let done = fx
         .store
-        .mark_delivered(task.id, Actor::Human, None, T2)
+        .mark_delivered(task.id, Actor::Human, None, T2, None)
         .await
         .unwrap()
         .expect("delivering task")
@@ -1965,7 +1974,7 @@ store_matrix!(mark_delivered_guarded, |store: Arc<dyn Store>| async move {
     // Done already: nothing more.
     assert!(
         fx.store
-            .mark_delivered(task.id, Actor::Human, None, T3)
+            .mark_delivered(task.id, Actor::Human, None, T3, None)
             .await
             .unwrap()
             .is_none()
@@ -2500,3 +2509,119 @@ store_matrix!(
     last_child_marked_done_closes_parent_children,
     |store: Arc<dyn Store>| async move { last_child_through_delivery(store, true).await }
 );
+
+// ---- a task delivery finishes unblocks the tasks waiting on it ----
+
+/// How the waited-on task is finished in `unblock_through_delivery`.
+#[derive(Clone, Copy)]
+enum Finish {
+    MarkDone,
+    LastStage,
+    StagesOff,
+    /// The target is a `delivering` parent; its last child's **Mark done** finishes it.
+    ParentClosed,
+}
+
+/// A task blocked on a delivering task is unblocked when delivery makes that task `done`,
+/// exactly as after a plain `done`: the `unblocked` event, the thread note and a published
+/// `TaskChanged(Unblocked)`.
+async fn unblock_through_delivery(store: Arc<dyn Store>, how: Finish) {
+    let clock = Arc::new(TestClock::new(T1));
+    let bus = axle::events::EventBus::new(store.clone(), clock.clone());
+    let mut rx = bus.subscribe();
+    let svc = DeliveryService::new(store.clone(), clock).with_events(bus);
+    let dx = Dx {
+        fx: Fx::new(store).await,
+        svc,
+    };
+    dx.stages(&[DeliveryStage::InPr, DeliveryStage::Merged])
+        .await;
+    let (target, child) = match how {
+        Finish::ParentClosed => {
+            let parent = dx.fx.claimed("parent", None).await;
+            let child = dx.fx.delivering("child", Some(parent.id), 7).await;
+            let (parent, target) = dx.fx.complete(parent.id, T1).await;
+            assert!(matches!(target, CompletionTarget::Delivering(_)));
+            (parent, Some(child))
+        }
+        _ => (dx.delivering("target", 7).await, None),
+    };
+    assert_eq!(target.status, TaskStatus::Delivering);
+    let waiter = dx.fx.claimed("waiter", None).await;
+    dx.fx
+        .svc
+        .block_with(
+            &dx.fx.owner,
+            waiter.id,
+            axle::service::tasks::BlockInput {
+                reason: Some("needs the target".into()),
+                waiting_on: Some(WaitingOn::Task(target.id)),
+                unblock: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(dx.fx.get(waiter.id).await.status, TaskStatus::Blocked);
+    while rx.try_recv().is_ok() {}
+
+    match how {
+        Finish::MarkDone => drop(dx.svc.mark_done(target.id).await.unwrap()),
+        Finish::LastStage => drop(dx.svc.advance(target.id).await.unwrap()),
+        Finish::StagesOff => dx.stages(&[]).await,
+        Finish::ParentClosed => drop(dx.svc.mark_done(child.unwrap().id).await.unwrap()),
+    }
+    assert_eq!(dx.fx.get(target.id).await.status, TaskStatus::Done);
+    let after = dx.fx.get(waiter.id).await;
+    assert!(
+        matches!(after.status, TaskStatus::Claimed | TaskStatus::Open),
+        "{:?}",
+        after.status
+    );
+    assert!(after.block.is_none());
+    let events = dx.fx.store.task_events(waiter.id).await.unwrap();
+    let unblocked = last_of(&events, TaskEventKind::Unblocked);
+    assert_eq!(
+        unblocked.payload.unwrap()["waiting_task_id"],
+        target.id.to_string()
+    );
+    let thread = dx.fx.store.task_thread(waiter.id).await.unwrap();
+    assert!(
+        thread
+            .iter()
+            .any(|m| m.body.starts_with("unblocked: \"") && m.body.contains("is done")),
+        "{thread:?}"
+    );
+    let mut published = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        if let axle::events::Event::TaskChanged { id, kind, .. } = e
+            && id == waiter.id
+        {
+            published.push(kind);
+        }
+    }
+    assert!(
+        published.contains(&TaskEventKind::Unblocked),
+        "{published:?}"
+    );
+}
+
+store_matrix!(
+    mark_done_unblocks_waiting,
+    |store: Arc<dyn Store>| async move { unblock_through_delivery(store, Finish::MarkDone).await }
+);
+
+store_matrix!(
+    last_stage_unblocks_waiting,
+    |store: Arc<dyn Store>| async move { unblock_through_delivery(store, Finish::LastStage).await }
+);
+
+store_matrix!(
+    stages_off_unblocks_waiting,
+    |store: Arc<dyn Store>| async move { unblock_through_delivery(store, Finish::StagesOff).await }
+);
+
+store_matrix!(delivering_parent_closing_unblocks_waiting, |store: Arc<
+    dyn Store,
+>| async move {
+    unblock_through_delivery(store, Finish::ParentClosed).await
+});

@@ -128,7 +128,8 @@ impl AppState {
                     .with_events(bus.clone()),
             ),
             delivery: Arc::new(
-                DeliveryService::new(store.clone(), clock.clone()).with_events(bus.clone()),
+                DeliveryService::from_config(store.clone(), clock.clone(), &config)
+                    .with_events(bus.clone()),
             ),
             enroll: Arc::new(EnrollService::new(
                 store.clone(),

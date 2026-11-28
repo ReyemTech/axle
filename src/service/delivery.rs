@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
+use time::Duration;
+
 use crate::clock::Clock;
+use crate::config::ServerConfig;
 use crate::delivery::links::{PrUrl, parse_pr_url};
 use crate::delivery::stages::{column, implied_between, next_enabled_after};
 use crate::domain::{
@@ -17,7 +20,9 @@ use crate::domain::{
 use crate::events::EventBus;
 use crate::service::announce::Notifier;
 use crate::service::tasks::{Caller, TaskError};
-use crate::store::{LinkOutcome, LinkPrRequest, NewTaskPr, StageMove, Store, StoreError};
+use crate::store::{
+    LinkOutcome, LinkPrRequest, NewTaskPr, StageMove, Store, StoreError, UnblockRule, Unblocked,
+};
 
 /// What went wrong with a delivery operation; `Display` is the message shown to the caller.
 #[derive(Debug, thiserror::Error)]
@@ -70,14 +75,48 @@ pub struct DeliveryService {
     store: Arc<dyn Store>,
     clock: Arc<dyn Clock>,
     events: Option<EventBus>,
+    /// The lease an unblocked task's owner gets back (as `TaskService`).
+    lease_ttl: Duration,
+    /// A session this long without a heartbeat no longer gets its unblocked task back.
+    presence_stale: Duration,
 }
 
 impl DeliveryService {
+    /// A service with the default lease TTL and presence window (see `ServerConfig`).
     pub fn new(store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Self {
         Self {
             store,
             clock,
             events: None,
+            lease_ttl: Duration::minutes(15),
+            presence_stale: Duration::seconds(90),
+        }
+    }
+
+    /// A service that unblocks waiting tasks with the server's lease TTL and presence window,
+    /// exactly as `TaskService::from_config` does.
+    pub fn from_config(store: Arc<dyn Store>, clock: Arc<dyn Clock>, cfg: &ServerConfig) -> Self {
+        Self {
+            lease_ttl: cfg.lease_ttl,
+            presence_stale: cfg.presence_stale,
+            ..Self::new(store, clock)
+        }
+    }
+
+    /// How a task that delivery finished unblocks its dependents (as `TaskService`'s rule).
+    fn unblock_rule(&self) -> UnblockRule {
+        UnblockRule {
+            live_since: self.clock.now() - self.presence_stale,
+            default_ttl: self.lease_ttl,
+        }
+    }
+
+    /// Publishes the tasks a committed write unblocked, as `TaskService` does after a `done`.
+    async fn publish_unblocked(&self, unblocked: &[Unblocked]) {
+        let notifier = self.notifier();
+        for u in unblocked {
+            notifier.changed(&u.task, TaskEventKind::Unblocked).await;
+            notifier.message_created(&u.note).await;
         }
     }
 
@@ -114,12 +153,16 @@ impl DeliveryService {
         let mut d = self.settings(project).await?;
         d.stages = stages;
         d.updated_at = self.clock.now();
-        let moved = self.store.set_project_delivery(&d, None).await?;
+        let applied = self
+            .store
+            .set_project_delivery(&d, None, Some(self.unblock_rule()))
+            .await?;
         let notifier = self.notifier();
-        for task in &moved {
+        for task in &applied.moved {
             notifier.changed(task, TaskEventKind::Delivered).await;
         }
-        Ok(moved)
+        self.publish_unblocked(&applied.unblocked).await;
+        Ok(applied.moved)
     }
 
     /// Links `raw_url` as the task's PR. Agents: the task's owner or creator; the human: any
@@ -262,6 +305,7 @@ impl DeliveryService {
                 actor: Actor::Human,
                 token: None,
                 now,
+                unblock: Some(self.unblock_rule()),
             })
             .await?
             .ok_or(DeliveryError::NotDelivering)?;
@@ -281,6 +325,7 @@ impl DeliveryService {
                 received_at: now,
             })
             .await?;
+        self.publish_unblocked(&moved.unblocked).await;
         let kind = if moved.delivered {
             TaskEventKind::Delivered
         } else {
@@ -304,9 +349,16 @@ impl DeliveryService {
         self.delivering(task).await?;
         let done = self
             .store
-            .mark_delivered(task, Actor::Human, None, self.clock.now())
+            .mark_delivered(
+                task,
+                Actor::Human,
+                None,
+                self.clock.now(),
+                Some(self.unblock_rule()),
+            )
             .await?
             .ok_or(DeliveryError::NotDelivering)?;
+        self.publish_unblocked(&done.unblocked).await;
         self.notifier()
             .announce(
                 &done.task,

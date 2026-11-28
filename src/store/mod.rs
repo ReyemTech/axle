@@ -187,13 +187,16 @@ pub trait Store: Send + Sync {
     /// `done` (`done_at = updated_at = d.updated_at`, `version` bumped) with a `delivered`
     /// event (actor the human, note `delivered_note(&d.stages)`, `token` recorded). Done tasks
     /// are never reopened. The parent rule then runs for the parents of moved tasks (as after
-    /// any child change). Returns the tasks moved, as updated: those the stages finished and
-    /// the parents the parent rule moved.
+    /// any child change). With `unblock`, every task that became `done` unblocks its waiting
+    /// tasks in the same transaction (see `UnblockRule`; actor the human). Returns the tasks
+    /// moved, as updated (those the stages finished and the parents the parent rule moved),
+    /// and the tasks unblocked.
     async fn set_project_delivery(
         &self,
         d: &ProjectDelivery,
         token: Option<TokenId>,
-    ) -> StoreResult<Vec<Task>>;
+        unblock: Option<UnblockRule>,
+    ) -> StoreResult<StagesApplied>;
 
     // ---- delivery: PR links and completion ----
 
@@ -249,17 +252,21 @@ pub trait Store: Send + Sync {
     /// without children whose `m.to` reaches the project's last enabled stage becomes `done`
     /// (`done_at = m.now`) with a `delivered` event (payload `stage`); a task in any other
     /// status only records the stage (stages reached before completion). The parent rule
-    /// then runs up the tree. `None` when the guard did not match (or no such task).
+    /// then runs up the tree. With `m.unblock`, every task the move made `done` (the task, a
+    /// parent the rule closed) unblocks its waiting tasks. `None` when the guard did not match
+    /// (or no such task).
     async fn advance_stage(&self, m: &StageMove) -> StoreResult<Option<StageMoved>>;
     /// The human's **Mark done**: guarded `delivering → done` (`done_at = updated_at = now`,
     /// `version` bumped), a `delivered` event with note `marked done by the human`, then the
-    /// parent rule. `None` when the task is not `delivering`.
+    /// parent rule; with `unblock`, the task and any parent it closed unblock their waiting
+    /// tasks. `None` when the task is not `delivering`.
     async fn mark_delivered(
         &self,
         task: TaskId,
         actor: Actor,
         token: Option<TokenId>,
         now: OffsetDateTime,
+        unblock: Option<UnblockRule>,
     ) -> StoreResult<Option<Transitioned>>;
     /// Appends `s` to the delivery log. `Duplicate` (nothing written) when the project already
     /// logged a signal with the same `delivery_id`; signals without one never collide.
@@ -650,7 +657,8 @@ pub struct TransitionRequest {
     /// Whenever the resulting status is not `blocked`, the detail is cleared regardless.
     pub block: Option<BlockWrite>,
     /// When the transition makes the task `done`: unblocks, in the same transaction, every
-    /// `blocked` task waiting on it (see `UnblockRule`). `None` leaves them alone.
+    /// `blocked` task waiting on it (see `UnblockRule`), and likewise for every `delivering`
+    /// ancestor the parent rule finished. `None` leaves them alone.
     pub unblock: Option<UnblockRule>,
 }
 
@@ -964,6 +972,17 @@ pub struct StageMove {
     pub actor: Actor,
     pub token: Option<TokenId>,
     pub now: OffsetDateTime,
+    /// Unblocks the waiting tasks of every task the move made `done`; `None` leaves them.
+    pub unblock: Option<UnblockRule>,
+}
+
+/// What `set_project_delivery` changed.
+#[derive(Debug, Clone, Default)]
+pub struct StagesApplied {
+    /// The tasks moved to `done`, as updated, parents included.
+    pub moved: Vec<Task>,
+    /// The tasks those unblocked.
+    pub unblocked: Vec<Unblocked>,
 }
 
 /// A stage move that applied.
@@ -976,6 +995,8 @@ pub struct StageMoved {
     /// Whether that closed the parent's last open child (the store recorded
     /// `children_complete` on it).
     pub children_complete: bool,
+    /// Tasks unblocked because the move made a task `done` (see `StageMove::unblock`).
+    pub unblocked: Vec<Unblocked>,
 }
 
 /// What `insert_signal` did.

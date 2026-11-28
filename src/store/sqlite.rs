@@ -14,15 +14,15 @@ use super::{
     AddProjectsRequest, ClaimAttempt, ClaimRequest, CompleteRequest, Completed, DeliveringRow,
     EditRequest, InboxFilter, LeaseUpdate, LinkOutcome, LinkPrRequest, MessageReceipt, MoveRequest,
     Moved, NewEnrollment, NewTaskPr, NewToken, ParentMove, ParentState, ParentStep, PollOutcome,
-    ProjectsAdded, Recipient, RelateRequest, Related, SignalInsert, StageMove, StageMoved, Store,
-    StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, UnblockRule,
-    Unblocked, block_previous_payload, child_event, children_complete_event, claim_event,
-    closes_child, completion_event, edit_payload, enrollment_token_label, finished_by,
-    like_pattern, link_refusal, marked_done_event, move_delivers, options_from, options_to,
-    parent_move_event, pr_linked_event, pr_unlinked_event, projects_added_note,
-    projects_added_payload, push_moved, recompute_parent, related_payload, send_time_recipient,
-    stage_delivered_event, stage_reached_event, stages_delivered_event, stages_from_json,
-    stages_to_json, unblocked_records,
+    ProjectsAdded, Recipient, RelateRequest, Related, SignalInsert, StageMove, StageMoved,
+    StagesApplied, Store, StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest,
+    Transitioned, UnblockRule, Unblocked, block_previous_payload, child_event,
+    children_complete_event, claim_event, closes_child, completion_event, edit_payload,
+    enrollment_token_label, finished_by, like_pattern, link_refusal, marked_done_event,
+    move_delivers, options_from, options_to, parent_move_event, pr_linked_event, pr_unlinked_event,
+    projects_added_note, projects_added_payload, push_moved, recompute_parent, related_payload,
+    send_time_recipient, stage_delivered_event, stage_reached_event, stages_delivered_event,
+    stages_from_json, stages_to_json, unblocked_records,
 };
 use crate::delivery::stages::{ChildState, CompletionTarget, STAGE_RANK_SQL, completion_target};
 use crate::domain::{
@@ -801,14 +801,22 @@ async fn advance_locked(
     insert_moved_stage(conn, m, m.to).await?;
     let reached = stage_reached_event(m);
     let delivered = updated.status == TaskStatus::Done;
+    let mut moved = Vec::new();
     let children_complete = if delivered {
         insert_event(conn, &reached, m.token).await?;
-        record_event(conn, &updated, &stage_delivered_event(m), m.token).await?
+        record_event_into(
+            conn,
+            &updated,
+            &stage_delivered_event(m),
+            m.token,
+            &mut moved,
+        )
+        .await?
     } else {
-        record_event(conn, &updated, &reached, m.token).await?
+        record_event_into(conn, &updated, &reached, m.token, &mut moved).await?
     };
     if parent_rule {
-        let moved = follow_children(
+        let own = follow_children(
             conn,
             task.id,
             task.project_id,
@@ -816,15 +824,19 @@ async fn advance_locked(
             &reached,
         )
         .await?;
-        if let Some((p, ev)) = moved {
-            record_event(conn, &p, &ev, m.token).await?;
+        if let Some((p, ev)) = own {
+            record_event_into(conn, &p, &ev, m.token, &mut moved).await?;
             updated = p;
         }
     }
+    let mut finished = vec![updated.clone()];
+    finished.extend(moved.into_iter().filter(|t| t.id != updated.id));
+    let unblocked = unblock_done(conn, &finished, m.now, m.actor, m.token, m.unblock).await?;
     Ok(Some(StageMoved {
         delivered: updated.status == TaskStatus::Done,
         children_complete,
         task: updated,
+        unblocked,
     }))
 }
 
@@ -1219,7 +1231,9 @@ async fn wait_allowed(
 async fn unblock_waiting(
     conn: &mut SqliteConnection,
     done: &Task,
-    req: &TransitionRequest,
+    now: OffsetDateTime,
+    actor: Actor,
+    token: Option<TokenId>,
     rule: UnblockRule,
 ) -> StoreResult<Vec<Unblocked>> {
     let waiting: Vec<Task> = sqlx::query(concat!(
@@ -1235,7 +1249,7 @@ async fn unblock_waiting(
     .iter()
     .map(task_from)
     .collect::<StoreResult<_>>()?;
-    let now = ts::enc(req.now);
+    let at = ts::enc(now);
     let mut out = Vec::with_capacity(waiting.len());
     for dep in waiting {
         let live: bool = match dep.owner_session_id {
@@ -1259,8 +1273,8 @@ async fn unblock_waiting(
                  WHERE id = ? AND status = 'blocked' RETURNING ",
                 task_cols!()
             ))
-            .bind(ts::enc(req.now + dep.lease_ttl.unwrap_or(rule.default_ttl)))
-            .bind(&now)
+            .bind(ts::enc(now + dep.lease_ttl.unwrap_or(rule.default_ttl)))
+            .bind(&at)
             .bind(dep.id.to_string())
             .fetch_optional(&mut *conn)
             .await?
@@ -1273,17 +1287,37 @@ async fn unblock_waiting(
                  WHERE id = ? AND status = 'blocked' RETURNING ",
                 task_cols!()
             ))
-            .bind(&now)
+            .bind(&at)
             .bind(dep.id.to_string())
             .fetch_optional(&mut *conn)
             .await?
         };
         let Some(row) = row else { continue };
         let task = task_from(&row)?;
-        let (event, note) = unblocked_records(&task, done, !live, req.event.actor, req.now);
-        record_event(conn, &task, &event, req.token).await?;
-        insert_message(conn, &note, req.token).await?;
+        let (event, note) = unblocked_records(&task, done, !live, actor, now);
+        record_event(conn, &task, &event, token).await?;
+        insert_message(conn, &note, token).await?;
         out.push(Unblocked { task, note });
+    }
+    Ok(out)
+}
+
+/// Applies `rule` (when given) to the waiting tasks of each task in `tasks` that is `done`:
+/// the tasks one write made `done` (the task itself, the `delivering` parents it finished).
+async fn unblock_done(
+    conn: &mut SqliteConnection,
+    tasks: &[Task],
+    now: OffsetDateTime,
+    actor: Actor,
+    token: Option<TokenId>,
+    rule: Option<UnblockRule>,
+) -> StoreResult<Vec<Unblocked>> {
+    let Some(rule) = rule else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for done in tasks.iter().filter(|t| t.status == TaskStatus::Done) {
+        out.extend(unblock_waiting(&mut *conn, done, now, actor, token, rule).await?);
     }
     Ok(out)
 }
@@ -1526,7 +1560,8 @@ async fn transition_in(
     let Some(task) = updated else {
         return Ok(None);
     };
-    let children_complete = record_event(conn, &task, &event, req.token).await?;
+    let mut moved = Vec::new();
+    let children_complete = record_event_into(conn, &task, &event, req.token, &mut moved).await?;
     if req.archive_plans {
         sqlx::query(
             "UPDATE message_recipients
@@ -1544,12 +1579,22 @@ async fn transition_in(
     if let Some(message) = &req.message {
         insert_message(conn, message, req.token).await?;
     }
-    let unblocked = match req.unblock {
-        Some(rule) if req.to == Some(TaskStatus::Done) && task.status == TaskStatus::Done => {
-            unblock_waiting(conn, &task, req, rule).await?
-        }
-        _ => Vec::new(),
-    };
+    // The task itself only when this transition finished it; then any `delivering` ancestor
+    // the parent rule finished.
+    let mut finished = Vec::new();
+    if req.to == Some(TaskStatus::Done) && task.status == TaskStatus::Done {
+        finished.push(task.clone());
+    }
+    finished.extend(moved);
+    let unblocked = unblock_done(
+        conn,
+        &finished,
+        req.now,
+        req.event.actor,
+        req.token,
+        req.unblock,
+    )
+    .await?;
     Ok(Some(Transitioned {
         task,
         children_complete,
@@ -1898,7 +1943,8 @@ impl Store for SqliteStore {
         &self,
         d: &ProjectDelivery,
         token: Option<TokenId>,
-    ) -> StoreResult<Vec<Task>> {
+        unblock: Option<UnblockRule>,
+    ) -> StoreResult<StagesApplied> {
         let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
         sqlx::query(
             "INSERT INTO project_delivery
@@ -1963,8 +2009,10 @@ impl Store for SqliteStore {
                 record_event_into(&mut tx, &task, &event, token, &mut moved).await?;
             }
         }
+        let unblocked =
+            unblock_done(&mut tx, &moved, d.updated_at, Actor::Human, token, unblock).await?;
         tx.commit().await?;
-        Ok(moved)
+        Ok(StagesApplied { moved, unblocked })
     }
 
     async fn link_pr(&self, req: &LinkPrRequest) -> StoreResult<LinkOutcome> {
@@ -2121,6 +2169,7 @@ impl Store for SqliteStore {
         actor: Actor,
         token: Option<TokenId>,
         now: OffsetDateTime,
+        unblock: Option<UnblockRule>,
     ) -> StoreResult<Option<Transitioned>> {
         let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
         let done = sqlx::query(concat!(
@@ -2141,13 +2190,18 @@ impl Store for SqliteStore {
             tx.rollback().await?;
             return Ok(None);
         };
+        let event = marked_done_event(task, actor, now);
+        let mut moved = Vec::new();
         let children_complete =
-            record_event(&mut tx, &done, &marked_done_event(task, actor, now), token).await?;
+            record_event_into(&mut tx, &done, &event, token, &mut moved).await?;
+        let mut finished = vec![done.clone()];
+        finished.extend(moved);
+        let unblocked = unblock_done(&mut tx, &finished, now, actor, token, unblock).await?;
         tx.commit().await?;
         Ok(Some(Transitioned {
             task: done,
             children_complete,
-            unblocked: Vec::new(),
+            unblocked,
         }))
     }
 

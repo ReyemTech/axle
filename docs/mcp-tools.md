@@ -440,7 +440,9 @@ any of `reason`, `waiting_on` and `unblock` (the rest are kept) and the history 
 ancestor, on a done or cancelled task, or on a task that already waits (directly or through
 others) on it.
 
-**Automatic unblock.** When a task is done, every blocked task waiting on it leaves
+**Automatic unblock.** When a task is done (by `task_complete`, or later through delivery: its
+last stage, **Mark done**, stages turned off, or its last delivering child finishing), every
+blocked task waiting on it leaves
 `blocked` with a system note in its thread (`unblocked: "<title>" (<id>) is done`) and an
 `unblocked` event: back to `claimed` with a fresh lease when its owner's session is live,
 else back to `open` with no owner, as if released. A cancelled task unblocks nothing; its
