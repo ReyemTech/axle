@@ -26,6 +26,7 @@ const SECRET: &str = "test-secret-0123456789";
 const INFRA: &str = "github.com/acme/platform-infra";
 
 struct App {
+    pool: sqlx::SqlitePool,
     state: AppState,
     clock: Arc<TestClock>,
     router: Router,
@@ -41,7 +42,7 @@ async fn app_with(configure: impl FnOnce(&mut ServerConfig)) -> App {
         .connect_with(opts.foreign_keys(true))
         .await
         .unwrap();
-    let store = Arc::new(SqliteStore::from_pool(pool).await.unwrap());
+    let store = Arc::new(SqliteStore::from_pool(pool.clone()).await.unwrap());
     let clock = Arc::new(TestClock::new(datetime!(2026-11-27 9:00 UTC)));
     let mut config = ServerConfig::from_lookup(|k| match k {
         "DATABASE_URL" => Some("sqlite::memory:".into()),
@@ -52,6 +53,7 @@ async fn app_with(configure: impl FnOnce(&mut ServerConfig)) -> App {
     configure(&mut config);
     let state = AppState::new(store, clock.clone(), config);
     App {
+        pool,
         router: router(state.clone()),
         state,
         clock,
@@ -5035,6 +5037,54 @@ mod stage_board {
         let ids = select_texts(&page, ".short-id");
         assert!(ids.iter().any(|t| t.starts_with("axl-")), "{ids:?}");
         assert_eq!(select_texts(&page, ".state .stage-word"), ["In PR"]);
+    }
+
+    #[tokio::test]
+    async fn stage_column_head_reads_label_dot_count() {
+        let (app, cookie, web, _shop) = two_projects().await;
+        delivering(
+            &app,
+            &web,
+            "web work",
+            "https://github.com/acme/web/pull/12",
+        )
+        .await;
+        let page = app.get("/ui/board", Some(&cookie)).await;
+        let html = page.html();
+        let head = Selector::parse("section.column[data-stage=in_pr] > header").unwrap();
+        let text: Vec<String> = html
+            .select(&head)
+            .next()
+            .unwrap()
+            .text()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .collect();
+        assert_eq!(text.join(" "), "In PR · 1");
+    }
+
+    #[tokio::test]
+    async fn stranded_delivering_task_sits_in_review() {
+        let app = app().await;
+        let cookie = app.login().await;
+        let web = app.agent(WEB, "mac", "claude-code").await;
+        let task = app.task(&web, "stranded", None).await;
+        // Stages are off, so no path produces this; force the row.
+        sqlx::query("UPDATE tasks SET status = 'delivering' WHERE id = ?")
+            .bind(task.id.to_string())
+            .execute(&app.pool)
+            .await
+            .unwrap();
+        let page = app.get("/ui/board", Some(&cookie)).await;
+        let html = page.html();
+        let sel =
+            Selector::parse("section.column[data-status=review] .card .state .status").unwrap();
+        let words: Vec<String> = html
+            .select(&sel)
+            .map(|e| e.text().collect::<String>())
+            .collect();
+        assert_eq!(words, ["delivering"]);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 {% for col in columns %}
 <section class="column" data-status="{{ col.status }}"{% if let Some(st) = col.stage %} data-stage="{{ st }}"{% endif %} aria-label="{{ col.label }}"{% if col.more.is_some() %} data-capped{% endif %}{% if col.expanded %} data-expanded{% endif %}>
-  <header><span class="aspect" data-aspect="{{ col.status }}" aria-hidden="true"></span><h2>{{ col.label }}</h2><span class="count">{% if let Some(d) = col.done %}{{ d.unseen }} unseen{% else %}{{ col.total }}{% endif %}</span></header>
+  <header><span class="aspect" data-aspect="{{ col.status }}" aria-hidden="true"></span><h2>{{ col.label }}</h2>{% if col.stage.is_some() %}<span class="sep" aria-hidden="true">·</span>{% endif %}<span class="count">{% if let Some(d) = col.done %}{{ d.unseen }} unseen{% else %}{{ col.total }}{% endif %}</span></header>
   {% if let Some(d) = col.done %}
   <div class="done-tools">
     {% if let Some(token) = csrf %}{% if !col.cards.is_empty() %}

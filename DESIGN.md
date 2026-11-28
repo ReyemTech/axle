@@ -309,7 +309,7 @@ On the task page, above the lease: the latest plan as peer text in a card-filled
 - **Waiting work shouts:** when the blocked or review column has cards, its glyph grows to 14px and its count to 18px bold in danger or warn. Empty columns stay quiet with a sentence of explanation.
 
 ### Stage columns
-Projects with delivery stages add one column per enabled stage between Review and Done, in stage order (filtered to one project: its stages; all projects: the union, each task only in its own project's column). The head is the stage name and a count (`IN PR · 4`) with the delivering glyph. Empty stage columns say what they wait for: "Nothing waiting for merge", "Nothing waiting for release", "Nothing waiting for deploy". A project without stages shows today's five columns.
+Projects with delivery stages add one column per enabled stage between Review and Done, in stage order (filtered to one project: its stages; all projects: the union, each task only in its own project's column). The head is the delivering glyph, the stage name, a middle dot and the count, set together on the left (`IN PR · 4`, uppercased by the label style). Empty stage columns say what they wait for: "Nothing waiting for merge", "Nothing waiting for release", "Nothing waiting for deploy". A project without stages shows today's five columns.
 
 ### Lease meter
 A project-coloured 2px track with an 8px occupancy bar whose length is time left on the lease (red; amber when under a fifth remains; zero when expired), beside text "lease" plus mono time left. JS decrements it between server renders.

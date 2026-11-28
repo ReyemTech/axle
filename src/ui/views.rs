@@ -1042,6 +1042,32 @@ async fn columns(
     Ok(out)
 }
 
+/// The delivery decoration of a single live card, as the board gives it: PR chip, and for a
+/// delivering task its stage word and "waiting for".
+async fn decorate_one(state: &AppState, card: &mut CardView, task: &Task) -> StoreResult<()> {
+    if let Some(pr) = state.store.task_pr(task.id).await?
+        && let Some(number) = pr.number
+    {
+        card.pr = Some(PrChip {
+            number,
+            url: pr.url,
+        });
+    }
+    if task.status == TaskStatus::Delivering {
+        let enabled = state
+            .store
+            .get_project_delivery(task.project_id)
+            .await?
+            .map(|d| d.stages)
+            .unwrap_or_default();
+        if let Some((stage, waiting)) = stage_column(&enabled, task.delivery_stage) {
+            card.stage = Some(stage.label());
+            card.waiting_for = waiting.then(|| stage.label());
+        }
+    }
+    Ok(())
+}
+
 /// The empty sentence of a stage column: what it is waiting for next.
 fn stage_empty_text(stage: DeliveryStage) -> &'static str {
     match stage {
@@ -1595,7 +1621,8 @@ async fn task_frames(state: &AppState, event: &Event) -> UiResult<Frames> {
         frames.push(("board".into(), PING.into()));
     }
     let mut labels = Labels::load(&*state.store).await?;
-    let card = card(&mut labels, CardCtx::of(state), &root).await?;
+    let mut card = card(&mut labels, CardCtx::of(state), &root).await?;
+    decorate_one(state, &mut card, &root).await?;
     // SSE data must be one line per `data:` field; HTML does not care about the newlines.
     let html = CardFragment { card }.render()?.replace(['\r', '\n'], " ");
     frames.push((format!("task-{}", root.id), html));

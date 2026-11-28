@@ -554,7 +554,9 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
   background: var(--text);
 }
 .column h2 { font-size: 12.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
+.column .sep { margin: 0 4px; color: var(--muted); font-weight: 700; }
 .column .count { margin-left: auto; font-size: 13px; font-weight: 600; color: var(--muted); }
+.column[data-stage] .count { margin-left: 0; }
 /* Waiting work reads from across the desk; an empty column stays quiet. */
 .column:is([data-status="blocked"], [data-status="review"]):has(.card) > header .aspect { width: 14px; height: 14px; }
 .column:is([data-status="blocked"], [data-status="review"]):has(.card) .count { font-size: 18px; font-weight: 700; }
