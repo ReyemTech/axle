@@ -139,8 +139,10 @@ async fn run(c: Collect<'_>, cfg: &crate::client::UsageConfig, limits: Limits) -
         ..template.clone()
     };
     let home = c.home.to_path_buf();
+    // SessionEnd is the last run: nothing may wait for a later one.
+    let flush = c.session_end;
     let read = tokio::task::spawn_blocking(move || {
-        read_all(parser, &home, files, main, &template, limits)
+        read_all(parser, &home, files, main, &template, limits, flush)
     })
     .await
     .ok()?;
@@ -298,6 +300,8 @@ struct Budget {
     deadline: Instant,
     records_left: usize,
     max_bytes: u64,
+    /// The last run of the session (SessionEnd): send a trailing fallback record now.
+    flush: bool,
 }
 
 /// Reads every file; only the main transcript (first) failing is an error, a subagent file
@@ -309,11 +313,13 @@ fn read_all(
     main: Option<Cursor>,
     template: &Cursor,
     limits: Limits,
+    flush: bool,
 ) -> io::Result<Vec<FileRead>> {
     let mut budget = Budget {
         deadline: Instant::now() + limits.parse_budget,
         records_left: limits.max_records,
         max_bytes: limits.max_file_bytes,
+        flush,
     };
     let mut main = Some(main);
     let mut out = Vec::with_capacity(files.len());
@@ -452,12 +458,17 @@ fn read_file(
         }
     }
 
-    // A cap cut a batch that has fallback records and no real one yet: the real record for
-    // the last fallback may be the next line, so that line is read again next run rather
-    // than sent twice under two keys. Not when it is the batch's first line (no progress).
-    if capped
-        && !state.saw_records
-        && let Some((at, before, i)) = last_fallback.filter(|(at, ..)| *at > start)
+    // A batch with fallback records and no real one yet: the real record for the last
+    // fallback may be the next line, not written yet or past a cap, so that line is read
+    // again next run rather than sent twice under two keys. A cap holds it only when it is
+    // not the batch's first line (else no progress); the end of the file holds it on every
+    // run but SessionEnd (it simply waits for the next one). Only the last can be waiting:
+    // an earlier fallback's real record would have come before the next `token_count`.
+    let hold = |at: usize| {
+        if capped { at > start } else { !budget.flush }
+    };
+    if !state.saw_records
+        && let Some((at, before, i)) = last_fallback.filter(|(at, ..)| hold(*at))
     {
         out.records.truncate(i);
         state = before;

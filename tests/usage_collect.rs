@@ -721,6 +721,93 @@ async fn codex_mixed_rollout_split_by_a_cap_counts_once() {
     assert_eq!(sent, ["resp_mixed0001", "resp_mixed0002"]);
 }
 
+fn codex_rollout(h: &TempHome) -> PathBuf {
+    h.path()
+        .join(".codex")
+        .join("sessions")
+        .join("rollout.jsonl")
+}
+
+fn sent_keys(bodies: &Bodies) -> Vec<String> {
+    bodies.lock().unwrap().iter().flat_map(keys).collect()
+}
+
+#[tokio::test]
+async fn codex_fallback_at_the_end_of_a_stop_run_waits_for_its_record() {
+    let h = TempHome::new();
+    let fixture =
+        std::fs::read_to_string(Path::new(FIXTURES).join("codex/0.172.0/mixed.jsonl")).unwrap();
+    // The first `token_count` (line 4) ends the file; its `token_usage_record` comes later.
+    let first_four: usize = fixture.split_inclusive('\n').take(4).map(str::len).sum();
+    let rollout = codex_rollout(&h);
+    h.write(&rollout, &fixture[..first_four]);
+    let (url, bodies) = fake_usage(200).await;
+    let e = env(&[]);
+    let stdin = stdin_for(&rollout);
+
+    let c = collect_args(Harness::Codex, h.path(), &stdin, session(&url), e.as_ref());
+    assert_eq!(collect(c).await, None);
+    assert_eq!(count(&bodies), 0, "the trailing fallback is held, not sent");
+    let line_four = fixture.split_inclusive('\n').nth(3).unwrap().len();
+    assert_eq!(h.offset(&rollout), (first_four - line_four) as u64);
+
+    h.append(&rollout, &fixture[first_four..]);
+    let c = collect_args(Harness::Codex, h.path(), &stdin, session(&url), e.as_ref());
+    assert_eq!(collect(c).await, None);
+    assert_eq!(h.offset(&rollout), fixture.len() as u64);
+    let sent = sent_keys(&bodies);
+    assert_eq!(sent, ["resp_mixed0001", "resp_mixed0002"]);
+    assert!(
+        sent.iter().all(|k| !k.contains(':')),
+        "no fallback key: {sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn codex_legacy_rollout_sends_the_held_fallback_on_session_end() {
+    let h = TempHome::new();
+    let fixture =
+        std::fs::read_to_string(Path::new(FIXTURES).join("codex/legacy-token-count/rollout.jsonl"))
+            .unwrap();
+    let rollout = codex_rollout(&h);
+    h.write(&rollout, &fixture);
+    let (url, bodies) = fake_usage(200).await;
+    let e = env(&[]);
+    let stdin = stdin_for(&rollout);
+    let meta = "0199a8f2-6c1e-7d30-9a41-0000legacy01";
+
+    // Stop: the earlier `token_count` is sent, the trailing one waits.
+    let c = collect_args(Harness::Codex, h.path(), &stdin, session(&url), e.as_ref());
+    assert_eq!(collect(c).await, None);
+    assert_eq!(sent_keys(&bodies), [format!("{meta}:1")]);
+    assert!(h.offset(&rollout) < fixture.len() as u64);
+
+    // Another Stop with nothing new: it still waits, nothing is sent.
+    let c = collect_args(Harness::Codex, h.path(), &stdin, session(&url), e.as_ref());
+    assert_eq!(collect(c).await, None);
+    assert_eq!(count(&bodies), 1);
+
+    // SessionEnd flushes it.
+    let mut c = collect_args(Harness::Codex, h.path(), &stdin, session(&url), e.as_ref());
+    c.session_end = true;
+    assert_eq!(collect(c).await, None);
+    assert_eq!(h.offset(&rollout), fixture.len() as u64);
+    assert_eq!(
+        sent_keys(&bodies),
+        [format!("{meta}:1"), format!("{meta}:2")]
+    );
+    let records: Vec<Value> = bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|b| b["records"].as_array().unwrap().clone())
+        .collect();
+    let total = |f: &str| records.iter().map(|r| r[f].as_u64().unwrap()).sum::<u64>();
+    assert_eq!(total("input"), 8928 + 2236);
+    assert_eq!(total("output"), 640 + 210);
+    assert_eq!(total("cache_read"), 3072 + 11264);
+}
+
 #[tokio::test]
 async fn end_to_end_against_the_server() {
     let h = TempHome::new();
