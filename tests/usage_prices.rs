@@ -252,3 +252,57 @@ fn load_reads_the_override_file() {
     assert!(missing.contains("nope.toml"), "{missing}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn serve_refuses_a_bad_prices_file() {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let dir = std::env::temp_dir().join(format!("axl-prices-serve-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad = dir.join("bad.toml");
+    std::fs::write(
+        &bad,
+        "version = \"v\"\n\n[[model]]\nid = \"a\"\ninput = \"x\"\noutput = 1\n",
+    )
+    .unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_axl"));
+    cmd.arg("serve")
+        .env_clear()
+        .env("HOME", &dir)
+        .env(
+            "DATABASE_URL",
+            format!("sqlite://{}", dir.join("a.db").display()),
+        )
+        .env("AXL_BIND", "127.0.0.1:0")
+        .env("AXL_ADMIN_SECRET", "test-secret-0123456789")
+        .env("AXL_PRICES_FILE", &bad)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let start = Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            child.kill().ok();
+            panic!("serve did not exit on a bad prices file");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(!status.success(), "{stderr}");
+    assert!(
+        stderr.contains("bad.toml") && stderr.contains("line 5"),
+        "{stderr}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

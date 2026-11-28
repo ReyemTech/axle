@@ -320,9 +320,20 @@ async fn serve(bind: Option<SocketAddr>, trusted_header: Option<String>) -> CliR
             config.allowed_hosts.join(", ")
         );
     }
+    let prices = axle::usage::prices::PriceTable::load(config.prices_file.as_deref())?;
+    eprintln!(
+        "axl: prices: {}, {} models{}",
+        prices.version(),
+        prices.len(),
+        config
+            .prices_file
+            .as_ref()
+            .map(|f| format!(" (+ {})", f.display()))
+            .unwrap_or_default()
+    );
     let store = open_store(&config.backend).await?;
     let addr = config.bind;
-    let state = AppState::new(store, Arc::new(SystemClock), config);
+    let state = AppState::new(store, Arc::new(SystemClock), config).with_prices(prices);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("axl: listening on http://{}", listener.local_addr()?);
     axle::http::serve(listener, state, stop_signal()).await?;
