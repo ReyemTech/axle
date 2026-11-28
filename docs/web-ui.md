@@ -10,8 +10,8 @@ none.
 
 ## The top bar
 
-Every page shares a bar with the sections (**Overview**, **Board**, **History**, **Inbox**, **Projects**,
-**Tokens**), a **Filter this page** box, and live counts: sessions **live**, tasks
+Every page shares a bar with the sections (**Overview**, **Board**, **History**, **Usage**, **Inbox**,
+**Projects**, **Tokens**), a **Filter this page** box, and live counts: sessions **live**, tasks
 **blocked**, and items that **need you**. The last links to the Needs you strip.
 
 ## Board
@@ -99,6 +99,38 @@ Filter by project, or search titles (case-insensitive for ASCII letters, and Pos
 press **Show**. **Show only auto-acked, unseen** lists the tasks behind the board's
 "N auto-acked, unseen" line, respecting the project filter. There, **Ack these** acks exactly
 the rows on the page (up to 50) and returns to the same list.
+
+## Usage
+
+**Usage** shows the tokens your agents' harnesses reported and what they would cost at API
+prices. "Estimated at API prices; subscription use is not billed per token." Days are UTC.
+All state is in the query string, so a view can be bookmarked.
+
+- **Range**: **Today** (since UTC midnight, listed per hour), **7 days** (the default),
+  **30 days**, **All time**, or **From/To dates** (whole UTC days, both inclusive; a From
+  after To is swapped). Filling in From or To without choosing a range uses the dates.
+- **Filters**: project, agent, harness, host and billing (subscription, api, unknown) are
+  selects; **Model** takes a model id and **Task id** a task id (its subtasks are included)
+  or `none` for usage while holding no task. A value that names nothing gives an empty
+  table ("No usage matches."); only a malformed date is an error ("Dates are YYYY-MM-DD.").
+- **Group by**: project (the default), task, agent, harness, host, model or day.
+
+The page shows, top to bottom:
+
+1. **Totals**: input, output, cache write and cache read tokens, the **API-equivalent
+   cost**, and how much of it was on a subscription or unknown billing ("Of which
+   subscription (est.)"). Numbers are compact (`1.24M`); hover for the exact value.
+2. **The breakdown table**: one row per group with requests, the four token kinds, the
+   API-equivalent cost and its share of the total cost (of the total tokens when nothing
+   has a price), as a bar beside the percentage. Projects carry their line colour, tasks
+   link to their page; usage while holding no task is "no task". A cost followed by `est.`
+   was partly or wholly on a subscription or unknown billing; "no price" means the model is
+   not in the price table, and "+ N no price" counts the records of a row that had none.
+   Rows are sorted by cost, rows with no priced record last.
+3. **Over time**: one line per day of the range (per hour for Today), empty days
+   included, with tokens, cost and a bar against the busiest day.
+
+The page does not refresh live; reload or press **Show** for new numbers.
 
 ## Needs you
 

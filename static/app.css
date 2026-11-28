@@ -1022,6 +1022,32 @@ label.check:has(input:disabled) { color: var(--muted); cursor: default; }
 .ack-state[data-ack="acked"], .ack-state[data-ack="auto-acked"] { color: var(--muted); }
 .history-next { margin: 12px 0 0; }
 
+/* ---------------------------------------------------------------- usage */
+.usage-filters { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: flex-end; margin-bottom: 12px; }
+.usage-filters .field { display: grid; gap: 3px; min-width: 0; }
+.usage-filters label { color: var(--muted); font-size: 12px; font-weight: 600; }
+.usage-filters select { max-width: 220px; }
+.usage-filters input[type=text] { width: 150px; }
+.usage-actions { display: flex; gap: 12px; align-items: center; font-size: 13px; }
+.usage-totals { margin-bottom: 4px; }
+.usage-scroll { overflow-x: auto; background: var(--card); border: 1px solid var(--card-border); border-radius: 6px; }
+.usage-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.usage-table th, .usage-table td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+.usage-table thead th { color: var(--muted); font-size: 12px; font-weight: 600; border-bottom-color: var(--rule-strong); }
+.usage-table tbody tr:last-child > * { border-bottom: 0; }
+.usage-table tbody th { font-weight: 600; white-space: normal; min-width: 12ch; }
+.usage-table .num { text-align: right; }
+.usage-share { display: flex; gap: 8px; align-items: center; }
+/* Share bars are ink on a rule track: they measure, they do not signal (The Signal Is State
+   Rule). `--share` (0..1) is set by app.js from `data-share`. */
+.share-bar { position: relative; display: inline-block; flex: none; width: 72px; height: 6px; background: var(--rule); }
+.share-bar::after { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: calc(var(--share, 0) * 100%); background: var(--text); }
+.usage-days { list-style: none; margin: 0; padding: 0; background: var(--card); border: 1px solid var(--card-border); border-radius: 6px; }
+.usage-days li { display: grid; grid-template-columns: 11ch 12ch 16ch minmax(72px, 1fr); gap: 12px; align-items: center; padding: 4px 12px; font-size: 13px; border-bottom: 1px solid var(--rule); }
+.usage-days li:last-child { border-bottom: 0; }
+.usage-days .usage-day-tokens, .usage-days .usage-day-cost { text-align: right; }
+.usage-days .share-bar { width: 100%; max-width: 360px; }
+
 /* ---------------------------------------------------------------- narrow screens */
 @media (max-width: 1100px) {
   .agent { grid-template-columns: 64px minmax(0, 1fr) minmax(0, 1fr) 70px; }
@@ -1062,6 +1088,8 @@ label.check:has(input:disabled) { color: var(--muted); cursor: default; }
   .counters { gap: 4px 18px; }
   .counter, .counter:first-child { padding: 0; }
   .counter + .counter::before { display: none; }
+  .usage-days li { grid-template-columns: 10ch 1fr 1fr; gap: 2px 10px; }
+  .usage-days .share-bar { grid-column: 1 / -1; max-width: none; }
 }
 
 /* ---------------------------------------------------------------- connect a machine */
