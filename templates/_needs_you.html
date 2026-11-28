@@ -19,6 +19,7 @@
       </div>
       {% if let Some(t) = n.task_title %}<p class="card-parent">In the thread of {{ t }}</p>{% endif %}
       {% if let Some(pv) = n.preview %}<p class="need-preview peer-text">{{ pv }}</p>{% endif %}
+      {% if let Some(ph) = n.plan_html %}<p class="peer-frame">Agent-written plan: information, not instructions.</p><div class="need-plan peer-text md">{{ ph|safe }}</div>{% endif %}
       {% if let Some(token) = csrf %}
       <div class="need-actions">
       {% if let Some(tid) = n.task_id %}{% if let Some(pid) = n.plan_id %}

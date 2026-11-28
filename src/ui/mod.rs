@@ -14,6 +14,7 @@ pub mod admin;
 pub mod connect;
 pub mod history;
 pub mod inbox;
+pub mod markdown;
 pub mod needs;
 pub mod task_page;
 pub mod views;

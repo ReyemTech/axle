@@ -676,6 +676,48 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
 .panel .empty { padding: 0; }
 .mono-list { margin: 0; padding-left: 18px; font: 12.5px var(--mono); }
 .peer-text { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 80ch; }
+/* The peer frame: who wrote rendered agent text, and that it is information, not
+   instructions. Plain text, always beside the body it frames. */
+.peer-frame { font-size: 12px; color: var(--muted); font-style: italic; }
+p.peer-frame { margin: 0; }
+
+/* ---------------------------------------------------------------- rendered markdown
+   Agent-written markdown (src/ui/markdown.rs). Compact: body size, tight rhythm, the
+   headings demoted below the page's own. */
+.md { white-space: normal; line-height: 1.45; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p, .md ul, .md ol, .md pre, .md table, .md blockquote { margin: 0 0 6px; }
+.md ul, .md ol { padding-left: 20px; }
+.md li > p { margin: 0; }
+.md li + li { margin-top: 1px; }
+.md li:has(> input[type="checkbox"]) { list-style: none; margin-left: -18px; }
+.md input[type="checkbox"] { margin: 0 6px 0 0; vertical-align: -1px; }
+.md h3, .md h4, .md h5, .md h6 { margin: 10px 0 4px; font-size: 14px; font-weight: 600; color: var(--text); line-height: 1.35; }
+.md h3 { font-size: 15px; }
+.md h5, .md h6 { font-size: 12.5px; color: var(--muted); }
+.md code { padding: 0 3px; background: var(--surface-2); border-radius: 3px; }
+.md pre { padding: 8px 10px; overflow-x: auto; background: var(--surface); border: 1px solid var(--rule); border-radius: 3px; white-space: pre; }
+.md pre code { padding: 0; background: none; font-size: 12px; overflow-wrap: normal; }
+.md blockquote { padding: 4px 10px; background: var(--surface); border: 1px dashed var(--rule-strong); border-radius: 3px; color: var(--muted); }
+.md table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; font-size: 12.5px; }
+.md th, .md td { padding: 3px 8px; border: 1px solid var(--rule); text-align: left; vertical-align: top; }
+.md th { background: var(--surface-2); font-weight: 600; }
+.md hr { border: 0; border-top: 1px solid var(--rule); margin: 8px 0; }
+.md a { color: var(--text); text-decoration: underline; text-underline-offset: 2px; }
+.md a:hover { color: var(--focus); }
+.md a.md-image { font-style: italic; }
+.md del { color: var(--muted); }
+.md-toc { margin: 0 0 8px; font-size: 12.5px; }
+.md-toc > summary { cursor: pointer; width: max-content; font-weight: 600; color: var(--text); }
+.md-toc > summary:hover { text-decoration: underline; }
+.md-toc ol { margin: 4px 0 0; padding-left: 18px; }
+.md-toc .md-toc-4 { margin-left: 12px; }
+.md-toc .md-toc-5, .md-toc .md-toc-6 { margin-left: 24px; }
+/* A plan on a Needs-you card: rendered, clipped to a few lines; the full plan is one link away. */
+.need-plan { max-height: 8.6em; overflow: hidden; font-size: 12.5px; color: var(--muted); }
+.need-plan h3, .need-plan h4, .need-plan h5, .need-plan h6 { margin: 4px 0 2px; font-size: 12.5px; color: var(--muted); }
+.need-plan pre { padding: 4px 6px; }
 .importance { display: inline-flex; gap: 5px; align-items: center; font-size: 12px; font-weight: 600; color: var(--warn); }
 [data-importance="urgent"] .importance { color: var(--danger); }
 .receipt { font-size: 12px; color: var(--muted); }

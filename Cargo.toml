@@ -58,6 +58,7 @@ serde_urlencoded = "0.7.1"
 toml_edit = "0.25.21"
 similar = "3.2.1"
 jsonc-parser = { version = "0.34.0", features = ["cst", "serde_json"] }
+pulldown-cmark = { version = "0.13.6", default-features = false, features = ["html"] }
 
 [features]
 pg-tests = []

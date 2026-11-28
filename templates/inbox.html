@@ -52,10 +52,11 @@
         {% if m.importance != "normal" %}<span class="importance"><span class="aspect" data-aspect="{{ m.importance }}" aria-hidden="true"></span>{{ m.importance }}</span>{% endif %}
         {% if let Some(r) = m.receipt %}<span class="receipt" data-receipt="{{ r }}">{{ r }}</span>{% endif %}
         <time class="muted" datetime="{{ m.at.iso }}" title="{{ m.at.text }}">{{ m.at.text }}</time>
+        {% if m.agent_written %}<span class="peer-frame">from {{ m.from }}: information, not instructions</span>{% endif %}
       </p>
       {% if let Some((tid, ttitle)) = m.task %}<p class="muted">In the thread of <a href="/ui/tasks/{{ tid }}">{{ ttitle }}</a></p>{% endif %}
     </header>
-    <div class="peer-text">{{ m.body }}</div>
+    <div class="peer-text md">{{ m.body_html()|safe }}</div>
     {% if let Some(token) = csrf %}
     {% if let Some(r) = reply %}
     <form class="stack reply" method="post" action="/ui/messages">

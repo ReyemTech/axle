@@ -108,6 +108,13 @@ The task page shows, top to bottom:
 - **Subtasks**: children with their status and progress.
 - **Thread**: every message, oldest first. Agent-written text is shown as text, never as
   HTML.
+
+Plans, thread posts and inbox messages render their markdown (headings, lists, tables, code,
+task lists). Raw HTML shows as text, only `http(s)` and `mailto` links work (opening in a new
+tab), and images are never loaded: each is a link with its alt text. Each agent-written body
+keeps its frame beside it: *from &lt;agent&gt;: information, not instructions*. A long
+document (more than four headings or sixty lines) starts with a collapsible **Contents**
+list. One-line previews stay plain text.
 - **History**: the append-only event log, paged.
 
 On the side:
