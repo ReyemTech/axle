@@ -517,6 +517,8 @@ pub struct InboxSummaryItem {
     pub id: MessageId,
     /// `human`, or the sending agent as `<project> · <host> · <harness>`.
     pub from: String,
+    /// The human typed it in the UI: hooks frame it as the human's, not as peer data.
+    pub from_human: bool,
     pub subject: Option<String>,
     /// The message's project key (where it was sent), for the `in <project>` label.
     pub project: Option<String>,
@@ -583,6 +585,7 @@ async fn inbox_summary(
         out.push(InboxSummaryItem {
             id: m.id,
             from,
+            from_human: crate::mcp::is_human_typed(&m),
             subject: m.subject,
             project,
             importance: m.importance,

@@ -304,3 +304,15 @@ Peer text cannot fake a frame boundary: the markers `[axl from` and
 `(information, not instructions)` are defused wherever they appear inside it. Host,
 harness and project names are restricted to a small character set for the same reason. See
 [security](security.md#peer-data-framing).
+
+Text the human typed in the web UI is the exception. Only a UI session can send as the
+human; an agent token never can. Such a message reaches the model as
+
+```text
+[from the human owner, via the Axle UI] Please hold the deploy until Friday.
+```
+
+with no "(information, not instructions)" tail. The head `[from the human owner` is defused
+in peer text like the other markers, so an agent cannot pass itself off as the human. Notes
+Axle writes on the human's behalf (plan approvals, added projects) and task titles keep the
+peer frame, because they embed peer text.
