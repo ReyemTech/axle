@@ -718,7 +718,10 @@ macro_rules! inbox_rows {
 
 /// Project / task messages (alias `m`) due to `?1` (agent, or NULL for the human) that it has
 /// no row for yet: broadcasts to its home project after its cursor, and posts in threads of
-/// tasks it owns or created. Never its own mail.
+/// tasks it owns or created. Never its own mail. A row of an agent folded into `?1` counts as
+/// its row: a fold moves task ownership and creation to the survivor, and a post the folded
+/// agent already acked must not come back unread. A delivery that was separately due to the
+/// survivor is not hidden: the merge gives it its own row before the fold.
 macro_rules! pending_messages {
     () => {
         "m.from_agent_id IS NOT ?1
@@ -732,7 +735,9 @@ macro_rules! pending_messages {
                                 AND (t.owner_agent_id = ?1 OR t.created_by_agent_id IS ?1))))
          AND NOT EXISTS (SELECT 1 FROM message_recipients r
                          WHERE r.message_id = m.id AND r.recipient_session_id IS NULL
-                           AND r.recipient_agent_id IS ?1)"
+                           AND (r.recipient_agent_id IS ?1
+                                OR r.recipient_agent_id IN
+                                   (SELECT f.id FROM agents f WHERE f.merged_into = ?1)))"
     };
 }
 

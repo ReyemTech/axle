@@ -820,3 +820,54 @@ store_matrix!(
         assert!(mail.contains(&"thread post".to_string()), "{mail:?}");
     }
 );
+
+store_matrix!(
+    a_folded_creators_ack_stays_acked_for_the_survivor,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store).await;
+        let a = env.harness(LOCAL, Some(FOLDER), "claude-code").await;
+        let local = a.project.clone().unwrap().id;
+        let remote = env.session(GIT, Some(OTHER_FOLDER), "laptop").await;
+        let target = remote.project.clone().unwrap().id;
+        let twin = env.harness(GIT, None, "claude-code").await;
+        env.harness(GIT, Some(FOLDER), "claude-code").await;
+
+        // A task created by the local agent that its twin never takes part in.
+        let task = env
+            .tasks
+            .create(
+                Caller::Agent(&a),
+                NewTask {
+                    project_id: target,
+                    title: "mine".into(),
+                    body: "body".into(),
+                    ..NewTask::default()
+                },
+            )
+            .await
+            .unwrap();
+        let post = env
+            .send_to(&remote, Address::Task(task.id), "thread post")
+            .await;
+        assert!(env.inbox_bodies(&a).await.contains(&"thread post".into()));
+        env.msgs.ack(Caller::Agent(&a), &[post.id]).await.unwrap();
+
+        env.adopt_merged(local).await;
+        // The survivor is now the creator, but the post was already handled: it is neither
+        // counted as unread nor delivered again.
+        let unread = env
+            .store
+            .unread_count(
+                axle::store::Recipient::Agent {
+                    agent: twin.agent.id,
+                    session: twin.session.id,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let mail = env.inbox_bodies(&twin).await;
+        assert!(!mail.contains(&"thread post".to_string()), "{mail:?}");
+        assert_eq!(unread, mail.len() as u64, "{mail:?}");
+    }
+);
