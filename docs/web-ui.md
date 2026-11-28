@@ -168,8 +168,8 @@ list. One-line previews stay plain text.
 On the side:
 
 - **Post to the thread**, as you, with an importance.
-- **Take over**: **Force release** (back to `open`) and **Cancel task**. Both ask for
-  confirmation.
+- **Take over**: **Force release** (back to `open`, also offered while delivering) and
+  **Cancel task**. Both ask for confirmation.
 - **Projects**: the lead and participating projects, and **Add project** for a top-level
   task. Projects are never removed.
 - **Link a task**: pick what this task is (*related to*, *a follow-up of*, *a duplicate of*)

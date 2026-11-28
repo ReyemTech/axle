@@ -5349,6 +5349,32 @@ mod delivery_panel {
     }
 
     #[tokio::test]
+    async fn force_release_offered_while_delivering() {
+        let (app, cookie, csrf, web) = setup(&[InPr, Merged]).await;
+        let task = delivering(&app, &web).await;
+        let path = format!("/ui/tasks/{}", task.id);
+        let page = app.get(&path, Some(&cookie)).await;
+        assert_eq!(
+            select_texts(
+                &page,
+                &format!("form[action='{path}/force-release'] button")
+            ),
+            ["Force release"]
+        );
+
+        let r = app
+            .post_form(
+                &format!("{path}/force-release"),
+                Some(&cookie),
+                &form(&csrf, &[]),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+        let t = app.state.store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Open);
+    }
+
+    #[tokio::test]
     async fn unlink_hidden_after_merge() {
         let (app, cookie, _csrf, web) = setup(&[InPr, Merged]).await;
         let unlink = "Unlink PR".to_string();

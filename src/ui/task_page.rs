@@ -566,7 +566,11 @@ pub(super) async fn render_task_page(
         eligibility,
         can_release: matches!(
             task.status,
-            TaskStatus::Planning | TaskStatus::Claimed | TaskStatus::Blocked | TaskStatus::Review
+            TaskStatus::Planning
+                | TaskStatus::Claimed
+                | TaskStatus::Blocked
+                | TaskStatus::Review
+                | TaskStatus::Delivering
         ),
         can_cancel: !matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled),
     };
