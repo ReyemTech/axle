@@ -521,6 +521,7 @@ pub async fn usage_page(
         &*state.store,
         &BoardQuery {
             project: q.project.clone(),
+            expand: None,
         },
     )
     .await
