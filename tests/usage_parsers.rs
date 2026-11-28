@@ -250,3 +250,158 @@ fn ids_and_harness_names() {
     );
     assert!(parsers::by_id("claude-code/9").is_none());
 }
+
+fn wire(records: &[ParsedRecord]) -> Vec<WireRecord> {
+    records
+        .iter()
+        .map(|r| r.to_wire(Billing::Unknown))
+        .collect()
+}
+
+fn parse_codex(rel: &str) -> Vec<ParsedRecord> {
+    let p = parsers::by_id("codex/1").unwrap();
+    parse_all(p, &read(rel), &mut ParserState::default())
+}
+
+#[test]
+fn codex_rollout_fixture() {
+    let got = parse_codex("codex/0.172.0/rollout.jsonl");
+    assert_eq!(wire(&got), expected("codex/0.172.0/rollout.expected.json"));
+    assert!(got.iter().all(|r| !r.fallback));
+    // The model changes mid-session; each record carries the latest turn_context model.
+    assert_eq!(got[0].model, "gpt-5.3-codex");
+    assert_eq!(got[1].model, "gpt-5.2");
+}
+
+#[test]
+fn codex_legacy_token_count_fixture() {
+    let got = parse_codex("codex/legacy-token-count/rollout.jsonl");
+    assert_eq!(
+        wire(&got),
+        expected("codex/legacy-token-count/rollout.expected.json")
+    );
+    let keys: Vec<_> = got.iter().map(|r| r.key.as_str()).collect();
+    assert_eq!(
+        keys,
+        [
+            "0199a8f2-6c1e-7d30-9a41-0000legacy01:1",
+            "0199a8f2-6c1e-7d30-9a41-0000legacy01:2"
+        ]
+    );
+    assert!(got.iter().all(|r| r.fallback));
+}
+
+#[test]
+fn codex_mixed_rollout_counts_once() {
+    let got = parse_codex("codex/0.172.0/mixed.jsonl");
+    assert_eq!(wire(&got), expected("codex/0.172.0/mixed.expected.json"));
+    assert!(got.iter().all(|r| !r.fallback));
+}
+
+#[test]
+fn codex_drop_fallback_only_when_the_file_has_records() {
+    let p = parsers::by_id("codex/1").unwrap();
+    let bytes = read("codex/0.172.0/mixed.jsonl");
+    let mut state = ParserState::default();
+    let mut all: Vec<ParsedRecord> = bytes
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| match p.line(l, &mut state) {
+            Line::Record(r) => Some(r),
+            Line::UsageShaped | Line::Other => None,
+        })
+        .collect();
+    assert!(all.iter().any(|r| r.fallback));
+    parsers::drop_fallback(&mut all, &state);
+    assert!(!all.is_empty());
+    assert!(all.iter().all(|r| !r.fallback));
+
+    let mut fallback_only = parse_codex("codex/legacy-token-count/rollout.jsonl");
+    let before = fallback_only.len();
+    parsers::drop_fallback(&mut fallback_only, &ParserState::default());
+    assert_eq!(fallback_only.len(), before);
+}
+
+/// Two reads of one file, the state carried between them, as two hook runs would.
+fn split_parse(rel: &str) -> Vec<ParsedRecord> {
+    let p = parsers::by_id("codex/1").unwrap();
+    let bytes = read(rel);
+    let lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
+    let mid = lines.len() / 2;
+    let mut state = ParserState::default();
+    let mut got = parse_all(p, &lines[..mid].join(&b'\n'), &mut state);
+    got.extend(parse_all(p, &lines[mid..].join(&b'\n'), &mut state));
+    got
+}
+
+#[test]
+fn codex_state_survives_a_split_read() {
+    for rel in [
+        "codex/0.172.0/rollout.jsonl",
+        "codex/legacy-token-count/rollout.jsonl",
+    ] {
+        assert_eq!(split_parse(rel), parse_codex(rel), "{rel}");
+    }
+}
+
+#[test]
+fn codex_input_excludes_cached() {
+    let p = parsers::by_id("codex/1").unwrap();
+    let mut s = ParserState {
+        model: Some("gpt-5.3-codex".into()),
+        ..ParserState::default()
+    };
+    let line = |input: i64, cached: i64| {
+        format!(
+            r#"{{"timestamp":"2026-11-28T10:00:00Z","type":"token_usage_record","payload":{{"response_id":"resp_1","usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"cache_write_input_tokens":5,"output_tokens":7,"reasoning_output_tokens":3}}}}}}"#
+        )
+    };
+    let Line::Record(r) = p.line(line(100, 80).as_bytes(), &mut s) else {
+        panic!("no record");
+    };
+    assert_eq!((r.counts.input, r.counts.cache_read), (20, 80));
+    assert_eq!((r.counts.cache_write_5m, r.counts.cache_write_1h), (5, 0));
+    assert_eq!((r.counts.output, r.counts.reasoning), (7, 3));
+    let Line::Record(r) = p.line(line(50, 80).as_bytes(), &mut s) else {
+        panic!("no record");
+    };
+    assert_eq!((r.counts.input, r.counts.cache_read), (0, 80));
+    assert!(s.saw_records);
+}
+
+#[test]
+fn codex_unrecognised_lines() {
+    let p = parsers::by_id("codex/1").unwrap();
+    let mut s = ParserState::default();
+    let record = br#"{"timestamp":"2026-11-28T10:00:00Z","type":"token_usage_record","payload":{"response_id":"resp_1","usage":{"input_tokens":1}}}"#;
+    // No turn_context yet: no model.
+    assert_eq!(p.line(record, &mut s), Line::UsageShaped);
+    s.model = Some("gpt-5.3-codex".into());
+    let count = br#"{"timestamp":"2026-11-28T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1}}}}"#;
+    // No session_meta yet: no key.
+    assert_eq!(p.line(count, &mut s), Line::UsageShaped);
+    let null_info = br#"{"timestamp":"2026-11-28T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":null}}"#;
+    assert_eq!(p.line(null_info, &mut s), Line::Other);
+    let bad = br#"{"timestamp":"2026-11-28T10:00:00Z","type":"token_usage_record","payload":{"response_id":"r","usage":{"input_tokens":"x"}}}"#;
+    assert_eq!(p.line(bad, &mut s), Line::UsageShaped);
+    let bad_ts = r#"{"timestamp":"…","type":"token_usage_record","payload":{"response_id":"r","usage":{"input_tokens":1}}}"#;
+    assert_eq!(p.line(bad_ts.as_bytes(), &mut s), Line::UsageShaped);
+    let other_event = br#"{"timestamp":"2026-11-28T10:00:00Z","type":"event_msg","payload":{"type":"agent_message"}}"#;
+    assert_eq!(p.line(other_event, &mut s), Line::Other);
+    assert_eq!(
+        p.line(br#"{"type":"response_item","payload":{}}"#, &mut s),
+        Line::Other
+    );
+    assert_eq!(p.line(b"not json", &mut s), Line::Other);
+    assert!(!s.saw_records);
+    assert_eq!(s.ordinal, 0);
+}
+
+#[test]
+fn codex_files_is_the_rollout() {
+    use axle::hook::Harness;
+    let p = parsers::for_harness(Harness::Codex);
+    assert_eq!(p.id(), "codex/1");
+    let path = Path::new("rollout.jsonl");
+    assert_eq!(p.files(path), vec![path.to_path_buf()]);
+}
