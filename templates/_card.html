@@ -22,9 +22,10 @@
   {% if let Some(r) = card.blocked_line %}<p class="card-blocked"><span class="card-blocked-label">{% if card.blocked_on_you %}Blocked on you:{% else %}Blocked:{% endif %}</span> <span class="card-blocked-reason" title="Agent-written">{{ r }}</span></p>{% endif %}
   {% if let Some((pid, ptitle)) = card.parent %}<p class="card-parent">Subtask of <a href="/ui/tasks/{{ pid }}">{{ ptitle }}</a></p>{% endif %}
   <div class="card-meta">
-    <span class="state" data-status="{{ card.status }}" data-aspect="{{ card.aspect }}"><span class="aspect" data-aspect="{{ card.aspect }}" aria-hidden="true"></span><span class="status">{{ card.label }}</span></span>
+    <span class="state" data-status="{{ card.status }}" data-aspect="{{ card.aspect }}"><span class="aspect" data-aspect="{{ card.aspect }}" aria-hidden="true"></span><span class="status">{{ card.label }}</span>{% if let Some(st) = card.stage %} <span class="stage-word">{{ st }}</span>{% endif %}</span>
     <span class="project" data-line="{{ card.project.line }}" title="{{ card.project.key }}">{{ card.project.name }}</span>
   </div>
+  <div class="card-chips"><span class="short-id" title="Task id">{{ card.short_id }}</span>{% if let Some(pr) = card.pr %} <a class="pr-chip" href="{{ pr.url }}" rel="noopener noreferrer" title="Open the pull request">PR #{{ pr.number }}</a>{% endif %}{% if let Some(w) = card.waiting_for %} <span class="waiting-for">waiting for {{ w }}</span>{% endif %}</div>
   {% if let Some(owner) = card.owner %}
   <div class="card-owner"><span class="owner-label">{% if card.status == "done" %}Done by{% else %}Held by{% endif %}</span> <span class="owner">{{ owner }}</span>{% if let Some(live) = card.owner_live %} <span class="presence" data-presence="{% if live %}live{% else %}stale{% endif %}" title="{% if live %}Session heartbeat within the last 90 seconds{% else %}No heartbeat for over 90 seconds{% endif %}"><span class="aspect" data-aspect="{% if live %}live{% else %}stale{% endif %}" aria-hidden="true"></span>{% if live %}live{% else %}stale{% endif %}</span>{% endif %}</div>
   {% endif %}

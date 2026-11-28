@@ -4874,3 +4874,179 @@ async fn human_moves_a_task_under_a_parent() {
         .await;
     assert_eq!(page.status, StatusCode::CONFLICT, "{}", page.body);
 }
+
+// ---------------------------------------------------------------- delivery stage columns
+
+mod stage_board {
+    use super::*;
+    use axle::domain::DeliveryStage::{self, InPr, Merged, Released};
+
+    const WEB: &str = "github.com/acme/web";
+    const SHOP: &str = "github.com/acme/shop";
+
+    async fn set_stages(app: &App, agent: &Resolved, stages: &[DeliveryStage]) {
+        let project = app
+            .state
+            .store
+            .get_project(agent.agent.project_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        app.state
+            .delivery
+            .set_stages(&project, stages.to_vec())
+            .await
+            .unwrap();
+    }
+
+    /// A task with a linked PR, completed into `delivering`.
+    async fn delivering(app: &App, by: &Resolved, title: &str, pr: &str) -> Task {
+        let task = app.task(by, title, None).await;
+        app.claim(by, task.id).await;
+        app.state
+            .delivery
+            .link_pr(Caller::Agent(by), task.id, pr)
+            .await
+            .unwrap();
+        let done = app
+            .state
+            .tasks
+            .complete(
+                by,
+                task.id,
+                Completion {
+                    summary: "done".into(),
+                    ..Completion::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(done.status, TaskStatus::Delivering);
+        done
+    }
+
+    fn column_names(page: &Page) -> Vec<String> {
+        select_texts(page, ".column > header h2")
+    }
+
+    async fn two_projects() -> (App, String, Resolved, Resolved) {
+        let app = app().await;
+        let cookie = app.login().await;
+        let web = app.agent(WEB, "mac", "claude-code").await;
+        let shop = app.agent(SHOP, "mac", "claude-code").await;
+        set_stages(&app, &web, &[InPr, Merged]).await;
+        (app, cookie, web, shop)
+    }
+
+    #[tokio::test]
+    async fn stage_columns_per_project() {
+        let (app, cookie, web, shop) = two_projects().await;
+        set_stages(&app, &shop, &[Released]).await;
+        let web_id = web.agent.project_id.unwrap();
+
+        let filtered = app
+            .get(&format!("/ui/board?project={web_id}"), Some(&cookie))
+            .await;
+        assert_eq!(
+            column_names(&filtered),
+            [
+                "Open", "Claimed", "Blocked", "Review", "In PR", "Merged", "Done"
+            ]
+        );
+        let all = app.get("/ui/board", Some(&cookie)).await;
+        assert_eq!(
+            column_names(&all),
+            [
+                "Open", "Claimed", "Blocked", "Review", "In PR", "Merged", "Released", "Done"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_sits_in_own_column() {
+        let (app, cookie, web, shop) = two_projects().await;
+        // The task reaches `in_pr` while the shop has it enabled, then the shop narrows to
+        // Released only.
+        set_stages(&app, &shop, &[InPr, Released]).await;
+        delivering(
+            &app,
+            &shop,
+            "shop work",
+            "https://github.com/acme/shop/pull/3",
+        )
+        .await;
+        set_stages(&app, &shop, &[Released]).await;
+        delivering(&app, &web, "web work", "https://github.com/acme/web/pull/4").await;
+
+        let page = app.get("/ui/board", Some(&cookie)).await;
+        let html = page.html();
+        let sections = Selector::parse("section.column").unwrap();
+        let titles = Selector::parse(".card-title").unwrap();
+        let in_column = |stage: &str| -> Vec<String> {
+            html.select(&sections)
+                .filter(|c| c.value().attr("data-stage") == Some(stage))
+                .flat_map(|c| {
+                    c.select(&titles)
+                        .map(|t| t.text().collect::<String>().trim().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        assert_eq!(in_column("in_pr"), ["web work"]);
+        assert_eq!(in_column("released"), ["shop work"]);
+        assert_eq!(
+            select_texts(&page, ".waiting-for"),
+            ["waiting for Released"]
+        );
+        for status in ["open", "claimed", "blocked", "review", "done"] {
+            let cards =
+                Selector::parse(&format!("section.column[data-status={status}] .card")).unwrap();
+            assert_eq!(html.select(&cards).count(), 0, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_stage_column_sentence() {
+        let (app, cookie, _web, _shop) = two_projects().await;
+        let page = app.get("/ui/board", Some(&cookie)).await;
+        let empties = select_texts(&page, "section.column[data-stage] .empty");
+        assert_eq!(
+            empties,
+            ["Nothing waiting for merge", "Nothing waiting for release"]
+        );
+    }
+
+    #[tokio::test]
+    async fn card_pr_chip_and_short_id() {
+        let (app, cookie, web, _shop) = two_projects().await;
+        delivering(
+            &app,
+            &web,
+            "web work",
+            "https://github.com/acme/web/pull/12",
+        )
+        .await;
+        let page = app.get("/ui/board", Some(&cookie)).await;
+        let html = page.html();
+        let link = Selector::parse("a[href=\"https://github.com/acme/web/pull/12\"]").unwrap();
+        let a = html.select(&link).next().expect("PR chip");
+        assert_eq!(a.text().collect::<String>(), "PR #12");
+        assert_eq!(a.value().attr("rel"), Some("noopener noreferrer"));
+        let ids = select_texts(&page, ".short-id");
+        assert!(ids.iter().any(|t| t.starts_with("axl-")), "{ids:?}");
+        assert_eq!(select_texts(&page, ".state .stage-word"), ["In PR"]);
+    }
+
+    #[tokio::test]
+    async fn no_stages_board_unchanged() {
+        let app = app().await;
+        let cookie = app.login().await;
+        let web = app.agent(WEB, "mac", "claude-code").await;
+        app.task(&web, "plain", None).await;
+        let page = app.get("/ui/board", Some(&cookie)).await;
+        assert_eq!(
+            column_names(&page),
+            ["Open", "Claimed", "Blocked", "Review", "Done"]
+        );
+    }
+}

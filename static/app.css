@@ -153,6 +153,19 @@ kbd {
   background: var(--sig-green);
 }
 :is(.aspect[data-aspect="open"], .station[data-status="open"]) { border-color: var(--text); }
+/* Delivering: a solid dot inside an outer ring (block cleared, train still moving). Always
+   beside the stage word; the ring keeps it apart from done's plain solid. */
+.aspect[data-aspect="delivering"] {
+  border-color: var(--sig-green);
+  background: radial-gradient(circle, var(--sig-green) 0 38%, transparent 42%);
+  box-shadow: 0 0 0 1.5px var(--card), 0 0 0 3px var(--sig-green);
+  margin: 0 3px;
+}
+.card-chips { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; margin-top: 6px; font-size: 12px; }
+.short-id, .pr-chip { font: 12px var(--mono); color: var(--muted); }
+.pr-chip { color: var(--accent); }
+.stage-word, .waiting-for { font-size: 12px; font-weight: 600; }
+.waiting-for { color: var(--muted); font-weight: 400; }
 /* Planning: a dashed ring, the block reserved but not yet occupied. Awaiting you: the same
    dashed ring in amber with a centre, like review (finished thinking, waiting on a check). */
 :is(.aspect[data-aspect="planning"], .station[data-status="planning"]) {

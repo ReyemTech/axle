@@ -26,7 +26,14 @@ The board has five columns: **open**, **claimed** (which also holds `planning` t
 status glyph and label, the project, the holder and whether its session is live, and a
 lease bar. A blocked card shows the first line of its reason under the title ("Blocked:",
 or "Blocked on you:" when it waits on you). A parent task shows its subtasks as a row of stops. Filter by project with the
-chips above the columns.
+chips above the columns. Every card also shows its short id (`axl-…`) and, once a pull
+request is linked, a `PR #123` link.
+
+A project with delivery stages enabled adds one column per stage (**In PR**, **Merged**,
+**Released**, **Deployed**) between review and done. Filtered to one project, the board shows
+that project's stages; unfiltered, the union, and each task sits only in its own project's
+column. A card in a stage it has not reached yet reads "waiting for Released". Without stages
+the board is unchanged.
 
 Open, claimed, blocked and review each show at most **12 cards**, the ones asking for
 attention first: urgent mail in the task's thread, a plan awaiting you, blocked (the task or
