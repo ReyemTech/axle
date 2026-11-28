@@ -503,10 +503,11 @@ impl WakeService {
     }
 
     /// What a session's bridge reports about a wake. `Failed`, `Held` and `Refused` clear the
-    /// session's reservation for `task`, are logged with a `wake_failed` history event, and
-    /// the router never tries that session for the task again. `Sent` (the prompt reached the
-    /// harness) adds a `wake_sent` history event; the router already logged the `sent` row
-    /// the caps count. Other outcomes are logged as they are.
+    /// session's reservation when it is task-less or for `task`, are logged with a
+    /// `wake_failed` history event, and the router never tries that session for the task
+    /// again. `Sent` (the prompt reached the harness) adds a `wake_sent` history event; the
+    /// router already logged the `sent` row the caps count. Other outcomes are logged as they
+    /// are.
     ///
     /// A report may name only a task the session was woken for: its current reservation or
     /// its newest `sent` wake. Any other task (another session's, or an unknown one) is
@@ -541,16 +542,9 @@ impl WakeService {
         }
         match outcome {
             WakeOutcome::Failed | WakeOutcome::Held | WakeOutcome::Refused => {
-                if let Some(t) = task {
-                    let holds = self
-                        .store
-                        .get_session(session)
-                        .await?
-                        .is_some_and(|s| s.wake_task_id == Some(t));
-                    if holds {
-                        self.store.clear_task_reservations(t).await?;
-                    }
-                }
+                // The session's own reservation: task-less (`wake_owner`, `wake_agent`) or
+                // for the reported task. Another task's reservation is left alone.
+                self.store.clear_session_reservation(session, task).await?;
                 self.follow_up(session, task, outcome, detail.clone(), now)
                     .await?;
                 if let Some(t) = task {

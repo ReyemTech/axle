@@ -695,3 +695,68 @@ store_matrix!(
         );
     }
 );
+
+store_matrix!(
+    clear_session_reservation_clears_only_its_own,
+    |store: Arc<dyn Store>| async move {
+        let s = session(&store).await;
+        let id = s.session.id;
+        let project = s.project.as_ref().unwrap().id;
+        let t = insert(&store, project, "t", true).await;
+        let other = insert(&store, project, "other", true).await;
+
+        // Nothing reserved: nothing to clear.
+        assert!(!store.clear_session_reservation(id, None).await.unwrap());
+
+        // A task-less reservation is cleared whether or not the report names a task.
+        for task in [None, Some(t.id)] {
+            idle(&store, id, T0 - Duration::minutes(1), T0).await;
+            assert!(
+                store
+                    .reserve_session(&reservation(id, None, T0))
+                    .await
+                    .unwrap()
+            );
+            assert!(store.clear_session_reservation(id, task).await.unwrap());
+            let got = store.get_session(id).await.unwrap().unwrap();
+            assert_eq!(got.wake_until, None);
+            assert_eq!(got.wake_task_id, None);
+        }
+
+        // A reservation for `t` is cleared by `t`, but not by another task or by no task.
+        idle(&store, id, T0 - Duration::minutes(1), T0).await;
+        assert!(
+            store
+                .reserve_session(&reservation(id, Some(t.id), T0))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .clear_session_reservation(id, Some(other.id))
+                .await
+                .unwrap()
+        );
+        assert!(!store.clear_session_reservation(id, None).await.unwrap());
+        assert_eq!(
+            store.get_session(id).await.unwrap().unwrap().wake_task_id,
+            Some(t.id)
+        );
+        // Another session's report never touches it.
+        assert!(
+            !store
+                .clear_session_reservation(SessionId::new(), Some(t.id))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .clear_session_reservation(id, Some(t.id))
+                .await
+                .unwrap()
+        );
+        let got = store.get_session(id).await.unwrap().unwrap();
+        assert_eq!(got.wake_until, None);
+        assert_eq!(got.wake_task_id, None);
+    }
+);

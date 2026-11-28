@@ -2258,6 +2258,23 @@ impl Store for SqliteStore {
         Ok(done.rows_affected() == 1)
     }
 
+    async fn clear_session_reservation(
+        &self,
+        session: SessionId,
+        task: Option<TaskId>,
+    ) -> StoreResult<bool> {
+        let done = sqlx::query(
+            "UPDATE sessions SET wake_task_id = NULL, wake_until = NULL
+              WHERE id = ? AND wake_until IS NOT NULL
+                AND (wake_task_id IS NULL OR wake_task_id = ?)",
+        )
+        .bind(session.to_string())
+        .bind(task.map(|t| t.to_string()))
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
     async fn clear_task_reservations(&self, task: TaskId) -> StoreResult<Vec<SessionId>> {
         let mut ids = sqlx::query_scalar::<_, String>(
             "UPDATE sessions SET wake_task_id = NULL, wake_until = NULL

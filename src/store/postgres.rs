@@ -2171,6 +2171,23 @@ impl Store for PostgresStore {
         Ok(done.rows_affected() == 1)
     }
 
+    async fn clear_session_reservation(
+        &self,
+        session: SessionId,
+        task: Option<TaskId>,
+    ) -> StoreResult<bool> {
+        let done = sqlx::query(
+            "UPDATE sessions SET wake_task_id = NULL, wake_until = NULL
+              WHERE id = $1 AND wake_until IS NOT NULL
+                AND (wake_task_id IS NULL OR wake_task_id = $2)",
+        )
+        .bind(session.as_uuid())
+        .bind(task.map(|t| t.as_uuid()))
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
     async fn clear_task_reservations(&self, task: TaskId) -> StoreResult<Vec<SessionId>> {
         let mut ids: Vec<SessionId> = sqlx::query_scalar::<_, Uuid>(
             "UPDATE sessions SET wake_task_id = NULL, wake_until = NULL

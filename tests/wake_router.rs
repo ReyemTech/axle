@@ -1005,3 +1005,72 @@ async fn wake_text_frames_and_caps_title() {
         "[axl wake] Axle started this turn because the human replied to you; call fetch_inbox."
     );
 }
+
+#[tokio::test]
+async fn failed_task_less_wakes_clear_their_reservation() {
+    for outcome in [WakeOutcome::Failed, WakeOutcome::Held, WakeOutcome::Refused] {
+        // An inbox wake (`wake_agent`) reports no task.
+        let env = Env::new().await;
+        let s = env.session("s").await;
+        env.idle(&s).await;
+        assert!(
+            env.wake
+                .wake_agent(s.agent.id, WakeTrigger::HumanReply)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            env.wake
+                .report(s.session.id, None, outcome, None)
+                .await
+                .unwrap()
+        );
+        let session = env.store.get_session(s.session.id).await.unwrap().unwrap();
+        assert_eq!(session.wake_until, None, "{outcome}: inbox wake cleared");
+
+        // Past the one-minute cap the session is free again, and no `expired` follows.
+        env.advance(Duration::seconds(61));
+        env.idle(&s).await;
+        assert!(
+            env.wake
+                .wake_agent(s.agent.id, WakeTrigger::HumanReply)
+                .await
+                .unwrap()
+                .is_some(),
+            "{outcome}: woken again after the cap"
+        );
+        env.wake.tick().await.unwrap();
+        assert_eq!(env.attempts(WakeOutcome::Expired, None).await, 0);
+
+        // An owner wake (`wake_owner`) reserves with no task but reports its task.
+        let env = Env::new().await;
+        let owner = env.session("owner").await;
+        let task = env.task("owned").await;
+        let task = env.claim(&owner, task.id).await;
+        env.idle(&owner).await;
+        assert_eq!(
+            env.wake
+                .wake_owner(&task, WakeTrigger::HumanPost, None)
+                .await
+                .unwrap(),
+            Some(owner.session.id)
+        );
+        assert!(
+            env.wake
+                .report(owner.session.id, Some(task.id), outcome, None)
+                .await
+                .unwrap()
+        );
+        let session = env
+            .store
+            .get_session(owner.session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.wake_until, None, "{outcome}: owner wake cleared");
+        env.advance(Duration::minutes(3));
+        env.wake.tick().await.unwrap();
+        assert_eq!(env.attempts(WakeOutcome::Expired, None).await, 0);
+    }
+}

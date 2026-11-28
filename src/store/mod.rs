@@ -336,6 +336,13 @@ pub trait Store: Send + Sync {
     async fn reserve_session(&self, r: &Reservation) -> StoreResult<bool>;
     /// Clears every reservation pointing at `task` and returns those sessions.
     async fn clear_task_reservations(&self, task: TaskId) -> StoreResult<Vec<SessionId>>;
+    /// Clears `session`'s own reservation when it carries no task or carries `task`, with one
+    /// guarded write; `false` when the session holds no such reservation.
+    async fn clear_session_reservation(
+        &self,
+        session: SessionId,
+        task: Option<TaskId>,
+    ) -> StoreResult<bool>;
     /// Clears every reservation with `wake_until <= now` and returns each session with the
     /// task it was reserved for.
     async fn expire_reservations(
