@@ -389,6 +389,7 @@ impl TaskService {
             reply_to,
             created_at: now,
             kind: MessageKind::Message,
+            options: Vec::new(),
         };
         if !self
             .store
@@ -507,6 +508,7 @@ impl TaskService {
             reply_to: None,
             created_at: self.clock.now(),
             kind: MessageKind::Plan,
+            options: Vec::new(),
         };
         let done = self
             .guarded(
@@ -631,6 +633,7 @@ impl TaskService {
                 reply_to: None,
                 created_at: now,
                 kind: MessageKind::System,
+                options: Vec::new(),
             },
         };
         match self.store.add_task_projects(&req).await? {
@@ -1018,6 +1021,7 @@ impl TaskService {
             reply_to: None,
             created_at: self.clock.now(),
             kind: MessageKind::System,
+            options: Vec::new(),
         };
         if let Err(e) = self.store.insert_message(&message, token).await {
             eprintln!("axl: failed to notify parent task {}: {e}", parent.id);
@@ -1206,6 +1210,7 @@ impl TaskService {
                 reply_to: None,
                 created_at: now,
                 kind: message_kind,
+                options: Vec::new(),
             };
             let req = TransitionRequest {
                 task: id,

@@ -428,6 +428,24 @@ pub struct InboxFilter {
     pub limit: Option<u32>,
 }
 
+/// The `messages.options` column for a message's quick replies: a JSON array, or NULL when
+/// there are none.
+pub fn options_to(options: &[String]) -> Option<String> {
+    if options.is_empty() {
+        return None;
+    }
+    Some(serde_json::to_string(options).expect("strings serialize"))
+}
+
+/// Reads `messages.options` back (NULL is no options).
+pub fn options_from(column: Option<String>) -> StoreResult<Vec<String>> {
+    match column {
+        None => Ok(Vec::new()),
+        Some(json) => serde_json::from_str(&json)
+            .map_err(|e| StoreError::Corrupt(format!("message options: {e}"))),
+    }
+}
+
 /// The recipient row a message gets at send time, if any: `(agent, session)`.
 pub fn send_time_recipient(to: &Address) -> Option<(Option<AgentId>, Option<SessionId>)> {
     match *to {

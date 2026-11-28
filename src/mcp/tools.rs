@@ -113,6 +113,10 @@ pub struct SendMessageParams {
     pub body: String,
     /// Defaults to `normal`.
     pub importance: Option<ImportanceParam>,
+    /// Only for `to: {human: true}`: 2 to 4 short answers (one line, at most 80 characters
+    /// each, no duplicates) the human can reply with in one click. Their reply is an ordinary
+    /// message whose body starts with the chosen answer.
+    pub options: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -328,7 +332,9 @@ impl AxleMcp {
     #[tool(description = described!(
         "Send a message to exactly one of: a project (everyone in it), an agent \
          (`<project>/<host>/<harness>`), a live session, a task thread, or the human. \
-         Messages you send are never shown back to you, including in your own other sessions."
+         Messages you send are never shown back to you, including in your own other sessions. \
+         Asking the human a question with a few clear answers? Pass them as `options` and \
+         the human can reply in one click."
     ))]
     async fn send_message(
         &self,
@@ -678,7 +684,7 @@ impl AxleMcp {
         let message = self
             .state
             .messages
-            .send(
+            .send_with_options(
                 &actor(me),
                 NewMessage {
                     to,
@@ -687,6 +693,7 @@ impl AxleMcp {
                     importance: p.importance.map(Into::into).unwrap_or_default(),
                     reply_to: None,
                 },
+                p.options.as_deref().unwrap_or_default(),
             )
             .await?;
         Ok(json!({

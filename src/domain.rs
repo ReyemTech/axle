@@ -527,6 +527,8 @@ pub struct Message {
     pub reply_to: Option<MessageId>,
     pub created_at: OffsetDateTime,
     pub kind: MessageKind,
+    /// Quick replies an agent offers the human (2-4 short answers); empty for most mail.
+    pub options: Vec<String>,
 }
 
 /// A message as one recipient sees it.

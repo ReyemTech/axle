@@ -483,6 +483,9 @@ impl<'a> Labels<'a> {
             "task": m.task_id,
             "reply_to": m.reply_to,
             "kind": m.kind,
+            // Agent-written like the body: frame markers defused (the body's frame names
+            // the author).
+            "options": m.options.iter().map(|o| defuse(o)).collect::<Vec<_>>(),
             "created_at": timestamp(m.created_at),
             "body": self.wrap(m.from, m.project_id, &m.body).await?,
         }))

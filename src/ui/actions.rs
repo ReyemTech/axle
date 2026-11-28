@@ -28,7 +28,9 @@ fn message_error(e: MessageError) -> UiError {
         }
         e @ MessageError::TooLong { .. } => UiError::Invalid(capitalise(&e.to_string())),
         MessageError::NotFound(what) => UiError::Invalid(format!("That {what} does not exist.")),
-        e @ MessageError::MismatchedReply => UiError::Invalid(capitalise(&e.to_string())),
+        e @ (MessageError::MismatchedReply
+        | MessageError::BadOptions(_)
+        | MessageError::OptionsNeedHuman) => UiError::Invalid(capitalise(&e.to_string())),
         MessageError::Store(e) => e.into(),
     }
 }
@@ -410,6 +412,21 @@ pub struct MessageForm {
     importance: String,
     #[serde(default)]
     reply_to: String,
+    /// The quick reply clicked, if any: it leads the body, before any typed text.
+    #[serde(default)]
+    option: String,
+    /// A Needs-you card's page (`/ui/` or `/ui/board`) to return to.
+    #[serde(default)]
+    back: String,
+}
+
+/// The reply body: a clicked quick reply, then (after a blank line) whatever was typed.
+fn reply_body(option: &str, typed: String) -> String {
+    match (option.trim(), typed.trim().is_empty()) {
+        ("", _) => typed,
+        (option, true) => option.to_string(),
+        (option, false) => format!("{option}\n\n{typed}"),
+    }
 }
 
 fn address(kind: &str, id: &str) -> UiResult<Address> {
@@ -428,7 +445,8 @@ pub async fn send_message(
     State(state): State<AppState>,
     Form(form): Form<MessageForm>,
 ) -> UiResult<Response> {
-    required_body(&form.body)?;
+    let body = reply_body(&form.option, form.body);
+    required_body(&body)?;
     let to = match form.to_kind.trim() {
         "" => {
             let (kind, id) = form.to.split_once(':').unwrap_or(("", ""));
@@ -443,15 +461,17 @@ pub async fn send_message(
         .send_as_human(NewMessage {
             to,
             subject: subject(&form.subject),
-            body: form.body,
+            body,
             importance: importance(&form.importance)?,
             reply_to,
         })
         .await
         .map_err(message_error)?;
-    Ok(see_other(&match reply_to {
-        Some(original) => format!("/ui/inbox?m={original}"),
-        None => format!("/ui/inbox?view=all&m={}", sent.id),
+    Ok(see_other(&match (form.back.as_str(), reply_to) {
+        ("/ui/", Some(_)) => "/ui/#needs-you".to_string(),
+        ("/ui/board", Some(_)) => "/ui/board#needs-you".to_string(),
+        (_, Some(original)) => format!("/ui/inbox?m={original}"),
+        (_, None) => format!("/ui/inbox?view=all&m={}", sent.id),
     }))
 }
 
@@ -551,5 +571,12 @@ mod tests {
         assert!(address("session", &id.to_string()).is_err());
         assert!(address("agent", "nope").is_err());
         assert_eq!(capitalise("cannot move"), "Cannot move.");
+    }
+
+    #[test]
+    fn quick_reply_leads_the_typed_text() {
+        assert_eq!(reply_body("", "typed".into()), "typed");
+        assert_eq!(reply_body("Yes", " \n ".into()), "Yes");
+        assert_eq!(reply_body(" Yes ", "and more".into()), "Yes\n\nand more");
     }
 }
