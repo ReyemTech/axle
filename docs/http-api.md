@@ -13,6 +13,7 @@ treat `/v1` as internal: it may change between releases.
 | `POST /v1/register` | bearer token | Register a session |
 | `POST /v1/heartbeat` | bearer token | Presence and lease renewal |
 | `POST /v1/turn` | bearer token | A hook's turn report (busy or idle) |
+| `POST /v1/wake/result` | bearer token | A bridge's report of what its adapter did with a wake |
 | `GET /v1/session` | bearer token | One session's wake channel and turn state, for `axl status` |
 | `GET /v1/events` | bearer token | Server-sent events for one session |
 | `GET /v1/inbox/summary` | bearer token | Unread mail, for hooks |
@@ -194,6 +195,16 @@ curl -s -X POST http://127.0.0.1:7420/v1/turn \
 `state` is `unknown`, `busy` or `idle`; anything else is a 4xx. An unknown session is 404,
 another token's session 403. The hooks send it with a 2 second timeout and ignore every
 error: a lost report is healed by the next heartbeat.
+
+## `POST /v1/wake/result`
+
+A bridge's report of what its wake adapter did with a `WakeRequested` event from
+`/v1/events`. Body: `{"session_id", "task_id", "outcome", "detail"}`, where `task_id` and
+`detail` may be null and `outcome` is `sent`, `held`, `refused` or `failed` (anything else
+is 400; `detail` is cut at 500 characters). Returns 204 with no body. An unknown session is
+404, another token's session 403. The bridge waits at most 30 seconds for its adapter, then
+reports `failed`. A bridge whose adapter has no working channel (today: every bridge) opens
+no wake stream and reports no `wake_channel` in its heartbeat.
 
 ## `GET /v1/session`
 

@@ -20,7 +20,7 @@ use tokio::sync::broadcast::error::RecvError;
 use super::{ApiError, AppState, AuthToken};
 use crate::domain::{
     Actor, Address, AgentId, Importance, MessageId, ProjectId, SessionId, TaskId, TaskStatus,
-    TurnState, WakeChannel,
+    TurnState, WakeChannel, WakeOutcome,
 };
 use crate::events::Event;
 use crate::service::identity::{IdentityError, IdentityInput, IdentityService, Resolved};
@@ -38,6 +38,7 @@ pub fn routes() -> Router<AppState> {
         .route("/register", post(register))
         .route("/heartbeat", post(heartbeat))
         .route("/turn", post(turn))
+        .route("/wake/result", post(wake_result))
         .route("/session", get(session_state))
         .route("/events", get(events))
         .route("/inbox/summary", get(inbox_summary))
@@ -230,6 +231,48 @@ async fn turn(
     state
         .wake
         .on_turn(r.session.id, req.state)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WakeResultRequest {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub task_id: Option<TaskId>,
+    pub outcome: WakeOutcome,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// Longest outcome detail kept, in characters.
+const WAKE_DETAIL_MAX: usize = 500;
+
+/// A bridge's report of what its adapter did with a wake. Only the named session's own
+/// token may report for it, and only what a bridge can observe (`sent`, `held`, `refused`,
+/// `failed`). `204` with no body.
+async fn wake_result(
+    State(state): State<AppState>,
+    Extension(AuthToken(token)): Extension<AuthToken>,
+    Json(req): Json<WakeResultRequest>,
+) -> Result<StatusCode, ApiError> {
+    let r = session_for(&state, token, req.session_id).await?;
+    if !matches!(
+        req.outcome,
+        WakeOutcome::Sent | WakeOutcome::Held | WakeOutcome::Refused | WakeOutcome::Failed
+    ) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "a bridge reports sent, held, refused or failed",
+        ));
+    }
+    let detail = req
+        .detail
+        .map(|d| d.chars().take(WAKE_DETAIL_MAX).collect::<String>());
+    state
+        .wake
+        .report(r.session.id, req.task_id, req.outcome, detail)
         .await
         .map_err(ApiError::internal)?;
     Ok(StatusCode::NO_CONTENT)
