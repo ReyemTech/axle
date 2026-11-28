@@ -145,6 +145,10 @@ The task page shows, top to bottom:
 - **Plan awaiting your approval** (when there is one): the latest plan as written, **Approve
   plan**, and **Request changes** with a required note. Earlier plans stay in the thread.
 - **Lease**: who holds it and for how long, or why it does not expire.
+- **Delivery** (when the project has [stages](delivery.md) on, or a PR is linked): the
+  short id, the linked PR as a chip, and the stages with where the task is. **Link PR** takes
+  a pull request URL, **Unlink PR** removes it (not after a merge), **Advance stage** moves a
+  delivering task one stage forward and **Mark done** finishes it. These are human only.
 - **Subtasks**: children with their status and progress.
 - **Related**: [linked tasks](concepts.md#related-tasks), each with the link in words
   (*follow-up of*, *duplicated by*, …), the other task's project, title and status, and
@@ -217,7 +221,7 @@ same and is shown on hover. A key that is a plain `host/path` links to its repos
 Each project row has a **Delivery stages** disclosure with four checkboxes (**In PR**,
 **Merged**, **Released**, **Deployed**) and **Save stages**. Tasks with a PR move through the
 ticked stages after the agent completes them; done means the last one ticked. Unticking all
-turns stages off and finishes any task still delivering.
+turns stages off and finishes any task still delivering. See [Delivery stages](delivery.md).
 
 ## Tokens
 

@@ -62,7 +62,10 @@ Most task tools return a task summary. `task_create` and `task_get` add `body`.
 }
 ```
 
-`status` is one of `open`, `planning`, `claimed`, `blocked`, `review`, `done`, `cancelled`.
+`status` is one of `open`, `planning`, `claimed`, `blocked`, `review`, `delivering`, `done`,
+`cancelled`. `task_get` and `task_claim` also return `short_id` (`axl-` and 8 hex digits) and
+`delivery`: `null`, or `{ stage, stages_enabled, pr: { url, number, state, ci } }`. See
+[delivery stages](delivery.md).
 `plan_state` is one of `none`, `drafting`, `submitted`, `changes_requested`, `approved`.
 `created_by` is an agent label or `human`.
 
@@ -291,7 +294,7 @@ Agents cannot ack tasks; only the human can, in the web UI.
 | Parameter | Type | Notes |
 |---|---|---|
 | `project` | string | Also matches parent tasks that span this project. |
-| `status` | string | One status. |
+| `status` | string | One status, such as `delivering`. A default listing never hides `delivering` tasks. |
 | `owner` | string | Owning agent label. |
 | `parent` | string | List this task's children. |
 | `include_acked` | boolean | Also return acked and auto-acked done tasks. Default `false`. |
@@ -331,7 +334,8 @@ Event kinds: `created`, `claimed`, `renewed`, `released`, `blocked`, `review`, `
 `cancelled`, `lease_expired_takeover`, `force_released`, `child_claimed`, `child_blocked`,
 `child_done`, `child_cancelled`, `children_complete`, `edited`, `plan_submitted`,
 `plan_approved`, `plan_changes_requested`, `projects_added`, `block_updated`, `unblocked`,
-`related`, `moved_under`.
+`related`, `moved_under`, `pr_linked`, `pr_relinked`, `pr_unlinked`, `ci_changed`,
+`stage_reached`, `delivered`.
 
 A blocked task also carries `blocked`: `reason`, `since`, `waiting_on` (`{"human": true}`,
 `{"task": "<id>"}`, `{"external": "<text>"}` or `null`) and `unblock`. The agent-written
@@ -356,7 +360,8 @@ already hold renews it; claiming your own blocked task resumes it. See
 | `id` | string | Claim this task. |
 | `next` | boolean | `true` to claim the next eligible task instead. |
 
-Pass exactly one of `id` or `next: true`. Returns the task object. For a plan-gated task the
+Pass exactly one of `id` or `next: true`. Returns the task object plus `branch_hint`, the
+task's short id (`axl-xxxxxxxx`): put it in the branch name. For a plan-gated task the
 status is `planning` and the result adds `next_step`:
 
 ```json
@@ -395,8 +400,8 @@ Post a reply in a task's thread. It reaches the task's owner and creator.
 ### `task_update`
 
 Set a task you own to `blocked` or `review`, edit its title or body, add participating
-projects, link it to other tasks and move it under a parent, in one call. All input is
-checked before anything is written.
+projects, link it to other tasks, move it under a parent and report its pull request, in one
+call. All input is checked before anything is written.
 
 | Parameter | Type | Notes |
 |---|---|---|
@@ -411,6 +416,7 @@ checked before anything is written.
 | `related` | array of `{id, kind}` | Links from this task to others. Creator or owner. `kind` is `relates`, `follow-up` (this task follows up the other) or `duplicate` (this task duplicates the other: it is cancelled with a note in its thread; refused once it is done). The linked task needs no rights; both tasks show the link. At most 20 links per task; one link per pair, so a new kind replaces the old one. |
 | `unrelate` | string array | Task ids whose link with this task to remove, whichever task added it. Creator or owner. Removing does not reopen a duplicate. |
 | `parent` | string | Move this top-level task under this parent (id). Creator or owner. See below. |
+| `pr` | string | URL of the pull request you opened. Creator or owner, in any status except `done` and `cancelled`. Reporting another PR replaces the link until the task is merged. See [delivery](delivery.md#link-a-task-to-its-pull-request). |
 
 ```json
 { "id": "01a21e49-0e09-77db-8833-c454a159bf8e", "status": "review", "reason": "Ready for a look" }
@@ -454,7 +460,7 @@ parent's progress counts it at once; from then on it behaves like any child (the
 coordinator hears when it blocks or closes, and the parent goes to `review` when its last
 open child closes).
 
-Errors: ``nothing to update: pass `status`, `title`, `body`, `add_projects`, `related`, `unrelate` and/or `parent` ``,
+Errors: ``nothing to update: pass `status`, `title`, `body`, `add_projects`, `related`, `unrelate`, `parent` and/or `pr` ``,
 `a task cannot be linked to itself`, `linked task <id> not found`,
 `task <id> already has the most links allowed (20)`, `a done task cannot be marked a duplicate`,
 `a task can be a duplicate of one task only`, `a task cannot be its own parent`,
@@ -471,7 +477,9 @@ Errors: ``nothing to update: pass `status`, `title`, `body`, `add_projects`, `re
 ancestor: …`, `waiting on task <id> would make a cycle: …`,
 `the task to wait on does not exist`,
 `not the owner of this task`, `cannot move a <from> task to <to>`,
-`child tasks belong to one project` (for `add_projects` on a child), the plan gate error
+`child tasks belong to one project` (for `add_projects` on a child),
+`pr must be a pull request in <host>/<owner>/<repo>`, `PR #<n> is already linked to task <id>`,
+`this task was already merged via #<n>; open a new task for follow-up work`, the plan gate error
 while `planning`.
 
 ### `task_propose_plan`
@@ -531,12 +539,15 @@ who did it.
 | `summary` | string, required | What was done. |
 | `changed_files` | string array | Paths. |
 | `tests` | string array | Commands or test names that passed. |
-| `links` | string array | Pull requests, builds, docs. |
+| `links` | string array | Pull requests, builds, docs. A pull request of the project's repository is linked to the task if none is yet. |
 
 ```json
 { "id": "01a21e49-0e09-77db-8833-c454a159bf8e", "summary": "Added a token bucket on /login.", "changed_files": ["src/auth.rs"], "tests": ["cargo test login_rate_limit"] }
 ```
 
-Returns the task object with `status: "done"`. Errors: `a summary is required`,
+Returns the task object with `status: "done"`, or `"delivering"` when the project has
+[delivery stages](delivery.md) on and a PR is linked; the result then adds a `next_step`,
+`Delivery is tracked by Axle; this task moves to done when it reaches <Last stage label>. Nothing more to do.`
+`task_complete` never contacts GitHub. Errors: `a summary is required`,
 `not the owner of this task`, and while `planning`:
 `the plan is not approved yet: write a spec or plan, submit it with task_propose_plan and wait for the human's approval`.

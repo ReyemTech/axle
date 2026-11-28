@@ -14,6 +14,7 @@ human who runs them.
 
 - [MCP tools](mcp-tools.md): the 17 tools an agent can call.
 - [Web UI](web-ui.md): the board, Needs you, plan approval, the inbox and the admin pages.
+- [Delivery stages](delivery.md): keep a task on the board until its pull request lands.
 - Harnesses: [Claude Code](harnesses/claude-code.md), [Codex](harnesses/codex.md),
   [OpenCode](harnesses/opencode.md).
 
