@@ -404,6 +404,23 @@ pub trait Store: Send + Sync {
         pricer: &dyn Pricer,
     ) -> StoreResult<UsageWritten>;
     async fn get_usage(&self, harness: &str, key: &str) -> StoreResult<Option<StoredUsage>>;
+    /// One row per group (one row for `Total`, even when nothing matches), unordered.
+    async fn usage_summary(
+        &self,
+        filter: &UsageFilter,
+        group: UsageGroup,
+    ) -> StoreResult<Vec<UsageRow>>;
+    /// Up to `limit` rows in id order after `after`, `occurred_at >= since` when set, only
+    /// NULL-cost rows when `unpriced_only`.
+    async fn usage_to_reprice(
+        &self,
+        since: Option<OffsetDateTime>,
+        unpriced_only: bool,
+        after: Option<UsageId>,
+        limit: u32,
+    ) -> StoreResult<Vec<RepriceRow>>;
+    /// Sets `cost_micros` / `price_ref` (`None`: both NULL) for each id, in one transaction.
+    async fn set_usage_costs(&self, costs: &[(UsageId, Option<Priced>)]) -> StoreResult<()>;
 }
 
 /// How far a message has got, from its recipient rows (spec §9 receipts).
@@ -509,6 +526,71 @@ pub struct StoredUsage {
     pub received_at: OffsetDateTime,
     /// `(task, parts)`, `None` = "no task"; ordered by task id text, `None` first.
     pub allocations: Vec<(Option<TaskId>, i64)>,
+}
+
+/// Which allocation rows a usage query counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskScope {
+    Task { id: TaskId, subtasks: bool },
+    NoTask,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UsageFilter {
+    /// `occurred_at >= from`
+    pub from: Option<OffsetDateTime>,
+    /// `occurred_at < to`
+    pub to: Option<OffsetDateTime>,
+    pub project: Option<ProjectId>,
+    pub agent: Option<AgentId>,
+    pub harness: Option<String>,
+    pub host: Option<String>,
+    pub task: Option<TaskScope>,
+    pub model: Option<String>,
+    pub billing: Option<Billing>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageGroup {
+    Total,
+    Project,
+    Task,
+    Agent,
+    Harness,
+    Host,
+    Model,
+    Day,
+    Hour,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UsageRow {
+    /// Project/agent/task id text, harness, host, model, `YYYY-MM-DD` (Day) or
+    /// `YYYY-MM-DDTHH` (Hour), all UTC; `None`: no project / no task; always `None` for Total.
+    pub key: Option<String>,
+    /// Distinct records touching the group (not split by parts).
+    pub requests: i64,
+    pub sessions: i64,
+    /// Token and cost sums divided by each allocation's `parts`.
+    pub input: f64,
+    pub output: f64,
+    pub cache_write: f64,
+    pub cache_read: f64,
+    pub cost_micros: f64,
+    /// Distinct records with a NULL cost; distinct records with billing other than `api`.
+    pub unpriced: i64,
+    pub estimated: i64,
+    /// The cost of the non-`api` records.
+    pub estimated_cost_micros: f64,
+}
+
+/// A stored record as the repricer sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepriceRow {
+    pub id: UsageId,
+    pub model: String,
+    pub speed: Option<String>,
+    pub counts: UsageCounts,
 }
 
 /// Whose inbox an operation works on.
