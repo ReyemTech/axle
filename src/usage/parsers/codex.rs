@@ -4,7 +4,10 @@
 //! line, keyed by `payload.response_id`. Older rollouts only have `event_msg` lines with
 //! `payload.type == "token_count"`; their `info.last_token_usage` is the fallback, keyed
 //! `<session_meta id>:<ordinal>` and dropped from a file that also has real records
-//! ([`super::drop_fallback`]). The model is the latest `turn_context.model`.
+//! ([`super::drop_fallback`]). Codex repeats a `token_count` snapshot (a rate-limit update
+//! re-sends the same totals), so a `token_count` yields a record, and takes the next
+//! ordinal, only when its running `info.total_token_usage` moves past the last one that did
+//! ([`ParserState::codex_total`]). The model is the latest `turn_context.model`.
 
 use std::path::{Path, PathBuf};
 
@@ -13,7 +16,7 @@ use serde::de::DeserializeOwned;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::{Line, ParsedRecord, Parser, ParserState};
+use super::{Line, ParsedRecord, Parser, ParserState, RunningTotal};
 use crate::store::UsageCounts;
 
 pub(super) struct Codex;
@@ -71,8 +74,15 @@ impl Parser for Codex {
                 let Some(count) = payload::<TokenCount>(line) else {
                     return Line::UsageShaped;
                 };
-                let Some(usage) = count.info.and_then(|i| i.last_token_usage) else {
+                let Some(info) = count.info else {
                     return Line::Other;
+                };
+                let Some(usage) = info.last_token_usage else {
+                    return Line::Other;
+                };
+                // Without the running total a repeat cannot be told from a new response.
+                let Some(total) = info.total_token_usage.map(|t| t.running()) else {
+                    return Line::UsageShaped;
                 };
                 let (Some(meta_id), Some(model), Some(at)) = (
                     state.session_meta_id.clone(),
@@ -81,6 +91,11 @@ impl Parser for Codex {
                 ) else {
                     return Line::UsageShaped;
                 };
+                if !total.advances(state.codex_total.as_ref()) {
+                    // The same snapshot again: already counted.
+                    return Line::Other;
+                }
+                state.codex_total = Some(total);
                 state.ordinal += 1;
                 let key = format!("{meta_id}:{}", state.ordinal);
                 Line::Record(record(key, at, model, &usage, true))
@@ -172,6 +187,8 @@ struct TokenCount {
 struct TokenCountInfo {
     #[serde(default)]
     last_token_usage: Option<Usage>,
+    #[serde(default)]
+    total_token_usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
@@ -186,9 +203,25 @@ struct Usage {
     output_tokens: Option<i64>,
     #[serde(default)]
     reasoning_output_tokens: Option<i64>,
+    #[serde(default)]
+    total_tokens: Option<i64>,
 }
 
 impl Usage {
+    fn running(&self) -> RunningTotal {
+        let n = |v: Option<i64>| v.unwrap_or(0);
+        RunningTotal {
+            total_tokens: self.total_tokens,
+            counts: [
+                n(self.input_tokens),
+                n(self.cached_input_tokens),
+                n(self.cache_write_input_tokens),
+                n(self.output_tokens),
+                n(self.reasoning_output_tokens),
+            ],
+        }
+    }
+
     fn counts(&self) -> UsageCounts {
         let n = |v: Option<i64>| v.unwrap_or(0);
         let cached = n(self.cached_input_tokens);

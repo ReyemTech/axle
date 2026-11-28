@@ -53,7 +53,9 @@ re-run `axl install` to add it (until then only `Stop` reports).
   `token_usage_record` events count (key `response_id`; input is `input_tokens` minus
   `cached_input_tokens`, which count as cache reads; `cache_write_input_tokens` count as
   cache writes). An older rollout without them falls back to `token_count` events
-  (`last_token_usage`, keyed by the rollout's session id and an ordinal). Only counts, the
+  (`last_token_usage`, keyed by the rollout's session id and an ordinal); a `token_count`
+  counts only when its running total (`total_token_usage`) has grown, so a repeated
+  snapshot, such as a rate-limit update, is not counted twice. Only counts, the
   model id, opaque ids and timestamps leave the machine (see
   [security](../security.md#token-usage)).
 - **Unverified: cache writes.** Axle assumes Codex's `cache_write_input_tokens` is *not*

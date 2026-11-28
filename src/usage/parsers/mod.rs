@@ -57,6 +57,30 @@ pub struct ParserState {
     pub session_meta_id: Option<String>,
     pub ordinal: u64,
     pub saw_records: bool,
+    /// Codex: the last `token_count` running total that yielded a fallback record. A
+    /// `token_count` whose total has not moved past it repeats a snapshot and counts nothing.
+    #[serde(default)]
+    pub codex_total: Option<RunningTotal>,
+}
+
+/// A Codex `info.total_token_usage`, as the fallback compares it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunningTotal {
+    pub total_tokens: Option<i64>,
+    /// input, cached input, cache write, output, reasoning.
+    pub counts: [i64; 5],
+}
+
+impl RunningTotal {
+    /// True when `self` is past `prev`: a larger `total_tokens` when both have one, else
+    /// counts that differ and none of which went down.
+    pub fn advances(&self, prev: Option<&RunningTotal>) -> bool {
+        let Some(prev) = prev else { return true };
+        if let (Some(now), Some(then)) = (self.total_tokens, prev.total_tokens) {
+            return now > then;
+        }
+        self.counts != prev.counts && self.counts.iter().zip(prev.counts).all(|(n, p)| *n >= p)
+    }
 }
 
 /// What one log line is.

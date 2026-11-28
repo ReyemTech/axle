@@ -255,7 +255,8 @@ row persists) as long as it belongs to the token (Controller's call).
 - `codex/1`: `token_usage_record`, key `response_id`; `input = input_tokens −
   cached_input_tokens`, `cache_read = cached_input_tokens`, `cache_write_5m =
   cache_write_input_tokens`. Fallback without `token_usage_record`: `token_count`'s
-  `last_token_usage`, key `<session_meta.id>:<ordinal>`.
+  `last_token_usage`, key `<session_meta.id>:<ordinal>`, only when `total_token_usage`
+  has advanced past the last one counted (a repeated snapshot counts nothing).
 - Unknown lines are skipped. A file with usage-shaped lines but no record prints once per
   session `axl: usage parser claude-code/1 does not recognise this log`.
 - A changed format gets a new id (`claude-code/2`); both stay while old logs exist.

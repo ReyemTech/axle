@@ -344,6 +344,108 @@ fn codex_state_survives_a_split_read() {
     }
 }
 
+/// mixed.jsonl without its `token_usage_record` lines: only the fallback is left, and it
+/// has four `token_count` events for two responses (each response's snapshot is repeated).
+fn mixed_fallback_only() -> Vec<u8> {
+    let bytes = read("codex/0.172.0/mixed.jsonl");
+    let lines: Vec<&[u8]> = bytes
+        .split(|b| *b == b'\n')
+        .filter(|l| !String::from_utf8_lossy(l).contains(r#""type":"token_usage_record""#))
+        .collect();
+    let counts = lines
+        .iter()
+        .filter(|l| String::from_utf8_lossy(l).contains(r#""type":"token_count""#))
+        .count();
+    assert_eq!(counts, 4);
+    lines.join(&b'\n')
+}
+
+#[test]
+fn codex_fallback_skips_a_repeated_snapshot() {
+    let p = parsers::by_id("codex/1").unwrap();
+    let mut state = ParserState::default();
+    let got = parse_all(p, &mixed_fallback_only(), &mut state);
+    let meta = "0199a8f2-6c1e-7d30-9a41-00000mixed01";
+    let keys: Vec<_> = got.iter().map(|r| r.key.clone()).collect();
+    assert_eq!(keys, [format!("{meta}:1"), format!("{meta}:2")]);
+    assert!(got.iter().all(|r| r.fallback));
+    let counts: Vec<_> = got
+        .iter()
+        .map(|r| {
+            (
+                r.counts.input,
+                r.counts.cache_read,
+                r.counts.output,
+                r.counts.reasoning,
+            )
+        })
+        .collect();
+    assert_eq!(counts, [(4904, 4096, 300, 120), (2308, 8192, 120, 0)]);
+    assert_eq!(state.ordinal, 2);
+
+    // Split across two runs, the state carried between them, it is still two.
+    let bytes = mixed_fallback_only();
+    let lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
+    for mid in 1..lines.len() {
+        let mut state = ParserState::default();
+        let mut split = parse_all(p, &lines[..mid].join(&b'\n'), &mut state);
+        split.extend(parse_all(p, &lines[mid..].join(&b'\n'), &mut state));
+        assert_eq!(split, got, "split at line {mid}");
+    }
+}
+
+#[test]
+fn codex_fallback_running_total_rules() {
+    let p = parsers::by_id("codex/1").unwrap();
+    let mut s = ParserState {
+        model: Some("gpt-5.3-codex".into()),
+        session_meta_id: Some("m".into()),
+        ..ParserState::default()
+    };
+    let count = |total: &str| {
+        format!(
+            r#"{{"timestamp":"2026-11-28T10:00:00Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{total},"last_token_usage":{{"input_tokens":1}}}}}}}}"#
+        )
+    };
+    let mut line = |total: &str| p.line(count(total).as_bytes(), &mut s);
+    assert!(matches!(
+        line(r#"{"input_tokens":10,"total_tokens":10}"#),
+        Line::Record(_)
+    ));
+    // An unchanged total is a repeat: no record, and not usage-shaped.
+    assert_eq!(
+        line(r#"{"input_tokens":10,"total_tokens":10}"#),
+        Line::Other
+    );
+    assert!(matches!(
+        line(r#"{"input_tokens":25,"total_tokens":25}"#),
+        Line::Record(_)
+    ));
+    // Without total_tokens, the full counts decide.
+    assert!(matches!(
+        line(r#"{"input_tokens":30,"output_tokens":1}"#),
+        Line::Record(_)
+    ));
+    assert_eq!(
+        line(r#"{"input_tokens":30,"output_tokens":1}"#),
+        Line::Other
+    );
+    assert_eq!(s.ordinal, 3);
+    // No running total at all: a repeat cannot be told apart.
+    let no_total = br#"{"timestamp":"2026-11-28T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1}}}}"#;
+    assert_eq!(p.line(no_total, &mut s), Line::UsageShaped);
+    assert_eq!(s.ordinal, 3);
+}
+
+#[test]
+fn parser_state_from_an_older_cursor_loads() {
+    let old = r#"{"model":"gpt-5.3-codex","session_meta_id":"m","ordinal":2,"saw_records":false}"#;
+    let s: ParserState = serde_json::from_str(old).unwrap();
+    assert_eq!((s.ordinal, s.codex_total.clone()), (2, None));
+    let round: ParserState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+    assert_eq!(round, s);
+}
+
 #[test]
 fn codex_input_excludes_cached() {
     let p = parsers::by_id("codex/1").unwrap();
