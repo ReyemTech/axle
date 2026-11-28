@@ -682,3 +682,36 @@ async fn decline_cancels_without_wake() {
         .unwrap();
     assert_eq!(env.notes(second.task.id).await, vec!["not this week"]);
 }
+
+#[tokio::test]
+async fn pending_request_can_be_cancelled() {
+    let env = Env::new().await;
+    let requester = env.session_of(OTHER, "r").await;
+    let out = env
+        .request(&requester, PROJECT, "Roll the CNPG users")
+        .await
+        .unwrap();
+    assert_eq!(out.task.status, TaskStatus::Requested);
+
+    // The requester withdraws its own pending request.
+    let task = env
+        .tasks
+        .cancel(Caller::Agent(&requester), out.task.id)
+        .await
+        .unwrap();
+    assert_eq!(task.status, TaskStatus::Cancelled);
+    assert!(!task.sanctioned);
+    assert_eq!(env.sent().await, 0);
+
+    // The human's Cancel works on a pending request too.
+    let other = env
+        .request(&requester, PROJECT, "Rotate the keys")
+        .await
+        .unwrap();
+    let task = env
+        .tasks
+        .cancel(Caller::Human, other.task.id)
+        .await
+        .unwrap();
+    assert_eq!(task.status, TaskStatus::Cancelled);
+}

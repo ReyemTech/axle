@@ -461,8 +461,10 @@ fn may_change(by: Caller<'_>, task: &Task) -> bool {
     }
 }
 
-/// The statuses a task can be cancelled from.
-const CANCELLABLE: [TaskStatus; 5] = [
+/// The statuses a task can be cancelled from (a pending request included, so its requester
+/// can withdraw it).
+const CANCELLABLE: [TaskStatus; 6] = [
+    TaskStatus::Requested,
     TaskStatus::Open,
     TaskStatus::Planning,
     TaskStatus::Claimed,
