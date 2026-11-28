@@ -38,6 +38,7 @@ pub fn routes() -> Router<AppState> {
         .route("/heartbeat", post(heartbeat))
         .route("/events", get(events))
         .route("/inbox/summary", get(inbox_summary))
+        .route("/leases", get(leases))
         .route("/whoami", get(whoami))
         .route("/token/revoke", post(revoke_self))
 }
@@ -166,7 +167,7 @@ pub struct HeartbeatRequest {
 #[derive(Debug, Serialize)]
 pub struct HeartbeatResponse {
     pub unread: u32,
-    /// Tasks this session holds (`claimed`, `blocked` or `review`).
+    /// Tasks this session holds (`planning`, `claimed`, `blocked` or `review`).
     pub leases: Vec<TaskId>,
 }
 
@@ -191,7 +192,13 @@ async fn heartbeat(
         .unread_count(&r)
         .await
         .map_err(ApiError::internal)?;
-    let leases = state
+    let leases = held(&state, &r).await?.into_iter().map(|t| t.id).collect();
+    Ok(Json(HeartbeatResponse { unread, leases }))
+}
+
+/// The tasks this session holds (`planning`, `claimed`, `blocked` or `review`).
+async fn held(state: &AppState, r: &Resolved) -> Result<Vec<crate::domain::Task>, ApiError> {
+    Ok(state
         .tasks
         .list(TaskFilter {
             owner: Some(r.agent.id),
@@ -210,9 +217,51 @@ async fn heartbeat(
                         | TaskStatus::Review
                 )
         })
-        .map(|t| t.id)
-        .collect();
-    Ok(Json(HeartbeatResponse { unread, leases }))
+        .collect())
+}
+
+// ---------------------------------------------------------------- leases
+
+#[derive(Debug, Serialize)]
+pub struct LeaseItem {
+    pub id: TaskId,
+    /// Peer-written and not framed: clients frame it with the three labels below, the way
+    /// the MCP tools frame task titles.
+    pub title: String,
+    pub status: TaskStatus,
+    /// `human` or the author's agent label.
+    pub created_by: String,
+    /// Who last replaced the title, when that is not its author.
+    pub edited_by: Option<String>,
+    /// The task's project key.
+    pub project: String,
+}
+
+/// The tasks this session holds, with titles, for the hooks. A plain read: unlike the
+/// heartbeat it renews nothing.
+async fn leases(
+    State(state): State<AppState>,
+    Extension(AuthToken(token)): Extension<AuthToken>,
+    Query(q): Query<SessionQuery>,
+) -> Result<Json<Vec<LeaseItem>>, ApiError> {
+    let r = session_for(&state, token, q.session).await?;
+    let mut labels = crate::mcp::Labels::new(&*state.store);
+    let mut out = Vec::new();
+    for t in held(&state, &r).await? {
+        let (created_by, edited_by, project) = labels
+            .title_frame(&t)
+            .await
+            .map_err(|_| ApiError::internal("cannot label a held task"))?;
+        out.push(LeaseItem {
+            id: t.id,
+            title: t.title,
+            status: t.status,
+            created_by,
+            edited_by,
+            project,
+        });
+    }
+    Ok(Json(out))
 }
 
 // ---------------------------------------------------------------- events

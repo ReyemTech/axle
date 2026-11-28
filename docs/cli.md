@@ -45,12 +45,14 @@ What it changes, per harness:
 
 | Harness | Bridge | Hooks | Where |
 |---|---|---|---|
-| Claude Code | yes | yes | An Axle-owned plugin under `~/.axl/integrations/claude-code/`, linked into `~/.claude/skills/axle` (user-scope entries in `~/.claude.json` and `~/.claude/settings.json` as the fallback) |
+| Claude Code | yes | yes | An Axle-owned plugin under `~/.axl/integrations/claude-code/`, linked into `~/.claude/skills/axle` (user-scope entries in `~/.claude.json` and `~/.claude/settings.json` as the fallback), and the rules block in `~/.claude/CLAUDE.md` |
 | Codex | yes | yes: SessionStart, PostToolUse, Stop | `~/.codex/config.toml` |
 | OpenCode | yes | none: OpenCode has no shell hooks | `~/.config/opencode/` |
 
-Each harness also gets a short block of instructions (`CLAUDE.md` or `AGENTS.md`) telling
-the agent how to use the Axle tools. Codex hooks run `axl hook <event> --harness codex`.
+Each harness also gets a short block of instructions telling the agent how to use the Axle
+tools, between `# >>> axle >>>` and `# <<< axle <<<` markers: `~/.claude/CLAUDE.md` for
+Claude Code (created if missing) and `AGENTS.md` for Codex and OpenCode. `axl uninstall`
+removes exactly that block. Codex hooks run `axl hook <event> --harness codex`.
 Codex asks you to trust new hooks the next time it starts; review them with `/hooks`.
 Existing hand-made `axle` entries are adopted rather than duplicated.
 
@@ -156,6 +158,7 @@ and revocation, and `revoke` cuts one off by id. For normal onboarding use `axl 
 | `~/.axl/config.toml` | `server_url` and `port`, written by `login`, `install` and `service`. |
 | `~/.axl/token` | This machine's token, mode 0600. |
 | `~/.axl/install-manifest.json` | What `axl install` changed, for `axl uninstall`. |
+| `~/.axl/sessions/<pid>.json` | The bridge's session, for the hooks to find. `<pid>.seen` lists messages the hooks already surfaced; `<pid>.<session>.nudged` marks the one-time "working without an axle task" reminder as given, and `<pid>.<session>.leases` caches "holds a task" for 5 minutes. The bridge removes them with the session file. |
 | `<file>.axl-backup-<UTC timestamp>` | A copy of a harness file from before it was edited. |
 | `~/.axl/logs/axl.log` | The local service's log. |
 

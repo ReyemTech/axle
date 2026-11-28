@@ -437,6 +437,22 @@ impl<'a> Labels<'a> {
         Ok(editors)
     }
 
+    /// What `task_title` frames a title with, for clients that frame it themselves (the
+    /// hooks): the author's label, the last title editor's label when that is someone else,
+    /// and the project key.
+    pub async fn title_frame(
+        &mut self,
+        t: &Task,
+    ) -> Result<(String, Option<String>, String), ToolError> {
+        let editor = self.editors(t).await?.title;
+        let from = self.actor(t.created_by).await?;
+        let edited = match editor {
+            Some(e) if !same_author(e, t.created_by) => Some(self.actor(e).await?),
+            _ => None,
+        };
+        Ok((from, edited, self.project(t.project_id).await?))
+    }
+
     /// The task's title, framed as peer data from its author (and last editor).
     pub async fn task_title(&mut self, t: &Task) -> Result<String, ToolError> {
         let editor = self.editors(t).await?.title;

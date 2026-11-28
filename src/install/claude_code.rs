@@ -1,7 +1,8 @@
 //! Claude Code: an Axle-owned plugin directory linked into `~/.claude/skills/axle`, or (the
-//! fallback) user-scope entries in `~/.claude.json`, `~/.claude/settings.json` and
-//! `~/.claude/CLAUDE.md`. Existing hand-made `axle` entries and bare `axl hook <event>`
-//! hooks are adopted: replaced by the managed form and recorded in the manifest.
+//! fallback) user-scope entries in `~/.claude.json` and `~/.claude/settings.json`; in both
+//! modes the rules block in `~/.claude/CLAUDE.md`. Existing hand-made `axle` entries and bare
+//! `axl hook <event>` hooks are adopted: replaced by the managed form and recorded in the
+//! manifest.
 
 use std::collections::HashSet;
 use std::io;
@@ -235,10 +236,12 @@ pub fn plan_install(
     let settings = edit_settings(&mut cx, mode)?;
     cx.plan.edits.extend(claude_json);
     cx.plan.edits.extend(settings);
-    match mode {
-        ClaudeMode::Plugin => plan_plugin(&mut cx)?,
-        ClaudeMode::UserScope => plan_claude_md(&mut cx)?,
+    if mode == ClaudeMode::Plugin {
+        plan_plugin(&mut cx)?;
     }
+    // In both modes: the plugin's skill loads only when the model asks for it, while
+    // `~/.claude/CLAUDE.md` is read at every session start.
+    plan_claude_md(&mut cx)?;
     plan_config_toml(&mut cx)?;
     Ok((cx.plan, cx.entries, cx.adopted))
 }

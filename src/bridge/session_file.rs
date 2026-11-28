@@ -25,7 +25,24 @@ pub fn path(home: &Path, harness_pid: u32) -> PathBuf {
         .join(format!("{harness_pid}.json"))
 }
 
-/// A written session file; `remove` (or drop) deletes it if it is still ours.
+/// `<pid>.seen`: message ids the hooks already surfaced for whatever session this pid runs.
+pub fn seen_path(session_file: &Path) -> PathBuf {
+    session_file.with_extension("seen")
+}
+
+/// `<pid>.<session>.nudged`: the hooks gave this session its one-time "no task" reminder.
+pub fn nudged_path(session_file: &Path, session: SessionId) -> PathBuf {
+    session_file.with_extension(format!("{session}.nudged"))
+}
+
+/// `<pid>.<session>.leases`: written when this session was seen holding a lease (or its
+/// server has no lease list); the hooks skip the lookup while it is fresh.
+pub fn lease_cache_path(session_file: &Path, session: SessionId) -> PathBuf {
+    session_file.with_extension(format!("{session}.leases"))
+}
+
+/// A written session file; `remove` (or drop) deletes it, and the hooks' files for it, if
+/// it is still ours.
 #[derive(Debug)]
 pub struct SessionFile {
     path: PathBuf,
@@ -62,8 +79,19 @@ impl SessionFile {
             .ok()
             .and_then(|b| serde_json::from_slice::<SessionInfo>(&b).ok())
             .is_some_and(|info| info.session_id == self.session_id);
-        if ours && let Err(e) = std::fs::remove_file(&self.path) {
+        if !ours {
+            return;
+        }
+        if let Err(e) = std::fs::remove_file(&self.path) {
             eprintln!("axl: cannot remove {}: {e}", self.path.display());
+        }
+        for companion in [
+            seen_path(&self.path),
+            nudged_path(&self.path, self.session_id),
+            lease_cache_path(&self.path, self.session_id),
+        ] {
+            // Absent is the common case; a leftover is harmless, so no line for it.
+            let _ = std::fs::remove_file(companion);
         }
     }
 }
