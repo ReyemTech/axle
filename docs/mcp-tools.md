@@ -1,6 +1,6 @@
 # MCP tools
 
-Axle serves 17 tools over MCP, both through `axl bridge` (stdio) and directly at `/mcp`
+Axle serves 18 tools over MCP, both through `axl bridge` (stdio) and directly at `/mcp`
 (Streamable HTTP). This page is the reference: what each tool does, its parameters, its
 errors, and an example.
 
@@ -8,7 +8,7 @@ errors, and an example.
 |---|---|
 | Identity and discovery | [`whoami`](#whoami), [`project_list`](#project_list), [`agent_list`](#agent_list) |
 | Messages | [`send_message`](#send_message), [`fetch_inbox`](#fetch_inbox), [`ack_messages`](#ack_messages), [`search_messages`](#search_messages) |
-| Tasks | [`task_create`](#task_create), [`task_list`](#task_list), [`task_get`](#task_get), [`task_claim`](#task_claim), [`task_post`](#task_post), [`task_update`](#task_update), [`task_propose_plan`](#task_propose_plan), [`task_renew`](#task_renew), [`task_release`](#task_release), [`task_complete`](#task_complete) |
+| Tasks | [`task_create`](#task_create), [`task_request`](#task_request), [`task_list`](#task_list), [`task_get`](#task_get), [`task_claim`](#task_claim), [`task_post`](#task_post), [`task_update`](#task_update), [`task_propose_plan`](#task_propose_plan), [`task_renew`](#task_renew), [`task_release`](#task_release), [`task_complete`](#task_complete) |
 
 ## Conventions
 
@@ -64,7 +64,7 @@ Most task tools return a task summary. `task_create` and `task_get` add `body`.
 }
 ```
 
-`status` is one of `open`, `planning`, `claimed`, `blocked`, `review`, `done`, `cancelled`.
+`status` is one of `requested`, `open`, `planning`, `claimed`, `blocked`, `review`, `done`, `cancelled`.
 `plan_state` is one of `none`, `drafting`, `submitted`, `changes_requested`, `approved`.
 `created_by` is an agent label or `human`.
 
@@ -108,12 +108,17 @@ No parameters.
   "harness": "claude-code",
   "session": "0199a000-0000-7000-8000-000000000001",
   "leases": [],
-  "unread": 0
+  "unread": 0,
+  "wake": { "channel": "claude-socket", "turn_state": "idle" }
 }
 ```
 
 Each entry in `leases` has `id`, `title`, `status`, `project` and `lease_expires_at`.
 `project` is `null` for a session with no home project.
+
+`wake` says how Axle can reach this session when it is idle. `channel` is `none`,
+`claude-socket`, `claude-monitor`, `codex-app-server` or `opencode-api` (`none`: Axle
+cannot wake it). `turn_state` is `unknown`, `busy` or `idle`, as the harness last reported.
 
 ### `project_list`
 
@@ -278,11 +283,49 @@ Create an open task. Its body becomes the first message of its thread.
 { "title": "Add rate limiting to /login", "body": "Return 429 after 10 failed attempts per minute." }
 ```
 
-Returns the task object with `body`. Errors: `a task needs a title`,
+Returns the task object with `body`. `task_create` never wakes anyone, with one exception:
+when `parent` is a sanctioned task already past its plan gate, the child is routed to a
+free session of its project at once (no approval card). A top-level `task_create` only
+queues an open task.
+
+Errors: `a task needs a title`,
 ``you have no home project; pass `project` (key or display name)``,
 `child tasks belong to one project`,
 `a child task's project must be its parent's project or one the parent spans`, and the plan
 gate error when the parent is still planning.
+
+### `task_request`
+
+Ask another project's agents to do work. It creates a work request: the human approves it
+first (it shows as a card in the web UI), unless the target project auto-starts requests,
+in which case it is open at once and routed to a free session if there is one, else
+queued. Your identity is the requester; there is no requester parameter.
+
+| Parameter | Type | Notes |
+|---|---|---|
+| `project` | string, required | The project that should do the work (key or display name). |
+| `title` | string, required | At most 200 characters. |
+| `body` | string, required | At most 64 KB. |
+| `eligibility` | object | `harness` and/or `host` allowed to claim it. |
+| `importance` | string | `normal` (default), `high` or `urgent`; applies to the first message. |
+| `parent` | string | Parent task id, to make the request a child task. |
+
+```json
+{ "project": "github.com/acme/api", "title": "Expose /v2/orders", "body": "The web app needs the v2 orders endpoint." }
+```
+
+Returns the task object plus `request_state`: `awaiting_human` (status `requested`),
+`routed` (open and a free session was woken) or `queued` (open, no free session). A
+request you repeat within 10 minutes returns the existing one; if that one is no longer
+pending (declined, so `cancelled`, or done) `request_state` is left out and `status` tells
+where it stands. Until approved a request cannot be claimed.
+
+Errors:
+
+- `request depth limit reached (2)` (the number is the configured limit)
+- `request would loop back to <project key>`
+- `too many requests; try again in <n> minutes` (10 requests per agent per hour)
+- the project and size errors of `task_create`, such as `unknown project "…"`
 
 ### `task_list`
 
@@ -293,7 +336,7 @@ Agents cannot ack tasks; only the human can, in the web UI.
 | Parameter | Type | Notes |
 |---|---|---|
 | `project` | string | Also matches parent tasks that span this project. |
-| `status` | string | One status. |
+| `status` | string | One status, including `requested` (work requests awaiting the human). |
 | `owner` | string | Owning agent label. |
 | `parent` | string | List this task's children. |
 | `include_acked` | boolean | Also return acked and auto-acked done tasks. Default `false`. |
@@ -385,7 +428,10 @@ Errors:
 
 ### `task_post`
 
-Post a reply in a task's thread. It reaches the task's owner and creator.
+Post a reply in a task's thread. It reaches the task's owner and creator. When another
+agent owns the task and its session is idle, the post may wake that owner, within the
+peer-wake guards (6 peer wakes per session per hour, 3 per hour per poster and owner pair,
+1 per task per 5 minutes). `send_message` never wakes anyone.
 
 | Parameter | Type | Notes |
 |---|---|---|

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::future::IntoFuture;
 use std::sync::Arc;
 
-use axle::clock::TestClock;
+use axle::clock::{Clock, TestClock};
 use axle::config::ServerConfig;
 use axle::http::{AppState, router};
 use axle::store::Store;
@@ -123,9 +123,14 @@ impl Server {
 
     /// A client for agent `(PROJECT, host, harness)` with its own session.
     async fn agent(&self, host: &str, harness: &str) -> Client {
+        self.agent_in(PROJECT, host, harness).await
+    }
+
+    /// A client for agent `(project, host, harness)` with its own session.
+    async fn agent_in(&self, project: &str, host: &str, harness: &str) -> Client {
         let session = uuid::Uuid::now_v7().to_string();
         self.connect(&[
-            ("x-axl-project", PROJECT),
+            ("x-axl-project", project),
             ("x-axl-host", host),
             ("x-axl-harness", harness),
             ("x-axl-session", &session),
@@ -199,13 +204,14 @@ store_matrix!(tool_schemas_have_no_identity_params, |store: Arc<
         "task_release",
         "task_complete",
         "task_propose_plan",
+        "task_request",
     ] {
         assert!(
             names.contains(&expected),
             "missing tool {expected}: {names:?}"
         );
     }
-    assert_eq!(names.len(), 17, "unexpected tools: {names:?}");
+    assert_eq!(names.len(), 18, "unexpected tools: {names:?}");
     for tool in &tools {
         let description = tool.description.as_deref().unwrap_or_default();
         assert!(
@@ -1807,4 +1813,287 @@ store_matrix!(agent_tokens_cannot_send_as_the_human, |store: Arc<
     for c in [agent, other] {
         c.cancel().await.unwrap();
     }
+});
+
+const OTHER: &str = "github.com/reyemtech/other";
+
+impl Server {
+    /// Registers project `key`.
+    async fn project(&self, key: &str) -> axle::domain::Project {
+        self.store
+            .upsert_project(key, key, self.clock.now())
+            .await
+            .unwrap()
+    }
+
+    /// Turns auto-start on for `key` (creating the project).
+    async fn auto_start(&self, key: &str) {
+        let now = self.clock.now();
+        let project = self.store.upsert_project(key, key, now).await.unwrap();
+        let settings = axle::domain::ProjectWakeSettings {
+            auto_start: true,
+            ..axle::domain::ProjectWakeSettings::defaults(project.id)
+        };
+        self.store.put_wake_settings(&settings, now).await.unwrap();
+    }
+
+    /// Makes `session` live, idle for 10 s and wakeable through a Claude socket.
+    async fn make_idle(&self, session: &str) {
+        let now = self.clock.now();
+        let id = session.parse().unwrap();
+        self.store
+            .report_turn(
+                id,
+                Some(axle::domain::TurnState::Idle),
+                Some(axle::domain::WakeChannel::ClaudeSocket),
+                now - time::Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        self.store.touch_heartbeat(id, now).await.unwrap();
+    }
+}
+
+store_matrix!(
+    task_request_awaiting_human,
+    |store: Arc<dyn Store>| async move {
+        let server = start(store).await;
+        server.project(OTHER).await;
+        let agent = server.agent("mac", "claude-code").await;
+        let t = ok(
+            &agent,
+            "task_request",
+            json!({"project": OTHER, "title": "Add a flag", "body": "please add --x"}),
+        )
+        .await;
+        assert_eq!(t["status"], "requested");
+        assert_eq!(t["request_state"], "awaiting_human");
+        assert_eq!(t["project"], OTHER);
+        assert!(t["title"].as_str().unwrap().contains("Add a flag"));
+        agent.cancel().await.unwrap();
+    }
+);
+
+store_matrix!(task_request_routed_in_auto_start, |store: Arc<
+    dyn Store,
+>| async move {
+    let server = start(store).await;
+    server.auto_start(PROJECT).await;
+    let requester = server.agent("mac", "claude-code").await;
+    let free = server.agent("linux", "claude-code").await;
+    let who = ok(&free, "whoami", json!({})).await;
+    server.make_idle(who["session"].as_str().unwrap()).await;
+    let t = ok(
+        &requester,
+        "task_request",
+        json!({"project": PROJECT, "title": "Do it", "body": "now", "importance": "high"}),
+    )
+    .await;
+    assert_eq!(t["status"], "open");
+    assert_eq!(t["request_state"], "routed");
+    for c in [requester, free] {
+        c.cancel().await.unwrap();
+    }
+});
+
+store_matrix!(task_request_queued_without_free_session, |store: Arc<
+    dyn Store,
+>| async move {
+    let server = start(store).await;
+    server.auto_start(PROJECT).await;
+    let requester = server.agent("mac", "claude-code").await;
+    let t = ok(
+        &requester,
+        "task_request",
+        json!({"project": PROJECT, "title": "Do it", "body": "now"}),
+    )
+    .await;
+    assert_eq!(t["status"], "open");
+    assert_eq!(t["request_state"], "queued");
+    requester.cancel().await.unwrap();
+});
+
+store_matrix!(
+    task_request_dedupe_of_declined_reports_its_status,
+    |store: Arc<dyn Store>| async move {
+        let server = start(store).await;
+        server.project(OTHER).await;
+        let agent = server.agent("mac", "claude-code").await;
+        let args = json!({"project": OTHER, "title": "Add a flag", "body": "please"});
+        let first = ok(&agent, "task_request", args.clone()).await;
+        let id: axle::domain::TaskId = first["id"].as_str().unwrap().parse().unwrap();
+        let task = server.store.get_task(id).await.unwrap().unwrap();
+        server
+            .tasks
+            .decline_request(id, task.version, None)
+            .await
+            .unwrap();
+        let again = ok(&agent, "task_request", args).await;
+        assert_eq!(again["id"], first["id"]);
+        assert_eq!(again["status"], "cancelled");
+        assert!(again.get("request_state").is_none(), "{again}");
+        agent.cancel().await.unwrap();
+    }
+);
+
+store_matrix!(task_request_guard_errors_are_tool_errors, |store: Arc<
+    dyn Store,
+>| async move {
+    let server = start(store).await;
+    let (pa, pb, pc, pd) = (
+        "github.com/acme/a",
+        "github.com/acme/b",
+        "github.com/acme/c",
+        "github.com/acme/d",
+    );
+    for key in [pb, pc, pd] {
+        server.project(key).await;
+    }
+    let a = server.agent_in(pa, "a", "claude-code").await;
+    let b = server.agent_in(pb, "b", "claude-code").await;
+    let c = server.agent_in(pc, "c", "claude-code").await;
+    let pa_id = server
+        .store
+        .upsert_project(pa, pa, server.clock.now())
+        .await
+        .unwrap()
+        .id;
+    let root = server
+        .tasks
+        .create(
+            axle::service::tasks::Caller::Human,
+            axle::service::tasks::NewTask {
+                project_id: pa_id,
+                title: "root".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    ok(&a, "task_claim", json!({"id": root.id})).await;
+    let to_b = ok(
+        &a,
+        "task_request",
+        json!({"project": pb, "title": "in b", "body": "x"}),
+    )
+    .await;
+    let id: axle::domain::TaskId = to_b["id"].as_str().unwrap().parse().unwrap();
+    let version = server.store.get_task(id).await.unwrap().unwrap().version;
+    server.tasks.approve_request(id, version).await.unwrap();
+    ok(&b, "task_claim", json!({"id": id})).await;
+
+    let (err, text) = call(
+        &b,
+        "task_request",
+        json!({"project": pa, "title": "back", "body": "x"}),
+    )
+    .await;
+    assert!(err);
+    assert_eq!(text, format!("request would loop back to {pa}"));
+
+    let to_c = ok(
+        &b,
+        "task_request",
+        json!({"project": pc, "title": "in c", "body": "x"}),
+    )
+    .await;
+    let id: axle::domain::TaskId = to_c["id"].as_str().unwrap().parse().unwrap();
+    let version = server.store.get_task(id).await.unwrap().unwrap().version;
+    server.tasks.approve_request(id, version).await.unwrap();
+    ok(&c, "task_claim", json!({"id": id})).await;
+    let (err, text) = call(
+        &c,
+        "task_request",
+        json!({"project": pd, "title": "in d", "body": "x"}),
+    )
+    .await;
+    assert!(err);
+    assert_eq!(text, "request depth limit reached (2)");
+
+    // The hourly cap: ten distinct requests, the eleventh is refused.
+    server.project(OTHER).await;
+    let spammer = server.agent("mac", "claude-code").await;
+    for i in 0..10 {
+        ok(
+            &spammer,
+            "task_request",
+            json!({"project": OTHER, "title": format!("job {i}"), "body": "x"}),
+        )
+        .await;
+    }
+    let (err, text) = call(
+        &spammer,
+        "task_request",
+        json!({"project": OTHER, "title": "job 10", "body": "x"}),
+    )
+    .await;
+    assert!(err);
+    assert!(
+        text.starts_with("too many requests; try again in "),
+        "{text}"
+    );
+    for client in [a, b, c, spammer] {
+        client.cancel().await.unwrap();
+    }
+});
+
+store_matrix!(
+    task_list_status_requested,
+    |store: Arc<dyn Store>| async move {
+        let server = start(store).await;
+        server.project(OTHER).await;
+        let agent = server.agent("mac", "claude-code").await;
+        let req = ok(
+            &agent,
+            "task_request",
+            json!({"project": OTHER, "title": "asked", "body": "x"}),
+        )
+        .await;
+        ok(
+            &agent,
+            "task_create",
+            json!({"title": "plain", "body": "x"}),
+        )
+        .await;
+        let listed = ok(&agent, "task_list", json!({"status": "requested"})).await;
+        let tasks = listed["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1, "{listed}");
+        assert_eq!(tasks[0]["id"], req["id"]);
+        agent.cancel().await.unwrap();
+    }
+);
+
+store_matrix!(
+    task_claim_requested_refused,
+    |store: Arc<dyn Store>| async move {
+        let server = start(store).await;
+        server.project(OTHER).await;
+        let agent = server.agent("mac", "claude-code").await;
+        let other = server.agent_in(OTHER, "linux", "claude-code").await;
+        let req = ok(
+            &agent,
+            "task_request",
+            json!({"project": OTHER, "title": "asked", "body": "x"}),
+        )
+        .await;
+        let (err, text) = call(&other, "task_claim", json!({"id": req["id"]})).await;
+        assert!(err);
+        assert_eq!(text, "waiting for the human to approve this request");
+        for c in [agent, other] {
+            c.cancel().await.unwrap();
+        }
+    }
+);
+
+store_matrix!(whoami_reports_wake, |store: Arc<dyn Store>| async move {
+    let server = start(store).await;
+    let agent = server.agent("mac", "claude-code").await;
+    let who = ok(&agent, "whoami", json!({})).await;
+    assert_eq!(who["wake"]["channel"], "none");
+    assert_eq!(who["wake"]["turn_state"], "unknown");
+    server.make_idle(who["session"].as_str().unwrap()).await;
+    let who = ok(&agent, "whoami", json!({})).await;
+    assert_eq!(who["wake"]["channel"], "claude-socket");
+    assert_eq!(who["wake"]["turn_state"], "idle");
+    agent.cancel().await.unwrap();
 });

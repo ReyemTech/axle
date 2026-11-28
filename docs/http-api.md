@@ -52,7 +52,7 @@ The Helm chart wires both into the pod's probes.
 
 ## `/mcp`
 
-The same 17 [MCP tools](mcp-tools.md) the bridge serves, over the MCP Streamable HTTP
+The same 18 [MCP tools](mcp-tools.md) the bridge serves, over the MCP Streamable HTTP
 transport. Requests are limited to 1 MB. Use this for MCP clients that can send headers and
 cannot spawn a local process.
 
