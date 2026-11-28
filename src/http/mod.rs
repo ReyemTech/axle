@@ -29,8 +29,10 @@ use crate::service::delivery::DeliveryService;
 use crate::service::enroll::EnrollService;
 use crate::service::messages::MessageService;
 use crate::service::tasks::TaskService;
+use crate::service::usage::UsageService;
 use crate::store::Store;
 use crate::ui::UiState;
+use crate::usage::prices::PriceTable;
 
 /// Everything a request handler needs; cheap to clone.
 #[derive(Clone)]
@@ -44,6 +46,7 @@ pub struct AppState {
     pub tasks: Arc<TaskService>,
     pub delivery: Arc<DeliveryService>,
     pub enroll: Arc<EnrollService>,
+    pub usage: Arc<UsageService>,
     /// Fired when the server starts shutting down; long-lived responses (SSE) end on it.
     pub shutdown: Shutdown,
     pub rate_limit: Arc<RateLimiter>,
@@ -136,6 +139,11 @@ impl AppState {
                 clock.clone(),
                 bus.clone(),
             )),
+            usage: Arc::new(UsageService::new(
+                store.clone(),
+                clock.clone(),
+                Arc::new(PriceTable::builtin()),
+            )),
             bus,
             shutdown: Shutdown::new(),
             rate_limit: Arc::new(RateLimiter::new(
@@ -148,6 +156,16 @@ impl AppState {
             store,
             clock,
         }
+    }
+
+    /// Uses `prices` instead of the built-in table.
+    pub fn with_prices(mut self, prices: PriceTable) -> Self {
+        self.usage = Arc::new(UsageService::new(
+            self.store.clone(),
+            self.clock.clone(),
+            Arc::new(prices),
+        ));
+        self
     }
 }
 

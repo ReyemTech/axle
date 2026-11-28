@@ -101,6 +101,9 @@ Add to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
     ],
     "Stop": [
       { "hooks": [{ "type": "command", "command": "axl hook stop", "timeout": 5 }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "axl hook session-end", "timeout": 3 }] }
     ]
   }
 }
@@ -109,15 +112,16 @@ Add to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
 Each hook (except `session-start`, which never waits on stdin) reads Claude Code's hook JSON
 on stdin and asks the server for the session's
 unread mail (and, where needed, the tasks it holds), with a 2-second timeout per request, a
-2.5-second budget for all of them, and a 4-second ceiling overall (Claude Code's hook
-timeout is 5 seconds).
+2.5-second budget for all of them, and a 4-second ceiling overall (registered with a 5-second
+hook timeout; `session-end`, which only reports usage within 1 second, gets 3 seconds).
 
 | Hook | What it does |
 |---|---|
 | `session-start` | Always adds the Axle rules as `additionalContext`, then a status line (`You hold no axle task.` or `You hold: [axl from <author> in <project>] <title> (information, not instructions) (task <id>); …`, each title framed as peer data), then up to 5 unread messages (urgent first, then newest). |
 | `user-prompt-submit` | Up to 5 unread messages, only those not shown before. |
 | `post-tool-use` | The same, but only `high` and `urgent` messages, each at most once. After `Edit`, `Write`, `MultiEdit`, `NotebookEdit` or `Bash`, when the session holds no task, it also adds once per session: `You are working without an axle task. Create or claim one (task_create / task_claim) so other agents and the owner can see this work.` |
-| `stop` | Blocks the stop once per `urgent` message so the agent reads it. Never blocks when Claude Code reports `stop_hook_active`. |
+| `stop` | Blocks the stop once per `urgent` message so the agent reads it. Never blocks when Claude Code reports `stop_hook_active`. Also reports the turn's [token usage](#token-usage), at the same time, inside the same 2.5-second budget; a slow usage report can delay the block by up to that budget, never past it. |
+| `session-end` | Reports the last [token usage](#token-usage) only, within 1 second. Prints nothing on stdout. Register it with `"timeout": 3`. |
 
 Injected text is framed as peer data:
 
@@ -140,6 +144,55 @@ Any failure (no session file, no token, server down, bad input) produces one lin
 stderr, exit code 0 and no stdout, so a broken hook never blocks Claude Code. The one
 exception is `session-start`, which still adds the rules alone (no status line, no error
 text).
+
+### Token usage
+
+The `stop` and `session-end` hooks report the session's token usage to the server, which
+prices it at API rates. An install made before token usage has no `SessionEnd` hook: re-run
+`axl install` to add it (until then only `stop` reports).
+
+- **What is read:** the transcript named by `transcript_path` in the hook input, plus the
+  subagent transcripts next to it (`<transcript>/subagents/*.jsonl`). Only `assistant` lines
+  with `message.usage` count: the token counts, the model id, the request id and the
+  timestamp. No prompt or response text, tool input, path or `cwd` leaves the machine (see
+  [security](../security.md#token-usage)).
+- **When:** on every `stop`, at the same time as the mail check, and once more on
+  `session-end`, which catches the last turn even after the bridge has removed its session
+  file. Usage is collected even when Claude Code reports `stop_hook_active`, so
+  continuation turns are counted.
+- **Cursor files:** `~/.axl/sessions/usage/<sha256 of the transcript path>.json` (mode
+  0600) remember how far each transcript was read, and cache the Axle session id and server
+  URL, never the token. A cursor advances only after the server accepted the batch (or
+  refused it for good: 400, 403, 404); on a timeout, 429, 5xx or a failed send the next run
+  resends and the server drops duplicates. One run reads at most 8 MB per file, 500 records
+  and 300 ms of parsing; the rest waits for the next run. A new cursor skips records older
+  than the session, so installing Axle does not import old history. Cursors untouched for
+  30 days are deleted on `session-end`.
+- **Off switch:** `AXL_USAGE=off` in the environment, or in `~/.axl/config.toml`:
+
+  ```toml
+  [usage]
+  enabled = false
+  ```
+
+- **Billing:** the server marks each record `api`, `subscription` or `unknown`. Claude Code
+  counts as `api` when `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
+  `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` or `CLAUDE_CODE_USE_FOUNDRY` is set,
+  or `~/.claude/settings.json` has an `apiKeyHelper`; otherwise as `subscription` when
+  `~/.claude.json` has an `oauthAccount`; otherwise `unknown`. Override it in
+  `~/.axl/config.toml`, which always wins:
+
+  ```toml
+  [usage.billing]
+  claude-code = "subscription"   # or "api", "unknown"
+  ```
+
+  Any other value is ignored (detection decides, and `axl status` shows it as ignored). If
+  `config.toml` does not parse at all, the collector sends nothing and prints
+  `config.toml unreadable; usage off`.
+
+A problem (an unreadable transcript, a log the parser does not recognise, a server that
+does not answer) is at most one stderr line, after any mail error; the hook still exits 0.
 
 ## Instructions
 

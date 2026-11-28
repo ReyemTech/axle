@@ -44,6 +44,17 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{AXL}} hook session-end",
+            "timeout": 3
+          }
+        ]
+      }
     ]
   }
 }

@@ -16,11 +16,11 @@ use crate::delivery::stages::{
     ChildState, CompletionTarget, completion_target, last_enabled, parent_stage,
 };
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, DeliverySignal, DeliveryStage, Enrollment,
-    EnrollmentId, EnrollmentKind, Importance, InboxItem, LinkKind, Message, MessageId, MessageKind,
-    PlanState, PrLinkedBy, Project, ProjectDelivery, ProjectId, Session, SessionId, Task,
-    TaskEvent, TaskEventKind, TaskId, TaskLink, TaskPr, TaskStageRow, TaskStatus, TokenId,
-    TokenInfo, WaitingOn,
+    Actor, Address, Agent, AgentId, Billing, BlockDetail, DeliverySignal, DeliveryStage,
+    Enrollment, EnrollmentId, EnrollmentKind, Importance, InboxItem, LinkKind, Message, MessageId,
+    MessageKind, PlanState, PrLinkedBy, Project, ProjectDelivery, ProjectId, Session, SessionId,
+    Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskPr, TaskStageRow, TaskStatus, TokenId,
+    TokenInfo, UsageId, WaitingOn,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -495,6 +495,38 @@ pub trait Store: Send + Sync {
     /// The tasks whose thread holds urgent mail waiting on the human (the same messages
     /// `human_attention` would list, urgent only, with no page limit), each once, by id.
     async fn urgent_attention_tasks(&self) -> StoreResult<Vec<TaskId>>;
+
+    // ---- usage ----
+
+    /// In one transaction, for each record: upserts by `(agent.harness, key)`. A new row takes
+    /// the batch's session/agent/project/token, `pricer`'s price and one allocation row per task
+    /// `session` held at `occurred_at` (`parts` = how many), or one `(NULL, 1)` row. An existing
+    /// row written by the same token keeps its session, model, billing, times and allocations,
+    /// takes the larger value of each count, and is re-priced from the merged counts; one
+    /// written by another token is left as it is (a duplicate).
+    async fn insert_usage(
+        &self,
+        batch: &UsageBatch<'_>,
+        pricer: &dyn Pricer,
+    ) -> StoreResult<UsageWritten>;
+    async fn get_usage(&self, harness: &str, key: &str) -> StoreResult<Option<StoredUsage>>;
+    /// One row per group (one row for `Total`, even when nothing matches), unordered.
+    async fn usage_summary(
+        &self,
+        filter: &UsageFilter,
+        group: UsageGroup,
+    ) -> StoreResult<Vec<UsageRow>>;
+    /// Up to `limit` rows in id order after `after`, `occurred_at >= since` when set, only
+    /// NULL-cost rows when `unpriced_only`.
+    async fn usage_to_reprice(
+        &self,
+        since: Option<OffsetDateTime>,
+        unpriced_only: bool,
+        after: Option<UsageId>,
+        limit: u32,
+    ) -> StoreResult<Vec<RepriceRow>>;
+    /// Sets `cost_micros` / `price_ref` (`None`: both NULL) for each id, in one transaction.
+    async fn set_usage_costs(&self, costs: &[(UsageId, Option<Priced>)]) -> StoreResult<()>;
 }
 
 /// How far a message has got, from its recipient rows (spec §9 receipts).
@@ -522,6 +554,149 @@ impl MessageReceipt {
             "sent"
         }
     }
+}
+
+/// Token counts of one model response. `input` is uncached input only; `output` includes
+/// `reasoning`, which is informational and never priced twice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageCounts {
+    pub input: i64,
+    pub output: i64,
+    pub cache_write_5m: i64,
+    pub cache_write_1h: i64,
+    pub cache_read: i64,
+    pub reasoning: i64,
+}
+
+/// One reported usage record, keyed by the harness's own id for the response.
+#[derive(Debug, Clone)]
+pub struct NewUsage {
+    pub key: String,
+    pub model: String,
+    pub counts: UsageCounts,
+    pub speed: Option<String>,
+    pub billing: Billing,
+    pub occurred_at: OffsetDateTime,
+}
+
+/// Records reported by one session in one request (see `Store::insert_usage`).
+#[derive(Debug, Clone)]
+pub struct UsageBatch<'a> {
+    pub session: SessionId,
+    /// The session's agent: its harness keys the records, its home project is theirs.
+    pub agent: &'a Agent,
+    pub token: TokenId,
+    pub parser: &'a str,
+    pub harness_session_id: Option<&'a str>,
+    pub records: &'a [NewUsage],
+    pub now: OffsetDateTime,
+}
+
+/// An API-equivalent price: micro-USD and the price-table entry it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Priced {
+    pub cost_micros: i64,
+    pub price_ref: String,
+}
+
+/// Prices a record's counts; the store calls it inside the write so a merged row is priced
+/// from its merged counts.
+pub trait Pricer: Send + Sync {
+    fn price(&self, model: &str, speed: Option<&str>, counts: &UsageCounts) -> Option<Priced>;
+}
+
+/// What `insert_usage` did: new rows, and records whose key was already stored (merged).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageWritten {
+    pub inserted: u32,
+    pub duplicate: u32,
+}
+
+/// A stored usage record with its allocation rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredUsage {
+    pub id: UsageId,
+    pub harness: String,
+    pub session: SessionId,
+    pub agent: AgentId,
+    pub project: Option<ProjectId>,
+    pub model: String,
+    pub counts: UsageCounts,
+    pub speed: Option<String>,
+    pub billing: Billing,
+    pub cost_micros: Option<i64>,
+    pub price_ref: Option<String>,
+    pub parser: String,
+    pub harness_session_id: Option<String>,
+    pub occurred_at: OffsetDateTime,
+    pub received_at: OffsetDateTime,
+    /// `(task, parts)`, `None` = "no task"; ordered by task id text, `None` first.
+    pub allocations: Vec<(Option<TaskId>, i64)>,
+}
+
+/// Which allocation rows a usage query counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskScope {
+    Task { id: TaskId, subtasks: bool },
+    NoTask,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UsageFilter {
+    /// `occurred_at >= from`
+    pub from: Option<OffsetDateTime>,
+    /// `occurred_at < to`
+    pub to: Option<OffsetDateTime>,
+    pub project: Option<ProjectId>,
+    pub agent: Option<AgentId>,
+    pub harness: Option<String>,
+    pub host: Option<String>,
+    pub task: Option<TaskScope>,
+    pub model: Option<String>,
+    pub billing: Option<Billing>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageGroup {
+    Total,
+    Project,
+    Task,
+    Agent,
+    Harness,
+    Host,
+    Model,
+    Day,
+    Hour,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UsageRow {
+    /// Project/agent/task id text, harness, host, model, `YYYY-MM-DD` (Day) or
+    /// `YYYY-MM-DDTHH` (Hour), all UTC; `None`: no project / no task; always `None` for Total.
+    pub key: Option<String>,
+    /// Distinct records touching the group (not split by parts).
+    pub requests: i64,
+    pub sessions: i64,
+    /// Token and cost sums divided by each allocation's `parts`.
+    pub input: f64,
+    pub output: f64,
+    pub cache_write: f64,
+    pub cache_read: f64,
+    pub cost_micros: f64,
+    /// Distinct records with a NULL cost; distinct records with billing other than `api`.
+    pub unpriced: i64,
+    pub estimated: i64,
+    /// The cost of the non-`api` records.
+    pub estimated_cost_micros: f64,
+}
+
+/// A stored record as the repricer sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepriceRow {
+    pub id: UsageId,
+    pub model: String,
+    pub speed: Option<String>,
+    pub counts: UsageCounts,
 }
 
 /// Whose inbox an operation works on.

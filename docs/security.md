@@ -144,6 +144,23 @@ rendered on the server with raw HTML off (it shows as text), links limited to `h
 `https` and `mailto` (with `rel="noopener noreferrer nofollow"`), and images never loaded
 (each becomes a link labelled with its alt text). Everything else peer-written is escaped.
 
+## Token usage
+
+The `stop` and `session-end` hooks read the harness's own session log (Claude Code
+transcripts, Codex rollouts) and report token usage to the server.
+
+Only counts, model names, opaque ids (request, response, harness session) and timestamps
+leave the machine. Never prompt or response text, tool input, file paths, `cwd`, git data,
+email or organisation. Parsers copy named numeric fields into a fixed struct; nothing is
+forwarded wholesale. Credential files are read for one key or mode field, never logged:
+`~/.claude.json` only for whether an `oauthAccount` is present, `~/.claude/settings.json`
+only for whether an `apiKeyHelper` is set, and `~/.codex/auth.json` only for `auth_mode`.
+The environment is checked for whether a billing variable is set, never for its value.
+
+The cursor files in `~/.axl/sessions/usage/` (mode 0600) hold a log path, byte offsets, the
+parser's state (the current model id and the log's session id), the billing kind and the
+Axle session id and server URL, never the token, and never leave the machine. `AXL_USAGE=off` or `[usage] enabled = false` turns reporting off.
+
 ## Rate limits
 
 - Each agent token gets a token bucket: `AXL_RATE_LIMIT_PER_SEC` sustained (default 20) and

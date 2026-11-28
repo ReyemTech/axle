@@ -25,17 +25,18 @@ use super::{
 };
 use crate::client::AxlDir;
 
-/// Codex event name and the `axl hook` argument for it.
-const EVENTS: [(&str, &str); 3] = [
-    ("SessionStart", "session-start"),
-    ("PostToolUse", "post-tool-use"),
-    ("Stop", "stop"),
+/// Codex event name, the `axl hook` argument for it and its timeout in seconds.
+const EVENTS: [(&str, &str, i64); 4] = [
+    ("SessionStart", "session-start", HOOK_TIMEOUT_SECS),
+    ("PostToolUse", "post-tool-use", HOOK_TIMEOUT_SECS),
+    ("Stop", "stop", HOOK_TIMEOUT_SECS),
+    ("SessionEnd", "session-end", 3),
 ];
 
 const BRIDGE_ARGS: [&str; 3] = ["bridge", "--harness", "codex"];
 const MCP_KEY: &str = "mcp_servers.axle";
 /// Codex kills a hook after this many seconds; `axl hook` gives up after 5 s on its own, so
-/// it always finishes first.
+/// it always finishes first. SessionEnd uses a shorter 3 s: the session is already closing.
 const HOOK_TIMEOUT_SECS: i64 = 10;
 
 struct Paths {
@@ -66,9 +67,9 @@ fn hook_command(axl: &str, arg: &str) -> String {
 fn hooks_body(axl: &str) -> String {
     EVENTS
         .iter()
-        .map(|(event, arg)| {
+        .map(|(event, arg, timeout)| {
             format!(
-                "[[hooks.{event}]]\n[[hooks.{event}.hooks]]\ntype = \"command\"\ncommand = {}\ntimeout = {HOOK_TIMEOUT_SECS}\n",
+                "[[hooks.{event}]]\n[[hooks.{event}.hooks]]\ntype = \"command\"\ncommand = {}\ntimeout = {timeout}\n",
                 toml_string(&hook_command(axl, arg))
             )
         })
@@ -314,7 +315,7 @@ fn adopt_hooks(cx: &mut Ctx, file: &Path, doc: &mut DocumentMut) -> Result<(), E
     }
     let hooks = doc["hooks"].as_table_mut().expect("checked above");
     let mut originals: Vec<(String, Vec<Value>)> = Vec::new();
-    for (event, _) in EVENTS {
+    for (event, _, _) in EVENTS {
         let Some(groups) = hooks.get_mut(event).and_then(Item::as_array_of_tables_mut) else {
             continue;
         };

@@ -256,6 +256,16 @@
   setInterval(tickLeases, 1000);
   document.addEventListener("htmx:load", tickLeases);
 
+  // A share bar carries its fraction (0..1) in `data-share`; `--share` sizes its ink fill.
+  function sizeShares() {
+    document.querySelectorAll(".share-bar[data-share]").forEach(function (el) {
+      var f = Math.max(0, Math.min(1, Number(el.getAttribute("data-share")) || 0));
+      el.style.setProperty("--share", f.toFixed(4));
+    });
+  }
+  sizeShares();
+  document.addEventListener("htmx:load", sizeShares);
+
   // `data-countdown` holds the seconds left when rendered (a pending code or login); the text
   // counts down from when this page first saw the element, like the lease bars.
   var countdownSeen = new WeakMap();

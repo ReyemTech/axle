@@ -60,7 +60,8 @@ id_type!(
     TaskId,
     MessageId,
     TokenId,
-    EnrollmentId
+    EnrollmentId,
+    UsageId
 );
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +242,22 @@ text_enum!(EnrollmentStatus {
     Consumed => "consumed",
     Expired => "expired",
     Denied => "denied",
+});
+
+/// How a harness is paid for: a flat subscription, per-token API billing, or not known
+/// (shown like a subscription: an estimate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Billing {
+    Subscription,
+    Api,
+    Unknown,
+}
+
+text_enum!(Billing {
+    Subscription => "subscription",
+    Api => "api",
+    Unknown => "unknown",
 });
 
 /// A pending or finished request to mint a host token (the secrets are stored only as hashes

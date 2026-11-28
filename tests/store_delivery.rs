@@ -221,7 +221,7 @@ async fn migration_keeps_earlier_columns_sqlite() {
         .map(|r| r.get::<String, _>("name"))
         .collect();
 
-    // Opening the store runs 0008.
+    // Opening the store runs 0009.
     let store = SqliteStore::from_pool(pool.clone()).await.unwrap();
     let events = store.task_events(done_id).await.unwrap();
     assert_eq!(events.len(), 1);
