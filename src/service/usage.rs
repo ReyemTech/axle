@@ -1,0 +1,270 @@
+//! Token usage: validating and storing reported records, and summaries over them.
+
+use std::sync::Arc;
+
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use time::{Date, Month, Time};
+
+use crate::clock::Clock;
+use crate::service::identity::Resolved;
+use crate::store::{
+    NewUsage, Pricer, Store, StoreError, StoreResult, UsageBatch, UsageCounts, UsageFilter,
+    UsageGroup, UsageRow,
+};
+use crate::usage::prices::PriceTable;
+use crate::usage::report::{
+    IngestOutcome, MAX_AGE, MAX_COUNT, MAX_FUTURE, MAX_KEY_BYTES, MAX_MODEL_BYTES, Rejected,
+    UsageReport, WireRecord,
+};
+
+#[derive(Debug, thiserror::Error)]
+pub enum UsageError {
+    /// The request as a whole is unusable; nothing was stored.
+    #[error("{0}")]
+    Envelope(String),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+const REPRICE_PAGE: u32 = 500;
+
+/// What `UsageService::reprice` did: records rewritten, and how many of those still have
+/// no price.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Repriced {
+    pub updated: u64,
+    pub unpriced: u64,
+}
+
+/// `--since` as given on the command line: `YYYY-MM-DD` (that day's UTC midnight) or RFC 3339.
+pub fn parse_since(raw: &str) -> Result<OffsetDateTime, String> {
+    let raw = raw.trim();
+    if let Ok(t) = OffsetDateTime::parse(raw, &Rfc3339) {
+        return Ok(t);
+    }
+    let bad = || format!("`{raw}` is not a date: use YYYY-MM-DD or an RFC 3339 timestamp");
+    let mut parts = raw.split('-');
+    let (Some(y), Some(m), Some(d), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(bad());
+    };
+    if y.len() != 4 || m.len() != 2 || d.len() != 2 {
+        return Err(bad());
+    }
+    let (Ok(y), Ok(m), Ok(d)) = (y.parse::<i32>(), m.parse::<u8>(), d.parse::<u8>()) else {
+        return Err(bad());
+    };
+    let month = Month::try_from(m).map_err(|_| bad())?;
+    let date = Date::from_calendar_date(y, month, d).map_err(|_| bad())?;
+    Ok(date.with_time(Time::MIDNIGHT).assume_utc())
+}
+
+pub struct UsageService {
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    prices: Arc<PriceTable>,
+}
+
+impl UsageService {
+    pub fn new(store: Arc<dyn Store>, clock: Arc<dyn Clock>, prices: Arc<PriceTable>) -> Self {
+        Self {
+            store,
+            clock,
+            prices,
+        }
+    }
+
+    pub fn prices(&self) -> &PriceTable {
+        &self.prices
+    }
+
+    /// Validates the envelope (an error stores nothing) and each record (a bad one is
+    /// rejected alone), then stores the good ones in one store call.
+    pub async fn ingest(
+        &self,
+        r: &Resolved,
+        report: &UsageReport,
+    ) -> Result<IngestOutcome, UsageError> {
+        check_envelope(report)?;
+        let now = self.clock.now();
+        let mut outcome = IngestOutcome::default();
+        let mut records = Vec::with_capacity(report.records.len());
+        for value in &report.records {
+            match validate(value, now) {
+                Ok(rec) => records.push(rec),
+                Err(rejected) => outcome.rejected.push(rejected),
+            }
+        }
+        if !records.is_empty() {
+            let written = self
+                .store
+                .insert_usage(
+                    &UsageBatch {
+                        session: r.session.id,
+                        agent: &r.agent,
+                        token: r.session.token_id,
+                        parser: &report.parser,
+                        harness_session_id: report.harness_session_id.as_deref(),
+                        records: &records,
+                        now,
+                    },
+                    &*self.prices,
+                )
+                .await?;
+            outcome.accepted = written.inserted;
+            outcome.duplicate = written.duplicate;
+        }
+        Ok(outcome)
+    }
+
+    /// Prices stored records again with the current table, in pages of 500 by id: those
+    /// at or after `since` (all when `None`), only the ones without a price when
+    /// `unpriced_only`.
+    pub async fn reprice(
+        &self,
+        since: Option<OffsetDateTime>,
+        unpriced_only: bool,
+    ) -> StoreResult<Repriced> {
+        let mut out = Repriced::default();
+        let mut after = None;
+        loop {
+            let page = self
+                .store
+                .usage_to_reprice(since, unpriced_only, after, REPRICE_PAGE)
+                .await?;
+            let Some(last) = page.last() else { break };
+            after = Some(last.id);
+            let costs: Vec<_> = page
+                .iter()
+                .map(|r| {
+                    (
+                        r.id,
+                        self.prices.price(&r.model, r.speed.as_deref(), &r.counts),
+                    )
+                })
+                .collect();
+            self.store.set_usage_costs(&costs).await?;
+            out.updated += costs.len() as u64;
+            out.unpriced += costs.iter().filter(|(_, p)| p.is_none()).count() as u64;
+            if page.len() < REPRICE_PAGE as usize {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn summary(
+        &self,
+        filter: &UsageFilter,
+        group: UsageGroup,
+    ) -> StoreResult<Vec<UsageRow>> {
+        self.store.usage_summary(filter, group).await
+    }
+}
+
+fn check_envelope(report: &UsageReport) -> Result<(), UsageError> {
+    let bad = |m: &str| Err(UsageError::Envelope(m.to_string()));
+    if !parser_ok(&report.parser) {
+        return bad("parser must be at most 32 bytes like name/1");
+    }
+    if report
+        .harness_version
+        .as_deref()
+        .is_some_and(|v| v.len() > 64)
+    {
+        return bad("harness_version over 64 bytes");
+    }
+    if report
+        .harness_session_id
+        .as_deref()
+        .is_some_and(|v| v.len() > 200)
+    {
+        return bad("harness_session_id over 200 bytes");
+    }
+    Ok(())
+}
+
+/// `[a-z0-9-]+/[0-9]+`, at most 32 bytes.
+fn parser_ok(p: &str) -> bool {
+    if p.is_empty() || p.len() > 32 {
+        return false;
+    }
+    let Some((name, version)) = p.split_once('/') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !version.is_empty()
+        && version.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn validate(value: &serde_json::Value, now: OffsetDateTime) -> Result<NewUsage, Rejected> {
+    let reject = |key: &str, reason: &str| Rejected {
+        key: key.to_string(),
+        reason: reason.to_string(),
+    };
+    let Ok(w) = serde_json::from_value::<WireRecord>(value.clone()) else {
+        let key = value.get("key").and_then(|k| k.as_str()).unwrap_or("");
+        return Err(reject(key, "malformed record"));
+    };
+    let key = w.key.as_str();
+    if key.is_empty() || key.len() > MAX_KEY_BYTES {
+        return Err(reject(key, "key empty or over 200 bytes"));
+    }
+    if w.model.is_empty()
+        || w.model.len() > MAX_MODEL_BYTES
+        || !w
+            .model
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:/@-".contains(&b))
+    {
+        return Err(reject(
+            key,
+            "model empty, over 128 bytes or has characters outside A-Za-z0-9._:/@-",
+        ));
+    }
+    let counts = [
+        w.input,
+        w.output,
+        w.cache_write_5m,
+        w.cache_write_1h,
+        w.cache_read,
+        w.reasoning,
+    ];
+    if counts.iter().any(|c| !(0..=MAX_COUNT).contains(c)) {
+        return Err(reject(key, "count below 0 or over 1000000000"));
+    }
+    let Ok(at) = OffsetDateTime::parse(&w.at, &Rfc3339) else {
+        return Err(reject(key, "timestamp not RFC 3339"));
+    };
+    if at > now + MAX_FUTURE {
+        return Err(reject(key, "timestamp more than 5 minutes ahead"));
+    }
+    if at < now - MAX_AGE {
+        return Err(reject(key, "timestamp more than 30 days old"));
+    }
+    if let Some(s) = &w.speed
+        && (s.len() > 16 || !s.bytes().all(|b| b.is_ascii_lowercase()))
+    {
+        return Err(reject(key, "speed over 16 bytes or not a-z"));
+    }
+    Ok(NewUsage {
+        key: w.key,
+        model: w.model,
+        counts: UsageCounts {
+            input: w.input,
+            output: w.output,
+            cache_write_5m: w.cache_write_5m,
+            cache_write_1h: w.cache_write_1h,
+            cache_read: w.cache_read,
+            reasoning: w.reasoning,
+        },
+        speed: w.speed,
+        billing: w.billing,
+        occurred_at: at,
+    })
+}

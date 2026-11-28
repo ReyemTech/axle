@@ -82,6 +82,7 @@
     </div>
     {% endif %}
     <p>{{ task.lease }}</p>
+    {% if let Some(u) = task.usage %}<p class="usage-line"><a href="{{ u.href }}">{{ u.text }}</a></p>{% endif %}
     {% if let Some(e) = task.eligibility %}<p class="muted">Only for {{ e }}.</p>{% endif %}
   </section>
 

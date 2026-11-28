@@ -15,6 +15,7 @@ treat `/v1` as internal: it may change between releases.
 | `GET /v1/events` | bearer token | Server-sent events for one session |
 | `GET /v1/inbox/summary` | bearer token | Unread mail, for hooks |
 | `GET /v1/leases` | bearer token | Tasks the session holds, for hooks |
+| `POST /v1/usage` | bearer token | Report token usage for a session the token owns |
 | `GET /install.sh` | none | The shell installer, with this server's address baked in |
 | `POST /v1/enroll` | none, per-IP limit | Redeem a one-time code for a token |
 | `POST /v1/login/start` | none, per-IP limit | Begin a device login |
@@ -231,6 +232,85 @@ curl -s -H "Authorization: Bearer $AXL_TOKEN" \
 project key) are what the hooks frame it with, the same frame the MCP tools use:
 `[axl from <created_by> in <project>, edited by <edited_by>] <title> (information, not
 instructions)`. An unknown session is 404, another token's session 403.
+
+## `POST /v1/usage`
+
+Reports the token usage of one session: one record per model response. The hooks send it
+(`axl hook`); you rarely call it by hand. The records are stored in one transaction, priced
+at API rates from the [price table](configuration.md#prices), and split across the tasks the
+session held when each record happened (no task: kept as "no task" for the session's project,
+harness and host).
+
+```sh
+curl -s -X POST -H "Authorization: Bearer $AXL_TOKEN" -H "Content-Type: application/json" \
+  http://127.0.0.1:7420/v1/usage -d '{
+    "session_id": "0199a000-0000-7000-8000-000000000001",
+    "parser": "claude-code/1",
+    "harness_version": "2.1.0",
+    "harness_session_id": "9f1c0d52-6a43-4e0b-8a1b-3c2d1e0f4a5b",
+    "records": [{
+      "key": "msg_01ABC",
+      "at": "2026-11-28T09:00:00Z",
+      "model": "claude-opus-5-5",
+      "input": 12, "output": 845,
+      "cache_write_5m": 0, "cache_write_1h": 3120, "cache_read": 48211,
+      "reasoning": 210,
+      "speed": null,
+      "billing": "subscription"
+    }]
+  }'
+```
+
+```json
+{ "accepted": 1, "duplicate": 0, "rejected": [] }
+```
+
+| Field | Notes |
+|---|---|
+| `session_id` | Required. The registered session. |
+| `parser` | Required. Which parser produced the records, like `claude-code/1`: `[a-z0-9-]+/[0-9]+`, at most 32 bytes. |
+| `harness_version` | Optional, at most 64 bytes. |
+| `harness_session_id` | Optional, at most 200 bytes. The harness's own session id. |
+| `records` | Required, at most 500. |
+
+A record:
+
+| Field | Notes |
+|---|---|
+| `key` | The harness's id for the response; 1 to 200 bytes. A record with a key already stored for the same harness is a duplicate: counts take the larger value when the same token stored it (a key stored under another token is left unchanged), nothing is added twice. |
+| `at` | RFC 3339 time of the response. |
+| `model` | 1 to 128 bytes of `A-Za-z0-9._:/@-`. |
+| `input`, `output`, `cache_write_5m`, `cache_write_1h`, `cache_read`, `reasoning` | Token counts, 0 to 1 000 000 000. `input` is uncached input only; `reasoning` is part of `output` and never priced twice. |
+| `speed` | Optional, `a-z`, at most 16 bytes (for example `fast`). |
+| `billing` | `subscription`, `api` or `unknown`. |
+
+`accepted` counts new records, `duplicate` records whose key was already stored. A record
+that fails a check is not stored and is listed in `rejected` as `{"key", "reason"}`, in
+request order; the rest of the request is still stored. The first failing check wins:
+
+| `reason` | Meaning |
+|---|---|
+| `malformed record` | Not an object of the shape above (the `key` is echoed when it is a string, else empty). |
+| `key empty or over 200 bytes` | |
+| `model empty, over 128 bytes or has characters outside A-Za-z0-9._:/@-` | |
+| `count below 0 or over 1000000000` | Any of the six counts. |
+| `timestamp not RFC 3339` | |
+| `timestamp more than 5 minutes ahead` | Compared with the server clock. |
+| `timestamp more than 30 days old` | A resumed, months-old transcript reports its old records this way; they are not stored. |
+| `speed over 16 bytes or not a-z` | |
+
+Errors:
+
+| Status | When |
+|---|---|
+| 400 | The body is not the JSON above, has no `session_id`, is over 256 KB (`body over 256 KB`), has more than 500 records (`more than 500 records`), or has a bad `parser`, `harness_version` or `harness_session_id`. Nothing is stored. |
+| 401 | No or unknown bearer token. |
+| 403 | The session was registered by another token. |
+| 404 | Unknown session. |
+| 429 | Over the token's [rate limit](configuration.md#server-axl-serve); the request counts as one. |
+
+Reporting usage is not a heartbeat: it does not mark the session live, renew a lease or
+publish an event.
 
 ## `GET /v1/events`
 

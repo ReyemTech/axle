@@ -143,6 +143,7 @@ async fn login_refuses_switching_servers_without_force() {
         &ClientConfig {
             server_url: Some("http://other.example:7420".into()),
             port: None,
+            ..ClientConfig::default()
         },
     )
     .unwrap();
@@ -440,4 +441,38 @@ async fn redirecting_server_gets_a_clear_error() {
         "{err}"
     );
     assert!(!err.contains("HTTP 308"), "{err}");
+}
+
+#[tokio::test]
+async fn login_keeps_usage_config() {
+    let srv = server().await;
+    let home = TempHome::new();
+    let dir = AxlDir::new(home.path());
+    let usage = axle::client::UsageConfig {
+        enabled: Some(false),
+        ..Default::default()
+    };
+    save_config(
+        &dir,
+        &ClientConfig {
+            usage: Some(usage.clone()),
+            ..ClientConfig::default()
+        },
+    )
+    .unwrap();
+    let issued = srv.state.enroll.issue_code("x").await.unwrap();
+    let mut out = Vec::new();
+    login(
+        home.path(),
+        LoginArgs {
+            code: Some(issued.code.clone()),
+            ..args(&srv.base)
+        },
+        &mut out,
+    )
+    .await
+    .unwrap();
+    let cfg = load_config(&dir).unwrap();
+    assert_eq!(cfg.server_url.as_deref(), Some(srv.base.as_str()));
+    assert_eq!(cfg.usage, Some(usage));
 }

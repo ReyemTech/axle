@@ -11,18 +11,20 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 
 use super::{
     AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate,
-    MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome, ProjectsAdded,
-    Recipient, RelateRequest, Related, Store, StoreError, StoreResult, TaskFilter, TaskOrder,
-    TransitionRequest, Transitioned, UnblockRule, Unblocked, block_previous_payload, child_event,
-    children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label,
-    like_pattern, options_from, options_to, projects_added_note, projects_added_payload,
-    related_payload, send_time_recipient, unblocked_records,
+    MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome, Priced, Pricer,
+    ProjectsAdded, Recipient, RelateRequest, Related, RepriceRow, Store, StoreError, StoreResult,
+    StoredUsage, TaskFilter, TaskOrder, TaskScope, TransitionRequest, Transitioned, UnblockRule,
+    Unblocked, UsageBatch, UsageCounts, UsageFilter, UsageGroup, UsageRow, UsageWritten,
+    block_previous_payload, child_event, children_complete_event, claim_event, closes_child,
+    edit_payload, enrollment_token_label, like_pattern, options_from, options_to,
+    projects_added_note, projects_added_payload, related_payload, send_time_recipient,
+    unblocked_records,
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId,
     EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId, Session,
     SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo,
-    WaitingOn,
+    UsageId, WaitingOn,
 };
 
 /// The columns `enrollment_from` reads (a macro so queries can `concat!` it statically).
@@ -2473,4 +2475,330 @@ impl Store for SqliteStore {
         }
         Ok(out)
     }
+
+    async fn insert_usage(
+        &self,
+        batch: &UsageBatch<'_>,
+        pricer: &dyn Pricer,
+    ) -> StoreResult<UsageWritten> {
+        let mut written = UsageWritten::default();
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        for r in batch.records {
+            let id = UsageId::new();
+            let priced = pricer.price(&r.model, r.speed.as_deref(), &r.counts);
+            let row = sqlx::query(
+                "INSERT INTO usage_records (id, harness, dedupe_key, session_id, agent_id,
+                     project_id, token_id, model, input_tokens, output_tokens,
+                     cache_write_5m_tokens, cache_write_1h_tokens, cache_read_tokens,
+                     reasoning_tokens, speed, billing, cost_micros, price_ref, parser,
+                     harness_session_id, occurred_at, received_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT (harness, dedupe_key) DO UPDATE SET
+                     input_tokens = MAX(usage_records.input_tokens, excluded.input_tokens),
+                     output_tokens = MAX(usage_records.output_tokens, excluded.output_tokens),
+                     cache_write_5m_tokens = MAX(usage_records.cache_write_5m_tokens,
+                                                 excluded.cache_write_5m_tokens),
+                     cache_write_1h_tokens = MAX(usage_records.cache_write_1h_tokens,
+                                                 excluded.cache_write_1h_tokens),
+                     cache_read_tokens = MAX(usage_records.cache_read_tokens,
+                                             excluded.cache_read_tokens),
+                     reasoning_tokens = MAX(usage_records.reasoning_tokens,
+                                            excluded.reasoning_tokens)
+                 WHERE usage_records.token_id = excluded.token_id
+                 RETURNING id, model, speed, input_tokens, output_tokens, cache_write_5m_tokens,
+                           cache_write_1h_tokens, cache_read_tokens, reasoning_tokens",
+            )
+            .bind(id.to_string())
+            .bind(&batch.agent.harness)
+            .bind(&r.key)
+            .bind(batch.session.to_string())
+            .bind(batch.agent.id.to_string())
+            .bind(batch.agent.project_id.map(|p| p.to_string()))
+            .bind(batch.token.to_string())
+            .bind(&r.model)
+            .bind(r.counts.input)
+            .bind(r.counts.output)
+            .bind(r.counts.cache_write_5m)
+            .bind(r.counts.cache_write_1h)
+            .bind(r.counts.cache_read)
+            .bind(r.counts.reasoning)
+            .bind(&r.speed)
+            .bind(r.billing.as_str())
+            .bind(priced.as_ref().map(|p| p.cost_micros))
+            .bind(priced.as_ref().map(|p| p.price_ref.as_str()))
+            .bind(batch.parser)
+            .bind(batch.harness_session_id)
+            .bind(ts::enc(r.occurred_at))
+            .bind(ts::enc(batch.now))
+            .fetch_optional(&mut *tx)
+            .await?;
+            // No row: another token already holds this key. Its counts are not ours to merge.
+            let Some(row) = row else {
+                written.duplicate += 1;
+                continue;
+            };
+            let stored: UsageId = uuid_of(row.try_get("id")?)?;
+            if stored == id {
+                written.inserted += 1;
+                let tasks = held_tasks(&mut tx, batch.session, r.occurred_at).await?;
+                let parts = tasks.len().max(1) as i64;
+                let tasks: Vec<Option<String>> = if tasks.is_empty() {
+                    vec![None]
+                } else {
+                    tasks.into_iter().map(Some).collect()
+                };
+                for task in tasks {
+                    sqlx::query(
+                        "INSERT INTO usage_allocations (usage_id, task_id, parts) VALUES (?, ?, ?)",
+                    )
+                    .bind(id.to_string())
+                    .bind(task)
+                    .bind(parts)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            } else {
+                written.duplicate += 1;
+                let model: String = row.try_get("model")?;
+                let speed: Option<String> = row.try_get("speed")?;
+                let priced = pricer.price(&model, speed.as_deref(), &counts_from(&row)?);
+                sqlx::query("UPDATE usage_records SET cost_micros = ?, price_ref = ? WHERE id = ?")
+                    .bind(priced.as_ref().map(|p| p.cost_micros))
+                    .bind(priced.as_ref().map(|p| p.price_ref.as_str()))
+                    .bind(stored.to_string())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(written)
+    }
+
+    async fn get_usage(&self, harness: &str, key: &str) -> StoreResult<Option<StoredUsage>> {
+        let Some(row) = sqlx::query(
+            "SELECT id, harness, session_id, agent_id, project_id, model, input_tokens,
+                    output_tokens, cache_write_5m_tokens, cache_write_1h_tokens,
+                    cache_read_tokens, reasoning_tokens, speed, billing, cost_micros, price_ref,
+                    parser, harness_session_id, occurred_at, received_at
+             FROM usage_records WHERE harness = ? AND dedupe_key = ?",
+        )
+        .bind(harness)
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let id: &str = row.try_get("id")?;
+        let allocations = sqlx::query(
+            "SELECT task_id, parts FROM usage_allocations
+             WHERE usage_id = ? ORDER BY COALESCE(task_id, '')",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|a| Ok((opt_uuid(a, "task_id")?, a.try_get("parts")?)))
+        .collect::<StoreResult<Vec<_>>>()?;
+        Ok(Some(StoredUsage {
+            id: uuid_of(id)?,
+            harness: row.try_get("harness")?,
+            session: uuid_of(row.try_get("session_id")?)?,
+            agent: uuid_of(row.try_get("agent_id")?)?,
+            project: opt_uuid(&row, "project_id")?,
+            model: row.try_get("model")?,
+            counts: counts_from(&row)?,
+            speed: row.try_get("speed")?,
+            billing: parse_text(row.try_get("billing")?)?,
+            cost_micros: row.try_get("cost_micros")?,
+            price_ref: row.try_get("price_ref")?,
+            parser: row.try_get("parser")?,
+            harness_session_id: row.try_get("harness_session_id")?,
+            occurred_at: ts::dec(row.try_get("occurred_at")?)?,
+            received_at: ts::dec(row.try_get("received_at")?)?,
+            allocations,
+        }))
+    }
+
+    async fn usage_summary(
+        &self,
+        filter: &UsageFilter,
+        group: UsageGroup,
+    ) -> StoreResult<Vec<UsageRow>> {
+        let (mode, task) = match filter.task {
+            None => (0, None),
+            Some(TaskScope::NoTask) => (1, None),
+            Some(TaskScope::Task { id, subtasks }) => (if subtasks { 3 } else { 2 }, Some(id)),
+        };
+        sqlx::query(usage_summary_sql(group))
+            .bind(filter.from.map(ts::enc))
+            .bind(filter.to.map(ts::enc))
+            .bind(filter.project.map(|p| p.to_string()))
+            .bind(filter.agent.map(|a| a.to_string()))
+            .bind(filter.harness.as_deref())
+            .bind(filter.host.as_deref())
+            .bind(filter.model.as_deref())
+            .bind(filter.billing.map(|b| b.as_str()))
+            .bind(mode)
+            .bind(task.map(|t| t.to_string()))
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(|r| {
+                Ok(UsageRow {
+                    key: r.try_get("key")?,
+                    requests: r.try_get("requests")?,
+                    sessions: r.try_get("sessions")?,
+                    input: r.try_get("input")?,
+                    output: r.try_get("output")?,
+                    cache_write: r.try_get("cache_write")?,
+                    cache_read: r.try_get("cache_read")?,
+                    cost_micros: r.try_get("cost_micros")?,
+                    unpriced: r.try_get("unpriced")?,
+                    estimated: r.try_get("estimated")?,
+                    estimated_cost_micros: r.try_get("estimated_cost_micros")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn usage_to_reprice(
+        &self,
+        since: Option<OffsetDateTime>,
+        unpriced_only: bool,
+        after: Option<UsageId>,
+        limit: u32,
+    ) -> StoreResult<Vec<RepriceRow>> {
+        sqlx::query(
+            "SELECT id, model, speed, input_tokens, output_tokens, cache_write_5m_tokens,
+                    cache_write_1h_tokens, cache_read_tokens, reasoning_tokens
+             FROM usage_records
+             WHERE (?1 IS NULL OR occurred_at >= ?1)
+               AND (?2 = 0 OR cost_micros IS NULL)
+               AND (?3 IS NULL OR id > ?3)
+             ORDER BY id LIMIT ?4",
+        )
+        .bind(since.map(ts::enc))
+        .bind(unpriced_only)
+        .bind(after.map(|a| a.to_string()))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|r| {
+            Ok(RepriceRow {
+                id: uuid_of(r.try_get("id")?)?,
+                model: r.try_get("model")?,
+                speed: r.try_get("speed")?,
+                counts: counts_from(r)?,
+            })
+        })
+        .collect()
+    }
+
+    async fn set_usage_costs(&self, costs: &[(UsageId, Option<Priced>)]) -> StoreResult<()> {
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        for (id, priced) in costs {
+            sqlx::query("UPDATE usage_records SET cost_micros = ?, price_ref = ? WHERE id = ?")
+                .bind(priced.as_ref().map(|p| p.cost_micros))
+                .bind(priced.as_ref().map(|p| p.price_ref.as_str()))
+                .bind(id.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+/// The aggregate statement for `group` (binds: from, to, project, agent, harness, host,
+/// model, billing, task mode 0 none / 1 no task / 2 task / 3 task and subtasks, task id).
+macro_rules! usage_sql {
+    ($key:literal, $group_by:literal) => {
+        concat!(
+            "WITH RECURSIVE tree(id) AS (
+                 SELECT ?10 UNION ALL SELECT t.id FROM tasks t JOIN tree ON t.parent_id = tree.id)
+             SELECT ", $key, " AS key,
+                    COUNT(DISTINCT r.id) AS requests,
+                    COUNT(DISTINCT r.session_id) AS sessions,
+                    COALESCE(SUM(r.input_tokens * 1.0 / a.parts), 0.0) AS input,
+                    COALESCE(SUM(r.output_tokens * 1.0 / a.parts), 0.0) AS output,
+                    COALESCE(SUM((r.cache_write_5m_tokens + r.cache_write_1h_tokens) * 1.0
+                                 / a.parts), 0.0) AS cache_write,
+                    COALESCE(SUM(r.cache_read_tokens * 1.0 / a.parts), 0.0) AS cache_read,
+                    COALESCE(SUM(r.cost_micros * 1.0 / a.parts), 0.0) AS cost_micros,
+                    COUNT(DISTINCT CASE WHEN r.cost_micros IS NULL THEN r.id END) AS unpriced,
+                    COUNT(DISTINCT CASE WHEN r.billing <> 'api' THEN r.id END) AS estimated,
+                    COALESCE(SUM(CASE WHEN r.billing <> 'api'
+                                      THEN r.cost_micros * 1.0 / a.parts END), 0.0)
+                        AS estimated_cost_micros
+             FROM usage_records r
+             JOIN usage_allocations a ON a.usage_id = r.id
+             JOIN agents g ON g.id = r.agent_id
+             WHERE (?1 IS NULL OR r.occurred_at >= ?1)
+               AND (?2 IS NULL OR r.occurred_at < ?2)
+               AND (?3 IS NULL OR r.project_id = ?3)
+               AND (?4 IS NULL OR r.agent_id = ?4)
+               AND (?5 IS NULL OR r.harness = ?5)
+               AND (?6 IS NULL OR g.host = ?6)
+               AND (?7 IS NULL OR r.model = ?7)
+               AND (?8 IS NULL OR r.billing = ?8)
+               AND (?9 = 0
+                    OR (?9 = 1 AND a.task_id IS NULL)
+                    OR (?9 = 2 AND a.task_id = ?10)
+                    OR (?9 = 3 AND a.task_id IN (SELECT id FROM tree)))",
+            $group_by
+        )
+    };
+}
+
+fn usage_summary_sql(group: UsageGroup) -> &'static str {
+    match group {
+        UsageGroup::Total => usage_sql!("NULL", ""),
+        UsageGroup::Project => usage_sql!("r.project_id", " GROUP BY 1"),
+        UsageGroup::Task => usage_sql!("a.task_id", " GROUP BY 1"),
+        UsageGroup::Agent => usage_sql!("r.agent_id", " GROUP BY 1"),
+        UsageGroup::Harness => usage_sql!("r.harness", " GROUP BY 1"),
+        UsageGroup::Host => usage_sql!("g.host", " GROUP BY 1"),
+        UsageGroup::Model => usage_sql!("r.model", " GROUP BY 1"),
+        UsageGroup::Day => usage_sql!("substr(r.occurred_at, 1, 10)", " GROUP BY 1"),
+        UsageGroup::Hour => usage_sql!("substr(r.occurred_at, 1, 13)", " GROUP BY 1"),
+    }
+}
+
+fn counts_from(row: &SqliteRow) -> StoreResult<UsageCounts> {
+    Ok(UsageCounts {
+        input: row.try_get("input_tokens")?,
+        output: row.try_get("output_tokens")?,
+        cache_write_5m: row.try_get("cache_write_5m_tokens")?,
+        cache_write_1h: row.try_get("cache_write_1h_tokens")?,
+        cache_read: row.try_get("cache_read_tokens")?,
+        reasoning: row.try_get("reasoning_tokens")?,
+    })
+}
+
+/// The tasks (id text) `session` held at `at`: claimed by it (a `claimed`, which covers a
+/// resume and a same-agent takeover, or a `lease_expired_takeover`) at or before `at`, with
+/// no release, finish or claim by another session after that claim and up to `at`. A
+/// session that re-claimed a task it still held has two qualifying claims, hence `DISTINCT`.
+async fn held_tasks(
+    conn: &mut SqliteConnection,
+    session: SessionId,
+    at: OffsetDateTime,
+) -> StoreResult<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT DISTINCT e.task_id FROM task_events e
+         WHERE e.kind IN ('claimed', 'lease_expired_takeover')
+           AND e.actor_session_id = ?1 AND e.created_at <= ?2
+           AND NOT EXISTS (SELECT 1 FROM task_events x
+             WHERE x.task_id = e.task_id AND x.created_at > e.created_at
+               AND x.created_at <= ?2
+               AND (x.kind IN ('released', 'done', 'cancelled', 'force_released')
+                    OR (x.kind IN ('claimed', 'lease_expired_takeover')
+                        AND x.actor_session_id IS NOT ?1)))",
+    )
+    .bind(session.to_string())
+    .bind(ts::enc(at))
+    .fetch_all(conn)
+    .await?)
 }

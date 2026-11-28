@@ -238,6 +238,8 @@ pub struct ServerConfig {
     /// Header naming the client IP behind a proxy (`AXL_TRUSTED_PROXY_HEADER`); its right-most
     /// entry keys the per-IP limits. Unset: the socket address is used and the header ignored.
     pub trusted_proxy_header: Option<String>,
+    /// Price overrides merged over the built-in table (`AXL_PRICES_FILE`; blank = none).
+    pub prices_file: Option<std::path::PathBuf>,
 }
 
 /// The server cannot tell clients its own address: it is bound beyond loopback and
@@ -395,6 +397,10 @@ impl ServerConfig {
             cookie_secure: boolean(&get, "AXL_COOKIE_SECURE", false)?,
             public_url,
             trusted_proxy_header,
+            prices_file: get("AXL_PRICES_FILE")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from),
         })
     }
 
