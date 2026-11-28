@@ -127,6 +127,32 @@ pub(super) fn cost_text(r: &UsageRow) -> String {
     s
 }
 
+/// A summed cost for the Totals: "no price" when nothing in it has a price, "≥ $X (some
+/// models unpriced)" when only some records do (the sum is then a lower bound), else "$X".
+/// `incomplete`: whether unpriced records may be missing from this sum.
+fn total_cost(r: &UsageRow, micros: f64, incomplete: bool) -> Amount {
+    if !priced(r) {
+        return Amount {
+            short: "no price".into(),
+            exact: "no price".into(),
+        };
+    }
+    if incomplete {
+        return Amount {
+            short: format!("\u{2265} {} (some models unpriced)", usd(micros)),
+            exact: format!("\u{2265} {}", usd_exact(micros)),
+        };
+    }
+    amount_usd(micros)
+}
+
+fn amount_usd(micros: f64) -> Amount {
+    Amount {
+        short: usd(micros),
+        exact: usd_exact(micros),
+    }
+}
+
 /// `data-share` (4 decimals, 0..1) and the visible percentage.
 fn share(part: f64, whole: f64) -> (String, String) {
     let f = if whole > 0.0 {
@@ -596,7 +622,10 @@ pub async fn usage_page(
     let mut labels = Labels::load(&*state.store).await?;
     let mut breakdown = Vec::with_capacity(rows.len());
     for r in &rows {
-        let (share, share_text) = if by_cost {
+        let (share, share_text) = if by_cost && !priced(r) {
+            // Its cost is unknown, so it has no share of the priced cost.
+            ("0.0000".to_string(), "no price".to_string())
+        } else if by_cost {
             share(r.cost_micros, total.cost_micros)
         } else {
             share(tokens(r), tokens(&total))
@@ -675,16 +704,18 @@ pub async fn usage_page(
             output: amount(total.output),
             cache_write: amount(total.cache_write),
             cache_read: amount(total.cache_read),
-            cost: Amount {
-                short: usd(total.cost_micros),
-                exact: usd_exact(total.cost_micros),
-            },
-            subscription: Amount {
-                short: usd(total.estimated_cost_micros),
-                exact: usd_exact(total.estimated_cost_micros),
+            cost: total_cost(&total, total.cost_micros, total.unpriced > 0),
+            // With no subscription record it is a true $0.00; otherwise an unpriced record
+            // may be one of them.
+            subscription: if total.estimated == 0 {
+                amount_usd(0.0)
+            } else {
+                total_cost(&total, total.estimated_cost_micros, total.unpriced > 0)
             },
         },
-        share_header: if by_cost {
+        share_header: if by_cost && total.unpriced > 0 {
+            "Share of priced cost"
+        } else if by_cost {
             "Share of cost"
         } else {
             "Share of tokens"

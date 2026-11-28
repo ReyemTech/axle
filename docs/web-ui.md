@@ -119,10 +119,13 @@ The page shows, top to bottom:
 
 1. **Totals**: input, output, cache write and cache read tokens, the **API-equivalent
    cost**, and how much of it was on a subscription or unknown billing ("Of which
-   subscription (est.)"). Numbers are compact (`1.24M`); hover for the exact value.
+   subscription (est.)"). Numbers are compact (`1.24M`); hover for the exact value. A cost
+   is "no price" when no model in the selection is in the price table, and a lower bound,
+   "≥ $X (some models unpriced)", when only some are.
 2. **The breakdown table**: one row per group with requests, the four token kinds, the
    API-equivalent cost and its share of the total cost (of the total tokens when nothing
-   has a price), as a bar beside the percentage. Projects carry their line colour, tasks
+   has a price), as a bar beside the percentage. When some records have no price the column
+   is "Share of priced cost", and a row with no priced record shows "no price" there. Projects carry their line colour, tasks
    link to their page; usage while holding no task is "no task". A cost followed by `est.`
    was partly or wholly on a subscription or unknown billing; "no price" means the model is
    not in the price table, and "+ N no price" counts the records of a row that had none.

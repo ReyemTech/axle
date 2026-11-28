@@ -341,6 +341,98 @@ async fn unknown_model_shows_no_price_last() {
     assert!(rows[0][6].ends_with("+ 1 no price"), "{rows:?}");
 }
 
+/// The Totals counter `name`: its text and its `title`.
+fn total(page: &Page, name: &str) -> (String, String) {
+    let html = page.html();
+    let sel = Selector::parse(&format!("dl.usage-totals [data-total={name}] dd")).unwrap();
+    let dd = html.select(&sel).next().expect("total");
+    (squash(&dd), dd.value().attr("title").unwrap().to_string())
+}
+
+#[tokio::test]
+async fn totals_with_nothing_priced_say_no_price() {
+    let app = app().await;
+    let a = app
+        .agent("github.com/acme/infra", "mac", "claude-code")
+        .await;
+    let at = "2026-11-27T08:00:00Z";
+    app.report(&a, "k1", "mystery-1", "api", (9_000, 0), at)
+        .await;
+    app.report(&a, "k2", "mystery-2", "subscription", (1_000, 0), at)
+        .await;
+
+    let page = app.get("/ui/usage?group=model").await;
+    assert_eq!(total(&page, "cost"), ("no price".into(), "no price".into()));
+    assert_eq!(
+        total(&page, "subscription"),
+        ("no price".into(), "no price".into())
+    );
+    // Nothing has a cost, so the share is of tokens.
+    assert!(
+        page.texts("table.usage-table th")
+            .contains(&"Share of tokens".to_string())
+    );
+}
+
+#[tokio::test]
+async fn totals_with_some_unpriced_are_a_lower_bound() {
+    let app = app().await;
+    let a = app
+        .agent("github.com/acme/infra", "mac", "claude-code")
+        .await;
+    let at = "2026-11-27T08:00:00Z";
+    // 1_000_000 × $4/M = $4.00 on a subscription; 500_000 × $4/M = $2.00 on the API.
+    app.report(
+        &a,
+        "s1",
+        "claude-opus-5-5",
+        "subscription",
+        (1_000_000, 0),
+        at,
+    )
+    .await;
+    app.report(&a, "p1", "claude-opus-5-5", "api", (500_000, 0), at)
+        .await;
+    app.report(&a, "m1", "mystery-1", "api", (9_000_000, 0), at)
+        .await;
+
+    let page = app.get("/ui/usage?group=model").await;
+    assert_eq!(
+        total(&page, "cost"),
+        (
+            "\u{2265} $6.00 (some models unpriced)".into(),
+            "\u{2265} $6.000000".into()
+        )
+    );
+    assert_eq!(
+        total(&page, "subscription"),
+        (
+            "\u{2265} $4.00 (some models unpriced)".into(),
+            "\u{2265} $4.000000".into()
+        )
+    );
+    assert!(
+        page.texts("table.usage-table th")
+            .contains(&"Share of priced cost".to_string())
+    );
+    let rows = page.table();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0][0], "claude-opus-5-5");
+    assert_eq!(rows[0][6], "$6.00 est.");
+    assert_eq!(rows[0][7], "100%");
+    assert_eq!(rows[1][0], "mystery-1");
+    assert_eq!(rows[1][6], "no price");
+    assert_eq!(rows[1][7], "no price");
+
+    // Without the unpriced model the totals are exact, as before.
+    let page = app.get("/ui/usage?model=claude-opus-5-5").await;
+    assert_eq!(total(&page, "cost"), ("$6.00".into(), "$6.000000".into()));
+    assert_eq!(
+        total(&page, "subscription"),
+        ("$4.00".into(), "$4.000000".into())
+    );
+}
+
 #[tokio::test]
 async fn subscription_shows_est() {
     let app = app().await;
