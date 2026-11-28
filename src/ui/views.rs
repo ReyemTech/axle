@@ -466,6 +466,8 @@ pub struct DoneHead {
     /// Auto-acked unseen done tasks, subtasks included (the same set History `?unseen=auto`
     /// lists).
     pub auto_unseen: u64,
+    /// The bulk button: "Ack all", or "Ack N shown" when more are unseen than the cards.
+    pub ack_all_label: String,
     /// `/ui/history`, plus `?project=<id>` when the board is filtered.
     pub history_href: String,
     /// `/ui/history?unseen=auto`, plus `&project=<id>` when the board is filtered.
@@ -587,6 +589,7 @@ async fn columns(
             done = Some(DoneHead {
                 unseen: state.store.count_tasks(&unseen).await?,
                 auto_unseen,
+                ack_all_label: String::new(),
                 history_href: match project {
                     Some(p) => format!("/ui/history?project={p}"),
                     None => "/ui/history".to_string(),
@@ -635,6 +638,13 @@ async fn columns(
         let mut cards = Vec::with_capacity(tasks.len());
         for t in &tasks {
             cards.push(card(labels, ctx, t).await?);
+        }
+        if let Some(d) = done.as_mut() {
+            d.ack_all_label = if d.unseen > cards.len() as u64 {
+                format!("Ack {} shown", cards.len())
+            } else {
+                "Ack all".to_string()
+            };
         }
         out.push(ColumnView {
             status: status.as_str(),

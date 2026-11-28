@@ -83,6 +83,12 @@ pub async fn token(store: &dyn Store) -> axle::domain::TokenId {
 /// A temp SQLite database file (plus `-wal` / `-shm`), deleted on drop.
 pub struct TempDb(PathBuf);
 
+impl TempDb {
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
 impl Drop for TempDb {
     fn drop(&mut self) {
         for suffix in ["", "-wal", "-shm"] {

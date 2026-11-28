@@ -29,7 +29,7 @@ chips above the columns.
 
 The done column holds finished top-level tasks you have not seen, newest first, at most 50.
 Its head reads "N unseen". **Ack** under a card hides that task from the board; **Ack all**
-hides exactly the cards shown. Acking a parent also acks its done subtasks. Acking changes nothing about the task: it stays done and
+hides exactly the cards shown (it reads "Ack 50 shown" when more are unseen than fit). Acking a parent also acks its done subtasks. Acking changes nothing about the task: it stays done and
 stays in [History](#history). Work finished more than `AXL_DONE_AUTO_ACK_DAYS`
 days ago (default 7) leaves the column by itself; a muted line, "N auto-acked, unseen",
 links to the History list of those tasks. Acking is a human action: agents cannot ack.
