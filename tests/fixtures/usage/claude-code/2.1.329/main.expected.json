@@ -1,0 +1,54 @@
+[
+  {
+    "key": "req_011CVa1Think",
+    "at": "2026-11-28T10:00:04.512Z",
+    "model": "claude-opus-5-5",
+    "input": 12,
+    "output": 845,
+    "cache_write_5m": 0,
+    "cache_write_1h": 3120,
+    "cache_read": 48211,
+    "reasoning": 0,
+    "speed": null,
+    "billing": "unknown"
+  },
+  {
+    "key": "req_011CVb2Fast",
+    "at": "2026-11-28T10:01:10.25Z",
+    "model": "claude-opus-5-5",
+    "input": 4,
+    "output": 512,
+    "cache_write_5m": 200,
+    "cache_write_1h": 1000,
+    "cache_read": 51331,
+    "reasoning": 300,
+    "speed": "fast",
+    "billing": "unknown"
+  },
+  {
+    "key": "req_011CVc3Flat",
+    "at": "2026-11-28T10:01:20.9Z",
+    "model": "claude-opus-5-5",
+    "input": 7,
+    "output": 96,
+    "cache_write_5m": 640,
+    "cache_write_1h": 0,
+    "cache_read": 52531,
+    "reasoning": 0,
+    "speed": null,
+    "billing": "unknown"
+  },
+  {
+    "key": "req_011CVd4Long",
+    "at": "2026-11-28T10:03:30.125Z",
+    "model": "claude-opus-5-5",
+    "input": 3,
+    "output": 150,
+    "cache_write_5m": 2048,
+    "cache_write_1h": 0,
+    "cache_read": 210000,
+    "reasoning": 0,
+    "speed": null,
+    "billing": "unknown"
+  }
+]

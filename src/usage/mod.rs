@@ -1,4 +1,6 @@
-//! Token usage: the price table (and, in later tasks, collection and parsing).
+//! Token usage: the price table, the wire types and the harness log parsers (collection
+//! follows in later tasks).
 
+pub mod parsers;
 pub mod prices;
 pub mod report;

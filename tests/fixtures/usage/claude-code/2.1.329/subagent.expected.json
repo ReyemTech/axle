@@ -1,0 +1,28 @@
+[
+  {
+    "key": "req_011CVe5Sub1",
+    "at": "2026-11-28T10:01:30Z",
+    "model": "claude-sonnet-5",
+    "input": 9,
+    "output": 88,
+    "cache_write_5m": 5400,
+    "cache_write_1h": 0,
+    "cache_read": 0,
+    "reasoning": 0,
+    "speed": null,
+    "billing": "unknown"
+  },
+  {
+    "key": "req_011CVf6Sub2",
+    "at": "2026-11-28T10:01:41.7Z",
+    "model": "claude-sonnet-5",
+    "input": 6,
+    "output": 240,
+    "cache_write_5m": 310,
+    "cache_write_1h": 0,
+    "cache_read": 5400,
+    "reasoning": 0,
+    "speed": null,
+    "billing": "unknown"
+  }
+]

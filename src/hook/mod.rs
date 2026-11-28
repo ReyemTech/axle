@@ -81,6 +81,14 @@ pub enum Harness {
 }
 
 impl Harness {
+    /// The harness's name, as `--harness` takes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Harness::ClaudeCode => "claude-code",
+            Harness::Codex => "codex",
+        }
+    }
+
     /// The harness named by a `--harness <name>` or `--harness=<name>` among `args`; anything
     /// else (no flag, an unknown name) is Claude Code.
     pub fn from_args(args: &[String]) -> Harness {
