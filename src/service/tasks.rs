@@ -1988,7 +1988,10 @@ impl TaskService {
         };
         if !matches!(
             event.kind,
-            TaskEventKind::Blocked | TaskEventKind::Done | TaskEventKind::Cancelled
+            TaskEventKind::Blocked
+                | TaskEventKind::Done
+                | TaskEventKind::Cancelled
+                | TaskEventKind::RequestDeclined
         ) {
             return;
         }

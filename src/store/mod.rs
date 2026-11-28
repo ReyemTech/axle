@@ -1101,7 +1101,7 @@ pub fn child_event(child: &Task, parent: TaskId, source: &TaskEvent) -> Option<T
         TaskEventKind::Claimed | TaskEventKind::LeaseExpiredTakeover => TaskEventKind::ChildClaimed,
         TaskEventKind::Blocked => TaskEventKind::ChildBlocked,
         TaskEventKind::Done => TaskEventKind::ChildDone,
-        TaskEventKind::Cancelled => TaskEventKind::ChildCancelled,
+        TaskEventKind::Cancelled | TaskEventKind::RequestDeclined => TaskEventKind::ChildCancelled,
         _ => return None,
     };
     Some(TaskEvent {
@@ -1120,7 +1120,10 @@ pub fn child_event(child: &Task, parent: TaskId, source: &TaskEvent) -> Option<T
 
 /// Whether a child event can be the one that finishes the last open child.
 pub fn closes_child(source: &TaskEvent) -> bool {
-    matches!(source.kind, TaskEventKind::Done | TaskEventKind::Cancelled)
+    matches!(
+        source.kind,
+        TaskEventKind::Done | TaskEventKind::Cancelled | TaskEventKind::RequestDeclined
+    )
 }
 
 /// The event recorded on a parent whose children are all `done` / `cancelled`.
