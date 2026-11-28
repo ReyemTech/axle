@@ -12,11 +12,9 @@ use async_trait::async_trait;
 use time::{Duration, OffsetDateTime};
 
 use crate::config::Backend;
+use crate::delivery::stages::{ChildState, CompletionTarget, completion_target};
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, Enrollment, EnrollmentId, EnrollmentKind,
-    Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState, Project,
-    ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus,
-    TokenId, TokenInfo, WaitingOn,
+    Actor, Address, Agent, AgentId, BlockDetail, Enrollment, EnrollmentId, EnrollmentKind, Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState, Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, WaitingOn, DeliveryStage, ProjectDelivery,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -168,6 +166,27 @@ pub trait Store: Send + Sync {
     async fn list_projects(&self) -> StoreResult<Vec<Project>>;
     /// Changes only the display name; `NotFound` if the project does not exist.
     async fn rename_project(&self, id: ProjectId, display_name: &str) -> StoreResult<()>;
+
+    // ---- delivery settings ----
+
+    /// The project's stored delivery settings; `None` when it has none (no stages).
+    async fn get_project_delivery(
+        &self,
+        project: ProjectId,
+    ) -> StoreResult<Option<ProjectDelivery>>;
+    /// Every stored delivery settings row, ordered by project id.
+    async fn list_project_delivery(&self) -> StoreResult<Vec<ProjectDelivery>>;
+    /// Upserts `d` and, in the same transaction, recomputes every `delivering` task of the
+    /// project with `completion_target(d.stages, …)`: a task whose target is `Done` becomes
+    /// `done` (`done_at = updated_at = d.updated_at`, `version` bumped) with a `delivered`
+    /// event (actor the human, note `delivered_note(&d.stages)`, `token` recorded). Done tasks
+    /// are never reopened. Parents are not recomputed here. Returns the tasks moved, as
+    /// updated.
+    async fn set_project_delivery(
+        &self,
+        d: &ProjectDelivery,
+        token: Option<TokenId>,
+    ) -> StoreResult<Vec<Task>>;
 
     // ---- agents ----
 
@@ -991,6 +1010,56 @@ pub fn children_complete_event(parent: TaskId, source: &TaskEvent) -> TaskEvent 
         actor: source.actor,
         kind: TaskEventKind::ChildrenComplete,
         note: Some("all child tasks are done or cancelled".to_string()),
+        payload: None,
+    }
+}
+
+/// The `project_delivery.stages` column: a JSON array of stage strings.
+pub fn stages_to_json(stages: &[DeliveryStage]) -> String {
+    serde_json::Value::from(stages.iter().map(|s| s.as_str()).collect::<Vec<_>>()).to_string()
+}
+
+/// Reads `project_delivery.stages` back.
+pub fn stages_from_json(text: &str) -> StoreResult<Vec<DeliveryStage>> {
+    let names: Vec<String> = serde_json::from_str(text)
+        .map_err(|e| StoreError::Corrupt(format!("delivery stages: {e}")))?;
+    names
+        .iter()
+        .map(|s| s.parse().map_err(StoreError::Corrupt))
+        .collect()
+}
+
+/// The history note of a task that a stage change finished.
+pub fn delivered_note(stages: &[DeliveryStage]) -> String {
+    match crate::delivery::stages::last_enabled(stages) {
+        None => "delivery stages turned off".to_string(),
+        Some(last) => format!("{} is now the last delivery stage", last.label()),
+    }
+}
+
+/// One delivering task as the settings recompute reads it (under the write lock).
+#[derive(Debug, Clone)]
+pub(crate) struct DeliveringRow {
+    pub task: TaskId,
+    pub stage: Option<DeliveryStage>,
+    pub has_pr: bool,
+    pub children: Vec<ChildState>,
+}
+
+/// Whether new stages finish a delivering task.
+pub(crate) fn finished_by(stages: &[DeliveryStage], row: &DeliveringRow) -> bool {
+    completion_target(stages, row.stage, row.has_pr, &row.children) == CompletionTarget::Done
+}
+
+/// The `delivered` event a stage change records on a task it finished (the human acts).
+pub(crate) fn stages_delivered_event(task: TaskId, d: &ProjectDelivery) -> TaskEvent {
+    TaskEvent {
+        id: uuid::Uuid::now_v7(),
+        task_id: task,
+        at: d.updated_at,
+        actor: Actor::Human,
+        kind: TaskEventKind::Delivered,
+        note: Some(delivered_note(&d.stages)),
         payload: None,
     }
 }

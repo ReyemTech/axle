@@ -10,19 +10,11 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 use time::{Duration as TimeDuration, OffsetDateTime};
 
 use super::{
-    AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate,
-    MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome, ProjectsAdded,
-    Recipient, RelateRequest, Related, Store, StoreError, StoreResult, TaskFilter, TaskOrder,
-    TransitionRequest, Transitioned, UnblockRule, Unblocked, block_previous_payload, child_event,
-    children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label,
-    like_pattern, options_from, options_to, projects_added_note, projects_added_payload,
-    related_payload, send_time_recipient, unblocked_records,
+    AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate, MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, RelateRequest, Related, Store, StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, UnblockRule, Unblocked, block_previous_payload, child_event, children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label, like_pattern, options_from, options_to, projects_added_note, projects_added_payload, related_payload, send_time_recipient, unblocked_records, DeliveringRow, finished_by, stages_delivered_event, stages_from_json, stages_to_json,
 };
+use crate::delivery::stages::ChildState;
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId,
-    EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId, Session,
-    SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo,
-    WaitingOn,
+    Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId, EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, WaitingOn, DeliveryStage, ProjectDelivery,
 };
 
 /// The columns `enrollment_from` reads (a macro so queries can `concat!` it statically).
@@ -194,6 +186,35 @@ fn block_from(row: &SqliteRow) -> StoreResult<Option<BlockDetail>> {
         ),
         unblock: row.try_get("unblock_text")?,
     }))
+}
+
+/// The columns `delivery_from` reads.
+macro_rules! delivery_cols {
+    () => {
+        "project_id, stages, repo, github_enabled, release_source, tag_pattern, deploy_source,
+         required_environment, updated_at"
+    };
+}
+
+fn delivery_from(row: &SqliteRow) -> StoreResult<ProjectDelivery> {
+    Ok(ProjectDelivery {
+        project_id: uuid_of(row.try_get("project_id")?)?,
+        stages: stages_from_json(row.try_get("stages")?)?,
+        repo: row.try_get("repo")?,
+        github_enabled: row.try_get("github_enabled")?,
+        release_source: parse_text(row.try_get("release_source")?)?,
+        tag_pattern: row.try_get("tag_pattern")?,
+        deploy_source: parse_text(row.try_get("deploy_source")?)?,
+        required_environment: row.try_get("required_environment")?,
+        updated_at: ts::dec(row.try_get("updated_at")?)?,
+    })
+}
+
+/// A row's `delivery_stage`.
+fn opt_stage(row: &SqliteRow) -> StoreResult<Option<DeliveryStage>> {
+    row.try_get::<Option<&str>, _>("delivery_stage")?
+        .map(parse_text)
+        .transpose()
 }
 
 fn event_from(row: &SqliteRow) -> StoreResult<TaskEvent> {
@@ -1329,6 +1350,126 @@ impl Store for SqliteStore {
             return Err(StoreError::NotFound("project"));
         }
         Ok(())
+    }
+
+    async fn get_project_delivery(
+        &self,
+        project: ProjectId,
+    ) -> StoreResult<Option<ProjectDelivery>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            delivery_cols!(),
+            " FROM project_delivery WHERE project_id = ?"
+        ))
+        .bind(project.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(delivery_from)
+        .transpose()
+    }
+
+    async fn list_project_delivery(&self) -> StoreResult<Vec<ProjectDelivery>> {
+        sqlx::query(concat!(
+            "SELECT ",
+            delivery_cols!(),
+            " FROM project_delivery ORDER BY project_id"
+        ))
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(delivery_from)
+        .collect()
+    }
+
+    async fn set_project_delivery(
+        &self,
+        d: &ProjectDelivery,
+        token: Option<TokenId>,
+    ) -> StoreResult<Vec<Task>> {
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        sqlx::query(
+            "INSERT INTO project_delivery
+                 (project_id, stages, repo, github_enabled, release_source, tag_pattern,
+                  deploy_source, required_environment, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (project_id) DO UPDATE
+                SET stages = excluded.stages, repo = excluded.repo,
+                    github_enabled = excluded.github_enabled,
+                    release_source = excluded.release_source,
+                    tag_pattern = excluded.tag_pattern,
+                    deploy_source = excluded.deploy_source,
+                    required_environment = excluded.required_environment,
+                    updated_at = excluded.updated_at",
+        )
+        .bind(d.project_id.to_string())
+        .bind(stages_to_json(&d.stages))
+        .bind(&d.repo)
+        .bind(d.github_enabled)
+        .bind(d.release_source.as_str())
+        .bind(&d.tag_pattern)
+        .bind(d.deploy_source.as_str())
+        .bind(&d.required_environment)
+        .bind(ts::enc(d.updated_at))
+        .execute(&mut *tx)
+        .await?;
+
+        let delivering = sqlx::query(
+            "SELECT t.id, t.delivery_stage,
+                    EXISTS (SELECT 1 FROM task_prs p WHERE p.task_id = t.id) AS has_pr
+               FROM tasks t
+              WHERE t.project_id = ? AND t.status = 'delivering'
+              ORDER BY t.created_at, t.id",
+        )
+        .bind(d.project_id.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut moved = Vec::new();
+        for row in &delivering {
+            let id: TaskId = uuid_of(row.try_get("id")?)?;
+            let children =
+                sqlx::query("SELECT status, delivery_stage FROM tasks WHERE parent_id = ?")
+                    .bind(id.to_string())
+                    .fetch_all(&mut *tx)
+                    .await?
+                    .iter()
+                    .map(|c| {
+                        Ok(ChildState {
+                            status: parse_text(c.try_get("status")?)?,
+                            stage: opt_stage(c)?,
+                        })
+                    })
+                    .collect::<StoreResult<Vec<_>>>()?;
+            let state = DeliveringRow {
+                task: id,
+                stage: opt_stage(row)?,
+                has_pr: row.try_get("has_pr")?,
+                children,
+            };
+            if !finished_by(&d.stages, &state) {
+                continue;
+            }
+            let done = sqlx::query(concat!(
+                "UPDATE tasks
+                    SET status = 'done', done_at = ?1, version = version + 1, updated_at = ?1
+                  WHERE id = ?2 AND status = 'delivering'
+                  RETURNING ",
+                task_cols!()
+            ))
+            .bind(ts::enc(d.updated_at))
+            .bind(state.task.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .as_ref()
+            .map(task_from)
+            .transpose()?;
+            if let Some(task) = done {
+                record_event(&mut tx, &task, &stages_delivered_event(task.id, d), token).await?;
+                moved.push(task);
+            }
+        }
+        tx.commit().await?;
+        Ok(moved)
     }
 
     async fn upsert_agent(
