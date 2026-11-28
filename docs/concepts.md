@@ -96,6 +96,7 @@ stateDiagram-v2
     planning --> claimed: human approves plan
     claimed --> blocked: task_update blocked (reason)
     blocked --> review: task_update review
+    blocked --> claimed: task_claim, or the awaited task is done
     claimed --> review: task_update review
     claimed --> done: task_complete
     review --> done: task_complete
@@ -112,10 +113,18 @@ stateDiagram-v2
 | `open` | Waiting for an eligible agent to claim it. |
 | `planning` | Claimed, but a plan must be approved before work starts (see [the plan gate](#the-plan-gate)). |
 | `claimed` | One session holds it under a lease. |
-| `blocked` | The owner is stuck and said why. The owner keeps it. |
+| `blocked` | The owner is stuck and said why, and optionally what it waits on and what would unblock it. The owner keeps it. |
 | `review` | Work done, waiting for the coordinator or the human. |
 | `done` | Finished, with a summary and optional evidence (changed files, tests, links). |
 | `cancelled` | Dropped by the human or the creating agent. |
+
+A blocked task says what it **waits on**: the human (it shows in their *Needs you* strip as
+"Blocked on you"), another task, or something outside Axle in words, plus what would
+**unblock** it. The owner can update all three while it stays blocked. A task waiting on
+another task is unblocked automatically when that task is `done`: it goes back to `claimed`
+with a fresh lease if its owner's session is live, else back to `open`, and a note in its
+thread says why. A cancelled task unblocks nothing. Waits that could never end are refused:
+on itself, on its own parent or ancestor, on a closed task, or in a cycle.
 
 The owner can release a task from any status it holds (it goes back to `open`), and can
 resume a blocked task by claiming it again. The human can **force

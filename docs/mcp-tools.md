@@ -327,7 +327,11 @@ A task with its children, progress, history and thread.
 Event kinds: `created`, `claimed`, `renewed`, `released`, `blocked`, `review`, `done`,
 `cancelled`, `lease_expired_takeover`, `force_released`, `child_claimed`, `child_blocked`,
 `child_done`, `child_cancelled`, `children_complete`, `edited`, `plan_submitted`,
-`plan_approved`, `plan_changes_requested`, `projects_added`.
+`plan_approved`, `plan_changes_requested`, `projects_added`, `block_updated`, `unblocked`.
+
+A blocked task also carries `blocked`: `reason`, `since`, `waiting_on` (`{"human": true}`,
+`{"task": "<id>"}`, `{"external": "<text>"}` or `null`) and `unblock`. The agent-written
+texts are framed like a title.
 
 Errors: `task not found`, `task id "…" is not a valid id`.
 
@@ -389,6 +393,8 @@ projects, in one call. All input is checked before anything is written.
 | `id` | string, required | Task id. |
 | `status` | string | `blocked` (needs `reason`) or `review` (work done, awaiting a check). Owner only. |
 | `reason` | string | Why it is blocked, or a note for review. Only with `status`. |
+| `waiting_on` | object | With `status: blocked`: exactly one of `{"human": true}`, `{"task": "<id>"}` or `{"external": "<text>"}` (at most 500 characters). |
+| `unblock` | string | With `status: blocked`: what would unblock it, at most 500 characters. |
 | `title` | string | New title. Creator or owner. |
 | `body` | string | New body. Creator or owner. |
 | `add_projects` | string array | Projects to add to a top-level task. Creator or owner. Never removed; adding one already listed does nothing. |
@@ -397,12 +403,37 @@ projects, in one call. All input is checked before anything is written.
 { "id": "01a21e49-0e09-77db-8833-c454a159bf8e", "status": "review", "reason": "Ready for a look" }
 ```
 
+```json
+{ "id": "01a21e49-0e09-77db-8833-c454a159bf8e", "status": "blocked",
+  "reason": "Needs the new orders column", "waiting_on": { "task": "01a21e49-2ab1-7782-b68a-4deae8e35420" },
+  "unblock": "The schema migration merged" }
+```
+
 Returns the task object. Edits keep the previous values in the history; the framed title
 then reads `…, edited by <agent>]` when someone other than the creator changed it.
+
+**Blocking.** `waiting_on` says what the task waits on: `human` puts it in the human's
+*Needs you* strip as "Blocked on you"; `task` links another task; `external` names something
+outside Axle. `status: blocked` on a task you already hold blocked updates it instead: pass
+any of `reason`, `waiting_on` and `unblock` (the rest are kept) and the history records
+`block_updated` with the previous values. A task can't wait on itself, on its own parent or
+ancestor, on a done or cancelled task, or on a task that already waits (directly or through
+others) on it.
+
+**Automatic unblock.** When a task is done, every blocked task waiting on it leaves
+`blocked` with a system note in its thread (`unblocked: "<title>" (<id>) is done`) and an
+`unblocked` event: back to `claimed` with a fresh lease when its owner's session is live,
+else back to `open` with no owner, as if released. A cancelled task unblocks nothing; its
+waiters stay blocked until their owner re-points or releases them.
 
 Errors: ``nothing to update: pass `status`, `title`, `body` and/or `add_projects` ``,
 `a reason is required to block a task`,
 `` `reason` goes with `status`; pass `status: blocked` or `status: review` ``,
+`` `waiting_on` and `unblock` go with `status: blocked` ``,
+`` `waiting_on` takes exactly one of … ``, `a task cannot wait on itself`,
+`cannot wait on a <done|cancelled> task: …`, `a subtask cannot wait on its own parent or
+ancestor: …`, `waiting on task <id> would make a cycle: …`,
+`the task to wait on does not exist`,
 `not the owner of this task`, `cannot move a <from> task to <to>`,
 `child tasks belong to one project` (for `add_projects` on a child), the plan gate error
 while `planning`.

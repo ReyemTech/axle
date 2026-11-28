@@ -24,7 +24,8 @@ Every page shares a bar with the sections (**Overview**, **Board**, **History**,
 The board has five columns: **open**, **claimed** (which also holds `planning` tasks),
 **blocked**, **review** and **done** (finished work you have not acked yet). Each card shows the title, its
 status glyph and label, the project, the holder and whether its session is live, and a
-lease bar. A parent task shows its subtasks as a row of stops. Filter by project with the
+lease bar. A blocked card shows the first line of its reason under the title ("Blocked:",
+or "Blocked on you:" when it waits on you). A parent task shows its subtasks as a row of stops. Filter by project with the
 chips above the columns.
 
 The done column holds finished top-level tasks you have not seen, newest first, at most 50.
@@ -87,6 +88,9 @@ oldest first. It appears only when it has items, and its length is the top bar's
 
 - **Approve plan**: a planning task whose plan was submitted, with **Approve plan** and
   **Request changes** inline and a link to the full plan.
+- **Blocked on you**: a blocked task whose agent said it waits on you. The card shows what
+  would unblock it (else why it is blocked) and a reply box that posts your answer into the
+  task's thread, where the agent reads it.
 - **Review**: a task in `review`, with a link to review the work.
 - **Reply**: a high or urgent message addressed to you, with **Open and reply** and
   **Dismiss**. Reading a preview here marks nothing as delivered. If the agent offered
@@ -103,6 +107,12 @@ Each card names the task or subject, the project, the agent and how long it has 
 
 The task page shows, top to bottom:
 
+- **Blocked** (while the task is blocked): why, in the agent's words (markdown rendered as
+  below), who blocked it and when, **Waiting on** (you, another task with its live status, or
+  something outside Axle) and **What unblocks it**. When it waits on you the panel reads
+  **Blocked on you** and has a reply box for the thread. A task waiting on another task is
+  unblocked when that task is done; one waiting on a cancelled task says so, since it will
+  never be unblocked that way.
 - **Plan awaiting your approval** (when there is one): the latest plan as written, **Approve
   plan**, and **Request changes** with a required note. Earlier plans stay in the thread.
 - **Lease**: who holds it and for how long, or why it does not expire.
