@@ -831,6 +831,7 @@ impl AxleMcp {
                 .transpose()?,
             // One extra row says whether there is another page.
             limit: Some(limit + 1),
+            ..TaskFilter::default()
         };
         let mut tasks = self.state.tasks.list(filter).await?;
         let next = more(&mut tasks, limit as usize).map(|last| last.id);

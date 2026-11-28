@@ -9,9 +9,9 @@ use uuid::Uuid;
 use super::{
     AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate,
     MessageReceipt, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, Store,
-    StoreError, StoreResult, TaskFilter, TransitionRequest, Transitioned, child_event,
+    StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, child_event,
     children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label,
-    projects_added_note, projects_added_payload, send_time_recipient,
+    like_pattern, projects_added_note, projects_added_payload, send_time_recipient,
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, Eligibility, Enrollment, EnrollmentId, EnrollmentStatus,
@@ -214,6 +214,26 @@ async fn record_event(
 }
 
 /// Task columns as a literal, so queries stay static SQL.
+/// The `WHERE` shared by `list_tasks` and `count_tasks` (everything but the `after` cursor).
+/// `$5` is top_level, `$6` the done mode (`any`/`unseen`/`auto`), `$7` its `since`, `$8` the
+/// title LIKE pattern (backslash escapes).
+macro_rules! task_where {
+    () => {
+        "($1::uuid IS NULL OR project_id = $1
+                    OR EXISTS (SELECT 1 FROM task_projects tp
+                               WHERE tp.task_id = tasks.id AND tp.project_id = $1))
+               AND ($2::text IS NULL OR status = $2)
+               AND ($3::uuid IS NULL OR owner_agent_id = $3)
+               AND ($4::uuid IS NULL OR parent_id = $4)
+               AND (NOT $5::bool OR parent_id IS NULL)
+               AND (status <> 'done' OR $6::text = 'any'
+                    OR (acked_at IS NULL
+                        AND (($6::text = 'unseen' AND done_at >= $7::timestamptz)
+                             OR ($6::text = 'auto' AND done_at < $7::timestamptz))))
+               AND ($8::text IS NULL OR title ILIKE $8 ESCAPE '\\')"
+    };
+}
+
 macro_rules! task_cols {
     () => {
         "id, project_id, parent_id, title, body, status, owner_session_id, owner_agent_id,
@@ -1209,32 +1229,62 @@ impl Store for PostgresStore {
     }
 
     async fn list_tasks(&self, filter: &TaskFilter) -> StoreResult<Vec<Task>> {
-        sqlx::query(concat!(
-            "SELECT ",
-            task_cols!(),
-            " FROM tasks
-             WHERE ($1::uuid IS NULL OR project_id = $1
-                    OR EXISTS (SELECT 1 FROM task_projects tp
-                               WHERE tp.task_id = tasks.id AND tp.project_id = $1))
-               AND ($2::text IS NULL OR status = $2)
-               AND ($3::uuid IS NULL OR owner_agent_id = $3)
-               AND ($4::uuid IS NULL OR parent_id = $4)
-               AND ($5::uuid IS NULL
-                    OR (created_at, id) > (SELECT created_at, id FROM tasks WHERE id = $5))
-             ORDER BY created_at, id
-             LIMIT $6"
-        ))
-        .bind(filter.project.map(|p| p.as_uuid()))
-        .bind(filter.status.map(|s| s.as_str()))
-        .bind(filter.owner.map(|a| a.as_uuid()))
-        .bind(filter.parent.map(|p| p.as_uuid()))
-        .bind(filter.after.map(|t| t.as_uuid()))
-        .bind(filter.limit.map(i64::from))
-        .fetch_all(&self.pool)
-        .await?
-        .iter()
-        .map(task_from)
-        .collect()
+        let (mode, since) = filter.done.parts();
+        let sql = match filter.order {
+            TaskOrder::Created => concat!(
+                "SELECT ",
+                task_cols!(),
+                " FROM tasks WHERE ",
+                task_where!(),
+                " AND ($9::uuid IS NULL
+                    OR (created_at, id) > (SELECT created_at, id FROM tasks WHERE id = $9))
+                 ORDER BY created_at, id
+                 LIMIT $10"
+            ),
+            TaskOrder::DoneNewest => concat!(
+                "SELECT ",
+                task_cols!(),
+                " FROM tasks WHERE ",
+                task_where!(),
+                " AND ($9::uuid IS NULL
+                    OR (done_at, id) < (SELECT done_at, id FROM tasks WHERE id = $9))
+                 ORDER BY done_at DESC, id DESC
+                 LIMIT $10"
+            ),
+        };
+        sqlx::query(sql)
+            .bind(filter.project.map(|p| p.as_uuid()))
+            .bind(filter.status.map(|s| s.as_str()))
+            .bind(filter.owner.map(|a| a.as_uuid()))
+            .bind(filter.parent.map(|p| p.as_uuid()))
+            .bind(filter.top_level)
+            .bind(mode)
+            .bind(since)
+            .bind(filter.title.as_deref().map(like_pattern))
+            .bind(filter.after.map(|t| t.as_uuid()))
+            .bind(filter.limit.map(i64::from))
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(task_from)
+            .collect()
+    }
+
+    async fn count_tasks(&self, filter: &TaskFilter) -> StoreResult<u64> {
+        let (mode, since) = filter.done.parts();
+        let n: i64 =
+            sqlx::query_scalar(concat!("SELECT COUNT(*) FROM tasks WHERE ", task_where!()))
+                .bind(filter.project.map(|p| p.as_uuid()))
+                .bind(filter.status.map(|s| s.as_str()))
+                .bind(filter.owner.map(|a| a.as_uuid()))
+                .bind(filter.parent.map(|p| p.as_uuid()))
+                .bind(filter.top_level)
+                .bind(mode)
+                .bind(since)
+                .bind(filter.title.as_deref().map(like_pattern))
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(n as u64)
     }
 
     async fn task_events(&self, id: TaskId) -> StoreResult<Vec<TaskEvent>> {

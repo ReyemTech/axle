@@ -1,6 +1,7 @@
 #[macro_use]
 mod common;
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -10,7 +11,9 @@ use axle::domain::{
 };
 use axle::service::identity::{IdentityInput, IdentityService, Resolved};
 use axle::service::tasks::{Caller, Completion, NewTask, TaskService};
-use axle::store::{LeaseUpdate, Store, TransitionRequest};
+use axle::store::{
+    DoneFilter, LeaseUpdate, Store, TaskFilter, TaskOrder, TransitionRequest, like_pattern,
+};
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
@@ -74,6 +77,36 @@ impl Env {
             .await
             .unwrap()
             .id
+    }
+
+    async fn create_titled(&self, title: &str, parent: Option<TaskId>) -> TaskId {
+        let project: ProjectId = self.agent.project.as_ref().expect("has a project").id;
+        self.svc
+            .create(
+                Caller::Agent(&self.agent),
+                NewTask {
+                    project_id: project,
+                    parent_id: parent,
+                    title: title.into(),
+                    ..NewTask::default()
+                },
+            )
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// Creates, claims and completes a task at `T0 + offset`.
+    async fn finish(&self, title: &str, parent: Option<TaskId>, offset: Duration) -> TaskId {
+        let id = self.create_titled(title, parent).await;
+        self.claim(id).await;
+        self.set_time(offset);
+        self.complete(id).await;
+        id
+    }
+
+    async fn list(&self, filter: TaskFilter) -> Vec<Task> {
+        self.store.list_tasks(&filter).await.unwrap()
     }
 
     async fn claim(&self, id: TaskId) {
@@ -178,6 +211,236 @@ store_matrix!(
         assert_eq!(again.acked_at, None);
     }
 );
+
+fn titles(tasks: Vec<Task>) -> Vec<String> {
+    tasks.into_iter().map(|t| t.title).collect()
+}
+
+fn done_with(done: DoneFilter) -> TaskFilter {
+    TaskFilter {
+        status: Some(TaskStatus::Done),
+        done,
+        ..TaskFilter::default()
+    }
+}
+
+store_matrix!(
+    unseen_and_auto_acked_split_at_exactly_n_days,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store).await;
+        env.finish("a", None, Duration::ZERO).await;
+        env.finish("b", None, Duration::seconds(1)).await;
+        let n = Duration::days(7);
+
+        // Queried at exactly T0 + N: `a` is exactly N days old, so still unseen.
+        let since = (T0 + n) - n;
+        assert_eq!(
+            titles(env.list(done_with(DoneFilter::Unseen { since })).await),
+            ["a", "b"]
+        );
+        assert!(
+            env.list(done_with(DoneFilter::AutoAckedUnseen { since }))
+                .await
+                .is_empty()
+        );
+
+        // One second later `a` has aged out; `b` is exactly N days old.
+        let since = (T0 + n + Duration::seconds(1)) - n;
+        assert_eq!(
+            titles(env.list(done_with(DoneFilter::Unseen { since })).await),
+            ["b"]
+        );
+        assert_eq!(
+            titles(
+                env.list(done_with(DoneFilter::AutoAckedUnseen { since }))
+                    .await
+            ),
+            ["a"]
+        );
+    }
+);
+
+store_matrix!(changing_n_moves_tasks_without_writes, |store: Arc<
+    dyn Store,
+>| async move {
+    let env = Env::new(store).await;
+    let a = env.finish("a", None, Duration::ZERO).await;
+    let now = T0 + Duration::days(5);
+    let before = env.get(a).await;
+
+    let count = |done| {
+        let store = env.store.clone();
+        async move {
+            store
+                .count_tasks(&TaskFilter {
+                    done,
+                    ..TaskFilter::default()
+                })
+                .await
+                .unwrap()
+        }
+    };
+    let auto = |d: i64| DoneFilter::AutoAckedUnseen {
+        since: now - Duration::days(d),
+    };
+    assert_eq!(count(auto(7)).await, 0);
+    assert_eq!(count(auto(3)).await, 1);
+    assert_eq!(
+        count(DoneFilter::Unseen {
+            since: now - Duration::days(7)
+        })
+        .await,
+        1
+    );
+
+    let after = env.get(a).await;
+    assert_eq!(
+        (after.version, after.updated_at, after.acked_at),
+        (before.version, before.updated_at, None)
+    );
+});
+
+store_matrix!(done_filter_leaves_other_statuses_alone, |store: Arc<
+    dyn Store,
+>| async move {
+    let env = Env::new(store).await;
+    env.create_titled("open one", None).await;
+    let claimed = env.create_titled("claimed one", None).await;
+    env.claim(claimed).await;
+    env.finish("done long ago", None, Duration::ZERO).await;
+    let now = T0 + Duration::days(30);
+
+    let since = now - Duration::days(7);
+    let got = env
+        .list(TaskFilter {
+            done: DoneFilter::Unseen { since },
+            ..TaskFilter::default()
+        })
+        .await;
+    assert_eq!(titles(got), ["open one", "claimed one"]);
+});
+
+store_matrix!(done_newest_first_top_level_paged, |store: Arc<
+    dyn Store,
+>| async move {
+    let env = Env::new(store).await;
+    let parent = env.create_titled("parent", None).await;
+    let child = env.finish("child", Some(parent), Duration::hours(1)).await;
+    // `y` and `z` finish in the same instant: ties break by id, descending.
+    let x = env.finish("x", None, Duration::hours(2)).await;
+    let y = env.create_titled("y", None).await;
+    let z = env.create_titled("z", None).await;
+    env.claim(y).await;
+    env.claim(z).await;
+    env.set_time(Duration::hours(3));
+    env.complete(y).await;
+    env.complete(z).await;
+    let w = env.finish("w", None, Duration::hours(4)).await;
+    assert_eq!(env.get(y).await.done_at, env.get(z).await.done_at);
+
+    let mut f = TaskFilter {
+        status: Some(TaskStatus::Done),
+        top_level: true,
+        order: TaskOrder::DoneNewest,
+        limit: Some(2),
+        ..TaskFilter::default()
+    };
+    let page1 = env.list(f.clone()).await;
+    f.after = page1.last().map(|t| t.id);
+    let page2 = env.list(f.clone()).await;
+    f.after = page2.last().map(|t| t.id);
+    let page3 = env.list(f.clone()).await;
+    assert!(page3.is_empty());
+    assert_eq!(page1.len(), 2);
+
+    let all_ids: Vec<TaskId> = page1.iter().chain(&page2).map(|t| t.id).collect();
+    assert_eq!(all_ids.len(), 4);
+    assert_eq!(all_ids.iter().collect::<HashSet<_>>().len(), 4);
+    assert!(!all_ids.contains(&child));
+    let (hi, lo) = if y.to_string() > z.to_string() {
+        (y, z)
+    } else {
+        (z, y)
+    };
+    assert_eq!(all_ids, [w, hi, lo, x]);
+
+    // The count ignores `after`, `limit` and `order`.
+    assert_eq!(env.store.count_tasks(&f).await.unwrap(), 4);
+
+    // An unknown cursor id yields an empty page, like the `Created` order.
+    f.after = Some(TaskId::new());
+    assert!(env.list(f.clone()).await.is_empty());
+    f.order = TaskOrder::Created;
+    assert!(env.list(f).await.is_empty());
+});
+
+store_matrix!(
+    title_search_is_literal_and_case_insensitive,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store).await;
+        for t in [
+            "fix the flaky test",
+            "100% done",
+            "a_b",
+            "axb",
+            "back\\slash",
+        ] {
+            env.create_titled(t, None).await;
+        }
+        let search = |q: &str| {
+            env.list(TaskFilter {
+                title: Some(q.into()),
+                ..TaskFilter::default()
+            })
+        };
+        assert_eq!(titles(search("FLAKY").await), ["fix the flaky test"]);
+        assert_eq!(titles(search("%").await), ["100% done"]);
+        assert_eq!(titles(search("a_b").await), ["a_b"]);
+        assert_eq!(titles(search("\\").await), ["back\\slash"]);
+        assert_eq!(titles(search("k\\s").await), ["back\\slash"]);
+    }
+);
+
+store_matrix!(count_matches_list, |store: Arc<dyn Store>| async move {
+    let env = Env::new(store).await;
+    let parent = env.create_titled("parent flaky", None).await;
+    env.finish("child flaky", Some(parent), Duration::hours(1))
+        .await;
+    env.finish("old flaky", None, Duration::hours(2)).await;
+    env.finish("recent", None, Duration::days(10)).await;
+    env.create_titled("open", None).await;
+    let now = T0 + Duration::days(10);
+    let since = now - Duration::days(7);
+    let project = env.agent.project.as_ref().unwrap().id;
+
+    let filters = [
+        TaskFilter::default(),
+        TaskFilter {
+            project: Some(project),
+            ..TaskFilter::default()
+        },
+        TaskFilter {
+            top_level: true,
+            ..TaskFilter::default()
+        },
+        done_with(DoneFilter::Unseen { since }),
+        done_with(DoneFilter::AutoAckedUnseen { since }),
+        TaskFilter {
+            done: DoneFilter::Unseen { since },
+            ..TaskFilter::default()
+        },
+        TaskFilter {
+            title: Some("FLAKY".into()),
+            top_level: true,
+            ..TaskFilter::default()
+        },
+    ];
+    for f in filters {
+        let n = env.list(f.clone()).await.len() as u64;
+        assert_eq!(env.store.count_tasks(&f).await.unwrap(), n, "{f:?}");
+    }
+    assert_eq!(like_pattern(r"a%b_c\d"), r"%a\%b\_c\\d%");
+});
 
 /// Copies migrations 0001..=0003 of `backend` into a fresh directory.
 fn old_migrations(backend: &str) -> std::path::PathBuf {

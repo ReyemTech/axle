@@ -234,9 +234,11 @@ pub trait Store: Send + Sync {
     async fn get_task(&self, id: TaskId) -> StoreResult<Option<Task>>;
     /// The extra participating projects listed for `id` (not its home project).
     async fn task_projects(&self, id: TaskId) -> StoreResult<Vec<ProjectId>>;
-    /// Tasks matching every set filter field, oldest first. `project` also matches tasks
+    /// Tasks matching every set filter field, in `filter.order` (oldest first by default). `project` also matches tasks
     /// that list it as an extra participating project.
     async fn list_tasks(&self, filter: &TaskFilter) -> StoreResult<Vec<Task>>;
+    /// How many tasks `list_tasks(filter)` would return ignoring `after`, `limit` and `order`.
+    async fn count_tasks(&self, filter: &TaskFilter) -> StoreResult<u64>;
     /// A task's history, oldest first.
     async fn task_events(&self, id: TaskId) -> StoreResult<Vec<TaskEvent>>;
     /// A page of a task's history, newest first: only events of `kind` when set, and only
@@ -557,6 +559,58 @@ pub struct TaskFilter {
     pub after: Option<TaskId>,
     /// `None`: no limit.
     pub limit: Option<u32>,
+    /// Only tasks with no parent.
+    pub top_level: bool,
+    /// How `done` rows are filtered; rows of any other status always pass.
+    pub done: DoneFilter,
+    /// Case-insensitive substring of the title; `%`, `_` and `\` match literally.
+    pub title: Option<String>,
+    /// Row order; also what `after` is a cursor into.
+    pub order: TaskOrder,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DoneFilter {
+    #[default]
+    Any,
+    /// `acked_at IS NULL AND done_at >= since` (since = now - N).
+    Unseen { since: OffsetDateTime },
+    /// `acked_at IS NULL AND done_at < since`.
+    AutoAckedUnseen { since: OffsetDateTime },
+}
+
+impl DoneFilter {
+    /// The `(mode, since)` the stores bind: mode is `any`, `unseen` or `auto`.
+    pub(crate) fn parts(self) -> (&'static str, Option<OffsetDateTime>) {
+        match self {
+            DoneFilter::Any => ("any", None),
+            DoneFilter::Unseen { since } => ("unseen", Some(since)),
+            DoneFilter::AutoAckedUnseen { since } => ("auto", Some(since)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TaskOrder {
+    /// `(created_at, id)` ascending; `after` = rows after the cursor.
+    #[default]
+    Created,
+    /// `(done_at, id)` descending; `after` = rows older than the cursor.
+    DoneNewest,
+}
+
+/// `q` as a LIKE pattern with `\` as the escape: `%q%` with `% _ \` escaped.
+pub fn like_pattern(q: &str) -> String {
+    let mut out = String::with_capacity(q.len() + 2);
+    out.push('%');
+    for c in q.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
 }
 
 #[derive(Debug, Clone)]
