@@ -325,46 +325,45 @@ store_matrix!(
     }
 );
 
-store_matrix!(
-    usage_duplicate_from_another_token_is_noop,
-    |store: Arc<dyn Store>| async move {
-        let env = Env::new(store);
-        let a = env.session("mac", "claude-code").await;
-        let other = env.session("linux", "claude-code").await;
-        assert_ne!(a.session.token_id, other.session.token_id);
-        report(&env, &a, &[rec("req_1", T0, 12)], &PerToken).await;
+store_matrix!(usage_duplicate_from_another_token_is_noop, |store: Arc<
+    dyn Store,
+>| async move {
+    let env = Env::new(store);
+    let a = env.session("mac", "claude-code").await;
+    let other = env.session("linux", "claude-code").await;
+    assert_ne!(a.session.token_id, other.session.token_id);
+    report(&env, &a, &[rec("req_1", T0, 12)], &PerToken).await;
 
-        env.set_time(Duration::minutes(1));
-        let mut bigger = rec("req_1", T0 + Duration::minutes(1), 500);
-        bigger.counts.output = 900;
-        let w = report(&env, &other, &[bigger], &PerToken).await;
-        assert_eq!(
-            w,
-            UsageWritten {
-                inserted: 0,
-                duplicate: 1
-            }
-        );
+    env.set_time(Duration::minutes(1));
+    let mut bigger = rec("req_1", T0 + Duration::minutes(1), 500);
+    bigger.counts.output = 900;
+    let w = report(&env, &other, &[bigger], &PerToken).await;
+    assert_eq!(
+        w,
+        UsageWritten {
+            inserted: 0,
+            duplicate: 1
+        }
+    );
 
-        let u = env
-            .store
-            .get_usage("claude-code", "req_1")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            u.counts,
-            UsageCounts {
-                input: 12,
-                output: 10,
-                ..UsageCounts::default()
-            },
-            "another token's counts are not merged"
-        );
-        assert_eq!(u.session, a.session.id);
-        assert_eq!(u.cost_micros, Some(12 + 10));
-    }
-);
+    let u = env
+        .store
+        .get_usage("claude-code", "req_1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        u.counts,
+        UsageCounts {
+            input: 12,
+            output: 10,
+            ..UsageCounts::default()
+        },
+        "another token's counts are not merged"
+    );
+    assert_eq!(u.session, a.session.id);
+    assert_eq!(u.cost_micros, Some(12 + 10));
+});
 
 store_matrix!(usage_allocation_zero_one_three_tasks, |store: Arc<
     dyn Store,
