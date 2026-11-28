@@ -640,6 +640,7 @@ async fn unreachable_server_still_configures_with_warning() {
         &ClientConfig {
             server_url: Some(url.clone()),
             port: None,
+            ..ClientConfig::default()
         },
     )
     .unwrap();
@@ -675,6 +676,7 @@ async fn no_server_non_interactive_goes_local() {
         &ClientConfig {
             server_url: None,
             port: Some(port),
+            ..ClientConfig::default()
         },
     )
     .unwrap();
@@ -1071,6 +1073,7 @@ async fn local_token_check_failure_does_not_mint() {
         &ClientConfig {
             server_url: Some(url.clone()),
             port: Some(port),
+            ..ClientConfig::default()
         },
     )
     .unwrap();
@@ -1332,6 +1335,7 @@ fn e2e_hand_made_token_is_never_printed() {
         &ClientConfig {
             server_url: Some("http://127.0.0.1:1".into()),
             port: None,
+            ..ClientConfig::default()
         },
     )
     .unwrap();
@@ -1764,6 +1768,7 @@ async fn status_reports_missing_token_with_fix() {
         &ClientConfig {
             server_url: Some(srv.base.clone()),
             port: None,
+            ..ClientConfig::default()
         },
     )
     .unwrap();
@@ -1790,6 +1795,7 @@ async fn status_reports_missing_token_with_fix() {
         &ClientConfig {
             server_url: Some(dead.clone()),
             port: None,
+            ..ClientConfig::default()
         },
     )
     .unwrap();
@@ -1864,6 +1870,7 @@ async fn status_flags_version_mismatch() {
         &ClientConfig {
             server_url: Some(base),
             port: None,
+            ..ClientConfig::default()
         },
     )
     .unwrap();
@@ -1932,6 +1939,7 @@ async fn stub_home(readyz: u16, whoami: u16) -> (TempHome, String) {
         &ClientConfig {
             server_url: Some(base.clone()),
             port: None,
+            ..ClientConfig::default()
         },
     )
     .unwrap();
@@ -1991,6 +1999,7 @@ async fn status_whoami_transport_failure_is_unsuccessful_with_a_retry() {
         &ClientConfig {
             server_url: Some(base),
             port: None,
+            ..ClientConfig::default()
         },
     )
     .unwrap();

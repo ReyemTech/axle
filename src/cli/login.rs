@@ -157,6 +157,7 @@ pub async fn login_with(
     let cfg = ClientConfig {
         server_url: Some(url.clone()),
         port: old.port,
+        usage: old.usage.clone(),
     };
     save_config(&dir, &cfg)?;
     if let Err(e) = write_token(&dir, &token) {

@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::Billing;
+
 pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:7420";
 
 #[derive(Debug, thiserror::Error)]
@@ -74,10 +76,39 @@ impl AxlDir {
     }
 }
 
+#[derive(Serialize, Deserialize, Default, Debug, PartialEq, Clone)]
+pub struct UsageConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Harness name -> billing kind; always wins over detection.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub billing: std::collections::BTreeMap<String, Billing>,
+}
+
 #[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
 pub struct ClientConfig {
     pub server_url: Option<String>,
     pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageConfig>,
+}
+
+/// Why usage collection is off: `Some("AXL_USAGE=off")`, `Some("[usage] enabled = false")`,
+/// or None (on). `AXL_USAGE` is off for "off", "0", "false", "no" (ASCII case-insensitive).
+pub fn usage_off(axl_usage: Option<&str>, cfg: &ClientConfig) -> Option<&'static str> {
+    if let Some(v) = axl_usage {
+        let v = v.trim();
+        if ["off", "0", "false", "no"]
+            .iter()
+            .any(|o| v.eq_ignore_ascii_case(o))
+        {
+            return Some("AXL_USAGE=off");
+        }
+    }
+    match cfg.usage.as_ref().and_then(|u| u.enabled) {
+        Some(false) => Some("[usage] enabled = false"),
+        _ => None,
+    }
 }
 
 /// A missing file is the default config; a malformed one is an error.
@@ -161,7 +192,7 @@ pub fn remove_token(dir: &AxlDir) -> Result<bool, ClientError> {
 }
 
 /// Writes `<path>.tmp` with mode 0600, then renames it over `path`.
-fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
