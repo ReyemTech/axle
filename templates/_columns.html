@@ -8,7 +8,7 @@
       <input type="hidden" name="csrf" value="{{ token }}">
       <input type="hidden" name="back" value="{{ ack_back }}">
       {% for card in col.cards %}<input type="hidden" name="id" value="{{ card.id }}" data-ack-for="{{ card.id }}">{% endfor %}
-      <button type="submit" class="secondary">Ack all</button>
+      <button type="submit" class="secondary">{{ d.ack_all_label }}</button>
     </form>
     {% endif %}{% endif %}
     <a class="history-link" href="{{ d.history_href }}">History →</a>

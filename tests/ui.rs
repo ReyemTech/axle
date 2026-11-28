@@ -871,6 +871,27 @@ async fn ack_forms_sit_outside_the_card() {
 }
 
 #[tokio::test]
+async fn ack_all_says_how_many_it_acks_when_unseen_exceeds_the_cards() {
+    let app = app().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    for i in 0..=50 {
+        let t = app.task(&infra, &format!("t{i}"), None).await;
+        app.complete(&infra, t.id).await;
+    }
+    let cookie = app.login().await;
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    let col = ".column[data-status=done]";
+    assert_eq!(
+        select_texts(&board, &format!("{col} form.ack-all button")),
+        ["Ack 50 shown"]
+    );
+    assert_eq!(
+        select_texts(&board, &format!("{col} .count")),
+        ["51 unseen"]
+    );
+}
+
+#[tokio::test]
 async fn ack_all_acks_only_the_cards_shown() {
     let app = app().await;
     let (_, cookie, csrf) = board_with_done(&app, &["a", "b"]).await;
@@ -3235,6 +3256,13 @@ async fn history_lists_every_done_task_paged() {
         )
         .await;
     assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+
+    // A cursor at a task that exists but is not done is as unknown as a missing one.
+    let open = app.task(&infra, "still open", None).await;
+    let not_done = app
+        .get(&format!("/ui/history?after={}", open.id), Some(&cookie))
+        .await;
+    assert_eq!(not_done.status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

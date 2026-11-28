@@ -124,8 +124,12 @@ pub async fn history(
             let id: TaskId = raw
                 .parse()
                 .map_err(|_| UiError::NotFound("No such page."))?;
-            if state.store.get_task(id).await?.is_none() {
-                return Err(UiError::NotFound("No such page."));
+            // The cursor must be a done task in the filtered project, like every page's last row.
+            match state.store.get_task(id).await? {
+                Some(t)
+                    if t.status == TaskStatus::Done
+                        && project_id.is_none_or(|p| p == t.project_id) => {}
+                _ => return Err(UiError::NotFound("No such page.")),
             }
             Some(id)
         }

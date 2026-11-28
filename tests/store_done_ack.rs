@@ -867,3 +867,42 @@ async fn backfill_sets_done_at_and_acks_old_rows_postgres() {
     schema.drop().await;
     common::resume(outcome);
 }
+
+/// A post-commit `get_task` failure (a corrupt row) must not turn a committed ack into an
+/// error or skip the other ids' events. SQLite only: it corrupts the file directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ack_survives_a_failing_post_commit_read() {
+    let (store, file) = common::sqlite_store().await;
+    let env = Env::new(store.clone()).await;
+    let bus = EventBus::new(store.clone(), env.clock.clone());
+    let svc = TaskService::new(
+        store.clone(),
+        env.clock.clone(),
+        Duration::hours(12),
+        Duration::hours(24),
+        Duration::seconds(90),
+    )
+    .with_events(bus.clone());
+    let bad = env.finish("bad", None, Duration::ZERO).await;
+    let good = env.finish("good", None, Duration::ZERO).await;
+    let url = format!("sqlite://{}", file.path().display());
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    sqlx::query("UPDATE tasks SET created_at = 'garbage' WHERE id = ?")
+        .bind(bad.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(store.get_task(bad).await.is_err());
+    let mut rx = bus.subscribe();
+
+    let acked = svc.ack_done(&[bad, good]).await.unwrap();
+    assert_eq!(set(acked), set([bad, good]));
+    match rx.recv().await.unwrap() {
+        Event::TaskChanged {
+            id,
+            kind: TaskEventKind::Acked,
+            ..
+        } => assert_eq!(id, good),
+        other => panic!("unexpected event {other:?}"),
+    }
+}

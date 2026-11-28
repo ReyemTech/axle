@@ -893,12 +893,14 @@ impl TaskService {
         }
         let acked = self.store.ack_done_tasks(ids, self.clock.now()).await?;
         let mut seen = std::collections::HashSet::new();
+        // The ack has committed: a failed read only costs that id's event, so log and go on.
         for id in ids {
-            if acked.contains(id)
-                && seen.insert(*id)
-                && let Some(task) = self.store.get_task(*id).await?
-            {
-                self.changed(&task, TaskEventKind::Acked).await;
+            if acked.contains(id) && seen.insert(*id) {
+                match self.store.get_task(*id).await {
+                    Ok(Some(task)) => self.changed(&task, TaskEventKind::Acked).await,
+                    Ok(None) => {}
+                    Err(e) => eprintln!("axl: failed to read acked task {id}: {e}"),
+                }
             }
         }
         Ok(acked)
