@@ -973,6 +973,40 @@ async fn turn_endpoint_updates_session_and_places_queue() {
     let s = app.state.store.get_session(session).await.unwrap().unwrap();
     assert_eq!(s.wake_task_id, Some(task.id));
 
+    // A heartbeat carrying a turn file older than the hook's last report cannot undo it.
+    let (status, _) = app
+        .post(
+            &token,
+            "/v1/turn",
+            json!({"session_id": session, "state": "busy", "at": "2026-11-28T09:00:02Z"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = app
+        .post(
+            &token,
+            "/v1/heartbeat",
+            json!({"session_id": session, "turn_state": "idle",
+                   "turn_state_at": "2026-11-28T09:00:01Z"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let s = app.state.store.get_session(session).await.unwrap().unwrap();
+    assert_eq!(s.turn_state, TurnState::Busy);
+    // A newer one, and a malformed time (treated as absent), apply.
+    for (state, at) in [("idle", "2026-11-28T09:00:03Z"), ("busy", "soon")] {
+        let (status, _) = app
+            .post(
+                &token,
+                "/v1/turn",
+                json!({"session_id": session, "state": state, "at": at}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let s = app.state.store.get_session(session).await.unwrap().unwrap();
+        assert_eq!(s.turn_state.as_str(), state);
+    }
+
     // Another token's session, an unknown session and a bad state are refused.
     let other = app.token().await;
     let (status, _) = app

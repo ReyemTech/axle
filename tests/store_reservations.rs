@@ -760,3 +760,109 @@ store_matrix!(
         assert_eq!(got.wake_task_id, None);
     }
 );
+
+store_matrix!(
+    turn_report_older_than_the_stored_one_is_ignored,
+    |store: Arc<dyn Store>| async move {
+        let s = session(&store).await;
+        let id = s.session.id;
+        idle(&store, id, T0 - Duration::minutes(1), T0).await;
+        assert!(
+            store
+                .reserve_session(&reservation(id, None, T0))
+                .await
+                .unwrap()
+        );
+
+        // The harness clock: the hook went busy at `busy_at`, after the heartbeat had read
+        // the idle file written at `idle_at`.
+        let idle_at = datetime!(2026-11-28 8:59:58 UTC);
+        let busy_at = datetime!(2026-11-28 9:00:01 UTC);
+        let recv = T0 + Duration::seconds(2);
+        assert_eq!(
+            store
+                .report_turn_at(id, Some(TurnState::Busy), None, Some(busy_at), recv)
+                .await
+                .unwrap(),
+            Some(id)
+        );
+
+        // The stale idle report lands later: its state is ignored, its channel is not.
+        assert_eq!(
+            store
+                .report_turn_at(
+                    id,
+                    Some(TurnState::Idle),
+                    Some(WakeChannel::ClaudeMonitor),
+                    Some(idle_at),
+                    recv + Duration::seconds(1),
+                )
+                .await
+                .unwrap(),
+            None
+        );
+        let got = store.get_session(id).await.unwrap().unwrap();
+        assert_eq!(got.turn_state, TurnState::Busy);
+        assert_eq!(got.turn_state_at, Some(recv));
+        assert_eq!(got.wake_channel, WakeChannel::ClaudeMonitor);
+
+        // A stale busy report does not clear a reservation either.
+        let later = T0 + Duration::minutes(5);
+        store
+            .report_turn_at(
+                id,
+                Some(TurnState::Idle),
+                None,
+                Some(busy_at + Duration::seconds(10)),
+                later - Duration::minutes(1),
+            )
+            .await
+            .unwrap();
+        store.touch_heartbeat(id, later).await.unwrap();
+        assert!(
+            store
+                .reserve_session(&reservation(id, None, later))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .report_turn_at(id, Some(TurnState::Busy), None, Some(busy_at), later)
+                .await
+                .unwrap(),
+            None
+        );
+        let got = store.get_session(id).await.unwrap().unwrap();
+        assert_eq!(got.turn_state, TurnState::Idle);
+        assert!(got.wake_until.is_some());
+
+        // A newer report, and one with no time (an older client), both apply.
+        store
+            .report_turn_at(
+                id,
+                Some(TurnState::Busy),
+                None,
+                Some(busy_at + Duration::seconds(11)),
+                later + Duration::seconds(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_session(id).await.unwrap().unwrap().turn_state,
+            TurnState::Busy
+        );
+        store
+            .report_turn(
+                id,
+                Some(TurnState::Idle),
+                None,
+                later + Duration::seconds(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_session(id).await.unwrap().unwrap().turn_state,
+            TurnState::Idle
+        );
+    }
+);

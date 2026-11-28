@@ -1416,6 +1416,16 @@ async fn prompt_and_tool_report_busy() {
         assert_eq!((o.code, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
     }
     assert_eq!(states(&reports, session), ["busy", "busy"]);
+    // Each report carries the time written to the turn file, so the server can order it
+    // against the heartbeat's copy of that file.
+    let (_, written) = axle::bridge::session_file::read_turn_at(&turn_file(&home.0)).unwrap();
+    let sent = reports.lock().unwrap().last().unwrap()["at"].clone();
+    let sent = time::OffsetDateTime::parse(
+        sent.as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    assert_eq!(Some(sent), written);
 
     // Codex: PostToolUse reports busy, Stop reports idle.
     let (server, reports) = turn_server(json!([]), TurnAnswer::Ok).await;

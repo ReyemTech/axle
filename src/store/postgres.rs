@@ -2077,11 +2077,12 @@ impl Store for PostgresStore {
         .collect())
     }
 
-    async fn report_turn(
+    async fn report_turn_at(
         &self,
         session: SessionId,
         state: Option<TurnState>,
         channel: Option<WakeChannel>,
+        reported_at: Option<OffsetDateTime>,
         now: OffsetDateTime,
     ) -> StoreResult<Option<SessionId>> {
         let mut tx = self.pool.begin().await?;
@@ -2093,23 +2094,38 @@ impl Store for PostgresStore {
                 .ok_or(StoreError::NotFound("session"))?;
         let task: Option<Uuid> = row.try_get("wake_task_id")?;
         let until: Option<OffsetDateTime> = row.try_get("wake_until")?;
-        let cleared = state == Some(TurnState::Busy) && until.is_some() && task.is_none();
-        sqlx::query(
-            "UPDATE sessions
-                SET turn_state_at = CASE WHEN $1::text IS NOT NULL AND $1 <> turn_state THEN $2
-                                         ELSE turn_state_at END,
-                    turn_state = COALESCE($1, turn_state),
-                    wake_channel = COALESCE($3, wake_channel),
-                    wake_until = CASE WHEN $4 THEN NULL ELSE wake_until END
-              WHERE id = $5",
-        )
-        .bind(state.map(|s| s.as_str()))
-        .bind(now)
-        .bind(channel.map(|c| c.as_str()))
-        .bind(cleared)
-        .bind(session.as_uuid())
-        .execute(&mut *tx)
-        .await?;
+        if let Some(channel) = channel {
+            sqlx::query("UPDATE sessions SET wake_channel = $1 WHERE id = $2")
+                .bind(channel.as_str())
+                .bind(session.as_uuid())
+                .execute(&mut *tx)
+                .await?;
+        }
+        let mut cleared = false;
+        if let Some(state) = state {
+            let busy = state == TurnState::Busy && until.is_some() && task.is_none();
+            // The guard is the rule: a report older than the stored one changes nothing.
+            let applied = sqlx::query(
+                "UPDATE sessions
+                    SET turn_state_at = CASE WHEN $1 <> turn_state THEN $2 ELSE turn_state_at END,
+                        turn_state = $1,
+                        turn_reported_at = COALESCE($3, turn_reported_at),
+                        wake_until = CASE WHEN $4 THEN NULL ELSE wake_until END
+                  WHERE id = $5
+                    AND ($3::timestamptz IS NULL OR turn_reported_at IS NULL
+                         OR turn_reported_at <= $3)",
+            )
+            .bind(state.as_str())
+            .bind(now)
+            .bind(reported_at)
+            .bind(busy)
+            .bind(session.as_uuid())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+                == 1;
+            cleared = busy && applied;
+        }
         tx.commit().await?;
         Ok(cleared.then_some(session))
     }

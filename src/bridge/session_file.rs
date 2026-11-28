@@ -73,11 +73,22 @@ pub fn write_turn(path: &Path, state: TurnState, at: time::OffsetDateTime) -> st
 
 /// The state in the turn file at `path`; missing, unreadable or malformed is `None`.
 pub fn read_turn(path: &Path) -> Option<TurnState> {
+    read_turn_at(path).map(|(state, _)| state)
+}
+
+/// The state in the turn file at `path` and when it was written (`None` if that part is
+/// missing or malformed); missing, unreadable or malformed state is `None`.
+pub fn read_turn_at(path: &Path) -> Option<(TurnState, Option<time::OffsetDateTime>)> {
     let text = std::fs::read_to_string(path).ok()?;
-    match text.split_whitespace().next()?.parse().ok()? {
-        TurnState::Unknown => None,
-        state => Some(state),
-    }
+    let mut parts = text.split_whitespace();
+    let state = match parts.next()?.parse().ok()? {
+        TurnState::Unknown => return None,
+        state => state,
+    };
+    let at = parts.next().and_then(|at| {
+        time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()
+    });
+    Some((state, at))
 }
 
 /// A written session file; `remove` (or drop) deletes it, and the hooks' files for it, if

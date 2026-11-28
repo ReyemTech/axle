@@ -509,17 +509,16 @@ async fn bridge_heartbeat_carries_the_hooks_turn_state() {
         beats(&seen)
     );
 
-    // A hook records idle; a later heartbeat carries it.
+    // A hook records idle; a later heartbeat carries it, with the time it was written.
     let turn = axle::bridge::session_file::turn_path(&home.0, std::process::id());
-    axle::bridge::session_file::write_turn(
-        &turn,
-        axle::domain::TurnState::Idle,
-        time::OffsetDateTime::now_utc(),
-    )
-    .unwrap();
+    let at = time::macros::datetime!(2026-11-28 9:00:01.5 UTC);
+    axle::bridge::session_file::write_turn(&turn, axle::domain::TurnState::Idle, at).unwrap();
     let mut carried = false;
     for _ in 0..200 {
-        if beats(&seen).iter().any(|b| b["turn_state"] == "idle") {
+        if beats(&seen)
+            .iter()
+            .any(|b| b["turn_state"] == "idle" && b["turn_state_at"] == "2026-11-28T09:00:01.5Z")
+        {
             carried = true;
             break;
         }

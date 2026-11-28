@@ -2171,11 +2171,12 @@ impl Store for SqliteStore {
         .collect()
     }
 
-    async fn report_turn(
+    async fn report_turn_at(
         &self,
         session: SessionId,
         state: Option<TurnState>,
         channel: Option<WakeChannel>,
+        reported_at: Option<OffsetDateTime>,
         now: OffsetDateTime,
     ) -> StoreResult<Option<SessionId>> {
         let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
@@ -2186,26 +2187,41 @@ impl Store for SqliteStore {
             .ok_or(StoreError::NotFound("session"))?;
         let task: Option<&str> = row.try_get("wake_task_id")?;
         let until: Option<&str> = row.try_get("wake_until")?;
-        let cleared = state == Some(TurnState::Busy) && until.is_some() && task.is_none();
-        let state = state.map(|s| s.as_str());
-        sqlx::query(
-            "UPDATE sessions
-                SET turn_state_at = CASE WHEN ? IS NOT NULL AND ? <> turn_state THEN ?
-                                         ELSE turn_state_at END,
-                    turn_state = COALESCE(?, turn_state),
-                    wake_channel = COALESCE(?, wake_channel),
-                    wake_until = CASE WHEN ? THEN NULL ELSE wake_until END
-              WHERE id = ?",
-        )
-        .bind(state)
-        .bind(state)
-        .bind(ts::enc(now))
-        .bind(state)
-        .bind(channel.map(|c| c.as_str()))
-        .bind(cleared)
-        .bind(session.to_string())
-        .execute(&mut *tx)
-        .await?;
+        if let Some(channel) = channel {
+            sqlx::query("UPDATE sessions SET wake_channel = ? WHERE id = ?")
+                .bind(channel.as_str())
+                .bind(session.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
+        let mut cleared = false;
+        if let Some(state) = state {
+            let busy = state == TurnState::Busy && until.is_some() && task.is_none();
+            let reported_at = reported_at.map(ts::enc);
+            // The guard is the rule: a report older than the stored one changes nothing.
+            let applied = sqlx::query(
+                "UPDATE sessions
+                    SET turn_state_at = CASE WHEN ? <> turn_state THEN ? ELSE turn_state_at END,
+                        turn_state = ?,
+                        turn_reported_at = COALESCE(?, turn_reported_at),
+                        wake_until = CASE WHEN ? THEN NULL ELSE wake_until END
+                  WHERE id = ?
+                    AND (? IS NULL OR turn_reported_at IS NULL OR turn_reported_at <= ?)",
+            )
+            .bind(state.as_str())
+            .bind(ts::enc(now))
+            .bind(state.as_str())
+            .bind(&reported_at)
+            .bind(busy)
+            .bind(session.to_string())
+            .bind(&reported_at)
+            .bind(&reported_at)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+                == 1;
+            cleared = busy && applied;
+        }
         tx.commit().await?;
         Ok(cleared.then_some(session))
     }

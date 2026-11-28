@@ -169,16 +169,17 @@ curl -s http://127.0.0.1:7420/v1/heartbeat \
 registers again. Once the session is marked alive and its leases renewed, a failure to
 place queued work on it is logged on the server and the heartbeat still succeeds.
 
-Two optional fields carry the bridge's view of the session; older bridges send neither,
+Optional fields carry the bridge's view of the session; older bridges send none of them,
 and a missing field leaves the stored value as it is:
 
 | Field | Values | Notes |
 |---|---|---|
 | `turn_state` | `busy`, `idle` | The hooks' last turn report, read from `~/.axl/sessions/<harness-pid>.turn`, so a report the server missed heals within 30 seconds. |
+| `turn_state_at` | RFC 3339 time | When the hooks wrote that state, from the same file. A `turn_state` older than the last report the server applied is ignored, so a heartbeat cannot undo a newer hook report. A malformed time counts as absent. |
 | `wake_channel` | `none`, `claude-socket`, `claude-monitor`, `codex-app-server`, `opencode-api` | How Axle can wake the session when it is idle. |
 
 ```json
-{ "session_id": "0199a000-0000-7000-8000-000000000003", "turn_state": "idle", "wake_channel": "claude-socket" }
+{ "session_id": "0199a000-0000-7000-8000-000000000003", "turn_state": "idle", "turn_state_at": "2026-11-28T09:00:01Z", "wake_channel": "claude-socket" }
 ```
 
 ## `POST /v1/turn`
@@ -190,10 +191,14 @@ has been idle for 5 seconds); going busy marks a delivered wake. Returns 204 wit
 ```sh
 curl -s -X POST http://127.0.0.1:7420/v1/turn \
   -H "Authorization: Bearer $AXL_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"session_id":"0199a000-0000-7000-8000-000000000003","state":"idle"}'
+  -d '{"session_id":"0199a000-0000-7000-8000-000000000003","state":"idle","at":"2026-11-28T09:00:01Z"}'
 ```
 
-`state` is `unknown`, `busy` or `idle`; anything else is a 4xx. An unknown session is 404,
+`state` is `unknown`, `busy` or `idle`; anything else is a 4xx. The optional `at` is when
+the hook made the report (RFC 3339, the agent machine's clock; the same time it writes to
+the turn file). A report older than the last one the server applied, by these times, is
+ignored and still returns 204; a report without `at`, or with a malformed one, always
+applies. An unknown session is 404,
 another token's session 403. The hooks send it with a 2 second timeout and ignore every
 error: a lost report is healed by the next heartbeat.
 

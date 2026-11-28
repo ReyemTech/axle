@@ -333,10 +333,17 @@ impl Bridge {
                 .inner
                 .turn_file
                 .as_deref()
-                .and_then(session_file::read_turn);
+                .and_then(session_file::read_turn_at);
             let mut body = json!({ "session_id": c.session_id });
-            if let Some(turn) = turn {
+            if let Some((turn, at)) = turn {
                 body["turn_state"] = json!(turn);
+                // Sent as written, so the server can drop it if a newer report arrived.
+                if let Some(at) = at.and_then(|at| {
+                    at.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                }) {
+                    body["turn_state_at"] = json!(at);
+                }
             }
             let channel = *self.inner.wake_channel.lock().expect("channel lock");
             if channel != WakeChannel::None {

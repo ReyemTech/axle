@@ -169,6 +169,10 @@ pub struct HeartbeatRequest {
     /// The bridge's view of the turn (from the hooks' turn file); older bridges omit it.
     #[serde(default)]
     pub turn_state: Option<TurnState>,
+    /// When the hooks wrote that turn state (RFC 3339, the agent machine's clock), so an old
+    /// one cannot undo a newer report; older bridges omit it, and a malformed one is ignored.
+    #[serde(default)]
+    pub turn_state_at: Option<String>,
     /// How Axle can wake this session, as the bridge last checked; older bridges omit it.
     #[serde(default)]
     pub wake_channel: Option<WakeChannel>,
@@ -201,7 +205,12 @@ async fn heartbeat(
     // The heartbeat has already committed: a routing error is logged, never a failed beat.
     if let Err(e) = state
         .wake
-        .on_turn_report(r.session.id, req.turn_state, req.wake_channel)
+        .on_turn_report(
+            r.session.id,
+            req.turn_state,
+            req.wake_channel,
+            report_time(req.turn_state_at.as_deref()),
+        )
         .await
     {
         eprintln!("axl: wake routing after a heartbeat failed: {e}");
@@ -221,6 +230,15 @@ async fn heartbeat(
 pub struct TurnRequest {
     pub session_id: SessionId,
     pub state: TurnState,
+    /// When the hook made the report (RFC 3339, the agent machine's clock); older hooks omit
+    /// it, and a malformed one is ignored.
+    #[serde(default)]
+    pub at: Option<String>,
+}
+
+/// A client's report time, RFC 3339; anything else is treated as absent.
+fn report_time(at: Option<&str>) -> Option<time::OffsetDateTime> {
+    time::OffsetDateTime::parse(at?, &time::format_description::well_known::Rfc3339).ok()
 }
 
 /// A hook's turn report: records the state and, going idle, tries to place queued work
@@ -233,7 +251,12 @@ async fn turn(
     let r = session_for(&state, token, req.session_id).await?;
     state
         .wake
-        .on_turn(r.session.id, req.state)
+        .on_turn_report(
+            r.session.id,
+            Some(req.state),
+            None,
+            report_time(req.at.as_deref()),
+        )
         .await
         .map_err(ApiError::internal)?;
     Ok(StatusCode::NO_CONTENT)

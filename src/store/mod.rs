@@ -330,6 +330,22 @@ pub trait Store: Send + Sync {
         state: Option<TurnState>,
         channel: Option<WakeChannel>,
         now: OffsetDateTime,
+    ) -> StoreResult<Option<SessionId>> {
+        self.report_turn_at(session, state, channel, None, now)
+            .await
+    }
+    /// [`Self::report_turn`] for a report the harness made at `reported_at` (its own clock,
+    /// so only compared with its other reports). A state reported before the stored report's
+    /// time is ignored, guarded in the write, so a heartbeat carrying an old turn file cannot
+    /// undo a newer hook report; the channel still applies. A report with no time (an older
+    /// client) always applies and leaves the stored time as it is.
+    async fn report_turn_at(
+        &self,
+        session: SessionId,
+        state: Option<TurnState>,
+        channel: Option<WakeChannel>,
+        reported_at: Option<OffsetDateTime>,
+        now: OffsetDateTime,
     ) -> StoreResult<Option<SessionId>>;
     /// Reserves the session for one wake with a single guarded write; `false` when the
     /// session is not free (see `Reservation`) or another reserver won the race.

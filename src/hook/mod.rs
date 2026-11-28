@@ -359,33 +359,31 @@ async fn run_mail(
     };
     let turn_file = session_file::turn_path(home, pid);
     let busy = matches!(event, Event::UserPromptSubmit | Event::PostToolUse);
-    if busy {
-        record_turn(&turn_file, TurnState::Busy);
-    }
+    let busy_at = busy.then(|| record_turn(&turn_file, TurnState::Busy));
     let started = std::time::Instant::now();
     let found = token(home, env_token).and_then(|t| Ok((t, client()?)));
     let result = match &found {
         Ok((token, client)) => {
             let file = session_file::path(home, pid);
-            mail(event, stdin, &file, &info, token, client, busy).await
+            mail(event, stdin, &file, &info, token, client, busy_at).await
         }
         Err(e) => Err(e.clone()),
     };
     // A stop that does not block ends the turn. The file is the record; the report is sent
     // only when the server answered, in what is left of the budget.
     if event == Event::Stop && !matches!(result, Ok(Some(_))) {
-        record_turn(&turn_file, TurnState::Idle);
+        let at = record_turn(&turn_file, TurnState::Idle);
         if let (Ok(_), Ok((token, client))) = (&result, &found) {
             let left = NETWORK_BUDGET.saturating_sub(started.elapsed());
-            let _ = tokio::time::timeout(left, report_turn(client, &info, token, TurnState::Idle))
-                .await;
+            let report = report_turn(client, &info, token, TurnState::Idle, at);
+            let _ = tokio::time::timeout(left, report).await;
         }
     }
     result
 }
 
-/// The mail part of UserPromptSubmit, PostToolUse and Stop, with `busy`'s turn report sent
-/// alongside the inbox fetch.
+/// The mail part of UserPromptSubmit, PostToolUse and Stop, with the busy turn report (made
+/// at `busy_at`) sent alongside the inbox fetch.
 async fn mail(
     event: Event,
     stdin: &str,
@@ -393,7 +391,7 @@ async fn mail(
     info: &SessionInfo,
     token: &str,
     client: &reqwest::Client,
-    busy: bool,
+    busy_at: Option<time::OffsetDateTime>,
 ) -> Result<Option<String>, String> {
     let nudged_path = session_file::nudged_path(file, info.session_id);
     let cache_path = session_file::lease_cache_path(file, info.session_id);
@@ -414,8 +412,8 @@ async fn mail(
                 }
             },
             async {
-                if busy {
-                    report_turn(client, info, token, TurnState::Busy).await;
+                if let Some(at) = busy_at {
+                    report_turn(client, info, token, TurnState::Busy, at).await;
                 }
             }
         )
@@ -637,21 +635,30 @@ fn token(home: &Path, env_token: Option<&str>) -> Result<String, String> {
     crate::client::read_token(env_token, &crate::client::AxlDir::new(home))
 }
 
-/// Writes the turn file the bridge sends with its heartbeat; a failure is dropped (the
-/// report itself may still arrive).
-fn record_turn(path: &Path, state: TurnState) {
-    let _ = session_file::write_turn(path, state, time::OffsetDateTime::now_utc());
+/// Writes the turn file the bridge sends with its heartbeat and returns the report time
+/// written; a failure is dropped (the report itself may still arrive).
+fn record_turn(path: &Path, state: TurnState) -> time::OffsetDateTime {
+    let at = time::OffsetDateTime::now_utc();
+    let _ = session_file::write_turn(path, state, at);
+    at
 }
 
-/// `POST /v1/turn`, best effort: under the client's `HTTP_TIMEOUT`, every outcome dropped.
-async fn report_turn(client: &reqwest::Client, info: &SessionInfo, token: &str, state: TurnState) {
+/// `POST /v1/turn` for a report made at `at` (the time in the turn file, so the server can
+/// order it against the heartbeat's copy), best effort: under the client's `HTTP_TIMEOUT`,
+/// every outcome dropped.
+async fn report_turn(
+    client: &reqwest::Client,
+    info: &SessionInfo,
+    token: &str,
+    state: TurnState,
+    at: time::OffsetDateTime,
+) {
     let url = format!("{}/v1/turn", info.server_url.trim_end_matches('/'));
-    let _ = client
-        .post(url)
-        .bearer_auth(token)
-        .json(&json!({ "session_id": info.session_id, "state": state }))
-        .send()
-        .await;
+    let mut body = json!({ "session_id": info.session_id, "state": state });
+    if let Ok(at) = at.format(&time::format_description::well_known::Rfc3339) {
+        body["at"] = json!(at);
+    }
+    let _ = client.post(url).bearer_auth(token).json(&body).send().await;
 }
 
 /// Records and reports that this harness's session is idle, printing nothing either way.
@@ -660,11 +667,11 @@ async fn report_idle(harness: Harness, home: Option<&Path>, env_token: Option<&s
     let Some((pid, info)) = find_session(home, harness) else {
         return;
     };
-    record_turn(&session_file::turn_path(home, pid), TurnState::Idle);
+    let at = record_turn(&session_file::turn_path(home, pid), TurnState::Idle);
     let (Ok(token), Ok(client)) = (token(home, env_token), client()) else {
         return;
     };
-    let _ = budget(report_turn(&client, &info, &token, TurnState::Idle)).await;
+    let _ = budget(report_turn(&client, &info, &token, TurnState::Idle, at)).await;
 }
 
 /// The session's unread mail, oldest first: the server's first page, plus any high or
