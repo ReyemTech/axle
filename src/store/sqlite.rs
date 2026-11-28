@@ -13,9 +13,9 @@ use super::{
     AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate,
     MessageReceipt, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, Store,
     StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, UnblockRule,
-    Unblocked, child_event, children_complete_event, claim_event, closes_child, edit_payload,
-    enrollment_token_label, like_pattern, options_from, options_to, projects_added_note,
-    projects_added_payload, send_time_recipient, unblocked_records,
+    Unblocked, block_previous_payload, child_event, children_complete_event, claim_event,
+    closes_child, edit_payload, enrollment_token_label, like_pattern, options_from, options_to,
+    projects_added_note, projects_added_payload, send_time_recipient, unblocked_records,
 };
 use crate::domain::{
     Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId,
@@ -1677,6 +1677,23 @@ impl Store for SqliteStore {
             tx.commit().await?;
             return Ok(None);
         }
+        // The values an update replaces, read under the write lock.
+        let mut event = req.event.clone();
+        if block.record_previous {
+            let previous =
+                sqlx::query(concat!("SELECT ", task_cols!(), " FROM tasks WHERE id = ?"))
+                    .bind(req.task.to_string())
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .as_ref()
+                    .map(task_from)
+                    .transpose()?
+                    .and_then(|t| t.block);
+            event.payload = Some(block_previous_payload(
+                event.payload.as_ref(),
+                previous.as_ref(),
+            ));
+        }
         let to = req.to.map(|s| s.as_str());
         let updated = sqlx::query(concat!(
             "UPDATE tasks
@@ -1758,7 +1775,7 @@ impl Store for SqliteStore {
             tx.commit().await?;
             return Ok(None);
         };
-        let children_complete = record_event(&mut tx, &task, &req.event, req.token).await?;
+        let children_complete = record_event(&mut tx, &task, &event, req.token).await?;
         if req.archive_plans {
             sqlx::query(
                 "UPDATE message_recipients

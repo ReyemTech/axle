@@ -13,9 +13,9 @@ use time::{Duration, OffsetDateTime};
 
 use crate::config::Backend;
 use crate::domain::{
-    Actor, Address, Agent, AgentId, Enrollment, EnrollmentId, EnrollmentKind, Importance,
-    InboxItem, Message, MessageId, MessageKind, PlanState, Project, ProjectId, Session, SessionId,
-    Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId, TokenInfo, WaitingOn,
+    Actor, Address, Agent, AgentId, BlockDetail, Enrollment, EnrollmentId, EnrollmentKind,
+    Importance, InboxItem, Message, MessageId, MessageKind, PlanState, Project, ProjectId, Session,
+    SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId, TokenInfo, WaitingOn,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -543,6 +543,38 @@ pub struct BlockWrite {
     pub reason: Option<String>,
     pub waiting_on: Option<WaitingOn>,
     pub unblock: Option<String>,
+    /// An update of a block: adds the replaced values (`previous_reason`,
+    /// `previous_waiting_on`, `previous_unblock`), read under the write's lock, to the
+    /// event's payload.
+    pub record_previous: bool,
+}
+
+/// `payload` (an object, or nothing) plus the `previous_*` values of `previous`.
+pub fn block_previous_payload(
+    payload: Option<&serde_json::Value>,
+    previous: Option<&BlockDetail>,
+) -> serde_json::Value {
+    let mut map = payload
+        .and_then(|p| p.as_object().cloned())
+        .unwrap_or_default();
+    let null = serde_json::Value::Null;
+    map.insert(
+        "previous_reason".into(),
+        previous.map_or(null.clone(), |b| b.reason.clone().into()),
+    );
+    map.insert(
+        "previous_waiting_on".into(),
+        previous
+            .and_then(|b| b.waiting_on.as_ref())
+            .map_or(null.clone(), WaitingOn::to_json),
+    );
+    map.insert(
+        "previous_unblock".into(),
+        previous
+            .and_then(|b| b.unblock.clone())
+            .map_or(null, Into::into),
+    );
+    map.into()
 }
 
 /// How a finished task unblocks the tasks waiting on it: a dependent whose owner session's

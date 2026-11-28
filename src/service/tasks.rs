@@ -812,23 +812,7 @@ impl TaskService {
         if let Some(u) = &unblock {
             detail.insert("unblock".into(), u.clone().into());
         }
-        if updating && let Some(previous) = &current.block {
-            detail.insert("previous_reason".into(), previous.reason.clone().into());
-            detail.insert(
-                "previous_waiting_on".into(),
-                previous
-                    .waiting_on
-                    .as_ref()
-                    .map_or(serde_json::Value::Null, WaitingOn::to_json),
-            );
-            detail.insert(
-                "previous_unblock".into(),
-                previous
-                    .unblock
-                    .clone()
-                    .map_or(serde_json::Value::Null, Into::into),
-            );
-        }
+        // An update's previous values are read by the store under the write's lock.
         let (from, to, kind): (&[TaskStatus], _, _) = if updating {
             (&[TaskStatus::Blocked], None, TaskEventKind::BlockUpdated)
         } else {
@@ -857,6 +841,7 @@ impl TaskService {
                         reason,
                         waiting_on: waiting_on.clone(),
                         unblock,
+                        record_previous: updating,
                     }),
                     ..Guarded::new(kind)
                 },
