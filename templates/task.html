@@ -95,6 +95,54 @@
   </section>
   {% endif %}
 
+  <section class="panel delivery-panel" aria-label="Delivery">
+    <h2 class="panel-title">Delivery <span class="short-id" title="Task id">{{ delivery.short_id }}</span></h2>
+    {% if let Some(e) = delivery.error %}<p class="error" role="alert">{{ e }}</p>{% endif %}
+    {% if delivery.rows.is_empty() %}
+    {% if let Some(pr) = delivery.pr %}<p><a class="pr-chip" href="{{ pr.url }}" rel="noopener noreferrer">{{ pr.text }}</a></p>{% else %}<p class="empty">No delivery stages for this project.</p>{% endif %}
+    {% else %}
+    <ol class="stage-rows">
+    {% for r in delivery.rows %}
+      <li class="stage-row" data-state="{{ r.state }}">
+        <span class="stage-label">{{ r.label }}</span>
+        <span class="stage-state">{{ r.state }}</span>
+        {% if let Some(at) = r.at %}<time class="muted" datetime="{{ at.iso }}" title="{{ at.text }}">{{ at.ago }}</time>{% endif %}
+        {% if let Some(n) = r.note %}<span class="stage-note muted">{{ n }}</span>{% endif %}
+        {% if let Some(pr) = r.pr %}<a class="pr-chip" href="{{ pr.url }}" rel="noopener noreferrer">{{ pr.text }}</a>{% endif %}
+      </li>
+    {% endfor %}
+    </ol>
+    {% endif %}
+    {% if let Some(token) = csrf %}
+    {% if delivery.can_link %}
+    <form class="stack" method="post" action="/ui/tasks/{{ task.id }}/pr">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <label for="pr-url">Pull request URL</label>
+      <input id="pr-url" name="url" type="url" required>
+      <button type="submit" class="secondary">Link PR</button>
+    </form>
+    {% endif %}
+    <div class="button-row">
+    {% if delivery.can_unlink %}
+    <form method="post" action="/ui/tasks/{{ task.id }}/pr/unlink" data-confirm="Unlink the pull request from this task?">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <button type="submit" class="secondary">Unlink PR</button>
+    </form>
+    {% endif %}
+    {% if delivery.can_move %}
+    <form method="post" action="/ui/tasks/{{ task.id }}/advance">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <button type="submit" class="secondary">Advance stage</button>
+    </form>
+    <form method="post" action="/ui/tasks/{{ task.id }}/mark-done" data-confirm="Mark this task done and skip the remaining stages?">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <button type="submit">Mark done</button>
+    </form>
+    {% endif %}
+    </div>
+    {% endif %}
+  </section>
+
   <section class="panel" aria-label="Subtasks">
     <h2 class="panel-title">Subtasks <span class="count">{{ children.len() }}</span></h2>
     {% if children.is_empty() %}<p class="empty">No subtasks yet.</p>{% else %}

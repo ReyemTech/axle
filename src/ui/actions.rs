@@ -2,17 +2,23 @@
 //! `require_session`, runs one service call as `Actor::Human` (which records a task event or
 //! a message and publishes it like an agent's write) and answers with a 303 back to a page.
 
+use axum::Extension;
 use axum::Form;
 use axum::extract::{Path, RawForm, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use serde::Deserialize;
 
+use super::SessionCtx;
+use super::task_page::{TaskQuery, render_task_page};
 use super::views::{UiError, UiResult};
 use crate::domain::{
-    Actor, Address, Importance, LinkKind, MessageId, ProjectId, TaskId, TokenId, clean_display_name,
+    Actor, Address, Importance, LinkKind, MessageId, ProjectId, Task, TaskId, TokenId,
+    clean_display_name,
 };
 use crate::http::AppState;
 use crate::service::auth::AuthError;
+use crate::service::delivery::DeliveryError;
 use crate::service::messages::{MessageError, NewMessage};
 use crate::service::tasks::{Caller, NewTask, TaskError};
 use crate::store::StoreError;
@@ -428,6 +434,85 @@ pub async fn cancel(State(state): State<AppState>, Path(id): Path<String>) -> Ui
         .await
         .map_err(task_error)?;
     Ok(see_other(&format!("/ui/tasks/{id}")))
+}
+
+// ---------------------------------------------------------------- delivery
+
+/// The outcome of a delivery action: back to the task page, or the page again with the
+/// refusal (the service's own message) in the Delivery panel.
+async fn delivery_outcome(
+    state: &AppState,
+    session: SessionCtx,
+    id: TaskId,
+    result: Result<Task, DeliveryError>,
+) -> UiResult<Response> {
+    let e = match result {
+        Ok(_) => return Ok(see_other(&format!("/ui/tasks/{id}"))),
+        Err(DeliveryError::Task(e @ (TaskError::NotFound | TaskError::Store(_)))) => {
+            return Err(task_error(e));
+        }
+        Err(DeliveryError::Store(e)) => return Err(e.into()),
+        Err(e) => e,
+    };
+    let status = match e {
+        DeliveryError::BadPrUrl(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        _ => StatusCode::CONFLICT,
+    };
+    let page = render_task_page(
+        state,
+        session,
+        id,
+        TaskQuery::default(),
+        Some(e.to_string()),
+    )
+    .await?;
+    Ok((status, page).into_response())
+}
+
+#[derive(Deserialize)]
+pub struct PrForm {
+    url: String,
+}
+
+pub async fn link_pr(
+    State(state): State<AppState>,
+    Extension(session): Extension<SessionCtx>,
+    Path(id): Path<String>,
+    Form(form): Form<PrForm>,
+) -> UiResult<Response> {
+    let id = task_id(&id)?;
+    let result = state.delivery.link_pr(Caller::Human, id, &form.url).await;
+    delivery_outcome(&state, session, id, result).await
+}
+
+pub async fn unlink_pr(
+    State(state): State<AppState>,
+    Extension(session): Extension<SessionCtx>,
+    Path(id): Path<String>,
+) -> UiResult<Response> {
+    let id = task_id(&id)?;
+    let result = state.delivery.unlink_pr(id).await;
+    delivery_outcome(&state, session, id, result).await
+}
+
+pub async fn advance_stage(
+    State(state): State<AppState>,
+    Extension(session): Extension<SessionCtx>,
+    Path(id): Path<String>,
+) -> UiResult<Response> {
+    let id = task_id(&id)?;
+    let result = state.delivery.advance(id).await;
+    delivery_outcome(&state, session, id, result).await
+}
+
+pub async fn mark_done(
+    State(state): State<AppState>,
+    Extension(session): Extension<SessionCtx>,
+    Path(id): Path<String>,
+) -> UiResult<Response> {
+    let id = task_id(&id)?;
+    let result = state.delivery.mark_done(id).await;
+    delivery_outcome(&state, session, id, result).await
 }
 
 // ---------------------------------------------------------------- ack

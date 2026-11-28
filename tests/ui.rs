@@ -5100,3 +5100,240 @@ mod stage_board {
         );
     }
 }
+
+// ---------------------------------------------------------------- task delivery panel
+
+mod delivery_panel {
+    use super::*;
+    use axle::domain::DeliveryStage::{self, InPr, Merged, Released};
+    use axle::store::StageMove;
+
+    const WEB: &str = "github.com/acme/web";
+    const PR: &str = "https://github.com/acme/web/pull/12";
+
+    async fn setup(stages: &[DeliveryStage]) -> (App, String, String, Resolved) {
+        let app = app().await;
+        let cookie = app.login().await;
+        let web = app.agent(WEB, "mac", "claude-code").await;
+        let project = app
+            .state
+            .store
+            .get_project(web.agent.project_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        app.state
+            .delivery
+            .set_stages(&project, stages.to_vec())
+            .await
+            .unwrap();
+        let csrf = csrf_for(&app, &cookie).await;
+        (app, cookie, csrf, web)
+    }
+
+    async fn delivering(app: &App, by: &Resolved) -> Task {
+        let task = app.task(by, "Ship it", None).await;
+        app.claim(by, task.id).await;
+        app.state
+            .delivery
+            .link_pr(Caller::Agent(by), task.id, PR)
+            .await
+            .unwrap();
+        app.state
+            .tasks
+            .complete(
+                by,
+                task.id,
+                Completion {
+                    summary: "done".into(),
+                    ..Completion::default()
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn move_to(app: &App, task: &Task, to: DeliveryStage, implied: Vec<DeliveryStage>) {
+        app.state
+            .store
+            .advance_stage(&StageMove {
+                task: task.id,
+                to,
+                implied,
+                signal_id: None,
+                detail: None,
+                actor: Actor::Human,
+                token: None,
+                now: app.state.clock.now(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    fn buttons(page: &Page) -> Vec<String> {
+        select_texts(page, ".delivery-panel button")
+    }
+
+    const PR_LINK: &str = ".delivery-panel a[href=\"https://github.com/acme/web/pull/12\"]";
+
+    #[tokio::test]
+    async fn delivery_panel_timeline() {
+        let (app, cookie, _csrf, web) = setup(&[InPr, Merged, Released]).await;
+        let task = delivering(&app, &web).await;
+        move_to(&app, &task, Released, vec![Merged]).await;
+        let page = app
+            .get(&format!("/ui/tasks/{}", task.id), Some(&cookie))
+            .await;
+        assert_eq!(
+            select_texts(&page, ".delivery-panel .short-id"),
+            [axle::domain::short_id(task.id)]
+        );
+        assert_eq!(
+            select_texts(&page, ".delivery-panel .stage-label"),
+            ["In PR", "Merged", "Released"]
+        );
+        assert_eq!(
+            select_texts(&page, ".delivery-panel .stage-state"),
+            ["reached", "implied", "reached"]
+        );
+        let notes = select_texts(&page, ".delivery-panel .stage-note");
+        assert!(
+            notes.iter().any(|n| n == "implied by Released"),
+            "{notes:?}"
+        );
+        assert_eq!(select_texts(&page, PR_LINK), ["PR #12"]);
+
+        // A stage not yet reached reads waiting.
+        let (app, cookie, _csrf, web) = setup(&[InPr, Merged]).await;
+        let task = delivering(&app, &web).await;
+        let page = app
+            .get(&format!("/ui/tasks/{}", task.id), Some(&cookie))
+            .await;
+        assert_eq!(
+            select_texts(&page, ".delivery-panel .stage-state"),
+            ["reached", "waiting"]
+        );
+    }
+
+    #[tokio::test]
+    async fn link_pr_form() {
+        let (app, cookie, csrf, web) = setup(&[InPr, Merged]).await;
+        let task = app.task(&web, "Ship it", None).await;
+        app.claim(&web, task.id).await;
+        let path = format!("/ui/tasks/{}", task.id);
+
+        let page = app.get(&path, Some(&cookie)).await;
+        assert!(buttons(&page).contains(&"Link PR".to_string()));
+
+        // Without CSRF nothing happens.
+        let denied = app
+            .post_form(
+                &format!("{path}/pr"),
+                Some(&cookie),
+                &serde_urlencoded::to_string([("url", PR)]).unwrap(),
+            )
+            .await;
+        assert_eq!(denied.status, StatusCode::FORBIDDEN);
+
+        // A bad URL shows the exact message in the panel.
+        let bad = app
+            .post_form(
+                &format!("{path}/pr"),
+                Some(&cookie),
+                &form(&csrf, &[("url", "https://github.com/other/repo/pull/3")]),
+            )
+            .await;
+        assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", bad.body);
+        assert_eq!(
+            select_texts(&bad, ".delivery-panel .error"),
+            ["pr must be a pull request in github.com/acme/web"]
+        );
+
+        let ok = app
+            .post_form(
+                &format!("{path}/pr"),
+                Some(&cookie),
+                &form(&csrf, &[("url", PR)]),
+            )
+            .await;
+        assert_eq!(ok.status, StatusCode::SEE_OTHER, "{}", ok.body);
+        assert_eq!(ok.location.as_deref(), Some(path.as_str()));
+        let page = app.get(&path, Some(&cookie)).await;
+        assert_eq!(select_texts(&page, PR_LINK), ["PR #12"]);
+        assert!(buttons(&page).contains(&"Unlink PR".to_string()));
+
+        // Unlink removes it again.
+        let un = app
+            .post_form(
+                &format!("{path}/pr/unlink"),
+                Some(&cookie),
+                &form(&csrf, &[]),
+            )
+            .await;
+        assert_eq!(un.status, StatusCode::SEE_OTHER, "{}", un.body);
+        assert!(app.state.store.task_pr(task.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn advance_and_mark_done_buttons() {
+        let (app, cookie, csrf, web) = setup(&[InPr, Merged, Released]).await;
+        let task = delivering(&app, &web).await;
+        let path = format!("/ui/tasks/{}", task.id);
+        let page = app.get(&path, Some(&cookie)).await;
+        let b = buttons(&page);
+        assert!(b.contains(&"Advance stage".to_string()), "{b:?}");
+        assert!(b.contains(&"Mark done".to_string()), "{b:?}");
+
+        let r = app
+            .post_form(&format!("{path}/advance"), Some(&cookie), &form(&csrf, &[]))
+            .await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+        let t = app.state.store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(t.delivery_stage, Some(Merged));
+        assert_eq!(t.status, TaskStatus::Delivering);
+
+        let r = app
+            .post_form(
+                &format!("{path}/mark-done"),
+                Some(&cookie),
+                &form(&csrf, &[]),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+        let t = app.state.store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Done);
+
+        // Done: neither button, and a repeat is refused in the panel.
+        let page = app.get(&path, Some(&cookie)).await;
+        let b = buttons(&page);
+        assert!(!b.contains(&"Advance stage".to_string()), "{b:?}");
+        assert!(!b.contains(&"Mark done".to_string()), "{b:?}");
+        let r = app
+            .post_form(
+                &format!("{path}/mark-done"),
+                Some(&cookie),
+                &form(&csrf, &[]),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CONFLICT);
+        assert_eq!(
+            select_texts(&r, ".delivery-panel .error"),
+            ["this task is not delivering"]
+        );
+    }
+
+    #[tokio::test]
+    async fn unlink_hidden_after_merge() {
+        let (app, cookie, _csrf, web) = setup(&[InPr, Merged]).await;
+        let task = delivering(&app, &web).await;
+        let path = format!("/ui/tasks/{}", task.id);
+        // Delivering: the store refuses an unlink, so the button is not offered.
+        let page = app.get(&path, Some(&cookie)).await;
+        assert!(!buttons(&page).contains(&"Unlink PR".to_string()));
+
+        move_to(&app, &task, Merged, vec![]).await;
+        let page = app.get(&path, Some(&cookie)).await;
+        assert!(!buttons(&page).contains(&"Unlink PR".to_string()));
+    }
+}
