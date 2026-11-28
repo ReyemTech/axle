@@ -4031,3 +4031,413 @@ async fn hostile_block_text_is_escaped() {
         "shown as text"
     );
 }
+
+// ---------------------------------------------------------------- board declutter
+
+/// The `name` attribute of every element matching `css`.
+fn attrs(page: &Page, css: &str, name: &str) -> Vec<String> {
+    let sel = Selector::parse(css).unwrap();
+    page.html()
+        .select(&sel)
+        .filter_map(|e| e.value().attr(name).map(str::to_string))
+        .collect()
+}
+
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
+                   connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+#[tokio::test]
+async fn board_columns_show_twelve_with_the_true_count_and_show_more() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    for i in 1..=15 {
+        app.task(&infra, &format!("Open task {i:02}"), None).await;
+    }
+    let res = app
+        .router
+        .clone()
+        .oneshot(
+            Request::get("/ui/board")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.headers()[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap(),
+        CSP,
+        "the CSP is unchanged"
+    );
+
+    let page = app.get("/ui/board", Some(&cookie)).await;
+    let open = ".column[data-status=open]";
+    assert_eq!(select_texts(&page, &format!("{open} .card")).len(), 12);
+    assert_eq!(
+        select_texts(&page, &format!("{open} > header .count")),
+        ["15"],
+        "the header counts every open task"
+    );
+    assert_eq!(
+        attrs(&page, open, "data-capped"),
+        [""],
+        "a capped column says so"
+    );
+    assert_eq!(
+        select_texts(&page, &format!("{open} .show-more")),
+        ["Show 3 more"]
+    );
+    assert_eq!(
+        attrs(&page, &format!("{open} .show-more"), "href"),
+        ["/ui/board?expand=open"],
+        "without JS the link renders the board with the column uncapped"
+    );
+    assert_eq!(
+        attrs(&page, &format!("{open} .show-more"), "hx-get"),
+        ["/ui/board/columns?expand=open"]
+    );
+    assert_eq!(
+        attrs(&page, &format!("{open} .show-more"), "hx-push-url"),
+        ["/ui/board?expand=open"]
+    );
+    assert!(
+        select_texts(&page, ".column[data-status=claimed] .show-more").is_empty(),
+        "an empty column has no link"
+    );
+
+    // The plain link: the whole board with Open uncapped and marked expanded.
+    let all = app.get("/ui/board?expand=open", Some(&cookie)).await;
+    assert_eq!(all.status, StatusCode::OK);
+    assert_eq!(select_texts(&all, &format!("{open} .card")).len(), 15);
+    assert!(select_texts(&all, &format!("{open} .show-more")).is_empty());
+    assert_eq!(attrs(&all, open, "data-expanded"), [""]);
+    assert!(attrs(&all, open, "data-capped").is_empty());
+    assert_eq!(
+        select_texts(&all, &format!("{open} .show-fewer")),
+        ["Show top 12"]
+    );
+    assert_eq!(
+        attrs(&all, &format!("{open} .show-fewer"), "href"),
+        ["/ui/board"]
+    );
+
+    // The fragment the htmx link fetches: the same uncapped column, no page chrome.
+    let frag = app
+        .get("/ui/board/columns?expand=open", Some(&cookie))
+        .await;
+    assert_eq!(frag.status, StatusCode::OK);
+    assert!(!frag.body.contains("<html"));
+    assert_eq!(select_texts(&frag, &format!("{open} .card")).len(), 15);
+
+    // Expansion keeps the project filter.
+    let project = infra.agent.project_id.unwrap();
+    let filtered = app
+        .get(&format!("/ui/board?project={project}"), Some(&cookie))
+        .await;
+    assert_eq!(
+        attrs(&filtered, &format!("{open} .show-more"), "href"),
+        [format!("/ui/board?project={project}&expand=open")]
+    );
+}
+
+#[tokio::test]
+async fn capped_columns_put_what_needs_attention_first() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let mut plain = Vec::new();
+    for i in 1..=12 {
+        plain.push(app.task(&infra, &format!("Plain {i:02}"), None).await);
+    }
+    // Claimed first, so its lease runs low while the others are fresh.
+    let expiring = app.task(&infra, "Lease running out", None).await;
+    app.claim(&infra, expiring.id).await;
+    app.clock.advance(time::Duration::minutes(13));
+    for t in &plain {
+        app.claim(&infra, t.id).await;
+    }
+    // A human-created task whose thread holds urgent mail for the human.
+    let urgent = app
+        .state
+        .tasks
+        .create(
+            Caller::Human,
+            NewTask {
+                project_id: infra.agent.project_id.unwrap(),
+                title: "Urgent thread".into(),
+                body: "body".into(),
+                ..NewTask::default()
+            },
+        )
+        .await
+        .unwrap();
+    app.claim(&infra, urgent.id).await;
+    app.state
+        .messages
+        .send(
+            &Actor::Agent(infra.agent.id, infra.session.id),
+            NewMessage {
+                to: Address::Task(urgent.id),
+                subject: Some("Prod is down".into()),
+                body: "Need a call now".into(),
+                importance: Importance::Urgent,
+                reply_to: None,
+            },
+        )
+        .await
+        .unwrap();
+    submitted_plan(&app, &infra, "Plan waits on you").await;
+    // A parent whose subtask is blocked.
+    let parent = app
+        .task(&infra, "Parent with a blocked subtask", None)
+        .await;
+    let child = app.task(&infra, "stuck child", Some(parent.id)).await;
+    app.claim(&infra, parent.id).await;
+    app.claim(&infra, child.id).await;
+    app.state
+        .tasks
+        .block(&infra, child.id, "waiting")
+        .await
+        .unwrap();
+
+    let page = app.get("/ui/board", Some(&cookie)).await;
+    let claimed = select_texts(&page, ".column[data-status=claimed] .card-title");
+    assert_eq!(claimed.len(), 12, "{claimed:?}");
+    assert_eq!(
+        claimed[..5],
+        [
+            "Urgent thread",
+            "Plan waits on you",
+            "Parent with a blocked subtask",
+            "Lease running out",
+            "Plain 01",
+        ],
+        "{claimed:?}"
+    );
+    assert_eq!(
+        select_texts(&page, ".column[data-status=claimed] > header .count"),
+        ["16"]
+    );
+    assert_eq!(
+        select_texts(&page, ".column[data-status=claimed] .show-more"),
+        ["Show 4 more"]
+    );
+    // Uncapped, the column keeps the same order and shows the rest after.
+    let all = app.get("/ui/board?expand=claimed", Some(&cookie)).await;
+    let claimed = select_texts(&all, ".column[data-status=claimed] .card-title");
+    assert_eq!(claimed.len(), 16);
+    assert_eq!(claimed[3], "Lease running out");
+    assert_eq!(claimed[15], "Plain 12");
+}
+
+#[tokio::test]
+async fn compact_cards_drop_the_detail_and_keep_the_signals() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let codex = app.agent(INFRA, "build-01", "codex").await;
+    let parent = app.task(&infra, "Rotate DB creds", None).await;
+    let a = app.task(&infra, "update secret", Some(parent.id)).await;
+    let b = app.task(&infra, "roll users", Some(parent.id)).await;
+    let _c = app.task(&infra, "update ES", Some(parent.id)).await;
+    app.complete(&codex, a.id).await;
+    app.claim(&infra, b.id).await;
+    app.claim(&infra, parent.id).await;
+    let lone = app.task(&infra, "Stuck alone", None).await;
+    app.claim(&infra, lone.id).await;
+    app.state
+        .tasks
+        .block(&infra, lone.id, "waiting on the vendor\nmore detail")
+        .await
+        .unwrap();
+
+    // Detailed (the default) offers Compact.
+    let page = app.get("/ui/board", Some(&cookie)).await;
+    assert_eq!(select_texts(&page, ".density a"), ["Detailed", "Compact"]);
+    assert_eq!(
+        select_texts(&page, ".density a[aria-current=true]"),
+        ["Detailed"]
+    );
+    assert!(!select_texts(&page, ".card .stations").is_empty());
+
+    // Choosing Compact sets a cookie and returns to the board (filter and expansion kept).
+    let set = app
+        .get("/ui/board/density?set=compact&expand=open", Some(&cookie))
+        .await;
+    assert_eq!(set.status, StatusCode::SEE_OTHER);
+    assert_eq!(set.location.as_deref(), Some("/ui/board?expand=open"));
+    let density = set.set_cookie.expect("a density cookie");
+    assert!(density.starts_with("axl_density=compact;"), "{density}");
+    assert!(density.contains("Path=/ui") && density.contains("SameSite=Strict"));
+    let both = format!("{cookie}; {}", cookie_pair(&density));
+
+    let page = app.get("/ui/board", Some(&both)).await;
+    assert_eq!(
+        select_texts(&page, ".density a[aria-current=true]"),
+        ["Compact"]
+    );
+    let card = format!("#task-{}", parent.id);
+    assert_eq!(attrs(&page, &card, "data-density"), ["compact"]);
+    assert!(select_texts(&page, &format!("{card} .stations")).is_empty());
+    assert!(select_texts(&page, &format!("{card} .owners")).is_empty());
+    assert!(select_texts(&page, &format!("{card} details.children")).is_empty());
+    assert_eq!(
+        select_texts(&page, &format!("{card} .ratio-text")),
+        ["1/3 subtasks"]
+    );
+    assert_eq!(
+        select_texts(&page, &format!("{card} .state .status")),
+        ["claimed"],
+        "the status word stays"
+    );
+    assert!(!select_texts(&page, &format!("{card} .owner")).is_empty());
+    assert!(!select_texts(&page, &format!("{card} .lease-meter")).is_empty());
+    assert_eq!(
+        select_texts(&page, &format!("#task-{} .card-blocked-reason", lone.id)),
+        ["waiting on the vendor"]
+    );
+    // A compact card re-fetches itself on its live event rather than taking the shared
+    // (detailed) render.
+    assert!(attrs(&page, &card, "sse-swap").is_empty());
+    assert_eq!(
+        attrs(&page, &card, "hx-get"),
+        [format!("/ui/tasks/{}/card", parent.id)]
+    );
+    assert_eq!(
+        attrs(&page, &card, "hx-trigger"),
+        [format!("sse:task-{}", parent.id)]
+    );
+    let one = app
+        .get(&format!("/ui/tasks/{}/card", parent.id), Some(&both))
+        .await;
+    assert_eq!(one.status, StatusCode::OK);
+    assert_eq!(attrs(&one, ".card", "data-density"), ["compact"]);
+    assert_eq!(select_texts(&one, ".ratio-text"), ["1/3 subtasks"]);
+    let detailed = app
+        .get(&format!("/ui/tasks/{}/card", parent.id), Some(&cookie))
+        .await;
+    assert!(!select_texts(&detailed, ".stations").is_empty());
+
+    // Back to Detailed.
+    let set = app.get("/ui/board/density?set=detailed", Some(&both)).await;
+    assert_eq!(set.location.as_deref(), Some("/ui/board"));
+    assert!(set.set_cookie.unwrap().starts_with("axl_density=detailed;"));
+}
+
+#[tokio::test]
+async fn filtering_can_fetch_every_card() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    for i in 1..=13 {
+        app.task(&infra, &format!("Open task {i:02}"), None).await;
+    }
+    let page = app.get("/ui/board", Some(&cookie)).await;
+    // The columns region re-fetches on a filter (the script asks with expand=all).
+    let trigger = attrs(&page, "#columns", "hx-trigger");
+    assert!(trigger[0].contains("axl:refetch"), "{trigger:?}");
+    let all = app.get("/ui/board/columns?expand=all", Some(&cookie)).await;
+    assert_eq!(
+        select_texts(&all, ".column[data-status=open] .card").len(),
+        13
+    );
+    assert!(
+        attrs(&all, ".column[data-status=open]", "data-expanded").is_empty(),
+        "a filter's fetch does not count as expanding the column"
+    );
+    assert!(select_texts(&all, ".show-more").is_empty());
+    let js = app.get("/ui/static/app.js", None).await;
+    assert!(js.body.contains("axl:refetch") && js.body.contains("data-capped"));
+}
+
+#[tokio::test]
+async fn urgent_thread_mail_and_its_archiving_refresh_the_board() {
+    use axle::events::Event;
+    let app = app().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let task = app
+        .state
+        .tasks
+        .create(
+            Caller::Human,
+            NewTask {
+                project_id: infra.agent.project_id.unwrap(),
+                title: "Human task".into(),
+                body: "body".into(),
+                ..NewTask::default()
+            },
+        )
+        .await
+        .unwrap();
+    let send = |importance| {
+        let app = &app;
+        let infra = &infra;
+        async move {
+            app.state
+                .messages
+                .send(
+                    &Actor::Agent(infra.agent.id, infra.session.id),
+                    NewMessage {
+                        to: Address::Task(task.id),
+                        subject: None,
+                        body: "x".into(),
+                        importance,
+                        reply_to: None,
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let board = |frames: &[(String, String)]| frames.iter().any(|(n, _)| n == "board");
+    let created = |m: &axle::domain::Message| Event::MessageCreated {
+        id: m.id,
+        to: m.to,
+        project_id: m.project_id,
+    };
+
+    let normal = send(Importance::Normal).await;
+    let frames = axle::ui::views::live_frames(&app.state, &created(&normal)).await;
+    assert!(
+        !board(&frames),
+        "ordinary thread mail does not re-rank: {frames:?}"
+    );
+
+    let urgent = send(Importance::Urgent).await;
+    let frames = axle::ui::views::live_frames(&app.state, &created(&urgent)).await;
+    assert!(
+        board(&frames),
+        "urgent thread mail re-ranks the board: {frames:?}"
+    );
+
+    let archived = Event::HumanArchived {
+        archived: vec![urgent.id],
+    };
+    let frames = axle::ui::views::live_frames(&app.state, &archived).await;
+    assert!(board(&frames), "archiving it re-ranks too: {frames:?}");
+    let archived = Event::HumanArchived {
+        archived: vec![normal.id],
+    };
+    let frames = axle::ui::views::live_frames(&app.state, &archived).await;
+    assert!(!board(&frames), "{frames:?}");
+}
+
+#[tokio::test]
+async fn density_links_follow_the_current_expansion() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let page = app.get("/ui/board?expand=open", Some(&cookie)).await;
+    // Without JS the links carry the page's expansion.
+    let hrefs = attrs(&page, ".density a", "href");
+    assert!(hrefs.iter().all(|h| h.contains("expand=open")), "{hrefs:?}");
+    // With JS, a click re-reads the expansion from the columns on screen.
+    assert_eq!(
+        attrs(&page, ".density a[data-density-link]", "href").len(),
+        2
+    );
+    let js = app.get("/ui/static/app.js", None).await;
+    assert!(js.body.contains("data-density-link"));
+}

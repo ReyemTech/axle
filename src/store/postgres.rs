@@ -2125,6 +2125,26 @@ impl Store for PostgresStore {
         .collect()
     }
 
+    async fn urgent_attention_tasks(&self) -> StoreResult<Vec<TaskId>> {
+        sqlx::query(concat!(
+            "SELECT DISTINCT m.task_id FROM messages m
+             WHERE m.importance = 'urgent' AND m.kind <> 'plan' AND m.task_id IS NOT NULL
+               AND (EXISTS (SELECT 1 FROM message_recipients r
+                            WHERE r.message_id = m.id AND r.recipient_agent_id IS NULL
+                              AND r.recipient_session_id IS NULL AND r.acked_at IS NULL)
+                    OR (",
+            pending_messages!(),
+            "))
+             ORDER BY m.task_id"
+        ))
+        .bind(Option::<Uuid>::None)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|row| Ok(row.try_get::<Uuid, _>("task_id")?.into()))
+        .collect()
+    }
+
     async fn message_receipts(&self, ids: &[MessageId]) -> StoreResult<Vec<MessageReceipt>> {
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {

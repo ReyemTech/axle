@@ -739,6 +739,54 @@ store_matrix!(human_attention_is_a_read_only_peek, |store: Arc<
     assert_eq!(receipts[0].delivered, 0, "peeking delivers nothing");
 });
 
+store_matrix!(
+    urgent_thread_mail_is_found_behind_older_attention,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let lead = env.session("mac").await;
+        let gated = env.gated(project_of(&lead)).await;
+        let quiet = env.gated(project_of(&lead)).await;
+        let messages =
+            axle::service::messages::MessageService::new(env.store.clone(), env.clock.clone());
+        let from = Actor::Agent(lead.agent.id, lead.session.id);
+        let send = |to: Address, importance: Importance| {
+            let messages = &messages;
+            let from = &from;
+            async move {
+                messages
+                    .send(
+                        from,
+                        axle::service::messages::NewMessage {
+                            to,
+                            subject: None,
+                            body: "x".into(),
+                            importance,
+                            reply_to: None,
+                        },
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        // More older high-importance mail than any attention page holds.
+        for _ in 0..205 {
+            send(Address::Human, Importance::High).await;
+        }
+        send(Address::Human, Importance::Urgent).await;
+        send(Address::Task(quiet.id), Importance::High).await;
+        let urgent = send(Address::Task(gated.id), Importance::Urgent).await;
+        let page = env.store.human_attention(200).await.unwrap();
+        assert!(!page.iter().any(|m| m.id == urgent.id), "beyond the page");
+
+        let tasks = env.store.urgent_attention_tasks().await.unwrap();
+        assert_eq!(
+            tasks,
+            vec![gated.id],
+            "only threads with urgent mail for the human"
+        );
+    }
+);
+
 store_matrix!(a_human_reply_archives_the_original, |store: Arc<
     dyn Store,
 >| async move {

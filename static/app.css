@@ -451,6 +451,8 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
 .lines a[aria-current="page"] { color: var(--text); font-weight: 600; background: var(--card); border-color: var(--card-border); }
 .lines a[aria-current="page"] .line-swatch { height: 6px; }
 .key { margin-left: auto; position: relative; }
+.density { margin-left: auto; }
+.density + .key { margin-left: 0; }
 .key > summary { list-style: none; }
 .key > summary::-webkit-details-marker { display: none; }
 .key[open] > summary { background: var(--band); border-color: var(--text); }
@@ -554,6 +556,14 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
 .done-tools .auto-acked a { color: var(--muted); }
 /* A done card's Ack sits under it, outside the article the live feed replaces. */
 .cards > form.ack { justify-self: end; margin-top: -2px; }
+/* A capped column's footer: how many more there are, as a labelled link. */
+.cards > :is(.show-more, .show-fewer) { justify-self: start; padding: 2px 4px; font-size: 13px; font-weight: 600; color: var(--text); text-underline-offset: 3px; }
+.cards > .show-fewer { font-weight: 400; color: var(--muted); }
+
+/* Compact cards: the same signals with tighter spacing (the stops, owner chips and subtask
+   list are not rendered). */
+.card[data-density="compact"] { gap: 3px; padding: 7px 10px; }
+.card[data-density="compact"] .progress { margin-top: 0; }
 
 .card {
   position: relative;
@@ -867,7 +877,7 @@ label.check:has(input:disabled) { color: var(--muted); cursor: default; }
 .segmented { display: flex; border: 1px solid var(--rule-strong); border-radius: var(--radius); overflow: hidden; }
 .segmented a { display: flex; align-items: center; height: 28px; padding: 0 12px; color: var(--muted); text-decoration: none; font-size: 13px; }
 .segmented a:hover { color: var(--text); background: var(--surface-2); }
-.segmented a[aria-current="page"] { background: var(--text); color: var(--bg); font-weight: 600; }
+.segmented a:is([aria-current="page"], [aria-current="true"]) { background: var(--text); color: var(--bg); font-weight: 600; }
 .filter { display: flex; gap: 8px; align-items: center; min-width: 0; }
 .inbox-bar .filter { flex: 1 1 220px; max-width: 480px; }
 .search-field { flex: 1; }
@@ -969,6 +979,7 @@ label.check:has(input:disabled) { color: var(--muted); cursor: default; }
   .topbar .search { order: 5; flex-basis: 100%; max-width: none; margin-bottom: 8px; }
   .pulse { gap: 10px; }
   .board-bar { flex-wrap: nowrap; }
+  .density a { padding: 0 8px; }
   .board-bar:has(.new-task[open]) { flex-wrap: wrap; }
   .lines {
     flex: 1 1 0;

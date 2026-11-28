@@ -158,6 +158,8 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/ui/pulse", get(views::pulse))
         .route("/ui/board", get(views::board))
         .route("/ui/board/columns", get(views::board_columns))
+        .route("/ui/board/density", get(views::set_density))
+        .route("/ui/tasks/{id}/card", get(views::card_fragment))
         .route("/ui/history", get(history::history))
         .route("/ui/tasks", post(actions::create_task))
         .route("/ui/tasks/{id}", get(task_page::task_page))

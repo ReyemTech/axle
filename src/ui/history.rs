@@ -106,6 +106,7 @@ pub async fn history(
         &*state.store,
         &BoardQuery {
             project: q.project.clone(),
+            expand: None,
         },
     )
     .await?;

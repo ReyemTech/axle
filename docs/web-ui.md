@@ -28,6 +28,22 @@ lease bar. A blocked card shows the first line of its reason under the title ("B
 or "Blocked on you:" when it waits on you). A parent task shows its subtasks as a row of stops. Filter by project with the
 chips above the columns.
 
+Open, claimed, blocked and review each show at most **12 cards**, the ones asking for
+attention first: urgent mail in the task's thread, a plan awaiting you, blocked (the task or
+one of its subtasks), in review (likewise), a lease expired or under a fifth left; then the
+column's usual order. The header always counts every task in the column. **Show N more**
+under a capped column shows the rest, and **Show top 12** caps it again. Your expanded
+columns are kept in the page address (`/ui/board?expand=claimed`), so they survive live
+updates and reloads, and a link to that address opens the board the same way. While you type
+in **Filter this page**, the board fetches every card first, so the filter searches all of
+them, not only the 12 shown.
+
+**Detailed** / **Compact** beside the Key switches the card view for you (kept in a cookie
+for this browser). Compact cards keep the title, status with its word, project, holder and
+presence, lease, the blocked reason's first line and the "N blocked" badge, and replace the
+subtask stops, the per-project holders and the subtask list with a count such as
+"3/5 subtasks".
+
 The done column holds finished top-level tasks you have not seen, newest first, at most 50.
 Its head reads "N unseen". **Ack** under a card hides that task from the board; **Ack all**
 hides exactly the cards shown (it reads "Ack 50 shown" when more are unseen than fit). Acking a parent also acks its done subtasks. Acking changes nothing about the task: it stays done and
