@@ -4,7 +4,7 @@
 
 **Goal:** When the human acts, or an agent's own task thread moves, Axle picks a free idle session, reserves it and publishes a wake for it; peer requests for work become `requested` tasks the human approves in Needs you, unless the project opted into auto-start.
 
-**Architecture:** Migration 0006 adds the `requested` status, request lineage columns, per-session turn state and reservations, project wake settings, kill switches and an append-only `wake_attempts` log. A new `WakeService` (`src/service/wake/`) holds the router and the guards. `TaskService` and `MessageService` call it after their commits, so every trigger row in the spec lives in a service. Hooks and the bridge report turn state. The bridge subscribes to `/v1/events` and hands `WakeRequested` to a `WakeAdapter`. This PR ships only the `none` adapter, so in production wakes are routed and recorded but no harness is poked yet (spec "Phases and PRs", item 1). The harness adapters are in `2026-11-28-wake-up-adapters.md`, the headless runner in `2026-11-28-wake-up-headless.md`.
+**Architecture:** Migration 0007 adds the `requested` status, request lineage columns, per-session turn state and reservations, project wake settings, kill switches and an append-only `wake_attempts` log. A new `WakeService` (`src/service/wake/`) holds the router and the guards. `TaskService` and `MessageService` call it after their commits, so every trigger row in the spec lives in a service. Hooks and the bridge report turn state. The bridge subscribes to `/v1/events` and hands `WakeRequested` to a `WakeAdapter`. This PR ships only the `none` adapter, so in production wakes are routed and recorded but no harness is poked yet (spec "Phases and PRs", item 1). The harness adapters are in `2026-11-28-wake-up-adapters.md`, the headless runner in `2026-11-28-wake-up-headless.md`.
 
 **Tech Stack:** Rust 2024, axum 0.8, sqlx 0.9 (SQLite + Postgres), rmcp, askama 0.16 + htmx (vendored), reqwest 0.13, tokio.
 
@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Migration files are `migrations/sqlite/0006_wake_up.sql` and `migrations/postgres/0006_wake_up.sql`. 0004_done_ack is on main and 0005 is taken by quick replies (`0005_message_options`, PR #14), so this is 0006. The SQLite `tasks` rebuild must also copy `done_at` / `acked_at` and recreate the `tasks_done` partial index. Never edit an existing migration.
+- Migration files are `migrations/sqlite/0007_wake_up.sql` and `migrations/postgres/0007_wake_up.sql`. 0004_done_ack and 0005_message_options are on main and 0006 is taken by blocked-task details (`0006_blocked_detail`), so this is 0007; if 0006 lands first, the SQLite `tasks` rebuild must copy its task columns too. The SQLite `tasks` rebuild must also copy `done_at` / `acked_at` and recreate the `tasks_done` partial index. Never edit an existing migration.
 - Rebase onto `main` once `fix/axle-reminders` merges: it rewrites `src/hook/mod.rs`, `src/bridge/session_file.rs` and `src/http/v1.rs` (it adds `GET /v1/leases`), all of which Tasks 8 and 9 touch.
 - Every new store method exists in both backends with identical semantics and a `store_matrix!` test. Guarded writes are one statement or one transaction whose `WHERE` is the rule. Times come from `Clock`, never `now()` in SQL.
 - Identity is never a tool argument: `task_request` takes no requester. The bridge headers identify it.
@@ -40,7 +40,7 @@
 
 | Path | Responsibility |
 |---|---|
-| `migrations/{sqlite,postgres}/0006_wake_up.sql` | Schema (spec "Migrations"). |
+| `migrations/{sqlite,postgres}/0007_wake_up.sql` | Schema (spec "Migrations"). |
 | `src/domain.rs` | `TaskStatus::Requested`, `TurnState`, `WakeChannel`, `WakeKind`, `WakeTrigger`, `WakeOutcome`, `ProjectWakeSettings`, `ServerSettings`, `WakeAttempt`; new `Task` and `Session` fields. |
 | `src/store/{mod,sqlite,postgres}.rs` | Request, settings, attempt, turn-state and reservation methods. |
 | `src/service/wake/mod.rs` | `WakeService`: router, owner and agent wakes, queue placement, ticker, wake text. |
@@ -57,10 +57,10 @@
 
 ---
 
-### Task 1: Schema 0006 and domain types
+### Task 1: Schema 0007 and domain types
 
 **Files:**
-- Create: `migrations/sqlite/0006_wake_up.sql`, `migrations/postgres/0006_wake_up.sql`, `tests/store_wake.rs`
+- Create: `migrations/sqlite/0007_wake_up.sql`, `migrations/postgres/0007_wake_up.sql`, `tests/store_wake.rs`
 - Modify: `src/domain.rs`, `src/store/sqlite.rs` (`task_from`, session decode, `insert_task`), `src/store/postgres.rs` (same), `src/service/tasks.rs` (the one `Task` literal), `src/ui/views.rs` / `src/mcp/tools.rs` (exhaustive `TaskStatus` matches)
 
 **Interfaces:**

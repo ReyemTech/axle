@@ -78,7 +78,7 @@
 ### Task 2: Runner and run store methods
 
 **Files:**
-- Modify: `src/domain.rs` (`WakeOutcome` gains `Offered`, `Started`, `Finished`, `Timeout`, `Cancelled`, `NoCommits`; `TaskEventKind` gains `RunStarted`, `RunFinished`, `PrOpened` (`run_started | run_finished | pr_opened`); `struct Runner { id: Uuid, host: String, harnesses: Vec<String>, projects: Vec<ProjectId>, paused: bool, last_seen_at: OffsetDateTime, can_deliver: bool }`), `src/store/{mod,sqlite,postgres}.rs`. No migration: 0006 already created `runners` and `server_settings`.
+- Modify: `src/domain.rs` (`WakeOutcome` gains `Offered`, `Started`, `Finished`, `Timeout`, `Cancelled`, `NoCommits`; `TaskEventKind` gains `RunStarted`, `RunFinished`, `PrOpened` (`run_started | run_finished | pr_opened`); `struct Runner { id: Uuid, host: String, harnesses: Vec<String>, projects: Vec<ProjectId>, paused: bool, last_seen_at: OffsetDateTime, can_deliver: bool }`), `src/store/{mod,sqlite,postgres}.rs`. No migration: 0007 already created `runners` and `server_settings`.
 - Test: `tests/store_runs.rs`
 
 **Interfaces:**

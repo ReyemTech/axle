@@ -91,9 +91,9 @@ Rules for `requested`:
 - It never expires; the card shows its age. Decline moves it to `cancelled`
   (`request_declined`); the task and thread stay.
 
-### Migrations `0006_wake_up.sql` (SQLite and Postgres)
+### Migrations `0007_wake_up.sql` (SQLite and Postgres)
 
-0005 is taken by quick replies (`0005_message_options`), so wake-up is 0006.
+0005 is quick replies (`0005_message_options`) and 0006 is blocked-task details (`0006_blocked_detail`), so wake-up is 0007.
 
 - `tasks`: status CHECK gains `requested` (SQLite rebuilds the table as 0002 did). New
   columns `sanctioned` (bool), `request_depth` (default 0), `origin_task_id` (the requester's
@@ -415,7 +415,7 @@ unfinished task is released to `open`, not retried the same day after `timeout` 
 
 ## Phases and PRs
 
-1. **Work requests and routing**, no pokes yet: migration 0006, `task_request`, the covering
+1. **Work requests and routing**, no pokes yet: migration 0007, `task_request`, the covering
    rule, Start now, the card, auto-start, turn state, router, events. Wakes are only recorded.
 2. **Claude Code wake** through the inbox socket, after spike 1.
 3. **OpenCode wake** through the shared server's API, after spike 3.
