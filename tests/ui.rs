@@ -5004,6 +5004,28 @@ mod requests {
     }
 
     #[tokio::test]
+    async fn decision_without_version_is_refused() {
+        let app = app().await;
+        let cookie = app.login().await;
+        let infra = app.agent(INFRA, "mac", "claude-code").await;
+        let task = ask(&app, &infra, "Add the bucket", "b").await;
+        let csrf = csrf_for(&app, &cookie).await;
+        for action in ["approve", "decline", "reply"] {
+            let path = format!("/ui/tasks/{}/request/{action}", task.id);
+            let body = format!("csrf={csrf}&body=sure");
+            let res = app.post_form(&path, Some(&cookie), &body).await;
+            assert_eq!(
+                res.status,
+                StatusCode::BAD_REQUEST,
+                "{action}: {}",
+                res.body
+            );
+        }
+        let after = task_now(&app, task.id).await;
+        assert_eq!(after.status, TaskStatus::Requested, "nothing was decided");
+    }
+
+    #[tokio::test]
     async fn stale_version_shows_request_changed() {
         let app = app().await;
         let cookie = app.login().await;

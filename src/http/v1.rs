@@ -198,11 +198,14 @@ async fn heartbeat(
         .await
         .map_err(ApiError::internal)?;
     // After the touch, so an idle report can place queued work on this (now live) session.
-    state
+    // The heartbeat has already committed: a routing error is logged, never a failed beat.
+    if let Err(e) = state
         .wake
         .on_turn_report(r.session.id, req.turn_state, req.wake_channel)
         .await
-        .map_err(ApiError::internal)?;
+    {
+        eprintln!("axl: wake routing after a heartbeat failed: {e}");
+    }
     let unread = state
         .messages
         .unread_count(&r)

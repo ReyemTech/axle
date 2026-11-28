@@ -278,8 +278,9 @@ pub async fn request_plan_changes(
 #[derive(Deserialize)]
 pub struct RequestForm {
     /// The task version the human read; the decision applies only while it is current.
+    /// Required: a form without it is refused rather than decided at version 0.
     #[serde(default)]
-    version: i64,
+    version: Option<i64>,
     #[serde(default)]
     note: String,
     #[serde(default)]
@@ -298,6 +299,16 @@ fn request_error(e: TaskError) -> UiError {
     }
 }
 
+impl RequestForm {
+    /// The version the human read; a form without one is a 400, so the stale guard cannot
+    /// be skipped.
+    fn version(&self) -> UiResult<i64> {
+        self.version.ok_or(UiError::BadRequest(
+            "Nothing was done: the form has no version.",
+        ))
+    }
+}
+
 /// The human approves work request `id` as they read it; it is routed or queued.
 pub async fn approve_request(
     State(state): State<AppState>,
@@ -307,7 +318,7 @@ pub async fn approve_request(
     let id = task_id(&id)?;
     state
         .tasks
-        .approve_request(id, form.version)
+        .approve_request(id, form.version()?)
         .await
         .map_err(request_error)?;
     Ok(see_other(&back_to(&form.back, id)))
@@ -322,7 +333,7 @@ pub async fn decline_request(
     let id = task_id(&id)?;
     state
         .tasks
-        .decline_request(id, form.version, Some(&form.note))
+        .decline_request(id, form.version()?, Some(&form.note))
         .await
         .map_err(request_error)?;
     Ok(see_other(&back_to(&form.back, id)))
@@ -337,6 +348,7 @@ pub async fn reply_request(
     Form(form): Form<RequestForm>,
 ) -> UiResult<Response> {
     let id = task_id(&id)?;
+    form.version()?;
     required_body(&form.body)?;
     let task = state
         .store

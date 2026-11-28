@@ -166,7 +166,8 @@ curl -s http://127.0.0.1:7420/v1/heartbeat \
 
 `leases` lists the ids of tasks this session holds (`planning`, `claimed`, `blocked` or
 `review`). An unknown session is 404 `{"error":"unknown session"}`; the bridge then
-registers again.
+registers again. Once the session is marked alive and its leases renewed, a failure to
+place queued work on it is logged on the server and the heartbeat still succeeds.
 
 Two optional fields carry the bridge's view of the session; older bridges send neither,
 and a missing field leaves the stored value as it is:

@@ -53,6 +53,9 @@ pub enum UiError {
     /// A form value the action cannot use (422).
     #[error("{0}")]
     Invalid(String),
+    /// A form that is missing a field our own pages always send (400).
+    #[error("{0}")]
+    BadRequest(&'static str),
     /// The action does not fit the current state, like releasing an open task (409).
     #[error("{0}")]
     Conflict(String),
@@ -77,6 +80,7 @@ impl IntoResponse for UiError {
         match self {
             UiError::NotFound(what) => error_page(StatusCode::NOT_FOUND, what),
             UiError::Invalid(why) => error_page(StatusCode::UNPROCESSABLE_ENTITY, &why),
+            UiError::BadRequest(why) => error_page(StatusCode::BAD_REQUEST, why),
             UiError::Conflict(why) => error_page(StatusCode::CONFLICT, &why),
             UiError::Internal(e) => {
                 eprintln!("axl: ui error: {e}");
