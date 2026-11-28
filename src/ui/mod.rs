@@ -162,6 +162,8 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/ui/tasks/{id}/post", post(actions::post_to_thread))
         .route("/ui/tasks/{id}/force-release", post(actions::force_release))
         .route("/ui/tasks/{id}/cancel", post(actions::cancel))
+        .route("/ui/tasks/{id}/ack", post(actions::ack_task))
+        .route("/ui/done/ack", post(actions::ack_done))
         .route("/ui/tasks/{id}/plan/approve", post(actions::approve_plan))
         .route(
             "/ui/tasks/{id}/plan/changes",

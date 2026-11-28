@@ -547,6 +547,13 @@ body.bare { display: grid; min-height: 100vh; align-content: center; }
 .column[data-status="review"]:has(.card) .count { color: var(--warn); }
 .cards { display: grid; gap: 8px; padding: 8px; }
 .column .empty { padding: 4px 4px 8px; }
+/* The Done head: Ack all and History on one row, the auto-acked line beneath in muted text. */
+.done-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding: 8px 12px 0; font-size: 13px; }
+.done-tools .history-link { margin-left: auto; }
+.done-tools .auto-acked { flex-basis: 100%; margin: 0; }
+.done-tools .auto-acked a { color: var(--muted); }
+/* A done card's Ack sits under it, outside the article the live feed replaces. */
+.cards > form.ack { justify-self: end; margin-top: -2px; }
 
 .card {
   position: relative;

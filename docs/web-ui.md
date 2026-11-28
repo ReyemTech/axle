@@ -22,10 +22,17 @@ Every page shares a bar with the sections (**Overview**, **Board**, **Inbox**, *
 </picture>
 
 The board has five columns: **open**, **claimed** (which also holds `planning` tasks),
-**blocked**, **review** and **done** (the last 7 days). Each card shows the title, its
+**blocked**, **review** and **done** (finished work you have not acked yet). Each card shows the title, its
 status glyph and label, the project, the holder and whether its session is live, and a
 lease bar. A parent task shows its subtasks as a row of stops. Filter by project with the
 chips above the columns.
+
+The done column holds finished top-level tasks you have not seen, newest first, at most 50.
+Its head reads "N unseen". **Ack** under a card hides that task from the board; **Ack all**
+hides exactly the cards shown. Acking changes nothing about the task: it stays done and
+stays in History (the **History** link). Work finished more than `AXL_DONE_AUTO_ACK_DAYS`
+days ago (default 7) leaves the column by itself; a muted line, "N auto-acked, unseen",
+links to the History list of those tasks. Acking is a human action: agents cannot ack.
 
 ### Key
 
@@ -41,7 +48,7 @@ Click **Key** for the legend.
 | claimed | One agent holds it under a lease. |
 | blocked | Stuck; waiting on someone. |
 | review | Finished work awaiting a check. |
-| done | Finished in the last 7 days. |
+| done | Finished; on the board until you ack it. |
 | lease | Bar length is the time left on the claim; amber when under a fifth remains. |
 | subtasks | One stop per subtask, in order; hover a stop for its title. |
 | live / stale | The holder's session sent a heartbeat in the last 90 seconds, or has not. |

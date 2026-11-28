@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use axle::clock::TestClock;
 use axle::config::{ServerConfig, UiAuth};
-use axle::domain::{Actor, Address, Importance, SessionId, Task, TaskId};
+use axle::domain::{Actor, Address, Importance, SessionId, Task, TaskId, TaskStatus};
 use axle::http::{AppState, router};
 use axle::service::identity::{IdentityInput, IdentityService, Resolved};
 use axle::service::messages::NewMessage;
@@ -714,14 +714,20 @@ async fn claimed_card_draws_its_lease() {
 }
 
 #[tokio::test]
-async fn board_done_column_shows_last_seven_days() {
+async fn board_done_column_shows_unseen_newest_first() {
     let app = app().await;
     let infra = app.agent(INFRA, "mac", "claude-code").await;
-    let old = app.task(&infra, "old work", None).await;
+    let old = app.task(&infra, "old", None).await;
     app.complete(&infra, old.id).await;
     app.clock.advance(time::Duration::days(8));
-    let recent = app.task(&infra, "recent work", None).await;
-    app.complete(&infra, recent.id).await;
+    let parent = app.task(&infra, "parent", None).await;
+    let child = app.task(&infra, "child", Some(parent.id)).await;
+    let first = app.task(&infra, "first", None).await;
+    app.complete(&infra, first.id).await;
+    app.clock.advance(time::Duration::minutes(1));
+    let second = app.task(&infra, "second", None).await;
+    app.complete(&infra, second.id).await;
+    app.complete(&infra, child.id).await;
     let cancelled = app.task(&infra, "dropped", None).await;
     app.state
         .tasks
@@ -732,9 +738,269 @@ async fn board_done_column_shows_last_seven_days() {
     let cookie = app.login().await;
     let page = app.get("/ui/board", Some(&cookie)).await;
     assert_eq!(page.status, StatusCode::OK);
-    let done = select_texts(&page, ".column[data-status=done] .card-title");
-    assert_eq!(done, ["recent work"]);
+    assert_eq!(
+        select_texts(&page, ".column[data-status=done] .card-title"),
+        ["second", "first"]
+    );
+    assert!(
+        select_texts(&page, ".column[data-status=done] header")
+            .join(" ")
+            .contains("2 unseen")
+    );
+    assert_eq!(
+        select_texts(&page, ".column[data-status=done] .auto-acked a"),
+        ["1 auto-acked, unseen \u{2192}"]
+    );
+    assert!(page.body.contains("href=\"/ui/history?unseen=auto\""));
+    assert!(page.body.contains("href=\"/ui/history\""));
     assert!(!page.text().contains("dropped"));
+    assert!(!page.text().contains("7 days"));
+}
+
+#[tokio::test]
+async fn auto_acked_line_hidden_at_zero() {
+    let app = app().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let t = app.task(&infra, "recent", None).await;
+    app.complete(&infra, t.id).await;
+    let cookie = app.login().await;
+    let page = app.get("/ui/board", Some(&cookie)).await;
+    assert!(select_texts(&page, ".column[data-status=done] .auto-acked").is_empty());
+}
+
+#[tokio::test]
+async fn auto_acked_link_carries_the_project_filter() {
+    let app = app().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let pid = infra.agent.project_id.unwrap();
+    let old = app.task(&infra, "old", None).await;
+    app.complete(&infra, old.id).await;
+    app.clock.advance(time::Duration::days(8));
+    let cookie = app.login().await;
+    let page = app
+        .get(&format!("/ui/board?project={pid}"), Some(&cookie))
+        .await;
+    assert!(
+        page.body.contains(&format!(
+            "href=\"/ui/history?unseen=auto&#38;project={pid}\""
+        )),
+        "{}",
+        page.body
+    );
+    // The fragment the board re-fetches renders the same head and Ack forms.
+    let frag = app
+        .get(&format!("/ui/board/columns?project={pid}"), Some(&cookie))
+        .await;
+    assert!(
+        frag.body.contains(&format!("project={pid}\"")),
+        "{}",
+        frag.body
+    );
+}
+
+async fn board_with_done(app: &App, titles: &[&str]) -> (Vec<Task>, String, String) {
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let mut tasks = Vec::new();
+    for t in titles {
+        let task = app.task(&infra, t, None).await;
+        app.complete(&infra, task.id).await;
+        tasks.push(task);
+    }
+    let cookie = app.login().await;
+    let csrf = csrf_for(app, &cookie).await;
+    (tasks, cookie, csrf)
+}
+
+#[tokio::test]
+async fn ack_removes_card_and_redirects_back() {
+    let app = app().await;
+    let (tasks, cookie, csrf) = board_with_done(&app, &["one"]).await;
+    let t = &tasks[0];
+    let pid = t.project_id;
+    let page = app
+        .post_form(
+            &format!("/ui/tasks/{}/ack", t.id),
+            Some(&cookie),
+            &format!("csrf={csrf}&back=%2Fui%2Fboard%3Fproject%3D{pid}"),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        page.location.as_deref(),
+        Some(&*format!("/ui/board?project={pid}"))
+    );
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    assert!(select_texts(&board, ".column[data-status=done] .card-title").is_empty());
+    assert_eq!(
+        app.state
+            .store
+            .get_task(t.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Done
+    );
+}
+
+#[tokio::test]
+async fn ack_forms_sit_outside_the_card() {
+    let app = app().await;
+    let (_, cookie, _) = board_with_done(&app, &["one"]).await;
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    let col = ".column[data-status=done]";
+    assert_eq!(
+        select_texts(&board, &format!("{col} form.ack button")),
+        ["Ack"]
+    );
+    assert!(select_texts(&board, &format!("{col} .card form")).is_empty());
+    assert_eq!(
+        select_texts(&board, &format!("{col} form.ack-all button")),
+        ["Ack all"]
+    );
+}
+
+#[tokio::test]
+async fn ack_all_acks_only_the_cards_shown() {
+    let app = app().await;
+    let (_, cookie, csrf) = board_with_done(&app, &["a", "b"]).await;
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    let sel = Selector::parse(".column[data-status=done] form.ack-all input[name=id]").unwrap();
+    let ids: Vec<String> = board
+        .html()
+        .select(&sel)
+        .map(|e| e.value().attr("value").unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    // "c" finishes between the render and the click.
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let c = app.task(&infra, "c", None).await;
+    app.complete(&infra, c.id).await;
+    let mut fields = vec![("csrf", csrf.as_str()), ("back", "/ui/board")];
+    fields.extend(ids.iter().map(|i| ("id", i.as_str())));
+    let page = app
+        .post_form(
+            "/ui/done/ack",
+            Some(&cookie),
+            &serde_urlencoded::to_string(&fields).unwrap(),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER);
+    assert_eq!(page.location.as_deref(), Some("/ui/board"));
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    assert_eq!(
+        select_texts(&board, ".column[data-status=done] .card-title"),
+        ["c"]
+    );
+}
+
+#[tokio::test]
+async fn ack_back_never_leaves_the_ui() {
+    let app = app().await;
+    let (tasks, cookie, csrf) = board_with_done(&app, &["one"]).await;
+    let path = format!("/ui/tasks/{}/ack", tasks[0].id);
+    for back in [
+        "//evil.example",
+        "/\\evil.example",
+        "https://evil.example",
+        "/ui/tokens",
+        "/ui/boardx",
+        "/ui/board?x=\n",
+        "",
+    ] {
+        let page = app
+            .post_form(&path, Some(&cookie), &form(&csrf, &[("back", back)]))
+            .await;
+        assert_eq!(page.status, StatusCode::SEE_OTHER, "{back}");
+        assert_eq!(page.location.as_deref(), Some("/ui/board"), "{back}");
+    }
+    for back in [
+        "/ui/history?unseen=auto",
+        "/ui/history",
+        "/ui/board?project=x",
+    ] {
+        let page = app
+            .post_form(&path, Some(&cookie), &form(&csrf, &[("back", back)]))
+            .await;
+        assert_eq!(page.location.as_deref(), Some(back));
+    }
+}
+
+#[tokio::test]
+async fn ack_rejects_bad_ids_and_missing_csrf() {
+    let app = app().await;
+    let (tasks, cookie, csrf) = board_with_done(&app, &["one"]).await;
+    let id = tasks[0].id.to_string();
+    let acked = |app: &App| {
+        let store = app.state.store.clone();
+        let tid = tasks[0].id;
+        async move {
+            store
+                .get_task(tid)
+                .await
+                .unwrap()
+                .unwrap()
+                .acked_at
+                .is_some()
+        }
+    };
+    let bad = app
+        .post_form(
+            "/ui/done/ack",
+            Some(&cookie),
+            &form(&csrf, &[("id", &id), ("id", "garbage")]),
+        )
+        .await;
+    assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(!acked(&app).await);
+
+    let single = format!("/ui/tasks/{id}/ack");
+    for (path, body) in [
+        ("/ui/done/ack", format!("id={id}")),
+        ("/ui/done/ack", format!("csrf=wrong&id={id}")),
+        (single.as_str(), String::new()),
+        (single.as_str(), "csrf=wrong".to_string()),
+    ] {
+        let page = app.post_form(path, Some(&cookie), &body).await;
+        assert_eq!(page.status, StatusCode::FORBIDDEN, "{path} {body}");
+    }
+    assert!(!acked(&app).await);
+
+    let unknown = format!("/ui/tasks/{}/ack", TaskId::new());
+    let page = app
+        .post_form(&unknown, Some(&cookie), &form(&csrf, &[]))
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER);
+    let page = app
+        .post_form("/ui/tasks/garbage/ack", Some(&cookie), &form(&csrf, &[]))
+        .await;
+    assert_eq!(page.status, StatusCode::NOT_FOUND);
+    let empty = app
+        .post_form("/ui/done/ack", Some(&cookie), &form(&csrf, &[]))
+        .await;
+    assert_eq!(empty.status, StatusCode::SEE_OTHER);
+    assert!(!acked(&app).await);
+}
+
+#[tokio::test]
+async fn ack_updates_the_board_live() {
+    let app = app().await;
+    let (tasks, cookie, csrf) = board_with_done(&app, &["one"]).await;
+    let mut events = app.state.bus.subscribe();
+    let page = app
+        .post_form(
+            &format!("/ui/tasks/{}/ack", tasks[0].id),
+            Some(&cookie),
+            &form(&csrf, &[]),
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER);
+    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("a live event")
+        .unwrap();
+    let frames = axle::ui::views::live_frames(&app.state, &event).await;
+    assert!(frames.iter().any(|(name, _)| name == "board"), "{frames:?}");
 }
 
 #[tokio::test]

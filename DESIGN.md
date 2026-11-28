@@ -303,6 +303,7 @@ On the task page, above the lease: the latest plan as peer text in a card-filled
 
 ### Columns
 - **Band:** tinted wash, 6px radius, min-height 160px. Header is 40px with a 2px ink bottom rule, the column's aspect glyph, an uppercase label and a count at the right. The 2px head rules join into one continuous line across the board: each non-last head extends 8px into the gutter with a 2px by 10px vertical joint, so gutters read as junctions between blocks.
+- **Done head:** the count reads "N unseen" (not a bare number). Under the rule sit a labelled **Ack all** button and a **History** link; when work has auto-acked, a muted line "N auto-acked, unseen" links to it and is hidden at zero. Each done card has a labelled **Ack** button beneath it, outside the card.
 - **Waiting work shouts:** when the blocked or review column has cards, its glyph grows to 14px and its count to 18px bold in danger or warn. Empty columns stay quiet with a sentence of explanation.
 
 ### Lease meter

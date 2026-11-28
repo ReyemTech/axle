@@ -22,10 +22,10 @@ use crate::domain::{
 use crate::events::Event;
 use crate::http::AppState;
 use crate::service::tasks::Progress;
-use crate::store::{Store, StoreError, StoreResult, TaskFilter};
+use crate::store::{DoneFilter, Store, StoreError, StoreResult, TaskFilter, TaskOrder};
 
-/// The board's Done column shows tasks finished within this window.
-pub const DONE_WINDOW: Duration = Duration::days(7);
+/// The Done column shows at most this many cards (`Ack all` acks exactly these).
+pub const DONE_COLUMN_LIMIT: u32 = 50;
 /// The overview shows agents seen within this window.
 pub const AGENT_WINDOW: Duration = Duration::hours(24);
 /// The deepest parent chain the live stream walks up to find a card.
@@ -455,6 +455,19 @@ pub struct ColumnView {
     pub status: &'static str,
     pub label: &'static str,
     pub cards: Vec<CardView>,
+    /// `Some` only for the Done column.
+    pub done: Option<DoneHead>,
+}
+
+/// The Done column's head: what you have not acked, and the History links.
+pub struct DoneHead {
+    /// Top-level unseen done tasks (may exceed the cards shown).
+    pub unseen: u64,
+    /// Auto-acked unseen done tasks, subtasks included (the same set History `?unseen=auto`
+    /// lists).
+    pub auto_unseen: u64,
+    /// `/ui/history?unseen=auto`, plus `&project=<id>` when the board is filtered.
+    pub auto_href: String,
 }
 
 #[derive(Clone)]
@@ -480,12 +493,16 @@ struct BoardPage {
     columns: Vec<ColumnView>,
     needs: Vec<NeedCard>,
     back: &'static str,
+    /// Where the Done column's Ack forms return to: the board, with its project filter.
+    ack_back: String,
 }
 
 #[derive(Template)]
 #[template(path = "_columns.html")]
 struct ColumnsFragment {
+    csrf: Option<String>,
     columns: Vec<ColumnView>,
+    ack_back: String,
 }
 
 #[derive(Deserialize)]
@@ -516,7 +533,7 @@ pub(super) fn project_options(
 }
 
 /// The project named by `?project=` (its id or its key); `None` when absent or blank.
-async fn board_filter(store: &dyn Store, q: &BoardQuery) -> UiResult<Option<Project>> {
+pub(super) async fn board_filter(store: &dyn Store, q: &BoardQuery) -> UiResult<Option<Project>> {
     let Some(raw) = q
         .project
         .as_deref()
@@ -535,24 +552,61 @@ async fn board_filter(store: &dyn Store, q: &BoardQuery) -> UiResult<Option<Proj
 /// Tasks per column. Open, Claimed and Done hold top-level tasks (subtasks show on their
 /// parent's card); Blocked and Review also hold subtasks, so everything waiting on someone is
 /// in its column. Claimed also holds `planning` tasks (the block is occupied, the work not yet
-/// started). Done holds tasks finished within `DONE_WINDOW`, newest first.
+/// started). Done holds the top-level tasks you have not acked (at most `DONE_COLUMN_LIMIT`),
+/// newest first.
 async fn columns(
     state: &AppState,
     labels: &mut Labels<'_>,
     project: Option<ProjectId>,
 ) -> StoreResult<Vec<ColumnView>> {
     let ctx = CardCtx::of(state);
-    let since = ctx.now - DONE_WINDOW;
+    let since = ctx.now - state.config.done_auto_ack;
     let mut out = Vec::with_capacity(COLUMNS.len());
     for (status, label) in COLUMNS {
-        let mut tasks: Vec<Task> = state
-            .store
-            .list_tasks(&TaskFilter {
+        let mut done = None;
+        let mut tasks: Vec<Task> = if status == TaskStatus::Done {
+            let unseen = TaskFilter {
                 project,
-                status: Some(status),
+                status: Some(TaskStatus::Done),
+                top_level: true,
+                done: DoneFilter::Unseen { since },
+                order: TaskOrder::DoneNewest,
                 ..TaskFilter::default()
-            })
-            .await?;
+            };
+            let auto_unseen = state
+                .store
+                .count_tasks(&TaskFilter {
+                    project,
+                    status: Some(TaskStatus::Done),
+                    done: DoneFilter::AutoAckedUnseen { since },
+                    ..TaskFilter::default()
+                })
+                .await?;
+            done = Some(DoneHead {
+                unseen: state.store.count_tasks(&unseen).await?,
+                auto_unseen,
+                auto_href: match project {
+                    Some(p) => format!("/ui/history?unseen=auto&project={p}"),
+                    None => "/ui/history?unseen=auto".to_string(),
+                },
+            });
+            state
+                .store
+                .list_tasks(&TaskFilter {
+                    limit: Some(DONE_COLUMN_LIMIT),
+                    ..unseen
+                })
+                .await?
+        } else {
+            state
+                .store
+                .list_tasks(&TaskFilter {
+                    project,
+                    status: Some(status),
+                    ..TaskFilter::default()
+                })
+                .await?
+        };
         if status == TaskStatus::Claimed {
             tasks.extend(
                 state
@@ -566,16 +620,12 @@ async fn columns(
             );
             tasks.sort_by_key(|t| (t.created_at, t.id));
         }
-        let mut tasks: Vec<Task> = tasks
+        let tasks: Vec<Task> = tasks
             .into_iter()
             .filter(|t| {
                 t.parent_id.is_none() || matches!(status, TaskStatus::Blocked | TaskStatus::Review)
             })
             .collect();
-        if status == TaskStatus::Done {
-            tasks.retain(|t| t.updated_at >= since);
-            tasks.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
-        }
         let mut cards = Vec::with_capacity(tasks.len());
         for t in &tasks {
             cards.push(card(labels, ctx, t).await?);
@@ -584,6 +634,7 @@ async fn columns(
             status: status.as_str(),
             label,
             cards,
+            done,
         });
     }
     Ok(out)
@@ -596,8 +647,9 @@ pub async fn board(
 ) -> UiResult<Response> {
     let filter = board_filter(&*state.store, &q).await?;
     let mut labels = Labels::load(&*state.store).await?;
-    let columns = columns(&state, &mut labels, filter.as_ref().map(|p| p.id)).await?;
-    let projects = project_options(&labels, filter.as_ref().map(|f| f.id));
+    let filter_id = filter.as_ref().map(|p| p.id);
+    let columns = columns(&state, &mut labels, filter_id).await?;
+    let projects = project_options(&labels, filter_id);
     let needs = needs_you(&state, &mut labels).await?;
     html(&BoardPage {
         logout: session.logout,
@@ -609,17 +661,31 @@ pub async fn board(
         columns,
         needs,
         back: "/ui/board",
+        ack_back: board_url(filter_id),
     })
+}
+
+/// The board's URL, with the project filter when there is one.
+fn board_url(project: Option<ProjectId>) -> String {
+    match project {
+        Some(p) => format!("/ui/board?project={p}"),
+        None => "/ui/board".to_string(),
+    }
 }
 
 pub async fn board_columns(
     State(state): State<AppState>,
+    Extension(session): Extension<SessionCtx>,
     Query(q): Query<BoardQuery>,
 ) -> UiResult<Response> {
-    let filter = board_filter(&*state.store, &q).await?;
+    let filter = board_filter(&*state.store, &q).await?.map(|p| p.id);
     let mut labels = Labels::load(&*state.store).await?;
-    let columns = columns(&state, &mut labels, filter.map(|p| p.id)).await?;
-    html(&ColumnsFragment { columns })
+    let columns = columns(&state, &mut labels, filter).await?;
+    html(&ColumnsFragment {
+        csrf: Some(session.csrf),
+        columns,
+        ack_back: board_url(filter),
+    })
 }
 
 // ---------------------------------------------------------------- children
