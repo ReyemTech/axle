@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use askama::Template;
 use axum::Extension;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
@@ -26,8 +26,14 @@ use crate::store::{DoneFilter, Store, StoreError, StoreResult, TaskFilter, TaskO
 
 /// The Done column shows at most this many cards (`Ack all` acks exactly these).
 pub const DONE_COLUMN_LIMIT: u32 = 50;
+/// The other columns show this many cards, most important first, until expanded.
+pub const COLUMN_CAP: usize = 12;
+/// The cookie holding the viewer's card density (`compact` or `detailed`).
+pub const DENSITY_COOKIE: &str = "axl_density";
 /// The overview shows agents seen within this window.
 pub const AGENT_WINDOW: Duration = Duration::hours(24);
+/// How many attention messages the board scans for urgent mail in task threads.
+const URGENT_SCAN: u32 = 200;
 /// The deepest parent chain the live stream walks up to find a card.
 const MAX_DEPTH: usize = 16;
 
@@ -278,6 +284,8 @@ pub struct CardView {
     pub blocked_line: Option<String>,
     /// A blocked task waits on the human.
     pub blocked_on_you: bool,
+    /// The viewer chose compact cards: no subtask stops, owner chips or subtask list.
+    pub compact: bool,
 }
 
 /// Characters of a blocked task's reason shown on its card.
@@ -461,6 +469,7 @@ async fn card(labels: &mut Labels<'_>, ctx: CardCtx, task: &Task) -> StoreResult
             .block
             .as_ref()
             .is_some_and(|b| b.waiting_on == Some(crate::domain::WaitingOn::Human)),
+        compact: false,
     })
 }
 
@@ -470,14 +479,210 @@ struct CardFragment {
     card: CardView,
 }
 
+/// Whether the request's density cookie asks for compact cards.
+pub(super) fn compact(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .any(|(name, value)| name == DENSITY_COOKIE && value == "compact")
+}
+
+/// `GET /ui/tasks/{id}/card`: one card in the viewer's density. Compact cards re-fetch
+/// themselves here on their live event, since the stream's shared render is detailed.
+pub async fn card_fragment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> UiResult<Response> {
+    let id: TaskId = id.parse().map_err(|_| UiError::NotFound("No such task."))?;
+    let task = state
+        .store
+        .get_task(id)
+        .await?
+        .ok_or(UiError::NotFound("No such task."))?;
+    let mut labels = Labels::load(&*state.store).await?;
+    let mut card = card(&mut labels, CardCtx::of(&state), &task).await?;
+    card.compact = compact(&headers);
+    html(&CardFragment { card })
+}
+
+#[derive(Deserialize)]
+pub struct DensityQuery {
+    /// `compact` or `detailed` (anything else reads as detailed).
+    #[serde(default)]
+    set: String,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    expand: Option<String>,
+}
+
+/// `GET /ui/board/density?set=compact|detailed`: stores the viewer's card density in a
+/// cookie and returns to the board with its filter and expanded columns. It changes nothing
+/// but that cookie, so it needs no CSRF token.
+pub async fn set_density(
+    State(state): State<AppState>,
+    Query(q): Query<DensityQuery>,
+) -> UiResult<Response> {
+    let value = if q.set == "compact" {
+        "compact"
+    } else {
+        "detailed"
+    };
+    let filter = board_filter(
+        &*state.store,
+        &BoardQuery {
+            project: q.project,
+            expand: None,
+        },
+    )
+    .await?;
+    let expand = Expand::parse(q.expand.as_deref());
+    let secure = if state.config.cookie_secure {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie = format!(
+        "{DENSITY_COOKIE}={value}; Path=/ui; HttpOnly; SameSite=Strict; Max-Age=31536000{secure}"
+    );
+    let mut res = (
+        StatusCode::SEE_OTHER,
+        [(
+            header::LOCATION,
+            board_href(filter.map(|p| p.id), &expand.statuses),
+        )],
+    )
+        .into_response();
+    res.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie).expect("a static cookie is a valid header value"),
+    );
+    Ok(res)
+}
+
 // ---------------------------------------------------------------- board
 
 pub struct ColumnView {
     pub status: &'static str,
     pub label: &'static str,
     pub cards: Vec<CardView>,
+    /// Every task in the column, shown or not (the header's count).
+    pub total: usize,
+    /// The viewer expanded this column (it renders uncapped, with "Show top 12").
+    pub expanded: bool,
+    /// Cards beyond the cap are hidden: the "Show N more" link.
+    pub more: Option<MoreLink>,
+    /// For an expanded column with more than the cap: the "Show top 12" link back.
+    pub fewer: Option<MoreLink>,
     /// `Some` only for the Done column.
     pub done: Option<DoneHead>,
+}
+
+/// A link that changes which columns are expanded: a plain board URL (works without JS)
+/// and the columns fragment htmx swaps in.
+pub struct MoreLink {
+    pub hidden: usize,
+    pub href: String,
+    pub hx: String,
+}
+
+/// Which columns render uncapped: the viewer's expanded columns (`?expand=open,claimed`),
+/// and `all` while the filter box searches every card.
+#[derive(Default)]
+pub(super) struct Expand {
+    statuses: Vec<&'static str>,
+    all: bool,
+}
+
+impl Expand {
+    fn parse(raw: Option<&str>) -> Self {
+        let mut out = Self::default();
+        for part in raw.unwrap_or("").split(',').map(str::trim) {
+            if part == "all" {
+                out.all = true;
+            } else if let Some((s, _)) = COLUMNS
+                .iter()
+                .find(|(s, _)| *s != TaskStatus::Done && s.as_str() == part)
+                && !out.statuses.contains(&s.as_str())
+            {
+                out.statuses.push(s.as_str());
+            }
+        }
+        // A stable order, so the same set always makes the same URL.
+        out.statuses
+            .sort_by_key(|s| COLUMNS.iter().position(|(c, _)| c.as_str() == *s));
+        out
+    }
+
+    fn has(&self, status: &str) -> bool {
+        self.statuses.contains(&status)
+    }
+
+    fn with(&self, status: &'static str, on: bool) -> Vec<&'static str> {
+        let mut v: Vec<&'static str> = self
+            .statuses
+            .iter()
+            .copied()
+            .filter(|s| *s != status)
+            .collect();
+        if on {
+            v.push(status);
+            v.sort_by_key(|s| COLUMNS.iter().position(|(c, _)| c.as_str() == *s));
+        }
+        v
+    }
+}
+
+/// `path` with the project filter and the expanded columns as its query.
+fn with_query(path: &str, project: Option<ProjectId>, expand: &[&str]) -> String {
+    let mut q = Vec::new();
+    if let Some(p) = project {
+        q.push(format!("project={p}"));
+    }
+    if !expand.is_empty() {
+        q.push(format!("expand={}", expand.join(",")));
+    }
+    if q.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{}", q.join("&"))
+    }
+}
+
+fn board_href(project: Option<ProjectId>, expand: &[&str]) -> String {
+    with_query("/ui/board", project, expand)
+}
+
+/// How urgently a card asks for attention (lower first): urgent mail in its thread, a plan
+/// awaiting the human, blocked (itself or a subtask), in review (itself or a subtask), a
+/// lease expired or under a fifth left, then everything else.
+fn attention(task: &Task, card: &CardView, urgent: &HashSet<TaskId>) -> u8 {
+    let sub = |status: &str| {
+        card.progress
+            .as_ref()
+            .is_some_and(|p| p.stations.iter().any(|s| s.status == status))
+    };
+    if urgent.contains(&task.id) {
+        0
+    } else if task.status == TaskStatus::Planning && task.plan_state == PlanState::Submitted {
+        1
+    } else if task.status == TaskStatus::Blocked || sub("blocked") {
+        2
+    } else if task.status == TaskStatus::Review || sub("review") {
+        3
+    } else if card
+        .lease
+        .as_ref()
+        .is_some_and(|l| l.left <= 0 || l.left * 5 < l.ttl)
+    {
+        4
+    } else {
+        5
+    }
 }
 
 /// The Done column's head: what you have not acked, and the History links.
@@ -520,6 +725,10 @@ struct BoardPage {
     back: &'static str,
     /// Where the Done column's Ack forms return to: the board, with its project filter.
     ack_back: String,
+    /// The viewer's card density, and the links that switch it.
+    compact: bool,
+    detailed_href: String,
+    compact_href: String,
 }
 
 #[derive(Template)]
@@ -535,6 +744,9 @@ pub struct BoardQuery {
     /// A project key or id.
     #[serde(default)]
     pub project: Option<String>,
+    /// Columns shown uncapped: `open,claimed,blocked,review`, or `all`.
+    #[serde(default)]
+    pub expand: Option<String>,
 }
 
 /// Every project as a `<select>` option, by name (`selected`: the chosen one).
@@ -579,13 +791,27 @@ pub(super) async fn board_filter(store: &dyn Store, q: &BoardQuery) -> UiResult<
 /// in its column. Claimed also holds `planning` tasks (the block is occupied, the work not yet
 /// started). Done holds the top-level tasks you have not acked (at most `DONE_COLUMN_LIMIT`),
 /// newest first.
+///
+/// The other columns show at most `COLUMN_CAP` cards, those asking for attention first (see
+/// `attention`; ties keep the column's order), unless `expand` names the column or is `all`.
 async fn columns(
     state: &AppState,
     labels: &mut Labels<'_>,
     project: Option<ProjectId>,
+    expand: &Expand,
+    compact: bool,
 ) -> StoreResult<Vec<ColumnView>> {
     let ctx = CardCtx::of(state);
     let since = ctx.now - state.config.done_auto_ack;
+    // Tasks whose thread holds unarchived urgent mail for the human.
+    let urgent: HashSet<TaskId> = state
+        .store
+        .human_attention(URGENT_SCAN)
+        .await?
+        .into_iter()
+        .filter(|m| m.importance == Importance::Urgent)
+        .filter_map(|m| m.task_id)
+        .collect();
     let mut out = Vec::with_capacity(COLUMNS.len());
     for (status, label) in COLUMNS {
         let mut done = None;
@@ -658,19 +884,53 @@ async fn columns(
             .collect();
         let mut cards = Vec::with_capacity(tasks.len());
         for t in &tasks {
-            cards.push(card(labels, ctx, t).await?);
+            let mut c = card(labels, ctx, t).await?;
+            c.compact = compact;
+            cards.push(c);
         }
+        let total = cards.len();
+        let key = status.as_str();
+        let (mut more, mut fewer, mut expanded) = (None, None, false);
         if let Some(d) = done.as_mut() {
             d.ack_all_label = if d.unseen > cards.len() as u64 {
                 format!("Ack {} shown", cards.len())
             } else {
                 "Ack all".to_string()
             };
+        } else {
+            let mut ranked: Vec<(u8, CardView)> = tasks
+                .iter()
+                .zip(cards)
+                .map(|(t, c)| (attention(t, &c, &urgent), c))
+                .collect();
+            ranked.sort_by_key(|(rank, _)| *rank);
+            cards = ranked.into_iter().map(|(_, c)| c).collect();
+            expanded = expand.has(key);
+            let link = |on: bool, hidden: usize| {
+                let set = expand.with(key, on);
+                MoreLink {
+                    hidden,
+                    href: board_href(project, &set),
+                    hx: with_query("/ui/board/columns", project, &set),
+                }
+            };
+            if total > COLUMN_CAP {
+                if expanded {
+                    fewer = Some(link(false, total - COLUMN_CAP));
+                } else if !expand.all {
+                    cards.truncate(COLUMN_CAP);
+                    more = Some(link(true, total - COLUMN_CAP));
+                }
+            }
         }
         out.push(ColumnView {
-            status: status.as_str(),
+            status: key,
             label,
             cards,
+            total,
+            expanded,
+            more,
+            fewer,
             done,
         });
     }
@@ -680,12 +940,20 @@ async fn columns(
 pub async fn board(
     State(state): State<AppState>,
     Extension(session): Extension<SessionCtx>,
+    headers: HeaderMap,
     Query(q): Query<BoardQuery>,
 ) -> UiResult<Response> {
     let filter = board_filter(&*state.store, &q).await?;
     let mut labels = Labels::load(&*state.store).await?;
     let filter_id = filter.as_ref().map(|p| p.id);
-    let columns = columns(&state, &mut labels, filter_id).await?;
+    let expand = Expand::parse(q.expand.as_deref());
+    let compact = compact(&headers);
+    let columns = columns(&state, &mut labels, filter_id, &expand, compact).await?;
+    let density_href = |set: &str| {
+        let base = with_query("/ui/board/density", filter_id, &expand.statuses);
+        let sep = if base.contains('?') { '&' } else { '?' };
+        format!("{base}{sep}set={set}")
+    };
     let projects = project_options(&labels, filter_id);
     let needs = needs_you(&state, &mut labels).await?;
     html(&BoardPage {
@@ -699,6 +967,9 @@ pub async fn board(
         needs,
         back: "/ui/board",
         ack_back: board_url(filter_id),
+        compact,
+        detailed_href: density_href("detailed"),
+        compact_href: density_href("compact"),
     })
 }
 
@@ -713,11 +984,13 @@ fn board_url(project: Option<ProjectId>) -> String {
 pub async fn board_columns(
     State(state): State<AppState>,
     Extension(session): Extension<SessionCtx>,
+    headers: HeaderMap,
     Query(q): Query<BoardQuery>,
 ) -> UiResult<Response> {
     let filter = board_filter(&*state.store, &q).await?.map(|p| p.id);
     let mut labels = Labels::load(&*state.store).await?;
-    let columns = columns(&state, &mut labels, filter).await?;
+    let expand = Expand::parse(q.expand.as_deref());
+    let columns = columns(&state, &mut labels, filter, &expand, compact(&headers)).await?;
     html(&ColumnsFragment {
         csrf: Some(session.csrf),
         columns,

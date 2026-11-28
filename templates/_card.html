@@ -1,5 +1,5 @@
 <article class="card" id="task-{{ card.id }}" data-status="{{ card.status }}" data-line="{{ card.project.line }}" data-nav tabindex="-1"
-         sse-swap="task-{{ card.id }}" hx-swap="outerHTML">
+         {% if card.compact %}data-density="compact" hx-get="/ui/tasks/{{ card.id }}/card" hx-trigger="sse:task-{{ card.id }}"{% else %}sse-swap="task-{{ card.id }}"{% endif %} hx-swap="outerHTML">
   <h3 class="card-title"><a class="card-link" href="/ui/tasks/{{ card.id }}">{{ card.title }}</a></h3>
   {% if let Some(r) = card.blocked_line %}<p class="card-blocked"><span class="card-blocked-label">{% if card.blocked_on_you %}Blocked on you:{% else %}Blocked:{% endif %}</span> <span class="card-blocked-reason" title="Agent-written">{{ r }}</span></p>{% endif %}
   {% if let Some((pid, ptitle)) = card.parent %}<p class="card-parent">Subtask of <a href="/ui/tasks/{{ pid }}">{{ ptitle }}</a></p>{% endif %}
@@ -17,6 +17,12 @@
   </div>
   {% endif %}
   {% if let Some(p) = card.progress %}
+  {% if card.compact %}
+  <div class="progress">
+    <span class="ratio-text" title="{{ p.done }} of {{ p.total }} subtasks done"><span class="ratio">{{ p.done }}/{{ p.total }}</span> subtasks</span>
+    {% if p.blocked > 0 %}<span class="badge-blocked"><span class="aspect" data-aspect="blocked" aria-hidden="true"></span>{{ p.blocked }} blocked</span>{% endif %}
+  </div>
+  {% else %}
   <div class="progress">
     <ol class="stations" aria-label="Subtasks">
       {% for s in p.stations %}<li class="station" data-status="{{ s.status }}" title="{{ s.title }}: {{ s.status }}"><span class="visually-hidden">{{ s.status }}</span></li>{% endfor %}
@@ -33,5 +39,6 @@
     <summary data-expand>Show {{ p.total }} subtask{% if p.total != 1 %}s{% endif %}</summary>
     <div hx-get="/ui/tasks/{{ card.id }}/children" hx-trigger="toggle from:closest details" hx-swap="innerHTML"><p class="loading">Loading subtasks…</p></div>
   </details>
+  {% endif %}
   {% endif %}
 </article>

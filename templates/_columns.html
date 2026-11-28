@@ -1,6 +1,6 @@
 {% for col in columns %}
-<section class="column" data-status="{{ col.status }}" aria-label="{{ col.label }}">
-  <header><span class="aspect" data-aspect="{{ col.status }}" aria-hidden="true"></span><h2>{{ col.label }}</h2><span class="count">{% if let Some(d) = col.done %}{{ d.unseen }} unseen{% else %}{{ col.cards.len() }}{% endif %}</span></header>
+<section class="column" data-status="{{ col.status }}" aria-label="{{ col.label }}"{% if col.more.is_some() %} data-capped{% endif %}{% if col.expanded %} data-expanded{% endif %}>
+  <header><span class="aspect" data-aspect="{{ col.status }}" aria-hidden="true"></span><h2>{{ col.label }}</h2><span class="count">{% if let Some(d) = col.done %}{{ d.unseen }} unseen{% else %}{{ col.total }}{% endif %}</span></header>
   {% if let Some(d) = col.done %}
   <div class="done-tools">
     {% if let Some(token) = csrf %}{% if !col.cards.is_empty() %}
@@ -25,6 +25,8 @@
   </form>
   {% endif %}{% endif %}
   {% endfor %}
+  {% if let Some(m) = col.more %}<a class="show-more" href="{{ m.href }}" hx-get="{{ m.hx }}" hx-target="#columns" hx-swap="innerHTML" hx-push-url="{{ m.href }}">Show {{ m.hidden }} more</a>{% endif %}
+  {% if let Some(m) = col.fewer %}<a class="show-fewer" href="{{ m.href }}" hx-get="{{ m.hx }}" hx-target="#columns" hx-swap="innerHTML" hx-push-url="{{ m.href }}">Show top 12</a>{% endif %}
   {% if col.cards.is_empty() %}<p class="empty">{% if col.status == "open" %}No open work. New tasks land here.{% else if col.status == "claimed" %}No block occupied. Claimed tasks show here with their lease.{% else if col.status == "blocked" %}Nothing blocked.{% else if col.status == "review" %}Nothing awaiting review.{% else %}Nothing unseen. Finished work stays here until you ack it or it auto-acks.{% endif %}</p>{% endif %}
   </div>
 </section>
