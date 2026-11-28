@@ -1,5 +1,23 @@
+{% if card.compact %}
+<article class="card" id="task-{{ card.id }}" data-status="{{ card.status }}" data-line="{{ card.project.line }}" data-nav tabindex="-1" data-density="compact"
+         hx-get="/ui/tasks/{{ card.id }}/card{% if !card.show_project %}?filtered=1{% endif %}" hx-trigger="sse:task-{{ card.id }}" hx-swap="outerHTML">
+  <span class="state" data-status="{{ card.status }}" data-aspect="{{ card.aspect }}"{% if card.status == "blocked" %} title="{{ card.blocked_tip() }}"{% endif %}><span class="aspect" data-aspect="{{ card.aspect }}" aria-hidden="true"></span><span class="status">{{ card.status }}</span></span>
+  <h3 class="card-title" title="{{ card.title }}"><a class="card-link" href="/ui/tasks/{{ card.id }}">{{ card.title }}</a></h3>
+  {% if card.show_project %}<span class="project" data-line="{{ card.project.line }}" title="{{ card.project.key }}">{{ card.project.name }}</span>{% endif %}
+  <span class="owner" title="{% if card.owner.is_some() %}{% if card.status == "done" %}Done by{% else %}Held by{% endif %}{% else %}Unowned{% endif %}">{% if let Some(owner) = card.owner %}{{ owner }}{% else %}open{% endif %}</span>
+  {% if let Some(l) = card.lease %}<span class="row-lease" data-lease-left="{{ l.left }}" data-lease-ttl="{{ l.ttl }}" data-lease-state="{{ card.lease_state() }}" title="Lease: the claim lapses unless the agent's heartbeat renews it">lease <span class="lease-left">{{ l.text }}</span></span>{% endif %}
+  {% if card.urgent %}<span class="chip" data-chip="urgent">urgent</span>{% endif %}
+  {% if card.aspect == "plan-submitted" %}<span class="chip" data-chip="plan">plan awaiting you</span>{% endif %}
+  {% if card.status == "blocked" %}{% if card.blocked_on_you %}<span class="chip" data-chip="blocked" title="{{ card.blocked_tip() }}">blocked on you</span>{% endif %}{% endif %}
+  {% if let Some(p) = card.progress %}
+  {% if p.blocked > 0 %}<span class="chip" data-chip="blocked" title="{{ p.blocked }} subtask{% if p.blocked != 1 %}s{% endif %} blocked">{{ p.blocked }} blocked</span>{% endif %}
+  {% if card.sub_review() > 0 %}<span class="chip" data-chip="review" title="{{ card.sub_review() }} subtask{% if card.sub_review() != 1 %}s{% endif %} in review">{{ card.sub_review() }} review</span>{% endif %}
+  <span class="ratio" title="{{ p.done }} of {{ p.total }} subtasks done">{{ p.done }}/{{ p.total }}</span>
+  {% endif %}
+</article>
+{% else %}
 <article class="card" id="task-{{ card.id }}" data-status="{{ card.status }}" data-line="{{ card.project.line }}" data-nav tabindex="-1"
-         {% if card.compact %}data-density="compact" hx-get="/ui/tasks/{{ card.id }}/card" hx-trigger="sse:task-{{ card.id }}"{% else %}sse-swap="task-{{ card.id }}"{% endif %} hx-swap="outerHTML">
+         sse-swap="task-{{ card.id }}" hx-swap="outerHTML">
   <h3 class="card-title"><a class="card-link" href="/ui/tasks/{{ card.id }}">{{ card.title }}</a></h3>
   {% if let Some(r) = card.blocked_line %}<p class="card-blocked"><span class="card-blocked-label">{% if card.blocked_on_you %}Blocked on you:{% else %}Blocked:{% endif %}</span> <span class="card-blocked-reason" title="Agent-written">{{ r }}</span></p>{% endif %}
   {% if let Some((pid, ptitle)) = card.parent %}<p class="card-parent">Subtask of <a href="/ui/tasks/{{ pid }}">{{ ptitle }}</a></p>{% endif %}
@@ -17,12 +35,6 @@
   </div>
   {% endif %}
   {% if let Some(p) = card.progress %}
-  {% if card.compact %}
-  <div class="progress">
-    <span class="ratio-text" title="{{ p.done }} of {{ p.total }} subtasks done"><span class="ratio">{{ p.done }}/{{ p.total }}</span> subtasks</span>
-    {% if p.blocked > 0 %}<span class="badge-blocked"><span class="aspect" data-aspect="blocked" aria-hidden="true"></span>{{ p.blocked }} blocked</span>{% endif %}
-  </div>
-  {% else %}
   <div class="progress">
     <ol class="stations" aria-label="Subtasks">
       {% for s in p.stations %}<li class="station" data-status="{{ s.status }}" title="{{ s.title }}: {{ s.status }}"><span class="visually-hidden">{{ s.status }}</span></li>{% endfor %}
@@ -40,5 +52,5 @@
     <div hx-get="/ui/tasks/{{ card.id }}/children" hx-trigger="toggle from:closest details" hx-swap="innerHTML"><p class="loading">Loading subtasks…</p></div>
   </details>
   {% endif %}
-  {% endif %}
 </article>
+{% endif %}

@@ -21,7 +21,7 @@
   <form class="ack" data-ack-for="{{ card.id }}" method="post" action="/ui/tasks/{{ card.id }}/ack">
     <input type="hidden" name="csrf" value="{{ token }}">
     <input type="hidden" name="back" value="{{ ack_back }}">
-    <button type="submit" class="secondary" aria-label="Ack {{ card.title }}">Ack</button>
+    <button type="submit" class="secondary{% if card.compact %} compact-ack{% endif %}" aria-label="Ack {{ card.title }}">Ack</button>
   </form>
   {% endif %}{% endif %}
   {% endfor %}
