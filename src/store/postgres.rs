@@ -261,6 +261,7 @@ macro_rules! clear_block {
 /// **Rule:** a transaction that may lock more than one `tasks` row takes `TASK_LOCK` first,
 /// before any row lock. Those transactions are:
 /// - transitions and claims of a subtask (`record_event` locks the parent after the child);
+/// - delivery writes: PR links and unlinks, stage moves, mark-done and stage saves;
 /// - transitions to `done` (they lock the tasks waiting on them, see `unblock_waiting`);
 /// - writes of a wait on a task (they must see every committed wait and `done`);
 /// - `claim_next_task`, heartbeat lease renewal and done-acks (multi-row statements).
@@ -784,8 +785,8 @@ async fn task_locked(conn: &mut PgConnection, id: TaskId) -> StoreResult<Option<
     .transpose()
 }
 
-/// `link_pr` inside its transaction, after locking the task; the caller commits only
-/// `Linked` / `Relinked`.
+/// `link_pr` inside its transaction, holding `TASK_LOCK`, after locking the task; the caller
+/// commits only `Linked` / `Relinked`.
 async fn link_locked(conn: &mut PgConnection, req: &LinkPrRequest) -> StoreResult<LinkOutcome> {
     let Some(task) = task_locked(conn, req.task).await? else {
         return Ok(LinkOutcome::NotFound);
@@ -1982,6 +1983,9 @@ impl Store for PostgresStore {
 
     async fn link_pr(&self, req: &LinkPrRequest) -> StoreResult<LinkOutcome> {
         let mut tx = self.pool.begin().await?;
+        // The lock order (see `TASK_LOCK`): a subtask's link locks its parent too, and a
+        // delivering parent's link may move its own parent.
+        task_lock(&mut tx).await?;
         let outcome = link_locked(&mut tx, req).await?;
         if matches!(
             outcome,
@@ -2002,7 +2006,9 @@ impl Store for PostgresStore {
         now: OffsetDateTime,
     ) -> StoreResult<Option<TaskPr>> {
         let mut tx = self.pool.begin().await?;
-        // Lock first, so the PR read below is the one the guarded update applies to.
+        // The lock order (see `TASK_LOCK`): a subtask's unlink locks its parent too.
+        task_lock(&mut tx).await?;
+        // Then the row, so the PR read below is the one the guarded update applies to.
         if task_locked(&mut tx, task).await?.is_none() {
             tx.rollback().await?;
             return Ok(None);

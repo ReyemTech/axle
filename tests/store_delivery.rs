@@ -1005,6 +1005,38 @@ store_matrix!(
     }
 );
 
+store_matrix!(
+    subtask_link_and_unlink_racing_a_heartbeat_do_not_deadlock,
+    |store: Arc<dyn Store>| async move {
+        let fx = Fx::new(store).await;
+        fx.stages(&[DeliveryStage::InPr, DeliveryStage::Merged])
+            .await;
+        let ttl = time::Duration::minutes(15);
+        for round in 0..10 {
+            // One session holds both: the heartbeat updates the parent and the child in one
+            // statement, while linking the child locks the child, then its parent.
+            let parent = fx.claimed("parent", None).await;
+            let child = fx.claimed("child", Some(parent.id)).await;
+            let req = fx.link_req(child.id, 300 + round, true);
+            let session = fx.owner.session.id;
+            let (linked, renewed) = tokio::join!(
+                fx.store.link_pr(&req),
+                fx.store.extend_session_leases(session, T0, ttl)
+            );
+            let linked = linked.unwrap_or_else(|e| panic!("round {round}: link: {e}"));
+            assert!(matches!(linked, LinkOutcome::Linked(_)), "{linked:?}");
+            renewed.unwrap_or_else(|e| panic!("round {round}: heartbeat: {e}"));
+            let (unlinked, renewed) = tokio::join!(
+                fx.store.unlink_pr(child.id, Actor::Human, None, T1),
+                fx.store.extend_session_leases(session, T0, ttl)
+            );
+            let unlinked = unlinked.unwrap_or_else(|e| panic!("round {round}: unlink: {e}"));
+            assert!(unlinked.is_some());
+            renewed.unwrap_or_else(|e| panic!("round {round}: heartbeat: {e}"));
+        }
+    }
+);
+
 store_matrix_raw!(
     relink_refused_after_merge,
     |store: Arc<dyn Store>, raw: common::RawDb| async move {
