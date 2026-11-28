@@ -15,7 +15,7 @@ wait?"). Answering means opening the message and typing the answer out.
 - **Human only.** Options on any other recipient are refused (`options are only for messages
   to the human`): only the human has buttons to press, and accepting them silently elsewhere
   would let an agent believe it had offered a choice that nobody sees.
-- **Storage.** Migration `0008_message_options` adds a nullable `messages.options` column in
+- **Storage.** Migration `0005_message_options` adds a nullable `messages.options` column in
   both stores, holding a JSON array. Messages stay append-only; options are never edited.
 - **Output.** Message JSON gains `options` (an array, empty for most mail), each entry defused
   of frame markers like the body. The human's answer is an ordinary message, so the agent
@@ -34,4 +34,4 @@ and editing or retracting options.
 
 ## Merge note
 
-`0008` assumes unmerged branches take `0004` to `0007`; renumber at merge if that changes.
+Numbered `0005`, the next free number after `0004_done_ack` on main.
