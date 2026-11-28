@@ -169,7 +169,10 @@ The task page shows, top to bottom:
   never be unblocked that way.
 - **Plan awaiting your approval** (when there is one): the latest plan as written, **Approve
   plan**, and **Request changes** with a required note. Earlier plans stay in the thread.
-- **Lease**: who holds it and for how long, or why it does not expire.
+- **Lease**: who holds it and for how long, or why it does not expire. Below it, once
+  agents have reported token usage on the task, a **Usage** line (tokens, API-equivalent
+  cost, sessions) linking to the Usage page for that task; a parent adds *incl. subtasks* and
+  sums its descendants. No usage, no line.
 - **Subtasks**: children with their status and progress.
 - **Related**: [linked tasks](concepts.md#related-tasks), each with the link in words
   (*follow-up of*, *duplicated by*, …), the other task's project, title and status, and

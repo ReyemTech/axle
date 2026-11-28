@@ -489,3 +489,102 @@ fn compact_and_usd() {
     assert_eq!(usd(3_400_000.0), "$3.40");
     assert_eq!(usd(1_234_560_000.0), "$1,234.56");
 }
+
+const USAGE_CSS: &str = "p.usage-line a";
+
+#[tokio::test]
+async fn task_line_shows_and_links() {
+    let app = app().await;
+    let a = app
+        .agent("github.com/acme/infra", "mac", "claude-code")
+        .await;
+    let t = app.task(&a, "Rotate the certs").await;
+    app.claim(&a, &t).await;
+    // 12 + 845 + 0 + 3,120 + 48,211 = 52,188 tokens
+    let report = UsageReport {
+        session_id: a.session.id,
+        parser: "claude-code/1".into(),
+        harness_version: None,
+        harness_session_id: None,
+        records: vec![json!({
+            "key": "k1", "at": "2026-11-27T09:00:00Z", "model": "claude-opus-5-5",
+            "input": 12, "output": 845,
+            "cache_write_5m": 48_211, "cache_write_1h": 0, "cache_read": 3120, "reasoning": 0,
+            "billing": "subscription",
+        })],
+    };
+    app.state.usage.ingest(&a, &report).await.unwrap();
+
+    let page = app.get(&format!("/ui/tasks/{}", t.id)).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    let text = page.texts(USAGE_CSS);
+    assert_eq!(text.len(), 1, "{text:?}");
+    assert!(
+        text[0].starts_with("Usage 52.2k tokens \u{b7} $0.")
+            && text[0].ends_with("API-equivalent est. \u{b7} 1 session"),
+        "{text:?}"
+    );
+    let sel = format!(
+        "p.usage-line a[href=\"/ui/usage?task={}&group=agent&range=all\"]",
+        t.id
+    );
+    assert_eq!(page.texts(&sel).len(), 1);
+}
+
+#[tokio::test]
+async fn parent_line_includes_subtasks() {
+    let app = app().await;
+    let a = app
+        .agent("github.com/acme/infra", "mac", "claude-code")
+        .await;
+    let parent = app.task(&a, "Parent").await;
+    let child = app
+        .state
+        .tasks
+        .create(
+            Caller::Agent(&a),
+            NewTask {
+                project_id: a.agent.project_id.unwrap(),
+                title: "Child".into(),
+                body: "body".into(),
+                parent_id: Some(parent.id),
+                ..NewTask::default()
+            },
+        )
+        .await
+        .unwrap();
+    app.claim(&a, &child).await;
+    app.report(
+        &a,
+        "k1",
+        "claude-opus-5-5",
+        "api",
+        (1_000, 10),
+        "2026-11-27T09:00:00Z",
+    )
+    .await;
+
+    let page = app.get(&format!("/ui/tasks/{}", parent.id)).await;
+    let text = page.texts(USAGE_CSS);
+    assert_eq!(text.len(), 1, "{text:?}");
+    assert!(
+        text[0].ends_with("1 session \u{b7} incl. subtasks"),
+        "{text:?}"
+    );
+    assert!(!text[0].contains(" est."), "{text:?}");
+    let page = app.get(&format!("/ui/tasks/{}", child.id)).await;
+    assert!(!page.texts(USAGE_CSS)[0].contains("incl. subtasks"));
+}
+
+#[tokio::test]
+async fn no_usage_no_line() {
+    let app = app().await;
+    let a = app
+        .agent("github.com/acme/infra", "mac", "claude-code")
+        .await;
+    let t = app.task(&a, "Quiet").await;
+    app.claim(&a, &t).await;
+    let page = app.get(&format!("/ui/tasks/{}", t.id)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.texts("p.usage-line").is_empty());
+}
