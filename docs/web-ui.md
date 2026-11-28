@@ -32,7 +32,9 @@ request is linked, a `PR #123` link.
 A project with delivery stages enabled adds one column per stage (**In PR**, **Merged**,
 **Released**, **Deployed**) between review and done. Filtered to one project, the board shows
 that project's stages; unfiltered, the union, and each task sits only in its own project's
-column. A card in a stage it has not reached yet reads "waiting for Released". Without stages
+column. A task that spans the filtered project but belongs to another sits in the board's
+nearest stage column at or below its own, keeping its own stage word, or in **Review** when
+the board has none. A card in a stage it has not reached yet reads "waiting for Released". Without stages
 the board is unchanged.
 
 Open, claimed, blocked and review each show at most **12 cards**, the ones asking for

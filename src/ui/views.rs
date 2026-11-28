@@ -1078,14 +1078,18 @@ fn stage_empty_text(stage: DeliveryStage) -> &'static str {
 }
 
 /// The delivery side of the board: which stage columns exist, and which `delivering` task
-/// sits in which. A task sits only in its own project's columns (`column`), never in today's.
+/// sits in which. A task is placed by its own project's stages (`column`). On a board
+/// filtered to another project it spans, that column may be missing: the task then sits in
+/// the board's nearest stage column below it, keeping its own stage word, or in Review.
 struct StageBoard {
     store: std::sync::Arc<dyn Store>,
     /// The stage columns, in stage order: the project's enabled stages, or the union.
     stages: Vec<DeliveryStage>,
-    /// Delivering tasks per stage column, with whether each is "waiting for" it.
-    placed: Vec<(DeliveryStage, Task, bool)>,
-    /// Delivering tasks whose project has no enabled stage (should not happen).
+    /// Delivering tasks per stage column: the column, the task's own stage column, the task,
+    /// and whether it is "waiting for" its own stage.
+    placed: Vec<(DeliveryStage, DeliveryStage, Task, bool)>,
+    /// Delivering tasks with no stage column on this board: their project has no enabled
+    /// stage (should not happen), or the board shows none at or below theirs.
     stranded: Vec<Task>,
 }
 
@@ -1122,8 +1126,12 @@ impl StageBoard {
                 continue;
             }
             let own = enabled.get(&t.project_id).map_or(&[][..], Vec::as_slice);
-            match stage_column(own, t.delivery_stage) {
-                Some((stage, waiting)) => placed.push((stage, t, waiting)),
+            let shown = stage_column(own, t.delivery_stage).and_then(|(stage, waiting)| {
+                let column = stages.iter().copied().rfind(|s| *s <= stage)?;
+                Some((column, stage, waiting))
+            });
+            match shown {
+                Some((column, stage, waiting)) => placed.push((column, stage, t, waiting)),
                 None => stranded.push(t),
             }
         }
@@ -1148,11 +1156,11 @@ impl StageBoard {
         let mut out = Vec::with_capacity(self.stages.len());
         for stage in &self.stages {
             let mut cards = Vec::new();
-            for (s, t, waiting) in &self.placed {
-                if s == stage {
+            for (column, own, t, waiting) in &self.placed {
+                if column == stage {
                     let mut c = card(labels, ctx, t).await?;
-                    c.stage = Some(stage.label());
-                    c.waiting_for = waiting.then(|| stage.label());
+                    c.stage = Some(own.label());
+                    c.waiting_for = waiting.then(|| own.label());
                     c.compact = compact;
                     c.urgent = urgent.contains(&t.id);
                     c.show_project = show_project;

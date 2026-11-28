@@ -4881,7 +4881,7 @@ async fn human_moves_a_task_under_a_parent() {
 
 mod stage_board {
     use super::*;
-    use axle::domain::DeliveryStage::{self, InPr, Merged, Released};
+    use axle::domain::DeliveryStage::{self, Deployed, InPr, Merged, Released};
 
     const WEB: &str = "github.com/acme/web";
     const SHOP: &str = "github.com/acme/shop";
@@ -5023,6 +5023,47 @@ mod stage_board {
                 Selector::parse(&format!("section.column[data-status={status}] .card")).unwrap();
             assert_eq!(html.select(&cards).count(), 0, "{status}");
         }
+    }
+
+    #[tokio::test]
+    async fn spanning_task_sits_in_a_column_the_board_has() {
+        let (app, cookie, web, shop) = two_projects().await;
+        set_stages(&app, &web, &[InPr, Merged, Released, Deployed]).await;
+        set_stages(&app, &shop, &[Merged, Deployed]).await;
+        let shop_id = shop.agent.project_id.unwrap();
+        let early = delivering(&app, &web, "early", "https://github.com/acme/web/pull/4").await;
+        let late = delivering(&app, &web, "late", "https://github.com/acme/web/pull/5").await;
+        app.state.delivery.advance(late.id).await.unwrap();
+        app.state.delivery.advance(late.id).await.unwrap();
+        for t in [&early, &late] {
+            app.state
+                .tasks
+                .add_projects(Caller::Human, t.id, &[shop_id])
+                .await
+                .unwrap();
+        }
+
+        // The shop board has no In PR or Released column: a web task sits in the nearest
+        // shop stage at or below its own, keeping its own stage word, or else in Review.
+        let page = app
+            .get(&format!("/ui/board?project={shop_id}"), Some(&cookie))
+            .await;
+        let html = page.html();
+        let titles = Selector::parse(".card-title").unwrap();
+        let in_column = |attr: &str, value: &str| -> Vec<String> {
+            let sel = Selector::parse(&format!("section.column[{attr}={value}]")).unwrap();
+            html.select(&sel)
+                .flat_map(|c| {
+                    c.select(&titles)
+                        .map(|t| t.text().collect::<String>().trim().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        assert_eq!(in_column("data-stage", "merged"), ["late"]);
+        assert_eq!(in_column("data-status", "review"), ["early"]);
+        let words = select_texts(&page, ".state .stage-word");
+        assert!(words.contains(&"Released".to_string()), "{words:?}");
     }
 
     #[tokio::test]
