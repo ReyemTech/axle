@@ -44,6 +44,7 @@ fn server_url_env_beats_config_beats_default() {
         &ClientConfig {
             server_url: Some("https://axle.example.com/".into()),
             port: None,
+            ..ClientConfig::default()
         },
     )
     .unwrap();

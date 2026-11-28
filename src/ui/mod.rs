@@ -17,6 +17,7 @@ pub mod inbox;
 pub mod markdown;
 pub mod needs;
 pub mod task_page;
+pub mod usage;
 pub mod views;
 
 use std::collections::HashMap;
@@ -161,6 +162,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/ui/board/density", get(views::set_density))
         .route("/ui/tasks/{id}/card", get(views::card_fragment))
         .route("/ui/history", get(history::history))
+        .route("/ui/usage", get(usage::usage_page))
         .route("/ui/tasks", post(actions::create_task))
         .route("/ui/tasks/{id}", get(task_page::task_page))
         .route("/ui/tasks/{id}/children", get(views::children))

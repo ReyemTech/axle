@@ -282,8 +282,54 @@ pub struct CardView {
     pub blocked_line: Option<String>,
     /// A blocked task waits on the human.
     pub blocked_on_you: bool,
-    /// The viewer chose compact cards: no subtask stops, owner chips or subtask list.
+    /// The viewer chose compact cards: one line of state, title, holder, lease and the
+    /// attention chips.
     pub compact: bool,
+    /// The task's thread holds unarchived urgent mail for the human (set by the board).
+    pub urgent: bool,
+    /// Whether a compact card names its project (not when the board shows one project).
+    pub show_project: bool,
+}
+
+/// Characters of a blocked task's reason in a compact card's tooltip.
+const BLOCKED_TIP: usize = 40;
+
+impl CardView {
+    /// A compact card's blocked tooltip: "Blocked: " and the reason's first
+    /// `BLOCKED_TIP` characters.
+    pub fn blocked_tip(&self) -> String {
+        let reason = self.blocked_line.as_deref().unwrap_or("");
+        let cut = match reason.char_indices().nth(BLOCKED_TIP) {
+            Some((cut, _)) => format!("{}…", reason[..cut].trim_end().trim_end_matches('…')),
+            None => reason.to_string(),
+        };
+        let who = if self.blocked_on_you {
+            "Blocked on you"
+        } else {
+            "Blocked"
+        };
+        if cut.is_empty() {
+            who.to_string()
+        } else {
+            format!("{who}: {cut}")
+        }
+    }
+
+    /// Subtasks in review, for a compact parent's chip.
+    pub fn sub_review(&self) -> usize {
+        self.progress.as_ref().map_or(0, |p| {
+            p.stations.iter().filter(|s| s.status == "review").count()
+        })
+    }
+
+    /// A compact card's lease state: `ok`, `low` (under a fifth left) or `expired`.
+    pub fn lease_state(&self) -> &'static str {
+        match &self.lease {
+            Some(l) if l.left <= 0 => "expired",
+            Some(l) if l.left * 5 < l.ttl => "low",
+            _ => "ok",
+        }
+    }
 }
 
 /// Characters of a blocked task's reason shown on its card.
@@ -468,6 +514,8 @@ async fn card(labels: &mut Labels<'_>, ctx: CardCtx, task: &Task) -> StoreResult
             .as_ref()
             .is_some_and(|b| b.waiting_on == Some(crate::domain::WaitingOn::Human)),
         compact: false,
+        urgent: false,
+        show_project: true,
     })
 }
 
@@ -494,6 +542,7 @@ pub async fn card_fragment(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(q): Query<CardQuery>,
 ) -> UiResult<Response> {
     let id: TaskId = id.parse().map_err(|_| UiError::NotFound("No such task."))?;
     let task = state
@@ -504,7 +553,18 @@ pub async fn card_fragment(
     let mut labels = Labels::load(&*state.store).await?;
     let mut card = card(&mut labels, CardCtx::of(&state), &task).await?;
     card.compact = compact(&headers);
+    if card.compact {
+        card.urgent = state.store.urgent_attention_tasks().await?.contains(&id);
+        card.show_project = q.filtered.is_none();
+    }
     html(&CardFragment { card })
+}
+
+#[derive(Deserialize)]
+pub struct CardQuery {
+    /// Present when the card sits on a board filtered to its project (no project tag).
+    #[serde(default)]
+    filtered: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -882,6 +942,8 @@ async fn columns(
         for t in &tasks {
             let mut c = card(labels, ctx, t).await?;
             c.compact = compact;
+            c.urgent = urgent.contains(&t.id);
+            c.show_project = project.is_none();
             cards.push(c);
         }
         let total = cards.len();

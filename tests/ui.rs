@@ -4387,20 +4387,56 @@ async fn compact_cards_drop_the_detail_and_keep_the_signals() {
     assert!(select_texts(&page, &format!("{card} .stations")).is_empty());
     assert!(select_texts(&page, &format!("{card} .owners")).is_empty());
     assert!(select_texts(&page, &format!("{card} details.children")).is_empty());
-    assert_eq!(
-        select_texts(&page, &format!("{card} .ratio-text")),
-        ["1/3 subtasks"]
-    );
+    assert!(select_texts(&page, &format!("{card} .card-owner")).is_empty());
+    assert!(select_texts(&page, &format!("{card} .card-parent")).is_empty());
+    assert!(select_texts(&page, &format!("{card} .lease-meter")).is_empty());
+    // One row: state with its word, the title with its tooltip, project key (all projects),
+    // holder, lease, the subtask count.
     assert_eq!(
         select_texts(&page, &format!("{card} .state .status")),
         ["claimed"],
-        "the status word stays"
+        "the status word stays beside the glyph"
     );
-    assert!(!select_texts(&page, &format!("{card} .owner")).is_empty());
-    assert!(!select_texts(&page, &format!("{card} .lease-meter")).is_empty());
     assert_eq!(
-        select_texts(&page, &format!("#task-{} .card-blocked-reason", lone.id)),
-        ["waiting on the vendor"]
+        attrs(&page, &format!("{card} .card-title"), "title"),
+        ["Rotate DB creds"]
+    );
+    assert_eq!(
+        select_texts(&page, &format!("{card} .card-title a")),
+        ["Rotate DB creds"]
+    );
+    assert_eq!(
+        select_texts(&page, &format!("{card} .project")),
+        ["acme/platform-infra"]
+    );
+    assert_eq!(
+        select_texts(&page, &format!("{card} .owner")),
+        ["claude-code@mac"]
+    );
+    assert_eq!(
+        attrs(&page, &format!("{card} .row-lease"), "data-lease-state").len(),
+        1
+    );
+    assert_eq!(select_texts(&page, &format!("{card} .ratio")), ["1/3"]);
+    assert_eq!(
+        attrs(&page, &format!("{card} .ratio"), "title"),
+        ["1 of 3 subtasks done"]
+    );
+    // No body preview, no blocked line: the reason is only in the tooltip.
+    assert!(select_texts(&page, &format!("{card} .card-blocked")).is_empty());
+    let stuck = format!("#task-{}", lone.id);
+    assert!(select_texts(&page, &format!("{stuck} .card-blocked")).is_empty());
+    assert_eq!(
+        attrs(&page, &format!("{stuck} .state"), "title"),
+        ["Blocked: waiting on the vendor"]
+    );
+    assert!(!page.body.contains("more detail"));
+    // An unowned open task says so.
+    let open = app.task(&infra, "Nobody yet", None).await;
+    let page = app.get("/ui/board", Some(&both)).await;
+    assert_eq!(
+        select_texts(&page, &format!("#task-{} .owner", open.id)),
+        ["open"]
     );
     // A compact card re-fetches itself on its live event rather than taking the shared
     // (detailed) render.
@@ -4418,7 +4454,7 @@ async fn compact_cards_drop_the_detail_and_keep_the_signals() {
         .await;
     assert_eq!(one.status, StatusCode::OK);
     assert_eq!(attrs(&one, ".card", "data-density"), ["compact"]);
-    assert_eq!(select_texts(&one, ".ratio-text"), ["1/3 subtasks"]);
+    assert_eq!(select_texts(&one, ".ratio"), ["1/3"]);
     let detailed = app
         .get(&format!("/ui/tasks/{}/card", parent.id), Some(&cookie))
         .await;
@@ -4428,6 +4464,172 @@ async fn compact_cards_drop_the_detail_and_keep_the_signals() {
     let set = app.get("/ui/board/density?set=detailed", Some(&both)).await;
     assert_eq!(set.location.as_deref(), Some("/ui/board"));
     assert!(set.set_cookie.unwrap().starts_with("axl_density=detailed;"));
+}
+
+#[tokio::test]
+async fn compact_rows_show_only_attention_chips() {
+    let app = app().await;
+    let cookie = app.login().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let set = app
+        .get("/ui/board/density?set=compact", Some(&cookie))
+        .await;
+    let both = format!("{cookie}; {}", cookie_pair(&set.set_cookie.unwrap()));
+
+    // A lease under a fifth left.
+    let expiring = app.task(&infra, "Lease running out", None).await;
+    app.claim(&infra, expiring.id).await;
+    app.clock.advance(time::Duration::minutes(13));
+    // Urgent mail in a human-created task's thread.
+    let urgent = app
+        .state
+        .tasks
+        .create(
+            Caller::Human,
+            NewTask {
+                project_id: infra.agent.project_id.unwrap(),
+                title: "Urgent thread".into(),
+                body: "body".into(),
+                ..NewTask::default()
+            },
+        )
+        .await
+        .unwrap();
+    app.claim(&infra, urgent.id).await;
+    app.state
+        .messages
+        .send(
+            &Actor::Agent(infra.agent.id, infra.session.id),
+            NewMessage {
+                to: Address::Task(urgent.id),
+                subject: Some("Prod is down".into()),
+                body: "Need a call now".into(),
+                importance: Importance::Urgent,
+                reply_to: None,
+            },
+        )
+        .await
+        .unwrap();
+    let plan = submitted_plan(&app, &infra, "Plan waits on you").await;
+    let on_you = app.task(&infra, "Needs a decision", None).await;
+    app.claim(&infra, on_you.id).await;
+    block(
+        &app,
+        &infra,
+        on_you.id,
+        "Pick a region for the new bucket before I can go on with the rest",
+        WaitingOn::Human,
+        "answer in the thread",
+    )
+    .await;
+    // A parent with one subtask blocked, one in review and one done.
+    let parent = app.task(&infra, "Parent with subtasks", None).await;
+    let stuck = app.task(&infra, "stuck child", Some(parent.id)).await;
+    let checked = app.task(&infra, "checked child", Some(parent.id)).await;
+    let finished = app.task(&infra, "finished child", Some(parent.id)).await;
+    app.claim(&infra, parent.id).await;
+    app.claim(&infra, stuck.id).await;
+    app.state
+        .tasks
+        .block(&infra, stuck.id, "waiting")
+        .await
+        .unwrap();
+    app.claim(&infra, checked.id).await;
+    app.state
+        .tasks
+        .to_review(&infra, checked.id, None)
+        .await
+        .unwrap();
+    app.complete(&infra, finished.id).await;
+    let done = app.task(&infra, "Shipped it", None).await;
+    app.complete(&infra, done.id).await;
+
+    let page = app.get("/ui/board", Some(&both)).await;
+    let chips = |id: TaskId| select_texts(&page, &format!("#task-{id} .chip"));
+    assert_eq!(chips(urgent.id), ["urgent"]);
+    assert_eq!(chips(plan.id), ["plan awaiting you"]);
+    assert_eq!(
+        select_texts(&page, &format!("#task-{} .state .status", plan.id)),
+        ["planning"],
+        "the short status word"
+    );
+    assert_eq!(chips(on_you.id), ["blocked on you"]);
+    let tip = attrs(&page, &format!("#task-{} .chip", on_you.id), "title");
+    assert_eq!(
+        tip,
+        ["Blocked on you: Pick a region for the new bucket before…"]
+    );
+    assert!(!page.body.contains("go on with the rest"));
+    assert_eq!(chips(parent.id), ["1 blocked", "1 review"]);
+    assert_eq!(
+        select_texts(&page, &format!("#task-{} .ratio", parent.id)),
+        ["1/3"]
+    );
+    assert!(chips(expiring.id).is_empty());
+    assert_eq!(
+        attrs(
+            &page,
+            &format!("#task-{} .row-lease", expiring.id),
+            "data-lease-state"
+        ),
+        ["low"]
+    );
+    assert_eq!(
+        select_texts(&page, &format!("#task-{} .row-lease", expiring.id)),
+        ["lease 2m left"]
+    );
+    assert_eq!(
+        attrs(
+            &page,
+            &format!("#task-{} .row-lease", urgent.id),
+            "data-lease-state"
+        ),
+        ["ok"]
+    );
+    // A Done row keeps its Ack, as a small button beside it.
+    assert_eq!(
+        select_texts(
+            &page,
+            &format!("form.ack[data-ack-for=\"{}\"] button.compact-ack", done.id)
+        ),
+        ["Ack"]
+    );
+
+    // Filtered to one project, the project tag goes and the live re-fetch keeps that.
+    let project = infra.agent.project_id.unwrap();
+    let filtered = app
+        .get(&format!("/ui/board?project={project}"), Some(&both))
+        .await;
+    let row = format!("#task-{}", urgent.id);
+    assert!(select_texts(&filtered, &format!("{row} .project")).is_empty());
+    assert_eq!(
+        attrs(&filtered, &row, "hx-get"),
+        [format!("/ui/tasks/{}/card?filtered=1", urgent.id)]
+    );
+    assert!(!select_texts(&page, &format!("{row} .project")).is_empty());
+    let one = app
+        .get(
+            &format!("/ui/tasks/{}/card?filtered=1", urgent.id),
+            Some(&both),
+        )
+        .await;
+    assert!(select_texts(&one, ".project").is_empty());
+    assert_eq!(select_texts(&one, ".chip"), ["urgent"]);
+
+    // Detailed is unchanged: no chips, the full rows.
+    let detailed = app.get("/ui/board", Some(&cookie)).await;
+    assert!(select_texts(&detailed, ".chip").is_empty());
+    assert!(select_texts(&detailed, ".compact-ack").is_empty());
+    assert!(!select_texts(&detailed, &format!("#task-{} .card-owner", urgent.id)).is_empty());
+    assert!(!select_texts(&detailed, &format!("#task-{} .lease-meter", urgent.id)).is_empty());
+    assert!(!select_texts(&detailed, &format!("#task-{} .stations", parent.id)).is_empty());
+    assert_eq!(
+        select_texts(
+            &detailed,
+            &format!("#task-{} .card-blocked-reason", on_you.id)
+        ),
+        ["Pick a region for the new bucket before I can go on with the rest"]
+    );
 }
 
 #[tokio::test]

@@ -2,13 +2,18 @@
 //! Every problem line is paired with the one command that fixes it. Nothing is written,
 //! and the token is used only as a bearer credential, never printed.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use super::install::{InstallEnv, display_name, redact};
-use crate::client::{Api, AxlDir, ClientError, read_token, resolve_server_url_with_warning};
+use crate::client::{
+    Api, AxlDir, ClientConfig, ClientError, load_config, read_token,
+    resolve_server_url_with_warning, usage_off,
+};
 use crate::daemon::ServiceState;
 use crate::install::{EditError, Harness, Manifest, Plan, axl_path, claude_code, codex, opencode};
+use crate::usage::cursor;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -64,22 +69,30 @@ fn line(label: &str, value: impl Into<String>, fix: Option<String>) -> StatusLin
 pub async fn run(env: &mut InstallEnv<'_>) -> StatusReport {
     let env_url = std::env::var("AXL_SERVER_URL").ok();
     let env_token = std::env::var("AXL_TOKEN").ok();
-    let report = status_with(env, env_url.as_deref(), env_token.as_deref()).await;
+    let env_usage = std::env::var("AXL_USAGE").ok();
+    let report = status_with(
+        env,
+        env_url.as_deref(),
+        env_token.as_deref(),
+        env_usage.as_deref(),
+    )
+    .await;
     let _ = write!(env.out, "{}", report.render());
     report
 }
 
 /// As [`status_with`], reading the server URL and token from `~/.axl` only.
 pub async fn status(env: &InstallEnv<'_>) -> StatusReport {
-    status_with(env, None, None).await
+    status_with(env, None, None, None).await
 }
 
-/// `env_url` / `env_token` are the values of `AXL_SERVER_URL` / `AXL_TOKEN`, which win over
-/// the files.
+/// `env_url` / `env_token` / `env_usage` are the values of `AXL_SERVER_URL` / `AXL_TOKEN` /
+/// `AXL_USAGE`, which win over the files.
 pub async fn status_with(
     env: &InstallEnv<'_>,
     env_url: Option<&str>,
     env_token: Option<&str>,
+    env_usage: Option<&str>,
 ) -> StatusReport {
     let dir = AxlDir::new(&env.home);
     let mut lines = Vec::new();
@@ -104,6 +117,13 @@ pub async fn status_with(
     )
     .await;
     harness_lines(&mut lines, env, &dir);
+    let cfg = load_config(&dir).map_err(|e| {
+        (
+            e.to_string(),
+            format!("fix or remove {}", dir.config_path().display()),
+        )
+    });
+    usage_lines(&mut lines, &env.home, cfg.as_ref(), env_usage);
 
     let ok = lines.iter().all(|l| l.fix.is_none());
     StatusReport { lines, ok }
@@ -324,6 +344,63 @@ fn harness_lines(lines: &mut Vec<StatusLine>, env: &InstallEnv<'_>, dir: &AxlDir
             lines.push(line(label, "not configured", Some(install_one)));
         }
     }
+}
+
+/// Whether usage reporting is on, the billing kind per harness (the config wins over what the
+/// collector last recorded) and the last successful report. Information only, except when
+/// config.toml does not parse: the collector then sends nothing, and the line says how to fix it.
+fn usage_lines(
+    lines: &mut Vec<StatusLine>,
+    home: &Path,
+    cfg: Result<&ClientConfig, &(String, String)>,
+    env_usage: Option<&str>,
+) {
+    let default = ClientConfig::default();
+    let (value, fix) = match (usage_off(env_usage, &default), cfg) {
+        (Some(why), _) => (format!("off ({why})"), None),
+        (None, Err((e, fix))) => (
+            format!("off (config.toml unreadable: {e})"),
+            Some(fix.clone()),
+        ),
+        (None, Ok(cfg)) => match usage_off(env_usage, cfg) {
+            Some(why) => (format!("off ({why})"), None),
+            None => ("on".to_string(), None),
+        },
+    };
+    lines.push(line("usage", value, fix));
+    let cfg = cfg.unwrap_or(&default);
+
+    let status = cursor::load_status(home);
+    let mut billing: BTreeMap<String, String> = status
+        .billing
+        .iter()
+        .map(|(h, b)| (h.clone(), b.to_string()))
+        .collect();
+    if let Some(u) = &cfg.usage {
+        for (h, raw) in &u.billing {
+            let shown = match u.billing_for(h) {
+                Some(b) => format!("{b} (from config)"),
+                None => format!("{raw:?} (not a billing kind; ignored)"),
+            };
+            billing.insert(h.clone(), shown);
+        }
+    }
+    let value = if billing.is_empty() {
+        "not reported yet".to_string()
+    } else {
+        billing
+            .iter()
+            .map(|(h, b)| format!("{h} {b}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    lines.push(line("usage billing", value, None));
+
+    let value = match status.last_success_at {
+        Some(t) => format!("last sent {t}"),
+        None => "none sent yet".to_string(),
+    };
+    lines.push(line("usage report", value, None));
 }
 
 fn plan_for(h: Harness, home: &Path, axl: &Path, manifest: &Manifest) -> Result<Plan, EditError> {

@@ -1,0 +1,230 @@
+# Axle built-in API price table. USD per million tokens (= micro-USD per token).
+#
+# Sources, read on 2026-11-28:
+#   Anthropic: https://platform.claude.com/docs/en/about-claude/pricing
+#              (model ids from the Claude API model list)
+#   OpenAI:    https://developers.openai.com/api/docs/pricing (Standard tier)
+#
+# Models whose price this table could not verify are omitted on purpose: they show "no price".
+# Override or extend with AXL_PRICES_FILE (same format; entries replace these by id).
+# OpenAI entries carry input, cache_read and output only. OpenAI models that bill a higher
+# rate above a context threshold (gpt-5.5, gpt-5.4 and their pro variants) are left out
+# rather than priced wrongly for long prompts.
+
+version = "2026-11-28"
+
+# ---- Anthropic -------------------------------------------------------------
+
+[[model]]
+id = "claude-fable-5-2"
+match = ["claude-fable-5-2-*", "anthropic/claude-fable-5-2*"]
+input = 8.00
+output = 40.00
+cache_write_5m = 10.00
+cache_write_1h = 16.00
+cache_read = 0.20
+fast = { input = 16.00, output = 80.00 }
+# source: Anthropic pricing page, model pricing and fast mode tables
+
+[[model]]
+id = "claude-fable-5-1"
+match = ["claude-fable-5-1-*", "anthropic/claude-fable-5-1*"]
+input = 10.00
+output = 50.00
+cache_write_5m = 12.50
+cache_write_1h = 20.00
+cache_read = 0.25
+# source: Anthropic pricing page, model pricing table
+
+[[model]]
+id = "claude-fable-5"
+match = ["claude-fable-5-20*", "anthropic/claude-fable-5"]
+input = 10.00
+output = 50.00
+cache_write_5m = 12.50
+cache_write_1h = 20.00
+cache_read = 1.00
+# source: Anthropic pricing page, model pricing table
+
+[[model]]
+id = "claude-opus-5-5"
+match = ["claude-opus-5-5-*", "anthropic/claude-opus-5-5*"]
+input = 4.00
+output = 20.00
+cache_write_5m = 5.00
+cache_write_1h = 8.00
+cache_read = 0.20
+fast = { input = 8.00, output = 40.00 }
+# source: design spec; matches the Anthropic pricing page model pricing and fast mode tables
+
+[[model]]
+id = "claude-opus-5"
+match = ["claude-opus-5-20*", "anthropic/claude-opus-5"]
+input = 5.00
+output = 25.00
+cache_write_5m = 6.25
+cache_write_1h = 10.00
+cache_read = 0.50
+fast = { input = 10.00, output = 50.00 }
+# source: Anthropic pricing page, model pricing and fast mode tables
+
+[[model]]
+id = "claude-opus-4-8"
+match = ["claude-opus-4-8-*", "anthropic/claude-opus-4-8*"]
+input = 5.00
+output = 25.00
+cache_write_5m = 6.25
+cache_write_1h = 10.00
+cache_read = 0.50
+fast = { input = 10.00, output = 50.00 }
+# source: Anthropic pricing page, model pricing and fast mode tables
+
+[[model]]
+id = "claude-opus-4-7"
+match = ["claude-opus-4-7-*", "anthropic/claude-opus-4-7*"]
+input = 5.00
+output = 25.00
+cache_write_5m = 6.25
+cache_write_1h = 10.00
+cache_read = 0.50
+# source: Anthropic pricing page, model pricing table
+
+[[model]]
+id = "claude-opus-4-6"
+match = ["claude-opus-4-6-*", "anthropic/claude-opus-4-6*"]
+input = 5.00
+output = 25.00
+cache_write_5m = 6.25
+cache_write_1h = 10.00
+cache_read = 0.50
+# source: Anthropic pricing page, model pricing table
+
+[[model]]
+id = "claude-sonnet-5-5"
+match = ["claude-sonnet-5-5-*", "anthropic/claude-sonnet-5-5*"]
+input = 2.00
+output = 10.00
+cache_write_5m = 2.50
+cache_write_1h = 4.00
+cache_read = 0.10
+# source: Anthropic pricing page, model pricing table
+
+[[model]]
+id = "claude-sonnet-5"
+match = ["claude-sonnet-5-20*", "anthropic/claude-sonnet-5"]
+input = 2.00
+output = 10.00
+cache_write_5m = 2.50
+cache_write_1h = 4.00
+cache_read = 0.20
+# source: Anthropic pricing page, model pricing table (introductory price is now standard)
+
+[[model]]
+id = "claude-sonnet-4-6"
+match = ["claude-sonnet-4-6-*", "anthropic/claude-sonnet-4-6*"]
+input = 3.00
+output = 15.00
+cache_write_5m = 3.75
+cache_write_1h = 6.00
+cache_read = 0.30
+# source: Anthropic pricing page, model pricing table
+
+[[model]]
+id = "claude-haiku-5-5"
+match = ["claude-haiku-5-5-*", "anthropic/claude-haiku-5-5*"]
+input = 0.10
+output = 0.50
+cache_write_5m = 0.125
+cache_write_1h = 0.20
+cache_read = 0.01
+long_context = { above = 100000, input = 0.50, output = 2.50, cache_write_5m = 0.625, cache_write_1h = 1.00, cache_read = 0.05 }
+# source: Anthropic pricing page, model pricing table (prompts up to / over 100,000 tokens)
+
+[[model]]
+id = "claude-haiku-4-5"
+match = ["claude-haiku-4-5-*", "anthropic/claude-haiku-4-5*"]
+input = 1.00
+output = 5.00
+cache_write_5m = 1.25
+cache_write_1h = 2.00
+cache_read = 0.10
+# source: Anthropic pricing page, model pricing table
+
+# ---- OpenAI ----------------------------------------------------------------
+
+[[model]]
+id = "gpt-5.3-codex"
+input = 1.75
+cache_read = 0.175
+output = 14.00
+# source: OpenAI API pricing page, specialized models, Standard tier
+
+[[model]]
+id = "gpt-5.2"
+input = 1.75
+cache_read = 0.175
+output = 14.00
+# source: OpenAI API pricing page, Standard tier
+
+[[model]]
+id = "gpt-5.1"
+input = 1.25
+cache_read = 0.125
+output = 10.00
+# source: OpenAI API pricing page, Standard tier
+
+[[model]]
+id = "gpt-5"
+input = 1.25
+cache_read = 0.125
+output = 10.00
+# source: OpenAI API pricing page, Standard tier
+
+[[model]]
+id = "gpt-5-mini"
+input = 0.25
+cache_read = 0.025
+output = 2.00
+# source: OpenAI API pricing page, Standard tier
+
+[[model]]
+id = "gpt-5-nano"
+input = 0.05
+cache_read = 0.005
+output = 0.40
+# source: OpenAI API pricing page, Standard tier
+
+[[model]]
+id = "gpt-4.1"
+input = 2.00
+cache_read = 0.50
+output = 8.00
+# source: OpenAI API pricing page, Standard tier
+
+[[model]]
+id = "gpt-4.1-mini"
+input = 0.40
+cache_read = 0.10
+output = 1.60
+# source: OpenAI API pricing page, Standard tier
+
+[[model]]
+id = "gpt-4o"
+input = 2.50
+cache_read = 1.25
+output = 10.00
+# source: OpenAI API pricing page, Standard tier
+
+[[model]]
+id = "gpt-4o-mini"
+input = 0.15
+cache_read = 0.075
+output = 0.60
+# source: OpenAI API pricing page, Standard tier
+
+[[model]]
+id = "o3"
+input = 2.00
+cache_read = 0.50
+output = 8.00
+# source: OpenAI API pricing page, Standard tier

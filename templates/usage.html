@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+{% block title %}Usage{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1 class="page-title">Usage</h1>
+  <p class="muted">Tokens your agents' harnesses reported, and what they would cost at API prices. Days are UTC.</p>
+  <p class="muted">Estimated at API prices; subscription use is not billed per token.</p>
+</div>
+<form class="usage-filters" method="get" action="/ui/usage" role="search">
+  <div class="field">
+    <label for="usage-range">Range</label>
+    <select id="usage-range" name="range">
+      {% for o in ranges %}<option value="{{ o.value }}"{% if o.selected %} selected{% endif %}>{{ o.label }}</option>{% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="usage-from">From (UTC)</label>
+    <input id="usage-from" type="date" name="from" value="{% if custom %}{{ from_day }}{% endif %}">
+  </div>
+  <div class="field">
+    <label for="usage-to">To (UTC)</label>
+    <input id="usage-to" type="date" name="to" value="{% if custom %}{{ to_day }}{% endif %}">
+  </div>
+  <div class="field">
+    <label for="usage-project">Project</label>
+    <select id="usage-project" name="project">
+      <option value=""{% if project_any %} selected{% endif %}>All projects</option>
+      {% for p in projects %}<option value="{{ p.id }}" title="{{ p.key }}"{% if p.selected %} selected{% endif %}>{{ p.name }}</option>{% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="usage-agent">Agent</label>
+    <select id="usage-agent" name="agent">
+      <option value=""{% if agent_any %} selected{% endif %}>All agents</option>
+      {% for o in agents %}<option value="{{ o.value }}"{% if o.selected %} selected{% endif %}>{{ o.label }}</option>{% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="usage-harness">Harness</label>
+    <select id="usage-harness" name="harness">
+      <option value="">All harnesses</option>
+      {% for o in harnesses %}<option value="{{ o.value }}"{% if o.selected %} selected{% endif %}>{{ o.label }}</option>{% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="usage-host">Host</label>
+    <select id="usage-host" name="host">
+      <option value="">All hosts</option>
+      {% for o in hosts %}<option value="{{ o.value }}"{% if o.selected %} selected{% endif %}>{{ o.label }}</option>{% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="usage-billing">Billing</label>
+    <select id="usage-billing" name="billing">
+      {% for o in billings %}<option value="{{ o.value }}"{% if o.selected %} selected{% endif %}>{{ o.label }}</option>{% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="usage-model">Model</label>
+    <input id="usage-model" type="text" name="model" value="{{ model }}" placeholder="Any model" autocomplete="off">
+  </div>
+  <div class="field">
+    <label for="usage-task">Task id</label>
+    <input id="usage-task" type="text" name="task" value="{{ task }}" placeholder="Any task, or none" autocomplete="off">
+  </div>
+  <div class="field">
+    <label for="usage-group">Group by</label>
+    <select id="usage-group" name="group">
+      {% for o in groups %}<option value="{{ o.value }}"{% if o.selected %} selected{% endif %}>{{ o.label }}</option>{% endfor %}
+    </select>
+  </div>
+  <div class="field usage-actions">
+    <button type="submit" class="secondary">Show</button>
+    <a href="/ui/usage">Clear filters</a>
+  </div>
+</form>
+<dl class="counters usage-totals">
+  <div class="counter" data-total="input"><dt class="label">Input</dt><dd class="value" title="{{ totals.input.exact }}">{{ totals.input.short }}</dd></div>
+  <div class="counter" data-total="output"><dt class="label">Output</dt><dd class="value" title="{{ totals.output.exact }}">{{ totals.output.short }}</dd></div>
+  <div class="counter" data-total="cache-write"><dt class="label">Cache write</dt><dd class="value" title="{{ totals.cache_write.exact }}">{{ totals.cache_write.short }}</dd></div>
+  <div class="counter" data-total="cache-read"><dt class="label">Cache read</dt><dd class="value" title="{{ totals.cache_read.exact }}">{{ totals.cache_read.short }}</dd></div>
+  <div class="counter" data-total="cost"><dt class="label">API-equivalent cost</dt><dd class="value" title="{{ totals.cost.exact }}">{{ totals.cost.short }}</dd></div>
+  <div class="counter" data-total="subscription"><dt class="label">Of which subscription (est.)</dt><dd class="value" title="{{ totals.subscription.exact }}">{{ totals.subscription.short }}</dd></div>
+</dl>
+<div class="section-head">
+  <h2 class="section-title">By {{ group_label|lower }}</h2>
+  <span class="muted">most expensive first; rows with no price last</span>
+</div>
+{% if rows.is_empty() %}
+<p class="empty">No usage matches.</p>
+{% else %}
+<div class="usage-scroll">
+<table class="usage-table">
+  <thead>
+    <tr>
+      <th scope="col">{{ group_label }}</th>
+      <th scope="col" class="num">Requests</th>
+      <th scope="col" class="num">Input</th>
+      <th scope="col" class="num">Output</th>
+      <th scope="col" class="num">Cache write</th>
+      <th scope="col" class="num">Cache read</th>
+      <th scope="col" class="num">API-equivalent cost</th>
+      <th scope="col">{{ share_header }}</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <th scope="row" class="usage-name">{% if let Some(p) = r.name.project %}<span class="project" data-line="{{ p.line }}" title="{{ p.key }}">{{ p.name }}</span>{% else if let Some(href) = r.name.href %}<a href="{{ href }}">{{ r.name.text }}</a>{% else if r.name.none %}<span class="muted">{{ r.name.text }}</span>{% else %}{{ r.name.text }}{% endif %}</th>
+      <td class="num">{{ r.requests }}</td>
+      <td class="num" title="{{ r.input.exact }}">{{ r.input.short }}</td>
+      <td class="num" title="{{ r.output.exact }}">{{ r.output.short }}</td>
+      <td class="num" title="{{ r.cache_write.exact }}">{{ r.cache_write.short }}</td>
+      <td class="num" title="{{ r.cache_read.exact }}">{{ r.cache_read.short }}</td>
+      <td class="num" title="{{ r.cost_exact }}">{{ r.cost }}</td>
+      <td class="usage-share"><span class="share-bar" data-share="{{ r.share }}" aria-hidden="true"></span><span>{{ r.share_text }}</span></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+<div class="section-head">
+  <h2 class="section-title">Over time</h2>
+  <span class="muted">{% if hourly %}per hour today, UTC{% else %}per UTC day{% endif %}; the bar is tokens against the busiest {% if hourly %}hour{% else %}day{% endif %}</span>
+</div>
+{% if days.is_empty() %}
+<p class="empty">No usage matches.</p>
+{% else %}
+<ol class="usage-days">
+{% for d in days %}
+  <li><time datetime="{{ d.datetime }}">{{ d.label }}</time><span class="usage-day-tokens" title="{{ d.tokens.exact }} tokens">{{ d.tokens.short }} tokens</span><span class="usage-day-cost">{{ d.cost }}</span><span class="share-bar" data-share="{{ d.share }}" aria-hidden="true"></span></li>
+{% endfor %}
+</ol>
+{% endif %}
+{% endblock %}

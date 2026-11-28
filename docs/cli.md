@@ -134,6 +134,13 @@ key must use letters, digits and `. _ : @ - /`, up to 200 bytes.
 for a folder with no remote. See [projects and identity](concepts.md#projects-and-identity).
 Neither form needs the server.
 
+Three more lines cover token usage: `usage` (`on`, or `off (AXL_USAGE=off)` /
+`off ([usage] enabled = false)`; `off (config.toml unreadable: …)` with a fix when the file
+does not parse, since the collector then sends nothing), `usage billing` (the billing kind per
+harness, `(from config)` when `[usage.billing]` set it, `(not a billing kind; ignored)` for
+a value it does not know, or `not reported yet`) and
+`usage report` (`last sent <time>` or `none sent yet`).
+
 ## `axl service`
 
 ```sh
@@ -159,6 +166,7 @@ remembered for later installs).
 ```sh
 axl serve [--bind ADDR] [--trusted-header NAME]
 axl token create --label NAME | list | revoke ID
+axl usage reprice [--since DATE] [--unpriced]
 ```
 
 `axl serve` runs the server in the foreground and needs `DATABASE_URL`; the flags override
@@ -167,6 +175,15 @@ also needs `DATABASE_URL`. It is the manual and admin path: `create` prints a to
 (redirect it into `~/.axl/token` with mode 0600), `list` shows id, label, creation, last use
 and revocation, and `revoke` cuts one off by id. For normal onboarding use `axl install` or
 **Tokens → Connect a machine** instead. `axl migrate` has its own `--help`.
+
+`axl usage reprice` recomputes the stored cost of token usage records with the current price
+table: the built-in one plus `AXL_PRICES_FILE` if set (see
+[configuration](configuration.md#prices)). It needs `DATABASE_URL`. `--since` limits it to
+records at or after a date (`YYYY-MM-DD`, UTC midnight, or an RFC 3339 timestamp);
+`--unpriced` only touches records that have no price yet, so prices already stored stay as
+they were. It prints `axl: repriced N records (M without a price)` to stderr, where M counts
+the records whose model the table still does not know. Run it after changing the price table
+or the prices file; the server does not need to stop.
 
 ## Files on the client
 

@@ -271,6 +271,7 @@ fn running_service_skips_port_check_for_its_own_port() {
         &ClientConfig {
             server_url: None,
             port: Some(port),
+            ..ClientConfig::default()
         },
     )
     .unwrap();
@@ -340,6 +341,7 @@ fn install_saves_non_default_port_and_keeps_other_keys() {
         &ClientConfig {
             server_url: Some("https://axle.example.com".into()),
             port: Some(9),
+            ..ClientConfig::default()
         },
     )
     .unwrap();
@@ -366,6 +368,7 @@ fn install_port_keeps_a_remote_server_url_and_moves_a_local_one() {
         &ClientConfig {
             server_url: Some("https://axle.example.com".into()),
             port: None,
+            ..ClientConfig::default()
         },
     )
     .unwrap();
@@ -382,6 +385,7 @@ fn install_port_keeps_a_remote_server_url_and_moves_a_local_one() {
             &ClientConfig {
                 server_url: Some(old.into()),
                 port: Some(9),
+                ..ClientConfig::default()
             },
         )
         .unwrap();
