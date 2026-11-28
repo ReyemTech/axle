@@ -1986,10 +1986,12 @@ impl TaskService {
         }
     }
 
-    /// A sanctioned task given back (`open` again) is placed again, or queued.
+    /// A sanctioned task given back (`open` again) is placed again, or queued, never to the
+    /// agent that created it (as `place_queued` does).
     async fn reroute(&self, task: &Task) {
         if task.sanctioned && task.status == TaskStatus::Open {
-            self.route(task, WakeTrigger::Queue, None).await;
+            let requester = task.created_by.ids().0;
+            self.route(task, WakeTrigger::Queue, requester).await;
         }
     }
 

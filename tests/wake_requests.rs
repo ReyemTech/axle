@@ -314,6 +314,44 @@ async fn auto_start_never_wakes_the_requester() {
 }
 
 #[tokio::test]
+async fn released_request_never_wakes_the_requester() {
+    let env = Env::new().await;
+    env.auto_start(PROJECT).await;
+    // The requester works in the target project and stays idle; the worker is busy.
+    let requester = env.session_of(PROJECT, "r").await;
+    let worker = env.session_of(PROJECT, "w").await;
+    env.idle(&requester).await;
+
+    let first = env
+        .request(&requester, PROJECT, "Tidy the README")
+        .await
+        .unwrap();
+    let second = env
+        .request(&requester, PROJECT, "Tidy the CHANGELOG")
+        .await
+        .unwrap();
+    for out in [&first, &second] {
+        assert_eq!(out.state, RequestState::Queued);
+        assert!(matches!(
+            env.tasks.claim(&worker, out.task.id).await.unwrap(),
+            ClaimOutcome::Claimed(_)
+        ));
+    }
+
+    // Given back by the worker, then by the human: neither reroute wakes the requester.
+    env.tasks
+        .release(&worker, first.task.id, None)
+        .await
+        .unwrap();
+    env.tasks.force_release(second.task.id).await.unwrap();
+    for out in [&first, &second] {
+        assert_eq!(env.get(out.task.id).await.status, TaskStatus::Open);
+    }
+    assert_eq!(env.reserved_task(&requester).await, None);
+    assert_eq!(env.sent().await, 0);
+}
+
+#[tokio::test]
 async fn dedupe_returns_existing_within_10_minutes() {
     let env = Env::new().await;
     let requester = env.session_of(OTHER, "r").await;
