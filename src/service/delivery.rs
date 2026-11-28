@@ -290,8 +290,18 @@ impl DeliveryService {
             .await?
             .ok_or(TaskError::UnknownProject)?;
         let enabled = self.settings(&project).await?.stages;
-        let to = next_enabled_after(&enabled, current.delivery_stage)
-            .ok_or(DeliveryError::NoNextStage)?;
+        // A delivering parent with its own PR shows the minimum of its own and its
+        // children's stages; move on from its own progress (its `task_stages`). The shown
+        // stage is never ahead of that, and is all a parent without a PR has.
+        let from = self
+            .store
+            .task_stages(task)
+            .await?
+            .iter()
+            .map(|s| s.stage)
+            .max()
+            .max(current.delivery_stage);
+        let to = next_enabled_after(&enabled, from).ok_or(DeliveryError::NoNextStage)?;
         let now = self.clock.now();
         let signal_id = Uuid::now_v7();
         let moved = self
@@ -299,7 +309,7 @@ impl DeliveryService {
             .advance_stage(&StageMove {
                 task,
                 to,
-                implied: implied_between(current.delivery_stage, to),
+                implied: implied_between(from, to),
                 signal_id: Some(signal_id),
                 detail: None,
                 actor: Actor::Human,

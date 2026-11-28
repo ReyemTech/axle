@@ -2625,3 +2625,53 @@ store_matrix!(delivering_parent_closing_unblocks_waiting, |store: Arc<
 >| async move {
     unblock_through_delivery(store, Finish::ParentClosed).await
 });
+
+store_matrix!(advance_parent_follows_its_own_stage, |store: Arc<
+    dyn Store,
+>| async move {
+    use DeliveryStage::*;
+    let dx = Dx::new(store).await;
+    dx.stages(&[InPr, Merged, Released]).await;
+    let parent = dx.fx.claimed("parent", None).await;
+    let child = dx.fx.claimed("child", Some(parent.id)).await;
+    let complete = |id: TaskId, n: i64| {
+        let dx = &dx;
+        async move {
+            dx.fx
+                .svc
+                .complete(
+                    &dx.fx.owner,
+                    id,
+                    Completion {
+                        summary: "shipped".into(),
+                        links: vec![pr_url(n)],
+                        ..Completion::default()
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    complete(child.id, 51).await;
+    let p = complete(parent.id, 50).await;
+    assert_eq!(p.status, TaskStatus::Delivering);
+
+    // The parent's own PR merges; the slower child holds its shown stage at In PR.
+    let p = dx.svc.advance(parent.id).await.unwrap();
+    assert_eq!(p.delivery_stage, Some(InPr));
+    // The next advance goes on from the parent's own Merged, to Released.
+    let p = dx.svc.advance(parent.id).await.unwrap();
+    assert_eq!(p.status, TaskStatus::Delivering);
+    let own: Vec<_> = dx
+        .fx
+        .store
+        .task_stages(parent.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.stage)
+        .collect();
+    assert_eq!(own, vec![InPr, Merged, Released]);
+    let err = dx.svc.advance(parent.id).await.unwrap_err();
+    assert!(matches!(err, DeliveryError::NoNextStage), "{err}");
+});
