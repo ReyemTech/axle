@@ -16,7 +16,7 @@ use axle::store::{
     DoneFilter, LeaseUpdate, Store, TaskFilter, TaskOrder, TransitionRequest, Transitioned,
     like_pattern,
 };
-use time::macros::datetime;
+use time::macros::{datetime, format_description};
 use time::{Duration, OffsetDateTime};
 
 const T0: OffsetDateTime = datetime!(2026-11-27 9:00 UTC);
@@ -592,6 +592,77 @@ store_matrix!(count_matches_list, |store: Arc<dyn Store>| async move {
     assert_eq!(like_pattern(r"a%b_c\d"), r"%a\%b\_c\\d%");
 });
 
+store_matrix!(done_newest_only_returns_done_rows, |store: Arc<
+    dyn Store,
+>| async move {
+    let env = Env::new(store).await;
+    env.create_titled("open", None).await;
+    let claimed = env.create_titled("claimed", None).await;
+    env.claim(claimed).await;
+    env.finish("done", None, Duration::hours(1)).await;
+    // `status` unset: the order itself restricts to done rows (and none has a NULL done_at).
+    let got = env
+        .list(TaskFilter {
+            order: TaskOrder::DoneNewest,
+            ..TaskFilter::default()
+        })
+        .await;
+    assert_eq!(titles(got), ["done"]);
+});
+
+/// The Done queries must use the partial index `tasks_done`, not scan and sort the table.
+#[tokio::test]
+async fn done_queries_use_the_tasks_done_index_sqlite() {
+    use axle::store::sqlite::{SqliteStore, count_tasks_sql, list_tasks_sql};
+    use sqlx::Row;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    let path = std::env::temp_dir().join(format!("axle-test-{}.db", uuid::Uuid::now_v7()));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&format!("sqlite://{}?mode=rwc", path.display()))
+        .await
+        .unwrap();
+    let store = SqliteStore::from_pool(pool.clone()).await.unwrap();
+    let since = T0 - Duration::days(7);
+
+    let plan = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get::<String, _>("detail"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    };
+    let list = plan(list_tasks_sql(&TaskFilter {
+        status: Some(TaskStatus::Done),
+        top_level: true,
+        done: DoneFilter::Unseen { since },
+        order: TaskOrder::DoneNewest,
+        ..TaskFilter::default()
+    }))
+    .await;
+    let count = plan(count_tasks_sql(&TaskFilter {
+        status: Some(TaskStatus::Done),
+        done: DoneFilter::AutoAckedUnseen { since },
+        ..TaskFilter::default()
+    }))
+    .await;
+    assert!(list.contains("USING INDEX tasks_done"), "{list}");
+    assert!(count.contains("USING INDEX tasks_done"), "{count}");
+
+    drop(store);
+    pool.close().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
 /// Copies migrations 0001..=0003 of `backend` into a fresh directory.
 fn old_migrations(backend: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("axle-mig-{}", uuid::Uuid::now_v7()));
@@ -613,7 +684,7 @@ fn old_migrations(backend: &str) -> std::path::PathBuf {
 }
 
 #[tokio::test]
-async fn backfill_sets_done_at_from_updated_at_sqlite() {
+async fn backfill_sets_done_at_and_acks_old_rows_sqlite() {
     use axle::store::sqlite::SqliteStore;
     use sqlx::sqlite::SqlitePoolOptions;
 
@@ -640,27 +711,53 @@ async fn backfill_sets_done_at_from_updated_at_sqlite() {
     .execute(&pool)
     .await
     .unwrap();
-    let done_id = uuid::Uuid::now_v7();
+    let old_id = uuid::Uuid::now_v7();
+    let recent_id = uuid::Uuid::now_v7();
     let open_id = uuid::Uuid::now_v7();
-    for (id, status) in [(done_id, "done"), (open_id, "open")] {
+    let recent_at = OffsetDateTime::now_utc() - Duration::hours(12);
+    // The store's fixed-width microsecond format.
+    let recent_text = format!(
+        "{}.{:06}Z",
+        recent_at
+            .format(format_description!(
+                "[year]-[month]-[day]T[hour]:[minute]:[second]"
+            ))
+            .unwrap(),
+        recent_at.microsecond()
+    );
+    for (id, status, updated) in [
+        (old_id, "done", "2020-01-01T09:00:00.000000Z"),
+        (recent_id, "done", recent_text.as_str()),
+        (open_id, "open", "2020-01-01T09:00:00.000000Z"),
+    ] {
         sqlx::query(
             "INSERT INTO tasks (id, project_id, title, status, created_at, updated_at)
-             VALUES (?, ?, 't', ?, '2026-11-01T00:00:00.000000Z', '2026-11-20T09:00:00.000000Z')",
+             VALUES (?, ?, 't', ?, '2019-12-01T00:00:00.000000Z', ?)",
         )
         .bind(id.to_string())
         .bind(&project)
         .bind(status)
+        .bind(updated)
         .execute(&pool)
         .await
         .unwrap();
     }
 
     let store = SqliteStore::from_pool(pool).await.unwrap();
-    let done = store.get_task(done_id.into()).await.unwrap().unwrap();
+    let old = store.get_task(old_id.into()).await.unwrap().unwrap();
+    let recent = store.get_task(recent_id.into()).await.unwrap().unwrap();
     let open = store.get_task(open_id.into()).await.unwrap().unwrap();
-    assert_eq!(done.done_at, Some(datetime!(2026-11-20 9:00 UTC)));
-    assert_eq!(done.acked_at, None);
+    // Older than the old 7-day board window: backfilled and acked.
+    assert_eq!(old.done_at, Some(datetime!(2020-01-01 9:00 UTC)));
+    assert_eq!(old.acked_at, old.done_at);
+    // Finished within the last day: backfilled and still unseen.
+    assert_eq!(
+        recent.done_at.map(|t| t.unix_timestamp()),
+        Some(recent_at.unix_timestamp())
+    );
+    assert_eq!(recent.acked_at, None);
     assert_eq!(open.done_at, None);
+    assert_eq!(open.acked_at, None);
 
     drop(store);
     let _ = std::fs::remove_dir_all(dir);
@@ -671,7 +768,7 @@ async fn backfill_sets_done_at_from_updated_at_sqlite() {
 
 #[cfg(feature = "pg-tests")]
 #[tokio::test]
-async fn backfill_sets_done_at_from_updated_at_postgres() {
+async fn backfill_sets_done_at_and_acks_old_rows_postgres() {
     use axle::store::postgres::PostgresStore;
 
     let schema = common::pg_bare_schema().await;
@@ -697,27 +794,44 @@ async fn backfill_sets_done_at_from_updated_at_postgres() {
             .execute(&pool)
             .await
             .unwrap();
-            let done_id = uuid::Uuid::now_v7();
+            let old_id = uuid::Uuid::now_v7();
+            let recent_id = uuid::Uuid::now_v7();
             let open_id = uuid::Uuid::now_v7();
-            for (id, status) in [(done_id, "done"), (open_id, "open")] {
+            let long_ago = datetime!(2020-01-01 9:00 UTC);
+            let recent_at = OffsetDateTime::now_utc() - Duration::hours(12);
+            for (id, status, updated) in [
+                (old_id, "done", long_ago),
+                (recent_id, "done", recent_at),
+                (open_id, "open", long_ago),
+            ] {
                 sqlx::query(
                     "INSERT INTO tasks (id, project_id, title, status, created_at, updated_at)
-                     VALUES ($1, $2, 't', $3, '2026-11-01T00:00:00Z', '2026-11-20T09:00:00Z')",
+                     VALUES ($1, $2, 't', $3, '2019-12-01T00:00:00Z', $4)",
                 )
                 .bind(id)
                 .bind(project)
                 .bind(status)
+                .bind(updated)
                 .execute(&pool)
                 .await
                 .unwrap();
             }
 
             let store = PostgresStore::from_pool(pool).await.unwrap();
-            let done = store.get_task(done_id.into()).await.unwrap().unwrap();
+            let old = store.get_task(old_id.into()).await.unwrap().unwrap();
+            let recent = store.get_task(recent_id.into()).await.unwrap().unwrap();
             let open = store.get_task(open_id.into()).await.unwrap().unwrap();
-            assert_eq!(done.done_at, Some(datetime!(2026-11-20 9:00 UTC)));
-            assert_eq!(done.acked_at, None);
+            // Older than the old 7-day board window: backfilled and acked.
+            assert_eq!(old.done_at, Some(long_ago));
+            assert_eq!(old.acked_at, old.done_at);
+            // Finished within the last day: backfilled and still unseen.
+            assert_eq!(
+                recent.done_at.map(|t| t.unix_timestamp()),
+                Some(recent_at.unix_timestamp())
+            );
+            assert_eq!(recent.acked_at, None);
             assert_eq!(open.done_at, None);
+            assert_eq!(open.acked_at, None);
         }
     })
     .await;

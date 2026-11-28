@@ -568,7 +568,9 @@ pub struct TaskFilter {
     pub top_level: bool,
     /// How `done` rows are filtered; rows of any other status always pass.
     pub done: DoneFilter,
-    /// Case-insensitive substring of the title; `%`, `_` and `\` match literally.
+    /// Substring of the title; `%`, `_` and `\` match literally. The match ignores case for
+    /// ASCII letters on both backends (`LIKE` on SQLite); Postgres (`ILIKE`) folds other
+    /// letters too.
     pub title: Option<String>,
     /// Row order; also what `after` is a cursor into.
     pub order: TaskOrder,
@@ -600,7 +602,9 @@ pub enum TaskOrder {
     /// `(created_at, id)` ascending; `after` = rows after the cursor.
     #[default]
     Created,
-    /// `(done_at, id)` descending; `after` = rows older than the cursor.
+    /// `(done_at, id)` descending; `after` = rows older than the cursor. Only done rows are
+    /// returned, whatever `status` says (the stores add a literal `status = 'done'`, which
+    /// also lets them use the `tasks_done` index).
     DoneNewest,
 }
 

@@ -19,7 +19,7 @@ use super::{
 use crate::domain::{
     Actor, Address, Agent, AgentId, Eligibility, Enrollment, EnrollmentId, EnrollmentStatus,
     Importance, InboxItem, Message, MessageId, Project, ProjectId, Session, SessionId, Task,
-    TaskEvent, TaskEventKind, TaskId, TokenId, TokenInfo,
+    TaskEvent, TaskEventKind, TaskId, TaskStatus, TokenId, TokenInfo,
 };
 
 /// The columns `enrollment_from` reads (a macro so queries can `concat!` it statically).
@@ -269,7 +269,6 @@ async fn record_event(
     Ok(true)
 }
 
-/// Task columns as a literal, so queries stay static SQL.
 /// The `WHERE` shared by `list_tasks` and `count_tasks` (everything but the `after` cursor).
 /// `?5` is top_level, `?6` the done mode (`any`/`unseen`/`auto`), `?7` its `since`, `?8` the
 /// title LIKE pattern (backslash escapes).
@@ -290,6 +289,7 @@ macro_rules! task_where {
     };
 }
 
+/// Task columns as a literal, so queries stay static SQL.
 macro_rules! task_cols {
     () => {
         "id, project_id, parent_id, title, body, status, owner_session_id, owner_agent_id,
@@ -297,6 +297,57 @@ macro_rules! task_cols {
          created_by_agent_id, created_by_session_id, created_at, updated_at, version,
          requires_plan, plan_state, done_at, acked_at"
     };
+}
+
+/// The statement `list_tasks` runs for `filter`. A literal `status = 'done'` lets the planner
+/// use the partial index `tasks_done`; `TaskOrder::DoneNewest` is only meaningful for done
+/// rows, so it always carries the literal. Public (hidden) so a test can `EXPLAIN` it.
+#[doc(hidden)]
+pub fn list_tasks_sql(filter: &TaskFilter) -> &'static str {
+    macro_rules! list_sql {
+        ($done_only:literal, $tail:expr) => {
+            concat!(
+                "SELECT ",
+                task_cols!(),
+                " FROM tasks WHERE ",
+                $done_only,
+                task_where!(),
+                $tail
+            )
+        };
+    }
+    macro_rules! created {
+        () => {
+            " AND (?9 IS NULL
+                    OR (created_at, id) > (SELECT created_at, id FROM tasks WHERE id = ?9))
+                 ORDER BY created_at, id
+                 LIMIT ?10"
+        };
+    }
+    match (filter.order, filter.status == Some(TaskStatus::Done)) {
+        (TaskOrder::Created, false) => list_sql!("", created!()),
+        (TaskOrder::Created, true) => list_sql!("status = 'done' AND ", created!()),
+        (TaskOrder::DoneNewest, _) => list_sql!(
+            "status = 'done' AND ",
+            " AND (?9 IS NULL
+                    OR (done_at, id) < (SELECT done_at, id FROM tasks WHERE id = ?9))
+                 ORDER BY done_at DESC, id DESC
+                 LIMIT ?10"
+        ),
+    }
+}
+
+/// The statement `count_tasks` runs for `filter` (same `status = 'done'` literal rule).
+#[doc(hidden)]
+pub fn count_tasks_sql(filter: &TaskFilter) -> &'static str {
+    if filter.status == Some(TaskStatus::Done) {
+        concat!(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'done' AND ",
+            task_where!()
+        )
+    } else {
+        concat!("SELECT COUNT(*) FROM tasks WHERE ", task_where!())
+    }
 }
 
 /// Whether the claimant may claim the `tasks` row in scope. Binds, in order:
@@ -1307,28 +1358,7 @@ impl Store for SqliteStore {
 
     async fn list_tasks(&self, filter: &TaskFilter) -> StoreResult<Vec<Task>> {
         let (mode, since) = filter.done.parts();
-        let sql = match filter.order {
-            TaskOrder::Created => concat!(
-                "SELECT ",
-                task_cols!(),
-                " FROM tasks WHERE ",
-                task_where!(),
-                " AND (?9 IS NULL
-                    OR (created_at, id) > (SELECT created_at, id FROM tasks WHERE id = ?9))
-                 ORDER BY created_at, id
-                 LIMIT ?10"
-            ),
-            TaskOrder::DoneNewest => concat!(
-                "SELECT ",
-                task_cols!(),
-                " FROM tasks WHERE ",
-                task_where!(),
-                " AND (?9 IS NULL
-                    OR (done_at, id) < (SELECT done_at, id FROM tasks WHERE id = ?9))
-                 ORDER BY done_at DESC, id DESC
-                 LIMIT ?10"
-            ),
-        };
+        let sql = list_tasks_sql(filter);
         sqlx::query(sql)
             .bind(filter.project.map(|p| p.to_string()))
             .bind(filter.status.map(|s| s.as_str()))
@@ -1377,18 +1407,18 @@ impl Store for SqliteStore {
 
     async fn count_tasks(&self, filter: &TaskFilter) -> StoreResult<u64> {
         let (mode, since) = filter.done.parts();
-        let n: i64 =
-            sqlx::query_scalar(concat!("SELECT COUNT(*) FROM tasks WHERE ", task_where!()))
-                .bind(filter.project.map(|p| p.to_string()))
-                .bind(filter.status.map(|s| s.as_str()))
-                .bind(filter.owner.map(|a| a.to_string()))
-                .bind(filter.parent.map(|p| p.to_string()))
-                .bind(filter.top_level)
-                .bind(mode)
-                .bind(since.map(ts::enc))
-                .bind(filter.title.as_deref().map(like_pattern))
-                .fetch_one(&self.pool)
-                .await?;
+        let sql = count_tasks_sql(filter);
+        let n: i64 = sqlx::query_scalar(sql)
+            .bind(filter.project.map(|p| p.to_string()))
+            .bind(filter.status.map(|s| s.as_str()))
+            .bind(filter.owner.map(|a| a.to_string()))
+            .bind(filter.parent.map(|p| p.to_string()))
+            .bind(filter.top_level)
+            .bind(mode)
+            .bind(since.map(ts::enc))
+            .bind(filter.title.as_deref().map(like_pattern))
+            .fetch_one(&self.pool)
+            .await?;
         Ok(n as u64)
     }
 
