@@ -2208,6 +2208,7 @@ impl Store for PostgresStore {
         Ok(Some(Transitioned {
             task: done,
             children_complete,
+            unblocked: Vec::new(),
         }))
     }
 

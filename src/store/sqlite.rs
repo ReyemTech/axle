@@ -2237,6 +2237,7 @@ impl Store for SqliteStore {
         Ok(Some(Transitioned {
             task: done,
             children_complete,
+            unblocked: Vec::new(),
         }))
     }
 
