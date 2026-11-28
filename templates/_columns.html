@@ -4,10 +4,10 @@
   {% if let Some(d) = col.done %}
   <div class="done-tools">
     {% if let Some(token) = csrf %}{% if !col.cards.is_empty() %}
-    <form class="ack-all" method="post" action="/ui/done/ack">
+    <form class="ack-all" data-bulk-ack method="post" action="/ui/done/ack">
       <input type="hidden" name="csrf" value="{{ token }}">
       <input type="hidden" name="back" value="{{ ack_back }}">
-      {% for card in col.cards %}<input type="hidden" name="id" value="{{ card.id }}">{% endfor %}
+      {% for card in col.cards %}<input type="hidden" name="id" value="{{ card.id }}" data-ack-for="{{ card.id }}">{% endfor %}
       <button type="submit" class="secondary">Ack all</button>
     </form>
     {% endif %}{% endif %}

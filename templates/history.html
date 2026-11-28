@@ -24,10 +24,10 @@
 <p class="empty">{% if auto %}No auto-acked, unseen tasks.{% else %}No finished tasks match.{% endif %}</p>
 {% else %}
 {% if auto %}{% if let Some(token) = csrf %}
-<form class="ack-these" method="post" action="/ui/done/ack">
+<form class="ack-these" data-bulk-ack method="post" action="/ui/done/ack">
   <input type="hidden" name="csrf" value="{{ token }}">
   <input type="hidden" name="back" value="{{ back }}">
-  {% for r in rows %}<input type="hidden" name="id" value="{{ r.id }}">{% endfor %}
+  {% for r in rows %}<input type="hidden" name="id" value="{{ r.id }}" data-ack-for="{{ r.id }}">{% endfor %}
   <button type="submit" class="secondary">Ack these</button>
 </form>
 {% endif %}{% endif %}

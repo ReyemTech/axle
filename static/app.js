@@ -108,7 +108,44 @@
     document.querySelectorAll("[data-nav]").forEach(function (el) {
       el.hidden = q !== "" && el.textContent.toLowerCase().indexOf(q) < 0;
     });
+    updateBulkAck(q !== "");
   }
+
+  // Bulk-ack forms (Ack all, Ack these) post every rendered id; while the filter hides cards
+  // they must only post the visible ones, and the button says how many that is.
+  function visibleAckInputs(form) {
+    return Array.prototype.filter.call(
+      form.querySelectorAll("input[data-ack-for]"),
+      function (i) {
+        var card = document.getElementById("task-" + i.getAttribute("data-ack-for"));
+        return !card || !card.hidden;
+      }
+    );
+  }
+  function updateBulkAck(filtering) {
+    document.querySelectorAll("form[data-bulk-ack]").forEach(function (form) {
+      var btn = form.querySelector("button[type=submit]");
+      if (!btn) return;
+      if (btn.getAttribute("data-label") === null) {
+        btn.setAttribute("data-label", btn.textContent);
+      }
+      btn.textContent = filtering
+        ? "Ack " + visibleAckInputs(form).length + " shown"
+        : btn.getAttribute("data-label");
+    });
+  }
+  document.addEventListener("submit", function (e) {
+    var form = e.target;
+    if (!(form instanceof HTMLFormElement) || !form.hasAttribute("data-bulk-ack")) return;
+    var shown = visibleAckInputs(form);
+    if (shown.length === 0) {
+      e.preventDefault();
+      return;
+    }
+    form.querySelectorAll("input[data-ack-for]").forEach(function (i) {
+      i.disabled = shown.indexOf(i) < 0;
+    });
+  });
   document.addEventListener("input", function (e) {
     if (e.target && e.target.id === "search") applySearch();
   });

@@ -3371,3 +3371,64 @@ async fn history_is_in_the_nav_and_requires_login() {
         ["History"]
     );
 }
+
+#[tokio::test]
+async fn bulk_ack_forms_link_each_id_to_its_card_for_the_filter() {
+    let app = app().await;
+    let (_, cookie, _) = board_with_done(&app, &["a", "b"]).await;
+    let board = app.get("/ui/board", Some(&cookie)).await;
+    assert_eq!(
+        select_texts(
+            &board,
+            ".column[data-status=done] form.ack-all[data-bulk-ack]"
+        )
+        .len(),
+        1
+    );
+    let ids = hidden_values(&board, "form.ack-all input[name=id]");
+    let linked = hidden_values(&board, "form.ack-all input[name=id][data-ack-for]");
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids, linked);
+    for id in &ids {
+        assert_eq!(
+            hidden_values(
+                &board,
+                &format!("form.ack-all input[data-ack-for=\"{id}\"]")
+            )
+            .len(),
+            1
+        );
+        assert_eq!(select_texts(&board, &format!("article#task-{id}")).len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn history_bulk_ack_links_each_id_to_its_row() {
+    let app = app().await;
+    let infra = app.agent(INFRA, "mac", "claude-code").await;
+    let t = app.task(&infra, "old", None).await;
+    app.complete(&infra, t.id).await;
+    app.clock.advance(time::Duration::days(8));
+    let recent = app.task(&infra, "recent", None).await;
+    app.complete(&infra, recent.id).await;
+    let cookie = app.login().await;
+    let page = app.get("/ui/history?unseen=auto", Some(&cookie)).await;
+    let ids = hidden_values(&page, "form.ack-these[data-bulk-ack] input[name=id]");
+    assert!(!ids.is_empty());
+    assert_eq!(
+        ids,
+        hidden_values(&page, "form.ack-these input[name=id][data-ack-for]")
+    );
+    for id in &ids {
+        assert_eq!(select_texts(&page, &format!("li#task-{id}")).len(), 1);
+    }
+}
+
+#[test]
+fn app_js_filters_bulk_ack_ids() {
+    let js = include_str!("../static/app.js");
+    assert!(js.contains("form[data-bulk-ack]"));
+    assert!(js.contains("input[data-ack-for]"));
+    assert!(js.contains("addEventListener(\"submit\""));
+    assert!(js.contains("updateBulkAck("));
+}
