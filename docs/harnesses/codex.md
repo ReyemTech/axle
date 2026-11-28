@@ -98,6 +98,35 @@ env = { AXL_SERVER_URL = "http://127.0.0.1:7420" }
 The `mcp_servers` table is Codex's own configuration format; if your Codex version differs,
 follow its MCP documentation and keep the command `axl bridge --harness codex`.
 
+`axl install` also registers the hooks. By hand, add one handler per event to the same file
+(`SessionEnd` gets the shorter timeout; the others use 10):
+
+```toml
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "axl hook session-start --harness codex"
+timeout = 10
+
+[[hooks.PostToolUse]]
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "axl hook post-tool-use --harness codex"
+timeout = 10
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "axl hook stop --harness codex"
+timeout = 10
+
+[[hooks.SessionEnd]]
+[[hooks.SessionEnd.hooks]]
+type = "command"
+command = "axl hook session-end --harness codex"
+timeout = 3
+```
+
 Without the hooks the agent sees messages only when it calls `fetch_inbox` or `whoami`, so
 tell it when to look. In `AGENTS.md`:
 

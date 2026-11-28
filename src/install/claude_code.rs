@@ -40,12 +40,14 @@ pub enum ClaudeMode {
 /// `strictKnownMarketplaces`) can silently skip it. Claude Code version: not run.
 pub const MODE: ClaudeMode = ClaudeMode::Plugin;
 
-/// Settings key and `axl hook` argument for each event the hooks cover.
-const EVENTS: [(&str, &str); 4] = [
-    ("SessionStart", "session-start"),
-    ("UserPromptSubmit", "user-prompt-submit"),
-    ("PostToolUse", "post-tool-use"),
-    ("Stop", "stop"),
+/// Settings key, `axl hook` argument and timeout in seconds for each event the hooks cover.
+/// SessionEnd gets 3 s: Claude Code cancels it when the session is already closing.
+const EVENTS: [(&str, &str, u32); 5] = [
+    ("SessionStart", "session-start", 5),
+    ("UserPromptSubmit", "user-prompt-submit", 5),
+    ("PostToolUse", "post-tool-use", 5),
+    ("Stop", "stop", 5),
+    ("SessionEnd", "session-end", 3),
 ];
 
 const PLUGIN_FILES: [&str; 4] = [
@@ -113,18 +115,18 @@ fn mcp_entry(axl: &str) -> CstInputValue {
     ])
 }
 
-fn handler(command: &str) -> CstInputValue {
+fn handler(command: &str, timeout: u32) -> CstInputValue {
     object(vec![
         ("type", string("command")),
         ("command", string(command)),
-        ("timeout", number(5)),
+        ("timeout", number(timeout)),
     ])
 }
 
-fn hook_group(command: &str) -> CstInputValue {
+fn hook_group(command: &str, timeout: u32) -> CstInputValue {
     object(vec![(
         "hooks",
-        CstInputValue::Array(vec![handler(command)]),
+        CstInputValue::Array(vec![handler(command, timeout)]),
     )])
 }
 
@@ -134,10 +136,10 @@ fn hooks_snippet(axl: &str) -> String {
         object(
             EVENTS
                 .iter()
-                .map(|(e, a)| {
+                .map(|(e, a, t)| {
                     (
                         *e,
-                        CstInputValue::Array(vec![hook_group(&hook_command(axl, a))]),
+                        CstInputValue::Array(vec![hook_group(&hook_command(axl, a), *t)]),
                     )
                 })
                 .collect(),
@@ -443,9 +445,9 @@ fn edit_settings(cx: &mut Ctx, mode: ClaudeMode) -> Result<Option<FileEdit>, Edi
     }
     let axl = cx.axl.clone();
     let desired = |event: &str| -> Option<(String, Value)> {
-        let (_, arg) = EVENTS.iter().find(|(e, _)| *e == event)?;
+        let (_, arg, timeout) = EVENTS.iter().find(|(e, _, _)| *e == event)?;
         let cmd = hook_command(&axl, arg);
-        let value = jsonc::to_value(&handler(&cmd));
+        let value = jsonc::to_value(&handler(&cmd, *timeout));
         Some((cmd, value))
     };
 
@@ -460,7 +462,7 @@ fn edit_settings(cx: &mut Ctx, mode: ClaudeMode) -> Result<Option<FileEdit>, Edi
     let kept: HashSet<&str> = if mode == ClaudeMode::UserScope {
         EVENTS
             .iter()
-            .map(|(e, _)| *e)
+            .map(|(e, _, _)| *e)
             .filter(|e| {
                 let mine: Vec<&Found> = seen.iter().filter(|f| f.event == *e).collect();
                 let (cmd, value) = desired(e).expect("known event");
@@ -509,7 +511,7 @@ fn edit_settings(cx: &mut Ctx, mode: ClaudeMode) -> Result<Option<FileEdit>, Edi
             p.remove();
         }
     } else {
-        for (event, arg) in EVENTS {
+        for (event, arg, timeout) in EVENTS {
             let key = format!("hooks.{event}");
             if !kept.contains(event) {
                 let hooks = obj
@@ -518,7 +520,7 @@ fn edit_settings(cx: &mut Ctx, mode: ClaudeMode) -> Result<Option<FileEdit>, Edi
                 let arr = hooks
                     .array_value_or_create(event)
                     .ok_or_else(|| manual(&format!("`hooks.{event}` is not an array")))?;
-                arr.append(hook_group(&hook_command(&cx.axl, arg)));
+                arr.append(hook_group(&hook_command(&cx.axl, arg), timeout));
             }
             // An adoption above already recorded this key; the dedup keeps its original.
             cx.push(&file, EntryKind::Added, &key, None);
@@ -688,7 +690,7 @@ pub fn plan_uninstall(home: &Path, manifest: &Manifest) -> Result<Plan, EditErro
     // ~/.claude/settings.json: every `axl hook <event>` handler.
     let event_keys: Vec<&str> = EVENTS
         .iter()
-        .map(|(e, _)| *e)
+        .map(|(e, _, _)| *e)
         .filter(|e| has(&paths.settings, &format!("hooks.{e}")))
         .collect();
     if !event_keys.is_empty()

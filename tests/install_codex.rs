@@ -278,6 +278,7 @@ fn hooks_block_written() {
         ("SessionStart", "session-start"),
         ("PostToolUse", "post-tool-use"),
         ("Stop", "stop"),
+        ("SessionEnd", "session-end"),
     ] {
         assert!(block.contains(&format!("[[hooks.{event}]]")), "{event}");
         let groups = v["hooks"][event].as_array().unwrap();
@@ -288,9 +289,10 @@ fn hooks_block_written() {
             h["command"].as_str().unwrap(),
             format!("{AXL} hook {arg} --harness codex")
         );
-        assert_eq!(h["timeout"].as_integer(), Some(10));
+        let want = if event == "SessionEnd" { 3 } else { 10 };
+        assert_eq!(h["timeout"].as_integer(), Some(want), "{event}");
     }
-    assert_eq!(v["hooks"].as_table().unwrap().len(), 3, "no other events");
+    assert_eq!(v["hooks"].as_table().unwrap().len(), 4, "no other events");
     assert!(
         plan.notes
             .iter()
@@ -352,7 +354,7 @@ fn moved_binary_is_rewritten_in_place() {
     assert!(adopted.is_empty(), "our own entries are not adoptions");
     let cfg = config(home.path());
     assert!(!cfg.contains(AXL), "old path left behind:\n{cfg}");
-    assert_eq!(cfg.matches("/usr/local/bin/axl").count(), 4);
+    assert_eq!(cfg.matches("/usr/local/bin/axl").count(), 5);
     assert!(cfg.trim_end().ends_with(END), "block stayed last:\n{cfg}");
     let (again, _, _) = plan_install(home.path(), Path::new("/usr/local/bin/axl"), &m).unwrap();
     assert_eq!(render_diff(&again), "");
@@ -392,10 +394,12 @@ fn uninstall_after_adoption_removes_managed_form_only() {
     let home = home_for("handmade");
     let mut m = Manifest::default();
     install(home.path(), &mut m).unwrap();
+    assert!(config(home.path()).contains("hook session-end"));
     let plan = plan_uninstall(home.path(), &m).unwrap();
     apply(&plan, datetime!(2026-11-27 12:10:00 UTC)).unwrap();
     let after = config(home.path());
     assert!(!after.contains("axle") && !after.contains(START), "{after}");
+    assert!(!after.contains("session-end"), "{after}");
     assert!(!after.contains("axl hook"));
     assert!(after.contains("[mcp_servers.other]") && after.contains("echo my own hook"));
     assert!(after.contains("model = \"gpt-5\""));

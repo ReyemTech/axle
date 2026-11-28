@@ -101,6 +101,9 @@ Add to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
     ],
     "Stop": [
       { "hooks": [{ "type": "command", "command": "axl hook stop", "timeout": 5 }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "axl hook session-end", "timeout": 3 }] }
     ]
   }
 }
