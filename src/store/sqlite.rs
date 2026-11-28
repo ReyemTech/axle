@@ -2504,6 +2504,7 @@ impl Store for SqliteStore {
                                              excluded.cache_read_tokens),
                      reasoning_tokens = MAX(usage_records.reasoning_tokens,
                                             excluded.reasoning_tokens)
+                 WHERE usage_records.token_id = excluded.token_id
                  RETURNING id, model, speed, input_tokens, output_tokens, cache_write_5m_tokens,
                            cache_write_1h_tokens, cache_read_tokens, reasoning_tokens",
             )
@@ -2529,8 +2530,13 @@ impl Store for SqliteStore {
             .bind(batch.harness_session_id)
             .bind(ts::enc(r.occurred_at))
             .bind(ts::enc(batch.now))
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
+            // No row: another token already holds this key. Its counts are not ours to merge.
+            let Some(row) = row else {
+                written.duplicate += 1;
+                continue;
+            };
             let stored: UsageId = uuid_of(row.try_get("id")?)?;
             if stored == id {
                 written.inserted += 1;

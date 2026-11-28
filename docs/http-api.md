@@ -276,7 +276,7 @@ A record:
 
 | Field | Notes |
 |---|---|
-| `key` | The harness's id for the response; 1 to 200 bytes. A record with a key already stored for the same harness is a duplicate: counts take the larger value, nothing is added twice. |
+| `key` | The harness's id for the response; 1 to 200 bytes. A record with a key already stored for the same harness is a duplicate: counts take the larger value when the same token stored it (a key stored under another token is left unchanged), nothing is added twice. |
 | `at` | RFC 3339 time of the response. |
 | `model` | 1 to 128 bytes of `A-Za-z0-9._:/@-`. |
 | `input`, `output`, `cache_write_5m`, `cache_write_1h`, `cache_read`, `reasoning` | Token counts, 0 to 1 000 000 000. `input` is uncached input only; `reasoning` is part of `output` and never priced twice. |

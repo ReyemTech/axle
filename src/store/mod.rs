@@ -396,8 +396,9 @@ pub trait Store: Send + Sync {
     /// In one transaction, for each record: upserts by `(agent.harness, key)`. A new row takes
     /// the batch's session/agent/project/token, `pricer`'s price and one allocation row per task
     /// `session` held at `occurred_at` (`parts` = how many), or one `(NULL, 1)` row. An existing
-    /// row keeps its session, model, billing, times and allocations, takes the larger value of
-    /// each count, and is re-priced from the merged counts.
+    /// row written by the same token keeps its session, model, billing, times and allocations,
+    /// takes the larger value of each count, and is re-priced from the merged counts; one
+    /// written by another token is left as it is (a duplicate).
     async fn insert_usage(
         &self,
         batch: &UsageBatch<'_>,

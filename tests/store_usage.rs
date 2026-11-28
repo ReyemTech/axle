@@ -4,7 +4,7 @@ mod common;
 use std::sync::Arc;
 
 use axle::clock::{Clock, TestClock};
-use axle::domain::{Billing, Eligibility, SessionId, Task, TaskId};
+use axle::domain::{Billing, Eligibility, SessionId, Task, TaskId, TokenId};
 use axle::service::identity::{IdentityInput, IdentityService, Resolved};
 use axle::service::tasks::{Caller, ClaimOutcome, Completion, NewTask, TaskService};
 use axle::store::{
@@ -43,6 +43,18 @@ impl Env {
     }
 
     async fn session_in(&self, project: &str, host: &str, harness: &str) -> Resolved {
+        let token = common::token(&*self.store).await;
+        self.session_with(project, host, harness, token).await
+    }
+
+    /// A new session of the agent `(project, host, harness)` under an existing `token`.
+    async fn session_with(
+        &self,
+        project: &str,
+        host: &str,
+        harness: &str,
+        token: TokenId,
+    ) -> Resolved {
         IdentityService::resolve(
             &*self.store,
             &*self.clock,
@@ -51,7 +63,7 @@ impl Env {
                 host: host.into(),
                 harness: harness.into(),
                 session: SessionId::new(),
-                token: common::token(&*self.store).await,
+                token,
             },
         )
         .await
@@ -269,7 +281,9 @@ store_matrix!(
     |store: Arc<dyn Store>| async move {
         let env = Env::new(store);
         let a = env.session("mac", "claude-code").await;
-        let b = env.session("linux", "claude-code").await;
+        let b = env
+            .session_with(PROJECT, "linux", "claude-code", a.session.token_id)
+            .await;
         report(&env, &a, &[rec("req_1", T0, 12)], &PerToken).await;
 
         env.set_time(Duration::minutes(1));
@@ -308,6 +322,47 @@ store_matrix!(
         assert_eq!((u.occurred_at, u.received_at), (T0, T0));
         assert_eq!(u.cost_micros, Some(12 + 900 + 7));
         assert_eq!(u.allocations, vec![(None, 1)]);
+    }
+);
+
+store_matrix!(
+    usage_duplicate_from_another_token_is_noop,
+    |store: Arc<dyn Store>| async move {
+        let env = Env::new(store);
+        let a = env.session("mac", "claude-code").await;
+        let other = env.session("linux", "claude-code").await;
+        assert_ne!(a.session.token_id, other.session.token_id);
+        report(&env, &a, &[rec("req_1", T0, 12)], &PerToken).await;
+
+        env.set_time(Duration::minutes(1));
+        let mut bigger = rec("req_1", T0 + Duration::minutes(1), 500);
+        bigger.counts.output = 900;
+        let w = report(&env, &other, &[bigger], &PerToken).await;
+        assert_eq!(
+            w,
+            UsageWritten {
+                inserted: 0,
+                duplicate: 1
+            }
+        );
+
+        let u = env
+            .store
+            .get_usage("claude-code", "req_1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            u.counts,
+            UsageCounts {
+                input: 12,
+                output: 10,
+                ..UsageCounts::default()
+            },
+            "another token's counts are not merged"
+        );
+        assert_eq!(u.session, a.session.id);
+        assert_eq!(u.cost_micros, Some(12 + 10));
     }
 );
 
