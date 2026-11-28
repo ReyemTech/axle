@@ -213,12 +213,13 @@ fn unrelated_config_untouched() {
     let home = home_for("unrelated");
     let mut m = Manifest::default();
     install(home.path(), &mut m, ClaudeMode::Plugin).unwrap();
-    for rel in [".claude.json", ".claude/settings.json", ".claude/CLAUDE.md"] {
+    for rel in [".claude.json", ".claude/settings.json"] {
         assert_eq!(
             std::fs::read(home.path().join(rel)).unwrap(),
             std::fs::read(fixture("unrelated", "before").join(rel)).unwrap(),
             "{rel} changed"
         );
+        let name = Path::new(rel).file_name().unwrap().to_string_lossy();
         assert!(
             std::fs::read_dir(home.path().join(rel).parent().unwrap())
                 .unwrap()
@@ -226,7 +227,7 @@ fn unrelated_config_untouched() {
                     .unwrap()
                     .file_name()
                     .to_string_lossy()
-                    .contains(".axl-backup-")),
+                    .starts_with(&format!("{name}.axl-backup-"))),
             "no backup for an untouched file"
         );
     }
@@ -475,27 +476,127 @@ fn claude_unparseable_json_is_manual_and_untouched() {
 
 #[test]
 fn orphan_marker_in_claude_md_is_manual() {
-    let home = Temp::new();
-    std::fs::create_dir_all(home.path().join(".claude")).unwrap();
-    let text = "# mine\n# >>> axle >>>\nhalf a block\n";
-    std::fs::write(home.path().join(".claude/CLAUDE.md"), text).unwrap();
-    let err = plan_install(
-        home.path(),
-        Path::new(AXL),
-        &Manifest::default(),
-        ClaudeMode::UserScope,
-    )
-    .unwrap_err();
-    match err {
-        EditError::NeedsManual { reason, .. } => {
-            assert!(reason.contains("CLAUDE.md:2"), "{reason}")
+    for mode in [ClaudeMode::Plugin, ClaudeMode::UserScope] {
+        let home = Temp::new();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let text = "# mine\n# >>> axle >>>\nhalf a block\n";
+        std::fs::write(home.path().join(".claude/CLAUDE.md"), text).unwrap();
+        let err =
+            plan_install(home.path(), Path::new(AXL), &Manifest::default(), mode).unwrap_err();
+        match err {
+            EditError::NeedsManual {
+                reason, snippet, ..
+            } => {
+                assert!(reason.contains("CLAUDE.md:2"), "{mode:?}: {reason}");
+                assert!(snippet.contains(axle::install::INSTRUCTIONS.trim_end()));
+            }
+            e => panic!("{e}"),
         }
-        e => panic!("{e}"),
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(".claude/CLAUDE.md")).unwrap(),
+            text,
+            "{mode:?}"
+        );
     }
+}
+
+fn block() -> String {
+    format!(
+        "# >>> axle >>>\n{}\n# <<< axle <<<\n",
+        axle::install::INSTRUCTIONS.trim_end()
+    )
+}
+
+#[test]
+fn plugin_mode_creates_claude_md_with_the_rules_block() {
+    let home = home_for("empty");
+    let mut m = Manifest::default();
+    let (plan, _, _) = plan_install(home.path(), Path::new(AXL), &m, ClaudeMode::Plugin).unwrap();
+    // Dry run: the diff names the file and shows the block; nothing is written yet.
+    let diff = render_diff(&plan);
+    assert!(diff.contains(".claude/CLAUDE.md"), "{diff}");
+    assert!(diff.contains("# >>> axle >>>"), "{diff}");
+    assert!(!home.path().join(".claude/CLAUDE.md").exists());
+
+    install(home.path(), &mut m, ClaudeMode::Plugin).unwrap();
+    let md = std::fs::read_to_string(home.path().join(".claude/CLAUDE.md")).unwrap();
+    assert_eq!(md, block());
+    let md_path = home.path().join(".claude/CLAUDE.md");
+    let kinds: Vec<_> = m
+        .entries
+        .iter()
+        .filter(|e| e.file == md_path)
+        .map(|e| (e.kind, e.key.clone()))
+        .collect();
+    assert!(
+        kinds.contains(&(axle::install::EntryKind::Block, "block".to_string())),
+        "{kinds:?}"
+    );
+    assert!(
+        kinds.contains(&(axle::install::EntryKind::CreatedFile, "file".to_string())),
+        "{kinds:?}"
+    );
+
+    // Uninstall removes the file it created.
+    let plan = plan_uninstall(home.path(), &m).unwrap();
+    apply(&plan, datetime!(2026-11-27 12:10:00 UTC)).unwrap();
+    assert!(!md_path.exists());
+}
+
+#[test]
+fn plugin_mode_appends_block_to_existing_claude_md_with_backup() {
+    let home = home_for("unrelated");
+    let original = std::fs::read_to_string(home.path().join(".claude/CLAUDE.md")).unwrap();
+    let mut m = Manifest::default();
+    install(home.path(), &mut m, ClaudeMode::Plugin).unwrap();
+    let md = std::fs::read_to_string(home.path().join(".claude/CLAUDE.md")).unwrap();
+    assert_eq!(md, format!("{original}\n{}", block()));
+    let backups: Vec<String> = std::fs::read_dir(home.path().join(".claude"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("CLAUDE.md.axl-backup-"))
+        .collect();
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(
+        std::fs::read_to_string(home.path().join(".claude").join(&backups[0])).unwrap(),
+        original
+    );
+
+    // Uninstall removes exactly the block.
+    let plan = plan_uninstall(home.path(), &m).unwrap();
+    apply(&plan, datetime!(2026-11-27 12:10:00 UTC)).unwrap();
     assert_eq!(
         std::fs::read_to_string(home.path().join(".claude/CLAUDE.md")).unwrap(),
-        text
+        original
     );
+}
+
+#[test]
+fn reinstall_adds_the_block_to_an_older_install() {
+    let home = home_for("unrelated");
+    let mut m = Manifest::default();
+    install(home.path(), &mut m, ClaudeMode::Plugin).unwrap();
+    // An install from before the block existed: no block in the file or the manifest.
+    let md_path = home.path().join(".claude/CLAUDE.md");
+    let original =
+        std::fs::read_to_string(fixture("unrelated", "before").join(".claude/CLAUDE.md")).unwrap();
+    std::fs::write(&md_path, &original).unwrap();
+    m.entries.retain(|e| e.file != md_path);
+
+    let (plan, entries, adopted) =
+        plan_install(home.path(), Path::new(AXL), &m, ClaudeMode::Plugin).unwrap();
+    assert!(adopted.is_empty());
+    let diff = render_diff(&plan);
+    assert!(diff.contains("# >>> axle >>>"), "{diff}");
+    apply(&plan, datetime!(2026-11-27 12:05:00 UTC)).unwrap();
+    for e in entries {
+        m.record(e);
+    }
+    let md = std::fs::read_to_string(&md_path).unwrap();
+    assert_eq!(md.matches("# >>> axle >>>").count(), 1);
+    // Re-running again changes nothing.
+    let (plan, _, _) = plan_install(home.path(), Path::new(AXL), &m, ClaudeMode::Plugin).unwrap();
+    assert_eq!(render_diff(&plan), "");
 }
 
 #[test]

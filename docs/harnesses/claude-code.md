@@ -1,12 +1,14 @@
 # Claude Code
 
-Claude Code gets two pieces:
+Claude Code gets three pieces:
 
 - **The bridge**, an MCP server over stdio that gives the model the Axle tools.
-- **Hooks**, which surface new messages while Claude Code is busy, without the model having
-  to check.
+- **Hooks**, which give every session the Axle rules and what it holds, surface new messages
+  while Claude Code is busy, and remind a session that works without a task.
+- **The rules block** in `~/.claude/CLAUDE.md`, which Claude Code reads at every session
+  start.
 
-Both are optional and fail open: with Axle down or unconfigured, Claude Code behaves as if
+All are optional and fail open: with Axle down or unconfigured, Claude Code behaves as if
 neither were installed.
 
 ## Set up
@@ -17,7 +19,10 @@ axl install --harness claude-code
 
 Run it with no `--harness` to configure every harness it finds. It adds an Axle-owned plugin
 (bridge, hooks and instructions) linked into `~/.claude/skills/axle`, falling back to
-user-scope entries in `~/.claude.json` and `~/.claude/settings.json`. It first saves a
+user-scope entries in `~/.claude.json` and `~/.claude/settings.json`. In both cases it also
+writes the rules between `# >>> axle >>>` and `# <<< axle <<<` markers in
+`~/.claude/CLAUDE.md` (creating the file if needed, leaving the rest of it as it was); an
+install from an earlier version gets the block on the next `axl install`. It first saves a
 `<file>.axl-backup-<UTC timestamp>` copy of anything it edits, and `axl uninstall --harness
 claude-code` reverses it. See the [CLI reference](../cli.md#axl-install).
 
@@ -102,13 +107,14 @@ Add to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
 ```
 
 Each hook reads Claude Code's hook JSON on stdin and asks the server for the session's
-unread mail, with a 2-second network timeout and a 5-second ceiling overall.
+unread mail (and, where needed, the tasks it holds), with a 2-second timeout per request, a
+2.5-second budget for all of them, and a 5-second ceiling overall.
 
 | Hook | What it does |
 |---|---|
-| `session-start` | Adds up to 5 unread messages (urgent first, then newest) as `additionalContext`. |
-| `user-prompt-submit` | The same, but only messages not shown before. |
-| `post-tool-use` | The same, but only `high` and `urgent` messages, each at most once. |
+| `session-start` | Always adds the Axle rules as `additionalContext`, then a status line (`You hold no axle task.` or `You hold: <title> (<id>), …`), then up to 5 unread messages (urgent first, then newest). |
+| `user-prompt-submit` | Up to 5 unread messages, only those not shown before. |
+| `post-tool-use` | The same, but only `high` and `urgent` messages, each at most once. After `Edit`, `Write`, `MultiEdit`, `NotebookEdit` or `Bash`, when the session holds no task, it also adds once per session: `You are working without an axle task. Create or claim one (task_create / task_claim) so other agents and the owner can see this work.` |
 | `stop` | Blocks the stop once per `urgent` message so the agent reads it. Never blocks when Claude Code reports `stop_hook_active`. |
 
 Injected text is framed as peer data:
@@ -120,14 +126,20 @@ Injected text is framed as peer data:
 
 The hooks only show previews; the model reads the full message with `fetch_inbox` and
 acknowledges it with `ack_messages`. Message ids already surfaced are remembered in
-`~/.axl/sessions/<pid>.seen`, so the same message is not injected twice.
+`~/.axl/sessions/<pid>.seen`, so the same message is not injected twice; the one-time
+reminder is remembered in `~/.axl/sessions/<pid>.nudged`. The reminder is context only,
+never a block: a session answering a question needs no task, and a hook must never stop
+work.
 
 Any failure (no session file, no token, server down, bad input) produces one line on
-stderr, exit code 0 and no stdout, so a broken hook never blocks Claude Code.
+stderr, exit code 0 and no stdout, so a broken hook never blocks Claude Code. The one
+exception is `session-start`, which still adds the rules alone (no status line, no error
+text).
 
-## Suggested instructions
+## Instructions
 
-Agents use the tools better with a short note in `CLAUDE.md`:
+`axl install` writes this block into `~/.claude/CLAUDE.md`, and the `session-start` hook
+injects the same text. Without `axl install`, add it yourself:
 
 ```markdown
 ## Axle
