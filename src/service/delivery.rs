@@ -287,7 +287,14 @@ impl DeliveryService {
             TaskEventKind::StageReached
         };
         self.notifier()
-            .announce(&moved.task, kind, None, Actor::Human, None, false)
+            .announce(
+                &moved.task,
+                kind,
+                None,
+                Actor::Human,
+                None,
+                moved.children_complete,
+            )
             .await;
         Ok(moved.task)
     }
@@ -302,15 +309,15 @@ impl DeliveryService {
             .ok_or(DeliveryError::NotDelivering)?;
         self.notifier()
             .announce(
-                &done,
+                &done.task,
                 TaskEventKind::Delivered,
                 Some("marked done by the human"),
                 Actor::Human,
                 None,
-                false,
+                done.children_complete,
             )
             .await;
-        Ok(done)
+        Ok(done.task)
     }
 
     /// The task's delivery state; `None` when its project has no stages and it has no PR.

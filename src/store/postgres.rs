@@ -920,12 +920,12 @@ async fn advance_locked(conn: &mut PgConnection, m: &StageMove) -> StoreResult<O
     insert_moved_stage(conn, m, m.to).await?;
     let reached = stage_reached_event(m);
     let delivered = updated.status == TaskStatus::Done;
-    if delivered {
+    let children_complete = if delivered {
         insert_event(conn, &reached, m.token).await?;
-        record_event(conn, &updated, &stage_delivered_event(m), m.token).await?;
+        record_event(conn, &updated, &stage_delivered_event(m), m.token).await?
     } else {
-        record_event(conn, &updated, &reached, m.token).await?;
-    }
+        record_event(conn, &updated, &reached, m.token).await?
+    };
     if parent_rule {
         let moved = follow_children(
             conn,
@@ -942,6 +942,7 @@ async fn advance_locked(conn: &mut PgConnection, m: &StageMove) -> StoreResult<O
     }
     Ok(Some(StageMoved {
         delivered: updated.status == TaskStatus::Done,
+        children_complete,
         task: updated,
     }))
 }
@@ -2180,7 +2181,7 @@ impl Store for PostgresStore {
         actor: Actor,
         token: Option<TokenId>,
         now: OffsetDateTime,
-    ) -> StoreResult<Option<Task>> {
+    ) -> StoreResult<Option<Transitioned>> {
         let mut tx = self.pool.begin().await?;
         // The guarded update locks the task row before the parent rule locks its parent.
         let done = sqlx::query(concat!(
@@ -2201,9 +2202,13 @@ impl Store for PostgresStore {
             tx.rollback().await?;
             return Ok(None);
         };
-        record_event(&mut tx, &done, &marked_done_event(task, actor, now), token).await?;
+        let children_complete =
+            record_event(&mut tx, &done, &marked_done_event(task, actor, now), token).await?;
         tx.commit().await?;
-        Ok(Some(done))
+        Ok(Some(Transitioned {
+            task: done,
+            children_complete,
+        }))
     }
 
     async fn insert_signal(&self, s: &DeliverySignal) -> StoreResult<SignalInsert> {

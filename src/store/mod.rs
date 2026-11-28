@@ -259,7 +259,7 @@ pub trait Store: Send + Sync {
         actor: Actor,
         token: Option<TokenId>,
         now: OffsetDateTime,
-    ) -> StoreResult<Option<Task>>;
+    ) -> StoreResult<Option<Transitioned>>;
     /// Appends `s` to the delivery log. `Duplicate` (nothing written) when the project already
     /// logged a signal with the same `delivery_id`; signals without one never collide.
     async fn insert_signal(&self, s: &DeliverySignal) -> StoreResult<SignalInsert>;
@@ -972,6 +972,9 @@ pub struct StageMoved {
     pub task: Task,
     /// Whether the move finished the task (`delivering → done`).
     pub delivered: bool,
+    /// Whether that closed the parent's last open child (the store recorded
+    /// `children_complete` on it).
+    pub children_complete: bool,
 }
 
 /// What `insert_signal` did.

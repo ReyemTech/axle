@@ -1731,7 +1731,8 @@ store_matrix!(mark_delivered_guarded, |store: Arc<dyn Store>| async move {
         .mark_delivered(task.id, Actor::Human, None, T2)
         .await
         .unwrap()
-        .expect("delivering task");
+        .expect("delivering task")
+        .task;
     assert_eq!(done.status, TaskStatus::Done);
     assert_eq!(done.done_at, Some(T2));
     assert_eq!(done.updated_at, T2);
@@ -2214,3 +2215,81 @@ store_matrix!(child_through_delivery_notifies_parent, |store: Arc<
         "{subjects:?}"
     );
 });
+
+/// The last open child of a claimed parent finishing through delivery closes the parent's
+/// children like a plain done: the high-importance message, and the parent's move to review
+/// published.
+async fn last_child_through_delivery(store: Arc<dyn Store>, mark_done: bool) {
+    let clock = Arc::new(TestClock::new(T1));
+    let bus = axle::events::EventBus::new(store.clone(), clock.clone());
+    let mut rx = bus.subscribe();
+    let svc = DeliveryService::new(store.clone(), clock).with_events(bus);
+    let dx = Dx {
+        fx: Fx::new(store).await,
+        svc,
+    };
+    dx.stages(&[DeliveryStage::InPr, DeliveryStage::Merged])
+        .await;
+    let parent = dx.fx.claimed("parent", None).await;
+    let child = dx.fx.claimed("child", Some(parent.id)).await;
+    dx.fx
+        .svc
+        .complete(
+            &dx.fx.owner,
+            child.id,
+            Completion {
+                summary: "shipped".into(),
+                links: vec![pr_url(7)],
+                ..Completion::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(dx.fx.get(parent.id).await.status, TaskStatus::Claimed);
+    while rx.try_recv().is_ok() {}
+
+    if mark_done {
+        dx.svc.mark_done(child.id).await.unwrap();
+    } else {
+        dx.svc.advance(child.id).await.unwrap();
+    }
+    assert_eq!(dx.fx.get(parent.id).await.status, TaskStatus::Review);
+    let subjects: Vec<_> = dx
+        .fx
+        .store
+        .task_thread(parent.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|m| m.subject)
+        .collect();
+    assert!(
+        subjects.contains(&"child tasks complete".to_string()),
+        "{subjects:?}"
+    );
+    let mut parent_changes = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        if let axle::events::Event::TaskChanged {
+            id, status, kind, ..
+        } = e
+            && id == parent.id
+        {
+            parent_changes.push((status, kind));
+        }
+    }
+    assert_eq!(
+        parent_changes,
+        vec![(TaskStatus::Review, TaskEventKind::ChildrenComplete)]
+    );
+}
+
+store_matrix!(last_child_advanced_closes_parent_children, |store: Arc<
+    dyn Store,
+>| async move {
+    last_child_through_delivery(store, false).await
+});
+
+store_matrix!(
+    last_child_marked_done_closes_parent_children,
+    |store: Arc<dyn Store>| async move { last_child_through_delivery(store, true).await }
+);
