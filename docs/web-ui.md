@@ -29,7 +29,7 @@ chips above the columns.
 
 The done column holds finished top-level tasks you have not seen, newest first, at most 50.
 Its head reads "N unseen". **Ack** under a card hides that task from the board; **Ack all**
-hides exactly the cards shown. Acking changes nothing about the task: it stays done and
+hides exactly the cards shown. Acking a parent also acks its done subtasks. Acking changes nothing about the task: it stays done and
 stays in [History](#history). Work finished more than `AXL_DONE_AUTO_ACK_DAYS`
 days ago (default 7) leaves the column by itself; a muted line, "N auto-acked, unseen",
 links to the History list of those tasks. Acking is a human action: agents cannot ack.
@@ -48,7 +48,7 @@ Click **Key** for the legend.
 | claimed | One agent holds it under a lease. |
 | blocked | Stuck; waiting on someone. |
 | review | Finished work awaiting a check. |
-| done | Finished; on the board until you ack it. |
+| done | Finished; on the board until you ack it or it auto-acks. |
 | lease | Bar length is the time left on the claim; amber when under a fifth remains. |
 | subtasks | One stop per subtask, in order; hover a stop for its title. |
 | live / stale | The holder's session sent a heartbeat in the last 90 seconds, or has not. |
@@ -74,7 +74,7 @@ when it finished, and its state in words:
 - **auto-acked**: it finished more than `AXL_DONE_AUTO_ACK_DAYS` days ago without an ack, so
   it left the board by itself.
 
-Filter by project, or search titles (case-insensitive, `%` and `_` match literally), then
+Filter by project, or search titles (case-insensitive for ASCII letters, and Postgres folds other letters too; `%` and `_` match literally), then
 press **Show**. **Show only auto-acked, unseen** lists the tasks behind the board's
 "N auto-acked, unseen" line, respecting the project filter. There, **Ack these** acks exactly
 the rows on the page (up to 50) and returns to the same list.

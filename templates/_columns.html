@@ -11,7 +11,7 @@
       <button type="submit" class="secondary">Ack all</button>
     </form>
     {% endif %}{% endif %}
-    <a class="history-link" href="/ui/history">History →</a>
+    <a class="history-link" href="{{ d.history_href }}">History →</a>
     {% if d.auto_unseen > 0 %}<p class="auto-acked"><a href="{{ d.auto_href }}">{{ d.auto_unseen }} auto-acked, unseen →</a></p>{% endif %}
   </div>
   {% endif %}
@@ -21,11 +21,11 @@
   <form class="ack" method="post" action="/ui/tasks/{{ card.id }}/ack">
     <input type="hidden" name="csrf" value="{{ token }}">
     <input type="hidden" name="back" value="{{ ack_back }}">
-    <button type="submit" class="secondary">Ack</button>
+    <button type="submit" class="secondary" aria-label="Ack {{ card.title }}">Ack</button>
   </form>
   {% endif %}{% endif %}
   {% endfor %}
-  {% if col.cards.is_empty() %}<p class="empty">{% if col.status == "open" %}No open work. New tasks land here.{% else if col.status == "claimed" %}No block occupied. Claimed tasks show here with their lease.{% else if col.status == "blocked" %}Nothing blocked.{% else if col.status == "review" %}Nothing awaiting review.{% else %}Nothing unseen. Finished work stays here until you ack it.{% endif %}</p>{% endif %}
+  {% if col.cards.is_empty() %}<p class="empty">{% if col.status == "open" %}No open work. New tasks land here.{% else if col.status == "claimed" %}No block occupied. Claimed tasks show here with their lease.{% else if col.status == "blocked" %}Nothing blocked.{% else if col.status == "review" %}Nothing awaiting review.{% else %}Nothing unseen. Finished work stays here until you ack it or it auto-acks.{% endif %}</p>{% endif %}
   </div>
 </section>
 {% endfor %}

@@ -466,6 +466,8 @@ pub struct DoneHead {
     /// Auto-acked unseen done tasks, subtasks included (the same set History `?unseen=auto`
     /// lists).
     pub auto_unseen: u64,
+    /// `/ui/history`, plus `?project=<id>` when the board is filtered.
+    pub history_href: String,
     /// `/ui/history?unseen=auto`, plus `&project=<id>` when the board is filtered.
     pub auto_href: String,
 }
@@ -585,6 +587,10 @@ async fn columns(
             done = Some(DoneHead {
                 unseen: state.store.count_tasks(&unseen).await?,
                 auto_unseen,
+                history_href: match project {
+                    Some(p) => format!("/ui/history?project={p}"),
+                    None => "/ui/history".to_string(),
+                },
                 auto_href: match project {
                     Some(p) => format!("/ui/history?unseen=auto&project={p}"),
                     None => "/ui/history?unseen=auto".to_string(),

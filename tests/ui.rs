@@ -753,6 +753,9 @@ async fn board_done_column_shows_unseen_newest_first() {
     );
     assert!(page.body.contains("href=\"/ui/history?unseen=auto\""));
     assert!(page.body.contains("href=\"/ui/history\""));
+    // Each per-card Ack button is named for its card.
+    assert!(page.body.contains("aria-label=\"Ack second\""));
+    assert!(page.body.contains("aria-label=\"Ack first\""));
     assert!(!page.text().contains("dropped"));
     assert!(!page.text().contains("7 days"));
 }
@@ -784,6 +787,13 @@ async fn auto_acked_link_carries_the_project_filter() {
         page.body.contains(&format!(
             "href=\"/ui/history?unseen=auto&#38;project={pid}\""
         )),
+        "{}",
+        page.body
+    );
+    // History keeps the filter too.
+    assert!(
+        page.body
+            .contains(&format!("href=\"/ui/history?project={pid}\"")),
         "{}",
         page.body
     );
@@ -906,6 +916,7 @@ async fn ack_back_never_leaves_the_ui() {
         "/ui/tokens",
         "/ui/boardx",
         "/ui/board?x=\n",
+        "/ui/board?q=caf\u{e9}",
         "",
     ] {
         let page = app

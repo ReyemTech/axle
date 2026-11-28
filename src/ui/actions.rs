@@ -339,7 +339,7 @@ pub struct AckForm {
 }
 
 /// Where an ack returns to: the board or History (with any query), else the board. `//`,
-/// `/\`, absolute URLs and other UI pages all fall back, so the redirect never leaves the UI.
+/// `/\`, absolute URLs, non-ASCII text and other UI pages all fall back, so the redirect never leaves the UI.
 fn ack_back(back: &str) -> &str {
     let ok = |page: &str| {
         back == page
@@ -347,7 +347,10 @@ fn ack_back(back: &str) -> &str {
                 .strip_prefix(page)
                 .is_some_and(|rest| rest.starts_with('?'))
     };
-    if (ok("/ui/board") || ok("/ui/history")) && !back.chars().any(char::is_control) {
+    if (ok("/ui/board") || ok("/ui/history"))
+        && back.is_ascii()
+        && !back.chars().any(char::is_control)
+    {
         back
     } else {
         "/ui/board"
