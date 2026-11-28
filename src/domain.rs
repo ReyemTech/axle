@@ -597,11 +597,11 @@ impl ProjectDelivery {
     /// The settings a project has before anyone configures it: no stages, and the sources
     /// that fit its key (GitHub for `github.com` keys, generic otherwise).
     pub fn defaults(project: &Project, now: OffsetDateTime) -> Self {
-        let github = project.key.split('/').next() == Some("github.com");
+        let github = crate::delivery::links::is_github_key(&project.key);
         ProjectDelivery {
             project_id: project.id,
             stages: Vec::new(),
-            repo: repo_of_key(&project.key),
+            repo: crate::delivery::links::repo_of_key(&project.key).map(|r| r.to_string()),
             github_enabled: github,
             release_source: if github {
                 ReleaseSource::GithubReleases
@@ -623,16 +623,6 @@ impl ProjectDelivery {
     pub fn last_stage(&self) -> Option<DeliveryStage> {
         self.stages.iter().copied().max()
     }
-}
-
-/// A project's repository: the first two path segments after the host, so
-/// `github.com/acme/mono/web` is `acme/mono`. `None` when the key has fewer.
-pub fn repo_of_key(key: &str) -> Option<String> {
-    let mut parts = key.split('/');
-    parts.next()?;
-    let owner = parts.next().filter(|s| !s.is_empty())?;
-    let name = parts.next().filter(|s| !s.is_empty())?;
-    Some(format!("{owner}/{name}"))
 }
 
 /// The PR a task ships in.
