@@ -2512,7 +2512,16 @@ store_matrix!(
 
 /// Delivery finishing a leaf can finish its `delivering` parent and close the grandparent's
 /// last open child: the grandparent's coordinator is told both, and its move is published.
-async fn cascade_notifies_grandparent(store: Arc<dyn Store>, mark_done: bool) {
+/// How the leaf is finished in `cascade_notifies_grandparent`.
+#[derive(Clone, Copy)]
+enum LeafFinish {
+    MarkDone,
+    Advance,
+    /// The project's stages are turned off, which finishes every delivering task.
+    StagesOff,
+}
+
+async fn cascade_notifies_grandparent(store: Arc<dyn Store>, how: LeafFinish) {
     let clock = Arc::new(TestClock::new(T1));
     let bus = axle::events::EventBus::new(store.clone(), clock.clone());
     let mut rx = bus.subscribe();
@@ -2531,11 +2540,16 @@ async fn cascade_notifies_grandparent(store: Arc<dyn Store>, mark_done: bool) {
     assert_eq!(parent.status, TaskStatus::Delivering);
     while rx.try_recv().is_ok() {}
 
-    if mark_done {
-        dx.svc.mark_done(leaf.id).await.unwrap();
-    } else {
-        dx.svc.advance(leaf.id).await.unwrap();
+    match how {
+        LeafFinish::MarkDone => {
+            dx.svc.mark_done(leaf.id).await.unwrap();
+        }
+        LeafFinish::Advance => {
+            dx.svc.advance(leaf.id).await.unwrap();
+        }
+        LeafFinish::StagesOff => dx.stages(&[]).await,
     }
+    assert_eq!(dx.fx.get(leaf.id).await.status, TaskStatus::Done);
     assert_eq!(dx.fx.get(parent.id).await.status, TaskStatus::Done);
     assert_eq!(dx.fx.get(grandparent.id).await.status, TaskStatus::Review);
     let subjects: Vec<_> = dx
@@ -2582,14 +2596,48 @@ async fn cascade_notifies_grandparent(store: Arc<dyn Store>, mark_done: bool) {
 store_matrix!(cascade_mark_done_notifies_grandparent, |store: Arc<
     dyn Store,
 >| async move {
-    cascade_notifies_grandparent(store, true).await
+    cascade_notifies_grandparent(store, LeafFinish::MarkDone).await
 });
 
 store_matrix!(cascade_advance_notifies_grandparent, |store: Arc<
     dyn Store,
 >| async move {
-    cascade_notifies_grandparent(store, false).await
+    cascade_notifies_grandparent(store, LeafFinish::Advance).await
 });
+
+store_matrix!(cascade_stages_off_notifies_grandparent, |store: Arc<
+    dyn Store,
+>| async move {
+    cascade_notifies_grandparent(store, LeafFinish::StagesOff).await
+});
+
+// A parent delivering only through its child stays delivering when that child is
+// force-released and the project's stages are saved again: it still has an open child.
+store_matrix!(
+    stages_save_keeps_parent_with_reopened_child,
+    |store: Arc<dyn Store>| async move {
+        let dx = Dx::new(store).await;
+        let stages = [DeliveryStage::InPr, DeliveryStage::Merged];
+        dx.stages(&stages).await;
+        let parent = dx.fx.claimed("parent", None).await;
+        let child = dx.fx.delivering("child", Some(parent.id), 7).await;
+        let (parent, _) = dx.fx.complete(parent.id, T1).await;
+        assert_eq!(parent.status, TaskStatus::Delivering);
+        dx.fx.svc.force_release(child.id).await.unwrap();
+        assert_eq!(dx.fx.get(child.id).await.status, TaskStatus::Open);
+
+        let moved = dx
+            .svc
+            .set_stages(&dx.fx.project, stages.to_vec())
+            .await
+            .unwrap();
+        assert!(moved.is_empty(), "{moved:?}");
+        assert_eq!(dx.fx.get(parent.id).await.status, TaskStatus::Delivering);
+        // Turning delivery off does not finish it either while the child is open.
+        dx.stages(&[]).await;
+        assert_eq!(dx.fx.get(parent.id).await.status, TaskStatus::Delivering);
+    }
+);
 
 // ---- a task delivery finishes unblocks the tasks waiting on it ----
 

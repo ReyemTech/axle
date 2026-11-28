@@ -1937,7 +1937,7 @@ impl Store for PostgresStore {
             .await?;
             delivering.extend(still.map(TaskId::from));
         }
-        let mut moved = Vec::new();
+        let (mut moved, mut finished) = (Vec::new(), Vec::new());
         for id in delivering {
             let state = DeliveringRow {
                 task: id,
@@ -1965,13 +1965,18 @@ impl Store for PostgresStore {
             if let Some(task) = done {
                 let event = stages_delivered_event(task.id, d);
                 push_moved(&mut moved, task.clone());
-                record_event_into(&mut tx, &task, &event, token, &mut moved).await?;
+                let closed = record_event_into(&mut tx, &task, &event, token, &mut moved).await?;
+                finished.push((task, closed));
             }
         }
         let unblocked =
             unblock_done(&mut tx, &moved, d.updated_at, Actor::Human, token, unblock).await?;
         tx.commit().await?;
-        Ok(StagesApplied { moved, unblocked })
+        Ok(StagesApplied {
+            moved,
+            finished,
+            unblocked,
+        })
     }
 
     async fn link_pr(&self, req: &LinkPrRequest) -> StoreResult<LinkOutcome> {

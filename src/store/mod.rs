@@ -190,7 +190,9 @@ pub trait Store: Send + Sync {
     /// any child change). With `unblock`, every task that became `done` unblocks its waiting
     /// tasks in the same transaction (see `UnblockRule`; actor the human). Returns the tasks
     /// moved, as updated (those the stages finished and the parents the parent rule moved),
-    /// and the tasks unblocked.
+    /// the tasks the stages finished themselves (with any `children_complete` each recorded)
+    /// and the tasks unblocked. A task with a child that is not `done` or `cancelled` is not
+    /// finished.
     async fn set_project_delivery(
         &self,
         d: &ProjectDelivery,
@@ -981,6 +983,10 @@ pub struct StageMove {
 pub struct StagesApplied {
     /// The tasks moved to `done`, as updated, parents included.
     pub moved: Vec<Task>,
+    /// The tasks the stages finished themselves (not through the parent rule), as updated,
+    /// each with the task on which finishing it recorded `children_complete` (see
+    /// `Transitioned::children_complete`).
+    pub finished: Vec<(Task, Option<TaskId>)>,
     /// The tasks those unblocked.
     pub unblocked: Vec<Unblocked>,
 }
@@ -1504,9 +1510,14 @@ pub(crate) struct DeliveringRow {
     pub children: Vec<ChildState>,
 }
 
-/// Whether new stages finish a delivering task.
+/// Whether new stages finish a delivering task. A task with a child that is not `done` or
+/// `cancelled` (one reopened by a force release, say) stays delivering, as under the parent
+/// rule (`recompute_parent`).
 pub(crate) fn finished_by(stages: &[DeliveryStage], row: &DeliveringRow) -> bool {
-    completion_target(stages, row.stage, row.has_pr, &row.children) == CompletionTarget::Done
+    row.children
+        .iter()
+        .all(|c| matches!(c.status, TaskStatus::Done | TaskStatus::Cancelled))
+        && completion_target(stages, row.stage, row.has_pr, &row.children) == CompletionTarget::Done
 }
 
 /// The `delivered` event a stage change records on a task it finished (the human acts).

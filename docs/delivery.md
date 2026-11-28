@@ -119,7 +119,10 @@ grandparent moves to `review`.
 Unticking stages recomputes every delivering task. One at or past the new last stage goes to
 `done`; the others stay at their furthest enabled stage. Unticking all of them moves every
 delivering task in the project to `done`, with the history note "delivery stages turned off",
-except a parent that still has a delivering child (see [Parents](#parents)).
+except a parent that still has a delivering child (see [Parents](#parents)) or a child that is
+open again (a force-released child, say). A task the stage change finishes is announced like
+one finished by **Advance stage** or **Mark done**: its parent's thread gets `child_done`, and
+so on up the tree.
 
 ## History
 

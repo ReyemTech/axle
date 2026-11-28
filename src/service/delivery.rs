@@ -22,6 +22,7 @@ use crate::service::announce::Notifier;
 use crate::service::tasks::{Caller, TaskError};
 use crate::store::{
     LinkOutcome, LinkPrRequest, NewTaskPr, StageMove, Store, StoreError, UnblockRule, Unblocked,
+    delivered_note,
 };
 
 /// What went wrong with a delivery operation; `Display` is the message shown to the caller.
@@ -157,11 +158,24 @@ impl DeliveryService {
             .store
             .set_project_delivery(&d, None, Some(self.unblock_rule()))
             .await?;
-        let notifier = self.notifier();
-        for task in &applied.moved {
-            notifier.changed(task, TaskEventKind::Delivered).await;
-        }
         self.publish_unblocked(&applied.unblocked).await;
+        // Each task the stages finished is announced as `advance` and `mark_done` announce
+        // theirs: its coordinator hears, and so does every ancestor the parent rule moved
+        // (whose moves `announce` publishes; those are the rest of `moved`).
+        let notifier = self.notifier();
+        let note = delivered_note(&d.stages);
+        for (task, children_complete) in &applied.finished {
+            notifier
+                .announce(
+                    task,
+                    TaskEventKind::Delivered,
+                    Some(&note),
+                    Actor::Human,
+                    None,
+                    *children_complete,
+                )
+                .await;
+        }
         Ok(applied.moved)
     }
 
