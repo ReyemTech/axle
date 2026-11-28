@@ -169,6 +169,25 @@ Nothing is deleted when a lease expires. The next claim takes over and the histo
 what happened. Writes from a session that has lost its lease are refused with
 `lease lost: another session now owns this task`.
 
+## Wake-ups
+
+Axle can start a turn in an idle session instead of waiting for it to poll. A session is
+**free** for new work when it is live, has reported `idle` for 5 seconds, holds no lease,
+can be woken (its harness reports a wake channel), is not already reserved, is eligible for
+the task and is not the agent that asked for it.
+
+When a sanctioned task needs a session, the router picks the free session woken least
+recently and **reserves** it for 2 minutes with one guarded write, so two sessions are never
+woken for one task. The woken session claims the task as usual; the claim clears the
+reservation. If it does not claim in time, the reservation expires and the router tries the
+next session. With nobody free the task is **queued** (history `queued`) and placed first in,
+first out as sessions go idle. A session whose wake failed, was held or was refused is not
+tried again for that task.
+
+Each session gets at most 1 wake a minute and 30 an hour, and at most 1 about the same task
+every 5 minutes. Every attempt is kept in the wake log. The wake prompt is a pointer (the
+task id and its framed, shortened title), never the task's body.
+
 ## Subtasks across projects
 
 Work that spans repositories is a **parent** task with **children**:

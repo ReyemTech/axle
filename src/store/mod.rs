@@ -13,7 +13,11 @@ use time::{Duration, OffsetDateTime};
 
 use crate::config::Backend;
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, Enrollment, EnrollmentId, EnrollmentKind, Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState, Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, WaitingOn, ProjectWakeSettings, ServerSettings, WakeAttempt, WakeKind, WakeOutcome, WakeTrigger, TurnState, WakeChannel,
+    Actor, Address, Agent, AgentId, BlockDetail, Enrollment, EnrollmentId, EnrollmentKind,
+    Importance, InboxItem, LinkKind, Message, MessageId, MessageKind, PlanState, Project,
+    ProjectId, ProjectWakeSettings, ServerSettings, Session, SessionId, Task, TaskEvent,
+    TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, TurnState, WaitingOn,
+    WakeAttempt, WakeChannel, WakeKind, WakeOutcome, WakeTrigger,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -273,6 +277,9 @@ pub trait Store: Send + Sync {
     -> StoreResult<()>;
     /// Appends one row to the wake log.
     async fn insert_wake_attempt(&self, a: &WakeAttempt) -> StoreResult<()>;
+    /// The newest `sent` wake (kind `wake`) to `session`, if any: what a later outcome row
+    /// for the same wake (claimed, expired, delivered, failed) takes its trigger from.
+    async fn last_wake_sent(&self, session: SessionId) -> StoreResult<Option<WakeAttempt>>;
     /// How many wake-log rows match `q`.
     async fn count_wake_attempts(&self, q: &AttemptQuery) -> StoreResult<u32>;
     /// The newest task in `project` with this dedupe key that `from` created at or after
@@ -340,6 +347,10 @@ pub trait Store: Send + Sync {
     /// or not done are skipped (their descendants too). Returns the ids newly acked.
     async fn ack_done_tasks(&self, ids: &[TaskId], now: OffsetDateTime)
     -> StoreResult<Vec<TaskId>>;
+    /// Appends `event` to its task's history and nothing else: the task row (status,
+    /// `version`, `updated_at`) is untouched and a child's event is not bubbled to its
+    /// parent. For Axle's own notes (`queued`, `routed`, `wake_sent`, `wake_failed`).
+    async fn append_task_event(&self, event: &TaskEvent) -> StoreResult<()>;
     /// A task's history, oldest first.
     async fn task_events(&self, id: TaskId) -> StoreResult<Vec<TaskEvent>>;
     /// A page of a task's history, newest first: only events of `kind` when set, and only
@@ -554,6 +565,21 @@ pub fn send_time_recipient(to: &Address) -> Option<(Option<AgentId>, Option<Sess
         Address::Human => Some((None, None)),
         Address::Project(_) | Address::Task(_) => None,
     }
+}
+
+/// Whether `claimant` may claim `task`, whose extra participating projects are
+/// `extra_projects`: the task's harness and host filters (when set) match exactly, and the
+/// claimant's home project is the task's home project or one of the extra ones. A claimant
+/// with no home project is never eligible. The claim (both stores) and the wake router use
+/// this one rule.
+pub fn eligible(task: &Task, extra_projects: &[ProjectId], claimant: &Claimant) -> bool {
+    let matches =
+        |filter: &Option<String>, value: &str| filter.as_deref().is_none_or(|f| f == value);
+    matches(&task.eligibility.harness, &claimant.harness)
+        && matches(&task.eligibility.host, &claimant.host)
+        && claimant
+            .project
+            .is_some_and(|p| p == task.project_id || extra_projects.contains(&p))
 }
 
 /// The caller of a claim, with everything the eligibility guard needs.

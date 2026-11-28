@@ -42,6 +42,11 @@ These are not configurable yet:
 | Enrollment and device-login requests | 10 per minute per client IP |
 | One-time code lifetime | 15 minutes, single use |
 | Device login lifetime | 10 minutes, polled every 7 seconds |
+| Wakes per session | 1 per minute and 30 per hour |
+| Wakes of one session about the same task | 1 per 5 minutes |
+| A woken session's reservation (time to claim) | 2 minutes |
+| A session counts as idle after reporting idle for | 5 seconds |
+| Wake ticker (expire reservations, place queued work) | every 15 seconds |
 
 ## Bridge and hooks (`axl bridge`, `axl hook`)
 

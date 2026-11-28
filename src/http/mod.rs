@@ -28,6 +28,7 @@ use crate::service::auth::AuthService;
 use crate::service::enroll::EnrollService;
 use crate::service::messages::MessageService;
 use crate::service::tasks::TaskService;
+use crate::service::wake::WakeService;
 use crate::store::Store;
 use crate::ui::UiState;
 
@@ -42,6 +43,8 @@ pub struct AppState {
     pub messages: Arc<MessageService>,
     pub tasks: Arc<TaskService>,
     pub enroll: Arc<EnrollService>,
+    /// The wake router; `serve` runs its ticker (`WakeService::spawn_ticker`).
+    pub wake: Arc<WakeService>,
     /// Fired when the server starts shutting down; long-lived responses (SSE) end on it.
     pub shutdown: Shutdown,
     pub rate_limit: Arc<RateLimiter>,
@@ -130,6 +133,9 @@ impl AppState {
                 clock.clone(),
                 bus.clone(),
             )),
+            wake: Arc::new(
+                WakeService::new(store.clone(), clock.clone(), &config).with_events(bus.clone()),
+            ),
             bus,
             shutdown: Shutdown::new(),
             rate_limit: Arc::new(RateLimiter::new(

@@ -7,10 +7,21 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use super::{
-    AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate, MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, RelateRequest, Related, Store, StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, UnblockRule, Unblocked, block_previous_payload, child_event, children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label, like_pattern, options_from, options_to, projects_added_note, projects_added_payload, related_payload, send_time_recipient, unblocked_records, AttemptQuery, to_u32, Reservation,
+    AddProjectsRequest, AttemptQuery, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter,
+    LeaseUpdate, MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome,
+    ProjectsAdded, Recipient, RelateRequest, Related, Reservation, Store, StoreError, StoreResult,
+    TaskFilter, TaskOrder, TransitionRequest, Transitioned, UnblockRule, Unblocked,
+    block_previous_payload, child_event, children_complete_event, claim_event, closes_child,
+    edit_payload, eligible, enrollment_token_label, like_pattern, options_from, options_to,
+    projects_added_note, projects_added_payload, related_payload, send_time_recipient, to_u32,
+    unblocked_records,
 };
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId, EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, WaitingOn, ProjectWakeSettings, ServerSettings, WakeAttempt, TurnState, WakeChannel,
+    Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId,
+    EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId,
+    ProjectWakeSettings, ServerSettings, Session, SessionId, Task, TaskEvent, TaskEventKind,
+    TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, TurnState, WaitingOn, WakeAttempt,
+    WakeChannel,
 };
 
 pub struct PostgresStore {
@@ -76,6 +87,23 @@ fn opt_id<T: From<Uuid>>(row: &PgRow, col: &str) -> StoreResult<Option<T>> {
 
 fn parse_text<T: std::str::FromStr<Err = String>>(s: &str) -> StoreResult<T> {
     s.parse().map_err(StoreError::Corrupt)
+}
+
+fn attempt_from(row: &PgRow) -> StoreResult<WakeAttempt> {
+    Ok(WakeAttempt {
+        id: row.try_get("id")?,
+        kind: parse_text(row.try_get("kind")?)?,
+        trigger: parse_text(row.try_get("trigger")?)?,
+        task_id: opt_id(row, "task_id")?,
+        session_id: opt_id(row, "session_id")?,
+        from_agent_id: opt_id(row, "from_agent_id")?,
+        runner_id: row.try_get("runner_id")?,
+        run_id: row.try_get("run_id")?,
+        outcome: parse_text(row.try_get("outcome")?)?,
+        detail: row.try_get("detail")?,
+        pr_url: row.try_get("pr_url")?,
+        at: row.try_get("created_at")?,
+    })
 }
 
 fn task_from(row: &PgRow) -> StoreResult<Task> {
@@ -426,8 +454,9 @@ async fn unblock_waiting(
     Ok(out)
 }
 
-/// Whether the claimant may claim the `tasks` row in scope. Uses `$2` harness, `$3` host,
-/// `$4` home project.
+/// `store::eligible` as SQL over the `tasks` row in scope, for picking a candidate in
+/// `claim_next_task` (the claim itself decides with `store::eligible`). Uses `$2` harness,
+/// `$3` host, `$4` home project.
 macro_rules! eligible {
     () => {
         "COALESCE((eligible_harness IS NULL OR eligible_harness = $2::text)
@@ -452,14 +481,9 @@ async fn claim_locked(
     let Some(row) = sqlx::query(concat!(
         "SELECT ",
         task_cols!(),
-        ", ",
-        eligible!(),
-        " AS eligible FROM tasks WHERE id = $1 FOR UPDATE OF tasks"
+        " FROM tasks WHERE id = $1 FOR UPDATE OF tasks"
     ))
     .bind(task.as_uuid())
-    .bind(&c.harness)
-    .bind(&c.host)
-    .bind(c.project.map(|p| p.as_uuid()))
     .fetch_optional(&mut *conn)
     .await?
     else {
@@ -470,38 +494,48 @@ async fn claim_locked(
         });
     };
     let previous = task_from(&row)?;
-    let eligible: bool = row.try_get("eligible")?;
+    // Participating projects are only added under the same row lock, so this read is stable.
+    let extra: Vec<ProjectId> =
+        sqlx::query_scalar::<_, Uuid>("SELECT project_id FROM task_projects WHERE task_id = $1")
+            .bind(task.as_uuid())
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect();
+    if !eligible(&previous, &extra, c) {
+        return Ok(ClaimAttempt {
+            previous: Some(previous),
+            eligible: false,
+            claimed: None,
+        });
+    }
 
     let claimed = sqlx::query(concat!(
         "UPDATE tasks
-            SET owner_session_id = $5, owner_agent_id = $6,
+            SET owner_session_id = $2, owner_agent_id = $3,
                 status = CASE WHEN status = 'open' AND requires_plan THEN 'planning'
                               WHEN status = 'planning' THEN 'planning'
                               ELSE 'claimed' END,
                 plan_state = CASE WHEN status = 'open' AND requires_plan THEN 'drafting'
                                   ELSE plan_state END,
                 lease_expires_at = CASE WHEN status = 'planning' AND plan_state = 'submitted'
-                                        THEN NULL ELSE $7 END,
-                lease_epoch = lease_epoch + 1, version = version + 1, updated_at = $8, ",
+                                        THEN NULL ELSE $4 END,
+                lease_epoch = lease_epoch + 1, version = version + 1, updated_at = $5, ",
         clear_block!(),
         "
           WHERE id = $1
             AND (status = 'open'
-                 OR (status IN ('claimed', 'planning') AND lease_expires_at < $8)
-                 OR (status IN ('claimed', 'planning', 'blocked', 'review') AND owner_agent_id = $6
-                     AND (owner_session_id = $5
+                 OR (status IN ('claimed', 'planning') AND lease_expires_at < $5)
+                 OR (status IN ('claimed', 'planning', 'blocked', 'review') AND owner_agent_id = $3
+                     AND (owner_session_id = $2
                           OR NOT EXISTS (SELECT 1 FROM sessions s
                                           WHERE s.id = tasks.owner_session_id
-                                            AND s.last_heartbeat_at >= $9))))
-            AND ",
-        eligible!(),
-        " RETURNING ",
+                                            AND s.last_heartbeat_at >= $6))))
+          RETURNING ",
         task_cols!()
     ))
     .bind(task.as_uuid())
-    .bind(&c.harness)
-    .bind(&c.host)
-    .bind(c.project.map(|p| p.as_uuid()))
     .bind(c.session.as_uuid())
     .bind(c.agent.as_uuid())
     .bind(req.lease_until(&previous))
@@ -518,7 +552,7 @@ async fn claim_locked(
     }
     Ok(ClaimAttempt {
         previous: Some(previous),
-        eligible,
+        eligible: true,
         claimed,
     })
 }
@@ -1968,6 +2002,22 @@ impl Store for PostgresStore {
         Ok(())
     }
 
+    async fn last_wake_sent(&self, session: SessionId) -> StoreResult<Option<WakeAttempt>> {
+        sqlx::query(
+            "SELECT id, kind, trigger, task_id, session_id, from_agent_id, runner_id, run_id,
+                    outcome, detail, pr_url, created_at
+               FROM wake_attempts
+              WHERE session_id = $1 AND kind = 'wake' AND outcome = 'sent'
+              ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(session.as_uuid())
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(attempt_from)
+        .transpose()
+    }
+
     async fn count_wake_attempts(&self, q: &AttemptQuery) -> StoreResult<u32> {
         let triggers: Option<Vec<&str>> = q
             .triggers
@@ -2327,6 +2377,11 @@ impl Store for PostgresStore {
             .fetch_one(&self.pool)
             .await?;
         Ok(n as u64)
+    }
+
+    async fn append_task_event(&self, event: &TaskEvent) -> StoreResult<()> {
+        let mut conn = self.pool.acquire().await?;
+        insert_event(&mut conn, event, None).await
     }
 
     async fn task_events(&self, id: TaskId) -> StoreResult<Vec<TaskEvent>> {

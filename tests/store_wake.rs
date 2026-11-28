@@ -533,6 +533,86 @@ store_matrix!(
     }
 );
 
+store_matrix!(last_wake_sent_is_the_newest_sent_row, |store: Arc<
+    dyn Store,
+>| async move {
+    let clock = TestClock::new(T0);
+    let a = agent(&store, &clock).await;
+    let session = a.session.id;
+    assert_eq!(store.last_wake_sent(session).await.unwrap(), None);
+
+    let task = task_in(a.project.as_ref().unwrap().id, "t", T0);
+    insert(&store, &task).await;
+    let mut older = attempt(session, WakeTrigger::StartNow, WakeOutcome::Sent, T0);
+    older.task_id = Some(task.id);
+    let mut newer = attempt(
+        session,
+        WakeTrigger::HumanReply,
+        WakeOutcome::Sent,
+        T0 + Duration::minutes(1),
+    );
+    newer.from_agent_id = Some(a.agent.id);
+    newer.detail = Some("d".into());
+    // Not `sent`, another kind, another session: none of them count.
+    let later_outcome = attempt(
+        session,
+        WakeTrigger::Queue,
+        WakeOutcome::Expired,
+        T0 + Duration::minutes(2),
+    );
+    let mut headless = attempt(
+        session,
+        WakeTrigger::Queue,
+        WakeOutcome::Sent,
+        T0 + Duration::minutes(3),
+    );
+    headless.kind = WakeKind::Headless;
+    let other = agent(&store, &clock).await;
+    let elsewhere = attempt(
+        other.session.id,
+        WakeTrigger::Queue,
+        WakeOutcome::Sent,
+        T0 + Duration::minutes(4),
+    );
+    for row in [&older, &newer, &later_outcome, &headless, &elsewhere] {
+        store.insert_wake_attempt(row).await.unwrap();
+    }
+    assert_eq!(store.last_wake_sent(session).await.unwrap(), Some(newer));
+    assert_eq!(
+        store.last_wake_sent(other.session.id).await.unwrap(),
+        Some(elsewhere)
+    );
+});
+
+store_matrix!(append_task_event_leaves_the_task_alone, |store: Arc<
+    dyn Store,
+>| async move {
+    let clock = TestClock::new(T0);
+    let a = agent(&store, &clock).await;
+    let task = task_in(a.project.as_ref().unwrap().id, "t", T0);
+    insert(&store, &task).await;
+    let before = store.get_task(task.id).await.unwrap().unwrap();
+
+    let event = TaskEvent {
+        id: uuid::Uuid::now_v7(),
+        task_id: task.id,
+        at: T0 + Duration::seconds(5),
+        actor: Actor::Human,
+        kind: TaskEventKind::Routed,
+        note: Some("n".into()),
+        payload: Some(serde_json::json!({ "session_id": a.session.id.to_string() })),
+    };
+    store.append_task_event(&event).await.unwrap();
+
+    assert_eq!(store.get_task(task.id).await.unwrap().unwrap(), before);
+    let events = store.task_events(task.id).await.unwrap();
+    assert_eq!(
+        events.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        vec![TaskEventKind::Created, TaskEventKind::Routed]
+    );
+    assert_eq!(events[1], event);
+});
+
 /// Copies every migration of `backend` before 0006 (wake-up) into a fresh directory.
 fn old_migrations(backend: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("axle-mig-{}", uuid::Uuid::now_v7()));

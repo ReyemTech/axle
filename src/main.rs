@@ -323,6 +323,7 @@ async fn serve(bind: Option<SocketAddr>, trusted_header: Option<String>) -> CliR
     let store = open_store(&config.backend).await?;
     let addr = config.bind;
     let state = AppState::new(store, Arc::new(SystemClock), config);
+    state.wake.clone().spawn_ticker(state.shutdown.clone());
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("axl: listening on http://{}", listener.local_addr()?);
     axle::http::serve(listener, state, stop_signal()).await?;

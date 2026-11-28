@@ -632,6 +632,14 @@ pub enum TaskEventKind {
     MovedUnder,
     /// No session was free when the task became routable, so it waits in the wake queue.
     Queued,
+    /// Axle reserved a free session for the task and asked it to wake (payload: the session
+    /// and agent).
+    Routed,
+    /// The session's bridge reported that it delivered the wake prompt.
+    WakeSent,
+    /// The wake could not be delivered (failed, held or refused); that session is not tried
+    /// again for this task.
+    WakeFailed,
     /// The human acknowledged a done task. Only ever published as a live event; it is
     /// never written to a task's history.
     Acked,
@@ -663,6 +671,9 @@ text_enum!(TaskEventKind {
     Related => "related",
     MovedUnder => "moved_under",
     Queued => "queued",
+    Routed => "routed",
+    WakeSent => "wake_sent",
+    WakeFailed => "wake_failed",
     Acked => "acked",
 });
 

@@ -10,10 +10,21 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 use time::{Duration as TimeDuration, OffsetDateTime};
 
 use super::{
-    AddProjectsRequest, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter, LeaseUpdate, MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome, ProjectsAdded, Recipient, RelateRequest, Related, Store, StoreError, StoreResult, TaskFilter, TaskOrder, TransitionRequest, Transitioned, UnblockRule, Unblocked, block_previous_payload, child_event, children_complete_event, claim_event, closes_child, edit_payload, enrollment_token_label, like_pattern, options_from, options_to, projects_added_note, projects_added_payload, related_payload, send_time_recipient, unblocked_records, AttemptQuery, to_u32, Reservation,
+    AddProjectsRequest, AttemptQuery, ClaimAttempt, ClaimRequest, EditRequest, InboxFilter,
+    LeaseUpdate, MessageReceipt, MoveRequest, Moved, NewEnrollment, NewToken, PollOutcome,
+    ProjectsAdded, Recipient, RelateRequest, Related, Reservation, Store, StoreError, StoreResult,
+    TaskFilter, TaskOrder, TransitionRequest, Transitioned, UnblockRule, Unblocked,
+    block_previous_payload, child_event, children_complete_event, claim_event, closes_child,
+    edit_payload, eligible, enrollment_token_label, like_pattern, options_from, options_to,
+    projects_added_note, projects_added_payload, related_payload, send_time_recipient, to_u32,
+    unblocked_records,
 };
 use crate::domain::{
-    Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId, EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId, Session, SessionId, Task, TaskEvent, TaskEventKind, TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, WaitingOn, ProjectWakeSettings, ServerSettings, WakeAttempt, TurnState, WakeChannel,
+    Actor, Address, Agent, AgentId, BlockDetail, Eligibility, Enrollment, EnrollmentId,
+    EnrollmentStatus, Importance, InboxItem, Message, MessageId, Project, ProjectId,
+    ProjectWakeSettings, ServerSettings, Session, SessionId, Task, TaskEvent, TaskEventKind,
+    TaskId, TaskLink, TaskStatus, TokenId, TokenInfo, TurnState, WaitingOn, WakeAttempt,
+    WakeChannel,
 };
 
 /// The columns `enrollment_from` reads (a macro so queries can `concat!` it statically).
@@ -144,6 +155,23 @@ fn session_from(row: &SqliteRow) -> StoreResult<Session> {
 /// A request chain as a JSON array of project id strings.
 fn request_chain_json(chain: &[ProjectId]) -> String {
     serde_json::Value::from(chain.iter().map(ToString::to_string).collect::<Vec<_>>()).to_string()
+}
+
+fn attempt_from(row: &SqliteRow) -> StoreResult<WakeAttempt> {
+    Ok(WakeAttempt {
+        id: uuid_of(row.try_get("id")?)?,
+        kind: parse_text(row.try_get("kind")?)?,
+        trigger: parse_text(row.try_get("trigger")?)?,
+        task_id: opt_uuid(row, "task_id")?,
+        session_id: opt_uuid(row, "session_id")?,
+        from_agent_id: opt_uuid(row, "from_agent_id")?,
+        runner_id: opt_uuid(row, "runner_id")?,
+        run_id: opt_uuid(row, "run_id")?,
+        outcome: parse_text(row.try_get("outcome")?)?,
+        detail: row.try_get("detail")?,
+        pr_url: row.try_get("pr_url")?,
+        at: ts::dec(row.try_get("created_at")?)?,
+    })
 }
 
 fn task_from(row: &SqliteRow) -> StoreResult<Task> {
@@ -402,7 +430,8 @@ pub fn count_tasks_sql(filter: &TaskFilter) -> &'static str {
     }
 }
 
-/// Whether the claimant may claim the `tasks` row in scope. Binds, in order:
+/// `store::eligible` as SQL over the `tasks` row in scope, for picking a candidate in
+/// `claim_next_task` (the claim itself decides with `store::eligible`). Binds, in order:
 /// harness, host, home project, home project.
 macro_rules! eligible {
     () => {
@@ -423,23 +452,12 @@ async fn claim_locked(
     let c = &req.claimant;
     let id = task.to_string();
     let agent = c.agent.to_string();
-    let project = c.project.map(|p| p.to_string());
     let now = ts::enc(req.now);
 
-    let Some(row) = sqlx::query(concat!(
-        "SELECT ",
-        task_cols!(),
-        ", ",
-        eligible!(),
-        " AS eligible FROM tasks WHERE id = ?"
-    ))
-    .bind(&c.harness)
-    .bind(&c.host)
-    .bind(&project)
-    .bind(&project)
-    .bind(&id)
-    .fetch_optional(&mut *conn)
-    .await?
+    let Some(row) = sqlx::query(concat!("SELECT ", task_cols!(), " FROM tasks WHERE id = ?"))
+        .bind(&id)
+        .fetch_optional(&mut *conn)
+        .await?
     else {
         return Ok(ClaimAttempt {
             previous: None,
@@ -448,7 +466,21 @@ async fn claim_locked(
         });
     };
     let previous = task_from(&row)?;
-    let eligible: bool = row.try_get("eligible")?;
+    let extra: Vec<ProjectId> =
+        sqlx::query_scalar::<_, String>("SELECT project_id FROM task_projects WHERE task_id = ?")
+            .bind(&id)
+            .fetch_all(&mut *conn)
+            .await?
+            .iter()
+            .map(|p| uuid_of(p))
+            .collect::<StoreResult<_>>()?;
+    if !eligible(&previous, &extra, c) {
+        return Ok(ClaimAttempt {
+            previous: Some(previous),
+            eligible: false,
+            claimed: None,
+        });
+    }
 
     // A `requires_plan` task is claimed into `planning`; a planning task stays planning on a
     // takeover, and a submitted plan (waiting on the human) keeps having no lease.
@@ -473,9 +505,7 @@ async fn claim_locked(
                           OR NOT EXISTS (SELECT 1 FROM sessions s
                                           WHERE s.id = tasks.owner_session_id
                                             AND s.last_heartbeat_at >= ?))))
-            AND ",
-        eligible!(),
-        " RETURNING ",
+          RETURNING ",
         task_cols!()
     ))
     .bind(c.session.to_string())
@@ -487,10 +517,6 @@ async fn claim_locked(
     .bind(&agent)
     .bind(c.session.to_string())
     .bind(ts::enc(req.live_since))
-    .bind(&c.harness)
-    .bind(&c.host)
-    .bind(&project)
-    .bind(&project)
     .fetch_optional(&mut *conn)
     .await?
     .as_ref()
@@ -502,7 +528,7 @@ async fn claim_locked(
     }
     Ok(ClaimAttempt {
         previous: Some(previous),
-        eligible,
+        eligible: true,
         claimed,
     })
 }
@@ -2055,6 +2081,22 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn last_wake_sent(&self, session: SessionId) -> StoreResult<Option<WakeAttempt>> {
+        sqlx::query(
+            "SELECT id, kind, trigger, task_id, session_id, from_agent_id, runner_id, run_id,
+                    outcome, detail, pr_url, created_at
+               FROM wake_attempts
+              WHERE session_id = ? AND kind = 'wake' AND outcome = 'sent'
+              ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(session.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(attempt_from)
+        .transpose()
+    }
+
     async fn count_wake_attempts(&self, q: &AttemptQuery) -> StoreResult<u32> {
         let triggers = q.triggers.as_ref().map(|list| {
             format!(
@@ -2377,6 +2419,11 @@ impl Store for SqliteStore {
             .fetch_one(&self.pool)
             .await?;
         Ok(n as u64)
+    }
+
+    async fn append_task_event(&self, event: &TaskEvent) -> StoreResult<()> {
+        let mut conn = self.pool.acquire().await?;
+        insert_event(&mut conn, event, None).await
     }
 
     async fn task_events(&self, id: TaskId) -> StoreResult<Vec<TaskEvent>> {
